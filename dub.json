@@ -1,0 +1,11 @@
+{
+	"authors": [
+		"Marcelo Aires Caetano"
+	],
+	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
+
+	
+	"description": "a dlang redis implementation",
+	"license": "MIT",
+	"name": "dreads"
+}
