@@ -4,6 +4,7 @@ version (unittest)
 {
     import std.stdio;
     import dreads.containers;
+    import unit_threaded;
 
     @("OrderedSet.add_elements")
     @safe unittest
@@ -25,7 +26,7 @@ version (unittest)
         a.add(1);
         a.add(2);
         a.add(3);
-        a.toString().shouldEqual("{1, 2, 3}");
+        a.toString.shouldEqual("{1, 2, 3}");
     }
 
     @("OrderedSet.length")
@@ -266,7 +267,7 @@ version (unittest)
         OrderedSet!string a;
         a.add("foo");
         a.add("bar");
-        a.toString().shouldEqual("{bar, foo}");
+        a.toString().shouldEqual("{\"bar\", \"foo\"}");
     }
 
     @("OrderedSet.add_single_element")

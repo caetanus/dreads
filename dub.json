@@ -3,6 +3,24 @@
 		"Marcelo Aires Caetano"
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
+	"targetType": "executable",
+	"targetPath": "bin",
+	"configurations": [{
+		"name": "executable"
+	},
+	        {
+            "name": "unittest",
+            "targetType": "executable",
+			"targetName": "dreads_tests",
+            "preBuildCommands": ["$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"],
+            "mainSourceFile": "bin/ut.d",
+            "excludedSourceFiles": ["src/main.d"],
+            "dependencies": {
+                "unit-threaded": "*"
+            }
+        }
+
+],
 
 	
 	"description": "a dlang redis implementation",

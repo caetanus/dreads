@@ -1,12 +1,30 @@
 module dreads.containers;
 import std.container.rbtree;
-import std.typecons : tuple;
-import std.stdio: writeln;
+import std.typecons : tuple, SafeRefCounted, RefCountedAutoInitialize;
+import std.stdio : writeln;
+
+struct AutoNew(T)
+{
+    static assert(is(T : Object), "Error: " ~ T.stringof ~ ": Auto new can only be used with classes");
+    private T val;
+    @property auto instance()
+    {
+        if (val is null)
+        {
+            val = new T;
+        }
+        return val;
+    }
+    @property auto constInstance() const {
+        return val;
+    }
+
+    alias instance this;
+}
 
 public struct OrderedSet(T)
-
-{ 
-    auto tree = new RedBlackTree!T ;
+{
+    AutoNew!(RedBlackTree!T) tree;
     this(T[] items...)
     {
         foreach (item; items)
@@ -24,22 +42,22 @@ public struct OrderedSet(T)
         }
     }
 
-    OrderedSet!T dup() const
+    @safe OrderedSet!T dup()
     {
         OrderedSet!T copy;
-        foreach (item; tree[])
-        {   
-            copy.add(cast(T)item);
+        foreach (item; tree)
+        {
+            copy.add(cast(T) item);
         }
         return copy;
     }
 
-    void add(T item)
+    @safe void add(T item)
     {
         tree.stableInsert(item);
     }
 
-    void remove(T item)
+    @safe void remove(T item)
     {
         auto r = tree.equalRange(item);
         {
@@ -47,33 +65,38 @@ public struct OrderedSet(T)
         }
     }
 
-    @safe bool has(T item) const
+    @safe bool has(T item)
     {
-        return item in tree;
-    }
-    @safe bool opBinary(string op: "in")(const T rhs) 
-    {
-        return has(rhs);   
+        return item in tree.instance;
     }
 
-    size_t length() const
+    @safe bool opBinary(string op : "in")(const T rhs)
+    {
+        return has(rhs);
+    }
+
+    @safe size_t length()
     {
         return tree.length;
     }
 
-    void clear()
+    @safe void clear()
     {
         tree.clear;
     }
 
-    @safe auto opSlice()
+    @safe @property auto opSlice()
     {
         return tree[];
     }
 
-    int opApply(int delegate(T) @safe dg) const @safe
+    @safe int opApply(scope int delegate(T) @safe dg) const
     {
-        foreach (e; tree[])
+        if (tree.constInstance is null) {
+            return 0;
+        }
+        if (dg is null) return 0;
+        foreach (e; tree.constInstance[])
         {
             auto r = dg(e);
             if (r)
@@ -82,37 +105,30 @@ public struct OrderedSet(T)
         return 0;
     }
 
-    @safe OrderedSet!T opBinary(string op : "+")(const ref OrderedSet!T other) const
+    @safe OrderedSet!T opBinary(string op : "+")(OrderedSet!T other)
     {
         return union_(other);
     }
 
-    @safe OrderedSet!T opBinary(string op : "-")(const ref OrderedSet!T other) const
+    @safe OrderedSet!T opBinary(string op : "-")(OrderedSet!T other)
     {
         return difference(other);
     }
 
-    //bool opEquals(const ref OrderedSet!T other) const
-    //{
-    //    import std.algorithm : equal;
-
-    //    return this.tree[].equal(other.tree);
-    //}
-
-    bool opEquals(R)(const R!T other) const
+    @safe bool opEquals(R)(const R!T other) const
     {
         import std.algorithm : equal;
 
-        return this.tree[].equal(other);
+        return this[].equal(other);
 
     }
 
-    auto range() const
+    @safe auto range()
     {
-        return tree[];
+        return tree.instance[];
     }
 
-    OrderedSet!T union_(const ref OrderedSet!T other) const
+    @safe OrderedSet!T union_(const OrderedSet!T other)
     {
         OrderedSet!T result = this.dup;
         foreach (item; other)
@@ -123,7 +139,7 @@ public struct OrderedSet(T)
 
     }
 
-    OrderedSet!T intersection(const ref OrderedSet!T other) const
+    @safe OrderedSet!T intersection(ref OrderedSet!T other)
     {
         OrderedSet!T result;
         foreach (item; this)
@@ -136,7 +152,7 @@ public struct OrderedSet(T)
         return result;
     }
 
-    OrderedSet!T difference(const ref OrderedSet!T other) const
+    @safe OrderedSet!T difference(ref OrderedSet!T other)
     {
         OrderedSet!T result;
         foreach (item; this)
@@ -149,12 +165,12 @@ public struct OrderedSet(T)
         return result;
     }
 
-    OrderedSet!T symmetricDifference(const ref OrderedSet!T other) const
+    @safe OrderedSet!T symmetricDifference(OrderedSet!T other)
     {
         return (this - other) + (other - this);
     }
 
-    bool isSubsetOf(const ref OrderedSet!T other) const
+    @safe bool isSubsetOf(ref OrderedSet!T other)
     {
         foreach (item; this)
         {
@@ -164,22 +180,29 @@ public struct OrderedSet(T)
         return true;
     }
 
-    bool isSuperSetOf(const ref OrderedSet!T other) const
+    @safe bool isSuperSetOf(ref OrderedSet!T other)
     {
         return other.isSubsetOf(this);
     }
 
-    string toString() const
+    @safe string toString() const
     {
         import std.array : appender;
         import std.format : format;
+
         auto a = appender!string();
         a.put("{");
         bool first = true;
-        foreach (item; tree[])
+        foreach (item; this)
         {
-            if (!first) a.put(", ");
-            a.put(item.format!"%s");
+            if (!first)
+                a.put(", ");
+            static if (is(T == string))
+            {
+                a.put(item.format!"\"%s\"");
+            }
+            else
+                a.put(item.format!"%s");
             first = false;
         }
         a.put("}");
@@ -190,7 +213,8 @@ public struct OrderedSet(T)
 
 unittest
 {
-    import std.stdio: writeln;
+    import std.stdio : writeln;
+
     writeln("Oi");
     OrderedSet!int a;
     assert(a.tree !is null, "tree is null");
