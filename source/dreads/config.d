@@ -16,6 +16,13 @@ public struct Config
     string maxmemoryPolicy = "noeviction"; // noeviction | allkeys-lru | volatile-lru
     long luaTimeLimitMs = 5000; // script execution budget; 0 = unlimited
     ulong luaMemoryLimit = 0; // bytes the Lua state may allocate; 0 = unlimited
+    // SQLite-style durability: full = fsync per mutation (Raft-correct),
+    // normal = flush per batch + periodic fsync, off = OS-buffered only
+    string synchronous = "full";
+    // replication (Raft phase 1)
+    uint raftNodeId = 0; // 0 = replication disabled
+    string raftPeers; // "2@host:port,3@host:port"
+    ushort raftPort = 0; // 0 = port + 10000
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -118,6 +125,30 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return cfg.luaTimeLimitMs >= 0;
     case "lua-memory-limit":
         return parseMemory(value, cfg.luaMemoryLimit);
+    case "synchronous":
+        switch (value)
+        {
+        case "off", "normal", "full":
+            cfg.synchronous = value;
+            return true;
+        default:
+            return false;
+        }
+    case "raft-node-id":
+        try
+            cfg.raftNodeId = value.to!uint;
+        catch (Exception)
+            return false;
+        return true;
+    case "raft-peers":
+        cfg.raftPeers = value.unquote;
+        return true;
+    case "raft-port":
+        try
+            cfg.raftPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
     default:
         return false;
     }

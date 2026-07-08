@@ -27,6 +27,9 @@
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
 	"dependencies": {
 		"automem": "~>0.6.11",
+		"raft": {
+			"path": "vendor/raft"
+		},
 		"vibe-core": "~>2.8"
 	},
 	"description": "a dlang redis implementation",
