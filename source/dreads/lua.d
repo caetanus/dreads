@@ -19,6 +19,7 @@ enum LUA_TLIGHTUSERDATA = 2;
 enum LUA_TNUMBER = 3;
 enum LUA_TSTRING = 4;
 enum LUA_TTABLE = 5;
+enum LUA_TFUNCTION = 6;
 
 // LUAI_MAXSTACK (1_000_000) + 1000, as in lua 5.4's luaconf.h
 enum LUA_REGISTRYINDEX = -1_001_000;
@@ -84,6 +85,7 @@ int luaopen_math(lua_State* L);
 
 // raw global access (bypasses the _G protection metatable)
 void lua_rawset(lua_State* L, int idx);
+int lua_rawget(lua_State* L, int idx);
 enum LUA_RIDX_GLOBALS = 2;
 
 // table traversal and integer introspection (cjson)

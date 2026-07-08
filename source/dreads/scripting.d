@@ -150,6 +150,10 @@ private bool ensureState() nothrow
     }
     // sandbox layer 4: instruction-count hook enforcing lua-time-limit
     lua_sethook(gL, &luaTimeoutHook, LUA_MASKCOUNT, 100_000);
+    // compiled-chunk cache (sha -> function): compiling dominates EVAL cost,
+    // so scripts compile once per state lifetime, like Redis
+    lua_createtable(gL, 0, 16);
+    lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_scripts");
     return true;
 }
 
@@ -611,13 +615,25 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         }
     }
 
-    if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
+    // cached compiled chunk, or compile and cache (compiling dominates EVAL)
+    lua_getfield(gL, LUA_REGISTRYINDEX, "dreads_scripts");
+    lua_pushlstring(gL, sha.ptr, 40);
+    lua_rawget(gL, -2);
+    if (lua_type(gL, -1) != LUA_TFUNCTION)
     {
-        luaErrToResp(o, "ERR Error compiling script: ");
-        return;
+        lua_settop(gL, lua_gettop(gL) - 1); // drop the miss
+        if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
+        {
+            luaErrToResp(o, "ERR Error compiling script: ");
+            return;
+        }
+        lua_pushlstring(gL, sha.ptr, 40);
+        lua_pushvalue(gL, -2);
+        lua_rawset(gL, -4); // cache[sha] = fn (fn stays on top)
     }
     // per-run _ENV: the script's globals live in a throwaway table chained to
     // the shared base — the cheap equivalent of a fresh interpreter per run
+    // (the cache table sitting below the function is harmless to pcall)
     lua_createtable(gL, 0, 8); // env
     lua_createtable(gL, 0, 1); // env metatable
     lua_rawgeti(gL, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
@@ -733,6 +749,11 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
     case "FLUSH":
         {
             gScripts.clear();
+            if (gL !is null) // drop the compiled-chunk cache too
+            {
+                lua_createtable(gL, 0, 16);
+                lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_scripts");
+            }
             repSimple(o, "OK");
             return;
         }
