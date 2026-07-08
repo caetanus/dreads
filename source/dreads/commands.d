@@ -1954,6 +1954,62 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             xread(ks, args, o);
             break;
         }
+    case "XREVRANGE":
+        {
+            import dreads.streamops : xrevrange;
+
+            xrevrange(ks, args, o, arena);
+            break;
+        }
+    case "XSETID":
+        {
+            import dreads.streamops : xsetid;
+
+            xsetid(ks, args, o);
+            break;
+        }
+    case "XINFO":
+        {
+            import dreads.streamops : xinfo;
+
+            xinfo(ks, args, o);
+            break;
+        }
+    case "XGROUP":
+        {
+            import dreads.streamops : xgroup;
+
+            xgroup(ks, args, o);
+            break;
+        }
+    case "XREADGROUP":
+        {
+            import dreads.streamops : xreadgroup;
+
+            xreadgroup(ks, args, o, arena);
+            break;
+        }
+    case "XACK":
+        {
+            import dreads.streamops : xack;
+
+            xack(ks, args, o);
+            break;
+        }
+    case "XPENDING":
+        {
+            import dreads.streamops : xpending;
+
+            xpending(ks, args, o);
+            break;
+        }
+    case "XCLAIM":
+        {
+            import dreads.streamops : xclaim;
+
+            xclaim(ks, args, o);
+            break;
+        }
     case "XDEL":
         {
             if (args.length < 2)
@@ -3640,7 +3696,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":
     case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
-    case "XADD", "XDEL", "XTRIM":
+    case "XADD", "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM":
     case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
     case "SETBIT", "BITOP", "BITFIELD":
     case "LMPOP", "SORT", "PFADD", "PFMERGE":

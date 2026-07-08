@@ -5,7 +5,9 @@ module dreads.stream;
 // order and range queries binary-search the lower bound. Fully @nogc.
 
 import core.stdc.stdlib : crealloc = realloc, cfree = free, malloc;
+import core.stdc.string : memmove;
 
+import dreads.dict : Dict, Unit;
 import dreads.mem : freeSlice, mallocDup;
 
 public struct StreamID
@@ -67,12 +69,114 @@ private struct SEntry
     size_t npairs;
 }
 
+/// One pending (delivered, unacknowledged) entry of a consumer group.
+public struct PelEntry
+{
+    StreamID id;
+    const(char)[] consumer; // slice of the group's consumers dict key: stable
+    ulong deliveryTimeMs;
+    ulong deliveryCount;
+}
+
+/// Consumer group: last-delivered cursor + pending entries list (sorted).
+public struct Group
+{
+    StreamID lastDelivered;
+    PelEntry* pel;
+    size_t plen;
+    size_t pcap;
+    Dict!Unit consumers;
+
+    void free() @nogc nothrow
+    {
+        if (pel !is null)
+            cfree(pel);
+        pel = null;
+        plen = pcap = 0;
+        consumers.free();
+    }
+
+    @property const(PelEntry)[] pending() const @nogc nothrow
+    {
+        return pel[0 .. plen];
+    }
+
+    /// Registers the consumer (if new) and returns its stable name slice.
+    const(char)[] ensureConsumer(scope const(char)[] name) @nogc nothrow
+    {
+        consumers.set(name, Unit());
+        // re-find to get the dict-owned slice
+        foreach (i; 0 .. consumers.capacity)
+        {
+            if (consumers.slotLive(i) && consumers.keyAt(i) == name)
+                return consumers.keyAt(i);
+        }
+        return null; // unreachable
+    }
+
+    private size_t pelLowerBound(StreamID id) const @nogc nothrow
+    {
+        size_t lo = 0, hi = plen;
+        while (lo < hi)
+        {
+            auto mid = lo + (hi - lo) / 2;
+            if (pel[mid].id < id)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo;
+    }
+
+    /// Adds or reassigns a pending entry.
+    void pelSet(StreamID id, scope const(char)[] consumer, ulong nowMillis,
+            ulong deliveryCount) @nogc nothrow
+    {
+        auto i = pelLowerBound(id);
+        if (i < plen && pel[i].id == id)
+        {
+            pel[i].consumer = consumer;
+            pel[i].deliveryTimeMs = nowMillis;
+            pel[i].deliveryCount = deliveryCount;
+            return;
+        }
+        if (plen == pcap)
+        {
+            pcap = pcap ? pcap * 2 : 8;
+            pel = cast(PelEntry*) crealloc(pel, pcap * PelEntry.sizeof);
+            assert(pel !is null, "out of memory");
+        }
+        if (i < plen)
+            memmove(&pel[i + 1], &pel[i], (plen - i) * PelEntry.sizeof);
+        pel[i] = PelEntry(id, consumer, nowMillis, deliveryCount);
+        plen++;
+    }
+
+    ptrdiff_t pelFind(StreamID id) const @nogc nothrow
+    {
+        auto i = pelLowerBound(id);
+        return i < plen && pel[i].id == id ? cast(ptrdiff_t) i : -1;
+    }
+
+    bool pelRemove(StreamID id) @nogc nothrow
+    {
+        auto i = pelFind(id);
+        if (i < 0)
+            return false;
+        if (cast(size_t) i + 1 < plen)
+            memmove(&pel[i], &pel[i + 1], (plen - i - 1) * PelEntry.sizeof);
+        plen--;
+        return true;
+    }
+}
+
 public struct Stream
 {
     private SEntry* entries;
     private size_t len;
     private size_t cap;
     StreamID lastId; // survives even when all entries are gone
+    Dict!Group groups; // consumer groups by name
 
     @property size_t length() const @nogc nothrow
     {
@@ -95,6 +199,29 @@ public struct Stream
         entries = null;
         len = cap = 0;
         lastId = StreamID(0, 0);
+        groups.free();
+    }
+
+    /// Fetches one entry's fields; returns dg's result, or -1 when absent.
+    int getEntry(StreamID id,
+            scope int delegate(const(FieldPair)[] pairs) @nogc nothrow dg) const @nogc nothrow
+    {
+        auto i = lowerBound(id);
+        if (i >= len || entries[i].id != id)
+            return -1;
+        return dg(entries[i].pairs[0 .. entries[i].npairs]);
+    }
+
+    /// First existing entry id strictly greater than after; ok=false at end.
+    StreamID nextAfter(StreamID after, out bool ok) const @nogc nothrow
+    {
+        auto start = after.seq == ulong.max ? StreamID(after.ms + 1, 0) : StreamID(after.ms,
+                after.seq + 1);
+        auto i = lowerBound(start);
+        if (i >= len)
+            return StreamID(0, 0);
+        ok = true;
+        return entries[i].id;
     }
 
     /// ID for XADD *: current ms, or lastId.ms with a bumped sequence when the
