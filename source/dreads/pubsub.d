@@ -148,7 +148,9 @@ public struct PubSub
     }
 
     /// Delivers to channel and pattern subscribers; returns the receiver count.
-    long publish(scope const(char)[] channel, scope const(char)[] payload) nothrow
+    /// verb is "message" for regular pub/sub, "smessage" for shard channels.
+    long publish(scope const(char)[] channel, scope const(char)[] payload,
+            scope const(char)[] verb = "message") nothrow
     {
         long receivers = 0;
         auto list = channels.get(channel);
@@ -156,7 +158,7 @@ public struct PubSub
         {
             scratch.clear();
             repArrayHeader(scratch, 3);
-            repBulk(scratch, "message");
+            repBulk(scratch, verb);
             repBulk(scratch, channel);
             repBulk(scratch, payload);
             foreach (i; 0 .. list.len)
@@ -210,6 +212,15 @@ public struct PubSub
     {
         auto list = channels.get(channel);
         return list is null ? 0 : list.len;
+    }
+
+    /// Total pattern subscriptions (Redis counts unique patterns; see DRIFT).
+    size_t patternCount() const @nogc nothrow
+    {
+        size_t n = 0;
+        foreach (i; 0 .. patternSubs.len)
+            n += patternSubs.items[i].patterns.length;
+        return n;
     }
 }
 
