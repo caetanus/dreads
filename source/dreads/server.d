@@ -23,6 +23,7 @@ import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.obj : Keyspace;
 import dreads.pubsub : PubSub, Subscriber;
+import dreads.replicator : gReplicator;
 import dreads.resp;
 import dreads.scripting : cachedScript, evalCommand, scriptCommand;
 
@@ -71,11 +72,55 @@ public int runServer(ushort port, const(char)[] aofPath = null)
             gAof.fsyncNow();
         }, true);
     }
+    initReplication();
     listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
         serveClient(conn);
     });
     printf("dreads listening on port %u\n", cast(uint) port);
     return runEventLoop();
+}
+
+/// Builds the Replicator from config when raft-node-id is set. Peers list:
+/// "2@host:port,3@host:port". Standalone (id 0) leaves gReplicator null.
+private void initReplication()
+{
+    import std.array : split;
+    import std.conv : to;
+
+    import raft.node : Config;
+    import raft.vibetransport : PeerAddress;
+
+    import dreads.replicator : gReplicator, Replicator;
+
+    if (gConfig.raftNodeId == 0)
+        return;
+    PeerAddress[] peers;
+    foreach (spec; gConfig.raftPeers.split(","))
+    {
+        if (spec.length == 0)
+            continue;
+        auto at = spec.split("@");
+        auto hp = at[1].split(":");
+        try
+            peers ~= PeerAddress(at[0].to!uint, hp[0].idup, hp[1].to!ushort);
+        catch (Exception)
+        {
+            printf("dreads: bad raft-peers entry\n");
+        }
+    }
+    Config cfg;
+    cfg.self = gConfig.raftNodeId;
+    foreach (ref p; peers)
+        cfg.peers ~= p.id;
+    cfg.seed = gConfig.raftNodeId * 2_654_435_761UL;
+    cfg.electionTimeoutTicks = 10; // 20ms tick -> ~200-400ms randomized
+    cfg.heartbeatTicks = 2; // ~40ms
+    auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
+    string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
+    gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gKeys);
+    gReplicator.start();
+    printf("dreads: raft node %u active on port %u (%zu peers)\n",
+            cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);
 }
 
 private struct Conn
@@ -698,6 +743,29 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     default:
         break;
+    }
+
+    // Raft policy gate — only when replication is configured; standalone
+    // (gReplicator is null) falls straight through with zero added cost.
+    if (gReplicator !is null)
+    {
+        if (isWriteCommand(uname))
+        {
+            if (!gReplicator.isLeader)
+            {
+                repError(o, "READONLY You can't write against a read only replica.");
+                return true;
+            }
+            import dreads.stream : nowMs;
+
+            // log [clock][raw command] and block until it commits + applies
+            try
+                gReplicator.proposeWrite(rawCmd, nowMs(), o);
+            catch (Exception)
+                repError(o, "ERR replication error");
+            return true;
+        }
+        // reads are served locally (leader or follower); no AOF in raft mode
     }
 
     if (gConfig.maxmemory && isWriteCommand(uname) && !freeMemoryIfNeeded())
