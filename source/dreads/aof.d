@@ -6,7 +6,7 @@ module dreads.aof;
 // (Redis's "everysec" policy). On boot the file is replayed through the same
 // parser and dispatch that serve sockets.
 
-import core.stdc.stdio : FILE, fclose, fopen, fflush, fread, fwrite, fprintf, stderr;
+import core.stdc.stdio : FILE, fclose, fopen, fflush, fread, fwrite, fprintf, snprintf, stderr;
 
 version (Posix)
 {
@@ -25,7 +25,7 @@ version (Windows)
 
 import dreads.commands : dispatch;
 import dreads.mem : Arena, ByteBuffer;
-import dreads.obj : Keyspace;
+import dreads.obj : Keyspace, RObj;
 import dreads.resp;
 import dreads.scripting : evalCommand;
 
@@ -106,6 +106,236 @@ public struct Aof
     }
 
     long lastFsyncUnix; // LASTSAVE
+}
+
+/// BGREWRITEAOF: rewrites the log as the minimal canonical command set that
+/// rebuilds the current keyspace (this is also what a Raft snapshot will
+/// ship). Runs synchronously — the event loop is single-threaded, so the
+/// keyspace cannot change under us. Reopens the live handle on success.
+public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) nothrow
+{
+    import core.stdc.stdio : rename;
+
+    import dreads.commands : fmtDouble;
+    import dreads.obj : ObjType;
+    import dreads.dict : StrVal;
+    import dreads.stream : StreamID, nowMs;
+
+    enum CHUNK = 128; // elements per emitted command
+
+    char[512] zpath = void;
+    char[520] ztmp = void;
+    if (path.length == 0 || path.length >= zpath.length)
+        return false;
+    zpath[0 .. path.length] = path;
+    zpath[path.length] = 0;
+    ztmp[0 .. path.length] = path;
+    ztmp[path.length .. path.length + 9] = ".rewrite\0";
+
+    auto f = fopen(ztmp.ptr, "wb");
+    if (f is null)
+        return false;
+
+    ByteBuffer buf;
+    bool flushBuf()
+    {
+        if (buf.empty)
+            return true;
+        auto ok = fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
+        buf.clear();
+        return ok;
+    }
+
+    auto now = nowMs();
+    bool ioOk = true;
+    foreach (i; 0 .. ks.d.capacity)
+    {
+        if (!ks.d.slotLive(i))
+            continue;
+        auto key = ks.d.keyAt(i);
+        auto obj = ks.d.valAt(i);
+        if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+            continue; // expired keys stay dead
+
+        final switch (obj.type)
+        {
+        case ObjType.str:
+            repArrayHeader(buf, 3);
+            repBulk(buf, "SET");
+            repBulk(buf, key);
+            repBulk(buf, obj.str.s);
+            break;
+        case ObjType.list:
+            {
+                size_t emitted = 0;
+                auto total = obj.list.length;
+                while (emitted < total)
+                {
+                    auto n = total - emitted > CHUNK ? CHUNK : total - emitted;
+                    repArrayHeader(buf, n + 2);
+                    repBulk(buf, "RPUSH");
+                    repBulk(buf, key);
+                    obj.list.walkRange(cast(long) emitted, n, (v) {
+                        repBulk(buf, v);
+                        return 0;
+                    });
+                    emitted += n;
+                }
+                break;
+            }
+        case ObjType.hash:
+            emitDictChunks(buf, "HSET", key, obj, true);
+            break;
+        case ObjType.set:
+            emitDictChunks(buf, "SADD", key, obj, false);
+            break;
+        case ObjType.zset:
+            {
+                size_t emitted = 0;
+                auto total = obj.zset.length;
+                while (emitted < total)
+                {
+                    auto n = total - emitted > CHUNK ? CHUNK : total - emitted;
+                    repArrayHeader(buf, 2 + n * 2);
+                    repBulk(buf, "ZADD");
+                    repBulk(buf, key);
+                    obj.zset.walkRange(emitted, n, false, (m, s) {
+                        char[40] fb = void;
+                        repBulk(buf, fmtDouble(fb, s));
+                        repBulk(buf, m);
+                        return 0;
+                    });
+                    emitted += n;
+                }
+                break;
+            }
+        case ObjType.stream:
+            {
+                obj.stream.walkRange(StreamID.minId, StreamID.maxId, 0, (id, pairs) {
+                    repArrayHeader(buf, 3 + pairs.length * 2);
+                    repBulk(buf, "XADD");
+                    repBulk(buf, key);
+                    char[48] ib = void;
+                    auto ilen = snprintf(ib.ptr, ib.length, "%llu-%llu", id.ms, id.seq);
+                    repBulk(buf, ib[0 .. ilen]);
+                    foreach (ref p; pairs)
+                    {
+                        repBulk(buf, p.field);
+                        repBulk(buf, p.value);
+                    }
+                    return 0;
+                });
+                char[48] lb = void;
+                auto llen = snprintf(lb.ptr, lb.length, "%llu-%llu",
+                        obj.stream.lastId.ms, obj.stream.lastId.seq);
+                if (obj.stream.length == 0
+                        && (obj.stream.lastId.ms != 0 || obj.stream.lastId.seq != 0))
+                {
+                    // empty stream with history: materialize then delete
+                    repArrayHeader(buf, 5);
+                    repBulk(buf, "XADD");
+                    repBulk(buf, key);
+                    repBulk(buf, lb[0 .. llen]);
+                    repBulk(buf, "f");
+                    repBulk(buf, "v");
+                    repArrayHeader(buf, 3);
+                    repBulk(buf, "XDEL");
+                    repBulk(buf, key);
+                    repBulk(buf, lb[0 .. llen]);
+                }
+                // groups (their PEL is volatile and not persisted — DRIFT)
+                bool first = true;
+                foreach (gi; 0 .. obj.stream.groups.capacity)
+                {
+                    if (!obj.stream.groups.slotLive(gi))
+                        continue;
+                    auto g = obj.stream.groups.valAt(gi);
+                    char[48] gb = void;
+                    auto glen = snprintf(gb.ptr, gb.length, "%llu-%llu",
+                            g.lastDelivered.ms, g.lastDelivered.seq);
+                    repArrayHeader(buf, first
+                            && obj.stream.length == 0 && obj.stream.lastId.ms == 0
+                            && obj.stream.lastId.seq == 0 ? 6 : 5);
+                    repBulk(buf, "XGROUP");
+                    repBulk(buf, "CREATE");
+                    repBulk(buf, key);
+                    repBulk(buf, obj.stream.groups.keyAt(gi));
+                    repBulk(buf, gb[0 .. glen]);
+                    if (first && obj.stream.length == 0 && obj.stream.lastId.ms == 0
+                            && obj.stream.lastId.seq == 0)
+                        repBulk(buf, "MKSTREAM");
+                    first = false;
+                }
+                if (obj.stream.length != 0 || obj.stream.lastId.ms != 0
+                        || obj.stream.lastId.seq != 0)
+                {
+                    repArrayHeader(buf, 3);
+                    repBulk(buf, "XSETID");
+                    repBulk(buf, key);
+                    repBulk(buf, lb[0 .. llen]);
+                }
+                break;
+            }
+        }
+        if (obj.expireAtMs != 0)
+        {
+            repArrayHeader(buf, 3);
+            repBulk(buf, "PEXPIREAT");
+            repBulk(buf, key);
+            char[24] eb = void;
+            auto elen = snprintf(eb.ptr, eb.length, "%llu", obj.expireAtMs);
+            repBulk(buf, eb[0 .. elen]);
+        }
+        if (buf.length > 256 * 1024)
+            ioOk = flushBuf() && ioOk;
+    }
+    ioOk = flushBuf() && ioOk;
+    fflush(f);
+    version (Posix)
+        fsync(fileno(f));
+    fclose(f);
+    if (!ioOk)
+        return false;
+    live.close();
+    if (rename(ztmp.ptr, zpath.ptr) != 0)
+        return false;
+    return live.open(path);
+}
+
+/// One SADD/HSET per chunk of a dict-backed container.
+private void emitDictChunks(ref ByteBuffer buf, scope const(char)[] verb,
+        scope const(char)[] key, RObj* obj, bool withValues) nothrow
+{
+    enum CHUNK = 128;
+    // count live entries
+    size_t total = withValues ? obj.hash.length : obj.set.length;
+    size_t emitted = 0;
+    size_t slot = 0;
+    while (emitted < total)
+    {
+        auto n = total - emitted > CHUNK ? CHUNK : total - emitted;
+        repArrayHeader(buf, 2 + n * (withValues ? 2 : 1));
+        repBulk(buf, verb);
+        repBulk(buf, key);
+        size_t inChunk = 0;
+        while (inChunk < n)
+        {
+            bool live = withValues ? obj.hash.slotLive(slot) : obj.set.slotLive(slot);
+            if (live)
+            {
+                if (withValues)
+                {
+                    repBulk(buf, obj.hash.keyAt(slot));
+                    repBulk(buf, obj.hash.valAt(slot).s);
+                }
+                else
+                    repBulk(buf, obj.set.keyAt(slot));
+                inChunk++;
+            }
+            slot++;
+        }
+        emitted += n;
+    }
 }
 
 /// The server's logging policy, factored out so recovery tests exercise the

@@ -17,7 +17,7 @@ import vibe.core.net : TCPConnection, listenTCP;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : TaskMutex;
 
-import dreads.aof : Aof, aofLoad;
+import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, isWriteCommand, propagationOverride;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.obj : Keyspace;
@@ -32,8 +32,12 @@ private __gshared Keyspace gKeys;
 private __gshared PubSub gPubSub;
 private __gshared PubSub gShardPubSub; // single node: shard = plain, own namespace
 private __gshared Aof gAof;
+private __gshared const(char)[] gAofPath;
 private __gshared ulong gWriteEpoch; // bumped on every effective write (WATCH)
 private __gshared ulong gClientIds;
+// MONITOR feed: registered connections receive every executed command
+private __gshared Conn*[64] gMonitors;
+private __gshared size_t gMonitorCount;
 
 public int runServer(ushort port, const(char)[] aofPath = null)
 {
@@ -46,6 +50,7 @@ public int runServer(ushort port, const(char)[] aofPath = null)
             return 1;
         }
         printf("dreads: AOF replayed %lld commands\n", replayed);
+        gAofPath = aofPath;
         if (!gAof.open(aofPath))
         {
             printf("dreads: cannot open AOF for append\n");
@@ -117,6 +122,7 @@ private void serveClient(TCPConnection tcp) nothrow
         gShardPubSub.dropAll(&c.shardSub);
         c.sub.free();
         c.shardSub.free();
+        unregisterMonitor(&c);
         import dreads.mem : freeSlice;
 
         c.clientName.freeSlice;
@@ -309,6 +315,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
+    if (gMonitorCount > 0)
+        feedMonitors(c, cmd);
+
     if (c.totalSubs > 0)
     {
         switch (uname)
@@ -478,6 +487,30 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             repInt(o, 0);
             return true;
         }
+    case "BGREWRITEAOF":
+        {
+            if (!gAof.enabled)
+            {
+                repError(o, "ERR AOF is not enabled");
+                return true;
+            }
+            if (aofRewrite(gAof, gAofPath, gKeys))
+                repSimple(o, "Background append only file rewriting started");
+            else
+                repError(o, "ERR AOF rewrite failed");
+            return true;
+        }
+    case "MONITOR":
+        {
+            if (gMonitorCount < gMonitors.length)
+            {
+                gMonitors[gMonitorCount++] = &c;
+                repSimple(o, "OK");
+            }
+            else
+                repError(o, "ERR too many monitors");
+            return true;
+        }
     case "SAVE":
     case "BGSAVE":
         {
@@ -534,10 +567,13 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "EVAL":
     case "EVALSHA":
+    case "EVAL_RO":
+    case "EVALSHA_RO":
         {
-            bool bySha = uname.length == 7;
+            bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
+            bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
             auto outBefore = o.length;
-            evalCommand(args, gKeys, o, arena, bySha);
+            evalCommand(args, gKeys, o, arena, bySha, readOnly);
             // scripts may write; log unless the script itself errored.
             // overrides set by commands inside the script are superseded by
             // logging the whole EVAL.
@@ -582,6 +618,52 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     }
     propagationOverride.clear();
     return keep;
+}
+
+private void unregisterMonitor(Conn* c) nothrow
+{
+    foreach (i; 0 .. gMonitorCount)
+    {
+        if (gMonitors[i] is c)
+        {
+            gMonitors[i] = gMonitors[gMonitorCount - 1];
+            gMonitorCount--;
+            return;
+        }
+    }
+}
+
+/// MONITOR feed line: +<unix>.<usec> [0 ?] "CMD" "arg" ...
+private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    import dreads.stream : nowMs;
+
+    static ByteBuffer line; // TLS; single-threaded event loop
+    line.clear();
+    auto ms = nowMs();
+    char[64] hdr = void;
+    auto n = snprintf(hdr.ptr, hdr.length, "+%llu.%03llu000 [0 client:%llu]",
+            ms / 1000, ms % 1000, from.id);
+    line.append(hdr[0 .. n]);
+    foreach (ref a; cmd.arr)
+    {
+        line.append(` "`);
+        foreach (ch; a.str)
+        {
+            if (ch == '"' || ch == '\\')
+                line.appendByte('\\');
+            line.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
+        }
+        line.appendByte('"');
+    }
+    line.append("\r\n");
+    foreach (i; 0 .. gMonitorCount)
+    {
+        if (gMonitors[i] !is &from)
+            connSink(cast(void*) gMonitors[i], line.data);
+    }
 }
 
 /// CLIENT GETNAME/SETNAME/ID/INFO/NO-EVICT/NO-TOUCH/LIST (minimal).

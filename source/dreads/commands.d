@@ -3635,7 +3635,7 @@ private bool eqICWithScores(scope const(char)[] s) @nogc nothrow
 }
 
 /// Redis's double formatting: integers print without decimals.
-private const(char)[] fmtDouble(return ref char[40] buf, double d) @nogc nothrow
+public const(char)[] fmtDouble(return ref char[40] buf, double d) @nogc nothrow
 {
     int n;
     if (d == cast(long) d && d > -1e17 && d < 1e17)

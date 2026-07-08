@@ -36,6 +36,7 @@ private struct BridgeCtx
 {
     Keyspace* ks;
     Arena* arena;
+    bool readOnly; // EVAL_RO / EVALSHA_RO
     ByteBuffer replyBuf; // staging for bridge replies, reused across calls
 }
 
@@ -138,6 +139,25 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     RVal cmd;
     cmd.type = RType.Array;
     cmd.arr = arr;
+
+    if (gCtx.readOnly)
+    {
+        import dreads.commands : isWriteCommand;
+
+        char[24] up = void;
+        auto cname = arr[0].str;
+        if (cname.length <= up.length)
+        {
+            foreach (ci, ch; cname)
+                up[ci] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+            if (isWriteCommand(up[0 .. cname.length]))
+            {
+                lua_pushlstring(L,
+                        "Write commands are not allowed from read-only scripts.".ptr, 55);
+                return lua_error(L);
+            }
+        }
+    }
 
     gCtx.replyBuf.clear();
     dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena);
@@ -292,7 +312,7 @@ private void sha1Hex(scope const(char)[] body_, ref char[40] outHex) nothrow
 
 /// EVAL script numkeys key [key ...] arg [arg ...]  (bySha: EVALSHA)
 public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
-        ref Arena arena, bool bySha) nothrow
+        ref Arena arena, bool bySha, bool readOnly = false) nothrow
 {
     if (args.length < 2)
     {
@@ -369,10 +389,12 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
 
     gCtx.ks = &ks;
     gCtx.arena = &arena;
+    gCtx.readOnly = readOnly;
     scope (exit)
     {
         gCtx.ks = null;
         gCtx.arena = null;
+        gCtx.readOnly = false;
         lua_settop(gL, 0);
     }
 
