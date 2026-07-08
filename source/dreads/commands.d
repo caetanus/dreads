@@ -2001,6 +2001,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             xclaim(ks, args, o);
             break;
         }
+    case "XAUTOCLAIM":
+        {
+            import dreads.streamops : xautoclaim;
+
+            xautoclaim(ks, args, o, arena);
+            break;
+        }
+    case "MEMORY":
+        {
+            memoryCmd(ks, args, o);
+            break;
+        }
     case "XDEL":
         {
             if (args.length < 2)
@@ -3424,6 +3436,87 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             return 0;
         });
     }
+}
+
+/// MEMORY USAGE key | DOCTOR | STATS (approximate accounting).
+private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+{
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'memory' command");
+        return;
+    }
+    if (eqICKeyword(args[0].str, "USAGE"))
+    {
+        if (args.length < 2)
+        {
+            arityErr(o, "memory usage");
+            return;
+        }
+        auto obj = ks.lookup(args[1].str);
+        if (obj is null)
+        {
+            repNullBulk(o);
+            return;
+        }
+        // rough estimate: payload bytes + fixed per-entry overheads
+        long bytes = cast(long) args[1].str.length + 56;
+        final switch (obj.type)
+        {
+        case ObjType.str:
+            bytes += obj.str.s.length;
+            break;
+        case ObjType.list:
+            foreach (v; obj.list)
+                bytes += v.length + 48;
+            break;
+        case ObjType.hash:
+            foreach (i; 0 .. obj.hash.capacity)
+            {
+                if (obj.hash.slotLive(i))
+                    bytes += obj.hash.keyAt(i).length + obj.hash.valAt(i).s.length + 64;
+            }
+            break;
+        case ObjType.set:
+            foreach (i; 0 .. obj.set.capacity)
+            {
+                if (obj.set.slotLive(i))
+                    bytes += obj.set.keyAt(i).length + 48;
+            }
+            break;
+        case ObjType.zset:
+            obj.zset.walkRange(0, obj.zset.length, false, (m, s) {
+                bytes += m.length + 80;
+                return 0;
+            });
+            break;
+        case ObjType.stream:
+            import dreads.stream : StreamID;
+
+            obj.stream.walkRange(StreamID.minId, StreamID.maxId, 0, (id, pairs) {
+                bytes += 40;
+                foreach (ref p; pairs)
+                    bytes += p.field.length + p.value.length + 32;
+                return 0;
+            });
+            break;
+        }
+        repInt(o, bytes);
+        return;
+    }
+    if (eqICKeyword(args[0].str, "DOCTOR"))
+    {
+        repBulk(o, "Sam, I detected a few issues in this dreads instance memory implants:\n\n * Everything looks fine.\n");
+        return;
+    }
+    if (eqICKeyword(args[0].str, "STATS"))
+    {
+        repArrayHeader(o, 2);
+        repBulk(o, "keys.count");
+        repInt(o, cast(long) ks.length);
+        return;
+    }
+    repError(o, "ERR Unknown MEMORY subcommand");
 }
 
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).

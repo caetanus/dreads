@@ -44,13 +44,17 @@ bound); the pipelined numbers show the real per-command cost.
 
 ## Features
 
-- **All six core data types**: strings, lists, hashes, sets, sorted sets,
-  streams. **120 core commands** (of Redis's 370 — see [DRIFT.md](DRIFT.md)
-  for the honest gap list), including TTL/expiration (`EXPIRE`/`PEXPIREAT`/
-  `TTL`/`PERSIST`, `SET` with `EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET`),
-  `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, set algebra with `*STORE` variants,
-  `ZPOP*`, `ZREMRANGEBY*`, `LMOVE`, `XADD`/`XRANGE`/`XREAD`/`XDEL`/`XTRIM`,
-  and Redis's exact error messages (`WRONGTYPE`, arity, `NOSCRIPT`, ...).
+- **222 of Redis's 241 core commands** (see [DRIFT.md](DRIFT.md) for the
+  honest gap list and semantic differences — the 19 missing are mostly
+  cluster/replication, which Raft will replace). All data types including
+  streams with consumer groups; GEO (geohash-scored zsets, Redis-exact
+  outputs); bitmaps with `BITFIELD`; HyperLogLog; TTL/expiration with the
+  full `SET` option set; `SCAN` family; `SORT`, `LCS`, `OBJECT`;
+  transactions (`MULTI`/`EXEC`/`WATCH`); **blocking commands** (`BLPOP`,
+  `BLMOVE`, `BZPOPMIN`, `XREAD BLOCK`, ...) on fiber wakeups; `MONITOR`;
+  `maxmemory` with sampled LRU eviction (jemalloc-exact accounting);
+  redis.conf-style configuration with live `CONFIG GET/SET`; and Redis's
+  exact error messages (`WRONGTYPE`, arity, `NOSCRIPT`, `BUSYGROUP`, ...).
 - **Pub/Sub**: `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE` (glob patterns)/
   `PUBLISH`/`PUBSUB`, with subscribe-mode command gating.
 - **Lua scripting**: `EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH` on the

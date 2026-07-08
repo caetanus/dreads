@@ -682,6 +682,101 @@ public void xpending(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
     }
 }
 
+/// XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
+public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
+{
+    if (args.length < 5)
+    {
+        repError(o, "ERR wrong number of arguments for 'xautoclaim' command");
+        return;
+    }
+    long minIdle, count = 100;
+    StreamID start;
+    if (!parseLong(args[3].str, minIdle) || minIdle < 0)
+    {
+        repError(o, "ERR Invalid min-idle-time argument for XAUTOCLAIM");
+        return;
+    }
+    if (!parseRangeId(args[4].str, true, start))
+    {
+        repError(o, "ERR Invalid stream ID specified as stream command argument");
+        return;
+    }
+    bool justId;
+    size_t i = 5;
+    while (i < args.length)
+    {
+        if (eqICKeyword(args[i].str, "COUNT") && i + 1 < args.length)
+        {
+            if (!parseLong(args[i + 1].str, count) || count < 1)
+            {
+                repError(o, "ERR COUNT must be > 0");
+                return;
+            }
+            i += 2;
+        }
+        else if (eqICKeyword(args[i].str, "JUSTID"))
+        {
+            justId = true;
+            i++;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+    }
+    bool wrong;
+    auto obj = ks.lookupTyped(args[0].str, ObjType.stream, wrong);
+    if (wrong)
+    {
+        repWrongTypeS(o);
+        return;
+    }
+    auto g = obj is null ? null : obj.stream.groups.get(args[1].str);
+    if (g is null)
+    {
+        repNoGroup(o, args[1].str, args[0].str);
+        return;
+    }
+    auto now = nowMs();
+    auto consumer = g.ensureConsumer(args[2].str);
+    // collect claimable ids (arena copies: pelSet mutates the list)
+    auto claimable = arena.allocArray!StreamID(g.pending.length);
+    size_t n = 0;
+    StreamID nextCursor = StreamID(0, 0);
+    foreach (ref pe; g.pending)
+    {
+        if (pe.id < start)
+            continue;
+        if (n == cast(size_t) count)
+        {
+            nextCursor = pe.id;
+            break;
+        }
+        auto idle = now > pe.deliveryTimeMs ? now - pe.deliveryTimeMs : 0;
+        if (idle < cast(ulong) minIdle)
+            continue;
+        if (obj.stream.getEntry(pe.id, (pairs) => 0) < 0)
+            continue; // deleted entries are skipped
+        claimable[n++] = pe.id;
+    }
+    repArrayHeader(o, 3);
+    repStreamId(o, nextCursor);
+    repArrayHeader(o, n);
+    foreach (id; claimable[0 .. n])
+    {
+        auto pi = g.pelFind(id);
+        auto dc = g.pending[pi].deliveryCount + (justId ? 0 : 1);
+        g.pelSet(id, consumer, now, dc);
+        if (justId)
+            repStreamId(o, id);
+        else
+            obj.stream.getEntry(id, (pairs) { repEntry(o, id, pairs); return 0; });
+    }
+    repArrayHeader(o, 0); // deleted-and-acked ids: we skip instead
+}
+
 /// XCLAIM key group consumer min-idle-time id [id ...] [JUSTID]
 public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
