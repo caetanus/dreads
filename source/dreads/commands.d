@@ -2272,6 +2272,51 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
 
+        // --- bitmaps ---
+    case "SETBIT":
+        {
+            import dreads.bitmap : setbit;
+
+            setbit(ks, args, o);
+            break;
+        }
+    case "GETBIT":
+        {
+            import dreads.bitmap : getbit;
+
+            getbit(ks, args, o);
+            break;
+        }
+    case "BITCOUNT":
+        {
+            import dreads.bitmap : bitcount;
+
+            bitcount(ks, args, o);
+            break;
+        }
+    case "BITPOS":
+        {
+            import dreads.bitmap : bitpos;
+
+            bitpos(ks, args, o);
+            break;
+        }
+    case "BITOP":
+        {
+            import dreads.bitmap : bitop;
+
+            bitop(ks, args, o, arena);
+            break;
+        }
+    case "BITFIELD":
+    case "BITFIELD_RO":
+        {
+            import dreads.bitmap : bitfield;
+
+            bitfield(ks, args, o, arena, name.length == 11);
+            break;
+        }
+
         // --- geo ---
     case "GEOADD":
         {
@@ -3538,6 +3583,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
     case "XADD", "XDEL", "XTRIM":
     case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
+    case "SETBIT", "BITOP", "BITFIELD":
         return true;
     default:
         return false;
