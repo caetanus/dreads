@@ -72,3 +72,20 @@ int lua_getfield(lua_State* L, int idx, const(char)* k);
 void lua_setfield(lua_State* L, int idx, const(char)* k);
 
 int lua_error(lua_State* L);
+int luaL_error(lua_State* L, const(char)* fmt, ...);
+
+// selective library loading (sandbox)
+void luaL_requiref(lua_State* L, const(char)* modname, lua_CFunction openf, int glb);
+int luaopen_base(lua_State* L);
+int luaopen_string(lua_State* L);
+int luaopen_table(lua_State* L);
+int luaopen_math(lua_State* L);
+
+// raw global access (bypasses the _G protection metatable)
+void lua_rawset(lua_State* L, int idx);
+enum LUA_RIDX_GLOBALS = 2;
+
+// instruction-count hook (script time limit)
+alias lua_Hook = void function(lua_State* L, void* ar) nothrow @nogc;
+void lua_sethook(lua_State* L, lua_Hook f, int mask, int count);
+enum LUA_MASKCOUNT = 1 << 3;

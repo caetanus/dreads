@@ -52,10 +52,18 @@ These exist but do not match Redis exactly:
   expired keys do not propagate explicit `DEL`s to the AOF (absolute
   timestamps make replay converge, but the window Redis closes with
   propagated deletes exists here).
-- **Lua**: system Lua 5.4, not Redis's patched 5.1; full stdlib open (no
-  sandbox); no `cjson`/`cmsgpack`/`struct`/`bit`/`redis.sha1hex`; no script
-  timeout/`SCRIPT KILL`; scripts log verbatim, so time-dependent commands
-  *inside* scripts (relative `EXPIRE`, `XADD *`) can drift on replay.
+- **Lua**: system Lua 5.4, not Redis's patched 5.1. **Sandboxed**: only
+  base/string/table/math are loaded (no io/os/package/debug),
+  `dofile`/`loadfile`/`load`/`print` pruned, `_G` protected against global
+  creation/reads of undefined globals, `math.random` reseeded
+  deterministically per invocation, and resource limits enforced —
+  `lua-time-limit` (instruction-count hook, default 5000ms) and
+  `lua-memory-limit` (allocator cap, default unlimited), both settable at
+  runtime via CONFIG SET. Still missing vs Redis:
+  `cjson`/`cmsgpack`/`struct`/`bit`/`redis.sha1hex` helper libraries and
+  `SCRIPT KILL` (the time limit hard-aborts instead); scripts log verbatim,
+  so time-dependent commands *inside* scripts (relative `EXPIRE`, `XADD *`)
+  can drift on replay.
 - **Protocol**: RESP2 only — `HELLO 3` answers `NOPROTO`. No `AUTH`
   passwords (no `requirepass` yet); no keyspace notifications.
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —

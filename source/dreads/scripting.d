@@ -42,15 +42,57 @@ private struct BridgeCtx
 
 private __gshared BridgeCtx gCtx;
 
+// --- sandbox: memory accounting and script deadline ---
+private __gshared ulong gLuaBytes; // bytes currently allocated by the state
+private __gshared long gLuaDeadlineMsecs; // MonoTime as msecs; 0 = no limit
+
 extern (C) private void* luaAllocFn(void* ud, void* ptr, size_t osize, size_t nsize) nothrow @nogc
 {
+    import dreads.config : gConfig;
+
+    // Lua 5.4: when ptr is null, osize is a type tag, not a size
+    auto oldSize = ptr is null ? 0 : osize;
     if (nsize == 0)
     {
         cfree(ptr);
+        gLuaBytes -= oldSize;
         return null;
     }
-    return crealloc(ptr, nsize);
+    if (nsize > oldSize && gConfig.luaMemoryLimit != 0
+            && gLuaBytes + (nsize - oldSize) > gConfig.luaMemoryLimit)
+        return null; // Lua turns this into a clean memory error
+    auto p = crealloc(ptr, nsize);
+    if (p !is null)
+        gLuaBytes += nsize - oldSize;
+    return p;
 }
+
+private long monoMsecs() nothrow @nogc
+{
+    import core.time : MonoTime;
+
+    return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+}
+
+extern (C) private void luaTimeoutHook(lua_State* L, void* ar) nothrow @nogc
+{
+    if (gLuaDeadlineMsecs != 0 && monoMsecs() > gLuaDeadlineMsecs)
+        luaL_error(L, "script exceeded the lua-time-limit");
+}
+
+// Scripts run in a curated environment: only base/string/table/math, no
+// io/os/package/debug, escape hatches pruned, and _G protected against
+// global creation (scripts share one state; globals would leak across them).
+private static immutable protectGlobalsChunk = q{
+    local mt = {}
+    mt.__newindex = function(t, n, v)
+        error("Script attempted to create global variable '" .. tostring(n) .. "'", 2)
+    end
+    mt.__index = function(t, n)
+        error("Script attempted to access nonexistent global variable '" .. tostring(n) .. "'", 2)
+    end
+    setmetatable(_G, mt)
+};
 
 private bool ensureState() nothrow
 {
@@ -59,8 +101,19 @@ private bool ensureState() nothrow
     gL = lua_newstate(&luaAllocFn, null);
     if (gL is null)
         return false;
-    luaL_openlibs(gL);
-    // global `redis` table with the call bridge
+    // sandbox layer 1: selective libraries
+    luaL_requiref(gL, "_G", &luaopen_base, 1);
+    luaL_requiref(gL, "string", &luaopen_string, 1);
+    luaL_requiref(gL, "table", &luaopen_table, 1);
+    luaL_requiref(gL, "math", &luaopen_math, 1);
+    lua_settop(gL, 0);
+    // sandbox layer 2: prune the escape hatches the base library ships
+    foreach (name; ["dofile\0", "loadfile\0", "load\0", "print\0"])
+    {
+        lua_pushnil(gL);
+        lua_setglobal(gL, name.ptr);
+    }
+    // global `redis` table with the call bridge (before _G gets protected)
     lua_createtable(gL, 0, 4);
     lua_pushcclosure(gL, &luaRedisCall, 0);
     lua_setfield(gL, -2, "call");
@@ -71,6 +124,20 @@ private bool ensureState() nothrow
     lua_pushcclosure(gL, &luaErrorReply, 0);
     lua_setfield(gL, -2, "error_reply");
     lua_setglobal(gL, "redis");
+    // pre-create KEYS/ARGV so reading them never trips the protection
+    lua_createtable(gL, 0, 0);
+    lua_setglobal(gL, "KEYS");
+    lua_createtable(gL, 0, 0);
+    lua_setglobal(gL, "ARGV");
+    // sandbox layer 3: protect _G
+    if (luaL_loadbuffer(gL, protectGlobalsChunk.ptr, protectGlobalsChunk.length,
+            "@sandbox") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
+    {
+        lua_settop(gL, 0);
+        return false;
+    }
+    // sandbox layer 4: instruction-count hook enforcing lua-time-limit
+    lua_sethook(gL, &luaTimeoutHook, LUA_MASKCOUNT, 100_000);
     return true;
 }
 
@@ -390,11 +457,22 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     gCtx.ks = &ks;
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    // deterministic per-invocation RNG (replicas/replay must agree)
+    lua_getglobal(gL, "math");
+    lua_getfield(gL, -1, "randomseed");
+    lua_pushinteger(gL, 0);
+    lua_pcall(gL, 1, 0, 0);
+    lua_settop(gL, 0);
+    // arm the script deadline for the timeout hook
+    import dreads.config : gConfig;
+
+    gLuaDeadlineMsecs = gConfig.luaTimeLimitMs > 0 ? monoMsecs() + gConfig.luaTimeLimitMs : 0;
     scope (exit)
     {
         gCtx.ks = null;
         gCtx.arena = null;
         gCtx.readOnly = false;
+        gLuaDeadlineMsecs = 0;
         lua_settop(gL, 0);
     }
 

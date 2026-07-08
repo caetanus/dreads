@@ -741,7 +741,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         // (name, value) pairs for every known directive matching the pattern
         static immutable names = [
             "port", "appendonly", "appendfilename", "dir", "maxmemory",
-            "maxmemory-policy",
+            "maxmemory-policy", "lua-time-limit", "lua-memory-limit",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -790,8 +790,16 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 auto n = snprintf(b.ptr, b.length, "%llu", gConfig.maxmemory);
                 repBulk(o, b[0 .. n]);
                 break;
-            default:
+            case "maxmemory-policy":
                 repBulk(o, gConfig.maxmemoryPolicy);
+                break;
+            case "lua-time-limit":
+                auto n = snprintf(b.ptr, b.length, "%lld", gConfig.luaTimeLimitMs);
+                repBulk(o, b[0 .. n]);
+                break;
+            default:
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.luaMemoryLimit);
+                repBulk(o, b[0 .. n]);
             }
         }
         return;
@@ -799,7 +807,9 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     if (eqICDebug(args[0].str, "SET") && args.length == 3)
     {
         // only runtime-safe parameters are settable
-        if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY"))
+        if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY")
+                || eqICDebug(args[1].str, "LUA-TIME-LIMIT")
+                || eqICDebug(args[1].str, "LUA-MEMORY-LIMIT"))
         {
             string name, value;
             try

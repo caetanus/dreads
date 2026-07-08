@@ -14,6 +14,8 @@ public struct Config
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
     string maxmemoryPolicy = "noeviction"; // noeviction | allkeys-lru | volatile-lru
+    long luaTimeLimitMs = 5000; // script execution budget; 0 = unlimited
+    ulong luaMemoryLimit = 0; // bytes the Lua state may allocate; 0 = unlimited
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -108,6 +110,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         default:
             return false;
         }
+    case "lua-time-limit":
+        try
+            cfg.luaTimeLimitMs = value.to!long;
+        catch (Exception)
+            return false;
+        return cfg.luaTimeLimitMs >= 0;
+    case "lua-memory-limit":
+        return parseMemory(value, cfg.luaMemoryLimit);
     default:
         return false;
     }
