@@ -156,7 +156,7 @@ public class RVariant
     this(BigInt bi)
     {
         type = RespVariantType.BigInt;
-        this.bi = i;
+        this.bi = bi;
     }
 
     this(double d)

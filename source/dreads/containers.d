@@ -70,9 +70,9 @@ public struct OrderedSet(T)
         return item in tree.instance;
     }
 
-    @safe bool opBinary(string op : "in")(const T rhs)
+    @safe bool opBinaryRight(string op : "in")(const T lhs)
     {
-        return has(rhs);
+        return has(lhs);
     }
 
     @safe size_t length()
@@ -115,12 +115,14 @@ public struct OrderedSet(T)
         return difference(other);
     }
 
-    @safe bool opEquals(R)(const R!T other) const
+    @safe bool opEquals(const OrderedSet!T other) const
     {
-        import std.algorithm : equal;
-
-        return this[].equal(other);
-
+        T[] a, b;
+        foreach (item; this)
+            a ~= item;
+        foreach (item; other)
+            b ~= item;
+        return a == b;
     }
 
     @safe auto range()
