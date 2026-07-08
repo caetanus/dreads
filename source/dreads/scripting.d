@@ -6,6 +6,7 @@ module dreads.scripting;
 // runs it through the @nogc dispatch, and converts the RESP reply back to Lua
 // values using Redis's conversion rules.
 
+import core.stdc.stdio : snprintf;
 import core.stdc.stdlib : crealloc = realloc, cfree = free;
 import core.sync.mutex : Mutex;
 
@@ -123,7 +124,16 @@ private bool ensureState() nothrow
     lua_setfield(gL, -2, "status_reply");
     lua_pushcclosure(gL, &luaErrorReply, 0);
     lua_setfield(gL, -2, "error_reply");
+    lua_pushcclosure(gL, &luaSha1Hex, 0);
+    lua_setfield(gL, -2, "sha1hex");
     lua_setglobal(gL, "redis");
+    // helper libraries scripts expect from Redis
+    {
+        import dreads.cjson : registerCjson;
+
+        registerCjson(gL);
+    }
+    registerBitLib(gL);
     // pre-create KEYS/ARGV so reading them never trips the protection
     lua_createtable(gL, 0, 0);
     lua_setglobal(gL, "KEYS");
@@ -139,6 +149,120 @@ private bool ensureState() nothrow
     // sandbox layer 4: instruction-count hook enforcing lua-time-limit
     lua_sethook(gL, &luaTimeoutHook, LUA_MASKCOUNT, 100_000);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// helper libraries: redis.sha1hex and the LuaJIT-style bit library
+// ---------------------------------------------------------------------------
+
+extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
+{
+    size_t len;
+    auto p = lua_tolstring(L, 1, &len);
+    if (p is null)
+        return luaL_error(L, "wrong number or type of arguments");
+    char[40] hex = void;
+    sha1Hex(p[0 .. len], hex);
+    lua_pushlstring(L, hex.ptr, 40);
+    return 1;
+}
+
+private int bitArg(lua_State* L, int idx) nothrow @nogc
+{
+    int isnum;
+    auto d = lua_tonumberx(L, idx, &isnum);
+    if (isnum == 0)
+        luaL_error(L, "bad argument to bit operation (number expected)");
+    return cast(int)(cast(long) d & 0xFFFF_FFFF);
+}
+
+extern (C) private int bitBand(lua_State* L) nothrow @nogc
+{
+    auto acc = bitArg(L, 1);
+    foreach (i; 2 .. lua_gettop(L) + 1)
+        acc &= bitArg(L, i);
+    lua_pushinteger(L, acc);
+    return 1;
+}
+
+extern (C) private int bitBor(lua_State* L) nothrow @nogc
+{
+    auto acc = bitArg(L, 1);
+    foreach (i; 2 .. lua_gettop(L) + 1)
+        acc |= bitArg(L, i);
+    lua_pushinteger(L, acc);
+    return 1;
+}
+
+extern (C) private int bitBxor(lua_State* L) nothrow @nogc
+{
+    auto acc = bitArg(L, 1);
+    foreach (i; 2 .. lua_gettop(L) + 1)
+        acc ^= bitArg(L, i);
+    lua_pushinteger(L, acc);
+    return 1;
+}
+
+extern (C) private int bitBnot(lua_State* L) nothrow @nogc
+{
+    lua_pushinteger(L, ~bitArg(L, 1));
+    return 1;
+}
+
+extern (C) private int bitLshift(lua_State* L) nothrow @nogc
+{
+    lua_pushinteger(L, cast(int)(bitArg(L, 1) << (bitArg(L, 2) & 31)));
+    return 1;
+}
+
+extern (C) private int bitRshift(lua_State* L) nothrow @nogc
+{
+    lua_pushinteger(L, cast(int)(cast(uint) bitArg(L, 1) >> (bitArg(L, 2) & 31)));
+    return 1;
+}
+
+extern (C) private int bitArshift(lua_State* L) nothrow @nogc
+{
+    lua_pushinteger(L, bitArg(L, 1) >> (bitArg(L, 2) & 31));
+    return 1;
+}
+
+extern (C) private int bitTobit(lua_State* L) nothrow @nogc
+{
+    lua_pushinteger(L, bitArg(L, 1));
+    return 1;
+}
+
+extern (C) private int bitTohex(lua_State* L) nothrow @nogc
+{
+    char[16] b = void;
+    auto n = snprintf(b.ptr, b.length, "%08x", cast(uint) bitArg(L, 1));
+    lua_pushlstring(L, b.ptr, n);
+    return 1;
+}
+
+private void registerBitLib(lua_State* L) nothrow @nogc
+{
+    lua_createtable(L, 0, 9);
+    lua_pushcclosure(L, &bitBand, 0);
+    lua_setfield(L, -2, "band");
+    lua_pushcclosure(L, &bitBor, 0);
+    lua_setfield(L, -2, "bor");
+    lua_pushcclosure(L, &bitBxor, 0);
+    lua_setfield(L, -2, "bxor");
+    lua_pushcclosure(L, &bitBnot, 0);
+    lua_setfield(L, -2, "bnot");
+    lua_pushcclosure(L, &bitLshift, 0);
+    lua_setfield(L, -2, "lshift");
+    lua_pushcclosure(L, &bitRshift, 0);
+    lua_setfield(L, -2, "rshift");
+    lua_pushcclosure(L, &bitArshift, 0);
+    lua_setfield(L, -2, "arshift");
+    lua_pushcclosure(L, &bitTobit, 0);
+    lua_setfield(L, -2, "tobit");
+    lua_pushcclosure(L, &bitTohex, 0);
+    lua_setfield(L, -2, "tohex");
+    lua_setglobal(L, "bit");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +487,7 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o) nothrow @nogc
 // Commands: EVAL / EVALSHA / SCRIPT
 // ---------------------------------------------------------------------------
 
-private void sha1Hex(scope const(char)[] body_, ref char[40] outHex) nothrow
+private void sha1Hex(scope const(char)[] body_, ref char[40] outHex) nothrow @nogc
 {
     static immutable hexDigits = "0123456789abcdef";
     SHA1 sha;

@@ -59,11 +59,15 @@ These exist but do not match Redis exactly:
   deterministically per invocation, and resource limits enforced —
   `lua-time-limit` (instruction-count hook, default 5000ms) and
   `lua-memory-limit` (allocator cap, default unlimited), both settable at
-  runtime via CONFIG SET. Still missing vs Redis:
-  `cjson`/`cmsgpack`/`struct`/`bit`/`redis.sha1hex` helper libraries and
-  `SCRIPT KILL` (the time limit hard-aborts instead); scripts log verbatim,
-  so time-dependent commands *inside* scripts (relative `EXPIRE`, `XADD *`)
-  can drift on replay.
+  runtime via CONFIG SET. Scripts also get a **throwaway `_ENV` per run**
+  (globals they create die with the execution — fresh-interpreter isolation
+  at shared-state cost) and the state is recycled past 32MB of heap.
+  Helper libraries: `cjson` (in-project D implementation), `redis.sha1hex`
+  and `bit` are provided; still missing: `cmsgpack` and `struct`, and
+  `SCRIPT KILL` (the time limit hard-aborts instead — with a single-threaded
+  event loop no other command can arrive mid-script anyway); scripts log
+  verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,
+  `XADD *`) can drift on replay.
 - **Protocol**: RESP2 only — `HELLO 3` answers `NOPROTO`. No `AUTH`
   passwords (no `requirepass` yet); no keyspace notifications.
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —

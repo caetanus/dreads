@@ -15,6 +15,7 @@ enum LUA_OK = 0;
 
 enum LUA_TNIL = 0;
 enum LUA_TBOOLEAN = 1;
+enum LUA_TLIGHTUSERDATA = 2;
 enum LUA_TNUMBER = 3;
 enum LUA_TSTRING = 4;
 enum LUA_TTABLE = 5;
@@ -84,6 +85,11 @@ int luaopen_math(lua_State* L);
 // raw global access (bypasses the _G protection metatable)
 void lua_rawset(lua_State* L, int idx);
 enum LUA_RIDX_GLOBALS = 2;
+
+// table traversal and integer introspection (cjson)
+int lua_next(lua_State* L, int idx);
+int lua_isinteger(lua_State* L, int idx);
+void lua_pushvalue(lua_State* L, int idx);
 
 // per-run environment swap (upvalue 1 of a chunk is its _ENV)
 const(char)* lua_setupvalue(lua_State* L, int funcindex, int n);
