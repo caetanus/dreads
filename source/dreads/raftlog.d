@@ -20,6 +20,7 @@ import raft.storage : Storage;
 import raft.types;
 
 import dreads.mem : freeSlice, mallocDup;
+import dreads.syncer : Durability;
 
 private enum FRAME_HDR = 20; // term(8) + index(8) + len(4)
 
@@ -27,6 +28,8 @@ final class RaftLog : Storage
 {
     private FILE* logF;
     private FILE* metaF;
+    // async group-commit durability; null in tests / synchronous mode
+    private Durability durability_;
     private Term term_;
     private NodeId voted_;
     // in-memory working copy (payloads malloc'd)
@@ -70,8 +73,29 @@ final class RaftLog : Storage
         return self;
     }
 
+    /// Attaches async group-commit durability (server mode). Once set,
+    /// append() no longer fdatasyncs inline; the caller gates its RPC reply
+    /// with awaitDurable(). The fd is this log's own file.
+    void enableAsyncDurability()
+    {
+        if (durability_ is null && logF !is null)
+            durability_ = new Durability(fileno(logF));
+    }
+
+    /// Fiber-side: yield until `index` is on disk (no-op when synchronous).
+    void awaitDurable(Index index) nothrow
+    {
+        if (durability_ !is null)
+            durability_.awaitDurable(index);
+    }
+
     void close() nothrow
     {
+        if (durability_ !is null)
+        {
+            durability_.stop();
+            durability_ = null;
+        }
         foreach (i; 0 .. len)
             (cast(const(char)[]) entries[i].payload).freeSlice;
         if (entries !is null)
@@ -187,7 +211,10 @@ nothrow:
             push(LogEntry(e.term, e.index, cast(const(ubyte)[]) copy));
         }
         fflush(logF);
-        maybeFsync(logF); // "full": before any RPC reply leaves this node
+        if (durability_ !is null)
+            durability_.requestSync(len); // async: caller awaits before reply
+        else
+            maybeFsync(logF); // sync path: "full" fdatasyncs before returning
     }
 
     void truncateFrom(Index from)
