@@ -13,7 +13,8 @@ import dreads.dict : Dict, StrVal, Unit;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
-import dreads.stream : FieldPair, StreamID, nowMs;
+import dreads.stream : FieldPair, StreamID;
+import dreads.det : detNow = now;
 
 /// When a command's effect must reach the AOF (and later the Raft log) in a
 /// different form than the client sent it — time- or randomness-dependent
@@ -28,8 +29,14 @@ private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
 
 /// Executes one client command, appending the reply to o.
 /// Returns false when the connection should be closed (QUIT).
-public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref Arena arena) @nogc nothrow
+public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref Arena arena,
+        ulong applyTime = 0) @nogc nothrow
 {
+    // freeze the clock for this command: wall time now, or the logged time
+    // when replaying a committed raft entry (deterministic apply on replicas)
+    import dreads.det : freezeClock;
+
+    freezeClock(applyTime);
     if (cmd.type != RType.Array || cmd.arr.length == 0)
     {
         repError(o, "ERR empty command");
@@ -221,7 +228,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, -1);
                 break;
             }
-            long rem = cast(long)(obj.expireAtMs - nowMs());
+            long rem = cast(long)(obj.expireAtMs - detNow());
             if (rem < 0)
                 rem = 0;
             repInt(o, inSec ? (rem + 500) / 1000 : rem);
@@ -1354,7 +1361,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "TIME":
         {
-            auto ms = nowMs();
+            auto ms = detNow();
             char[24] b = void;
             repArrayHeader(o, 2);
             auto n = snprintf(b.ptr, b.length, "%llu", ms / 1000);
@@ -1847,7 +1854,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             if (autoId)
-                id = obj.stream.nextId(nowMs());
+                id = obj.stream.nextId(detNow());
             auto np = (args.length - 2) / 2;
             auto pairs = arena.allocArray!FieldPair(np);
             foreach (i; 0 .. np)
@@ -2090,7 +2097,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "RANDOMKEY":
         {
             // deterministic "random": the first live, unexpired slot
-            auto now = nowMs();
+            auto now = detNow();
             foreach (i; 0 .. ks.d.capacity)
             {
                 if (!ks.d.slotLive(i))
@@ -2512,7 +2519,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto i = cast(size_t) cursor > cap ? cap : cast(size_t) cursor;
             auto found = arena.allocArray!(const(char)[])(cast(size_t) count);
             size_t got, examined;
-            auto now = nowMs();
+            auto now = detNow();
             while (i < cap && examined < cast(size_t) count)
             {
                 if (ks.d.slotLive(i))
@@ -3585,7 +3592,7 @@ private bool resolveExpireMs(long v, bool isSec, bool isRel, ref long absMs) @no
     bool ovf;
     long ms = isSec ? muls(v, 1000, ovf) : v;
     if (isRel)
-        ms = adds(ms, cast(long) nowMs(), ovf);
+        ms = adds(ms, cast(long) detNow(), ovf);
     if (ovf)
         return false;
     absMs = ms;

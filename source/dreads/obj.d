@@ -6,6 +6,7 @@ module dreads.obj;
 import dreads.dict : Dict, StrVal, Unit;
 import dreads.list : DList;
 import dreads.stream : Stream, StreamID, nowMs;
+import dreads.det : detNow = now;
 import dreads.zset : ZSet;
 
 public enum ObjType : ubyte
@@ -179,7 +180,7 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return null;
-        if (o.expireAtMs != 0 && nowMs() >= o.expireAtMs)
+        if (o.expireAtMs != 0 && detNow() >= o.expireAtMs)
         {
             d.del(k);
             return null;
