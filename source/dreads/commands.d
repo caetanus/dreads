@@ -2272,6 +2272,65 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
 
+        // --- misc tail: lists, sort, lcs, hash rand, hll ---
+    case "LPOS":
+        {
+            import dreads.miscops : lpos;
+
+            lpos(ks, args, o, arena);
+            break;
+        }
+    case "LMPOP":
+        {
+            import dreads.miscops : lmpop;
+
+            lmpop(ks, args, o);
+            break;
+        }
+    case "SORT":
+    case "SORT_RO":
+        {
+            import dreads.miscops : sortCmd;
+
+            sortCmd(ks, args, o, arena, name.length == 7);
+            break;
+        }
+    case "LCS":
+        {
+            import dreads.miscops : lcs;
+
+            lcs(ks, args, o, arena);
+            break;
+        }
+    case "HRANDFIELD":
+        {
+            import dreads.miscops : hrandfield;
+
+            hrandfield(ks, args, o);
+            break;
+        }
+    case "PFADD":
+        {
+            import dreads.hll : pfadd;
+
+            pfadd(ks, args, o);
+            break;
+        }
+    case "PFCOUNT":
+        {
+            import dreads.hll : pfcount;
+
+            pfcount(ks, args, o);
+            break;
+        }
+    case "PFMERGE":
+        {
+            import dreads.hll : pfmerge;
+
+            pfmerge(ks, args, o);
+            break;
+        }
+
         // --- bitmaps ---
     case "SETBIT":
         {
@@ -3584,6 +3643,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "XADD", "XDEL", "XTRIM":
     case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
     case "SETBIT", "BITOP", "BITFIELD":
+    case "LMPOP", "SORT", "PFADD", "PFMERGE":
         return true;
     default:
         return false;
