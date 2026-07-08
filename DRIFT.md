@@ -83,10 +83,42 @@ These exist but do not match Redis exactly:
   memory is higher than Redis for small containers; `OBJECT ENCODING`
   reports our actual encodings.
 
+## Raft replication (phase 1 — implemented, verified live)
+
+`vendor/raft` + `dreads/replicator.d` replace the legacy replication wire with
+a consensus-replicated log. Opt-in via `raft-node-id`/`raft-peers`/`raft-port`;
+standalone dreads (no config) instantiates none of it and the write path is
+byte-identical. Verified on a live 3-node cluster: leader election,
+replication of writes to followers, deterministic apply (EXPIRE resolves to
+the same absolute TTL on every replica via the injectable determinism clock),
+and leader-failover with committed data surviving. The log entry is
+`[u64 clock][raw RESP command]`; the leader logs without executing (Raft only
+mutates state on commit) and every replica applies with the injected clock.
+
+**Phase-1 gaps (deliberate — static-membership-first was an explicit
+decision to avoid debugging consensus and reconfiguration at once):**
+
+- **No dynamic membership — no runtime join/leave.** Peers are fixed at boot
+  by `raft-peers`. Adding a 4th node to a running 3-node cluster, or formally
+  removing a node so the majority is recomputed, is NOT supported (needs joint
+  consensus / §6 single-server changes + AddServer/RemoveServer RPCs). A dead
+  node is *tolerated* (cluster runs on the majority) and an existing node can
+  *restart* and re-sync from its durable raftlog (tested), but that is "the
+  same member returning," not a new member. Cluster size is set at boot.
+- **No ReadIndex.** Leader reads are served locally; a just-partitioned leader
+  could serve slightly stale data until it steps down. Followers serve their
+  local applied state (Redis async-replica read semantics).
+- **`EVAL`-with-writes and `MULTI`/`EXEC` are not raft-routed yet** — they run
+  locally on the leader (not replicated through the log).
+- **`ROLE`/`WAIT`/`REPLICAOF` still report standalone values** (not raft-aware).
+- **No snapshot transfer (InstallSnapshot)** — a far-behind or brand-new node
+  can't be caught up by a log-compacting leader yet (`BGREWRITEAOF` output is
+  the intended snapshot format).
+
 ## Roadmap beyond parity
 
-Raft replication (vendor/raft) replaces the legacy replication wire; the
-deterministic AOF (with the propagation-override rules) is the replicated
-log and `BGREWRITEAOF` output is the snapshot format. Cluster commands wait
-on that discussion. `DUMP`/`RESTORE` and Redis Functions are next when
-parity work resumes.
+Phase-2: **sharding** — slot ranges (CRC16/16384) each owned by a Raft group,
+which is the single-machine shared-nothing threading model (thread-per-shard).
+This is also where dynamic membership and the `CLUSTER`/`MOVED`/`ASK` command
+surface land. `DUMP`/`RESTORE`/`MIGRATE` and Redis Functions when parity work
+resumes.
