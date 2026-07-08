@@ -23,6 +23,9 @@ import dreads.stream : FieldPair, StreamID, nowMs;
 /// thread, and the test runner gets one buffer per thread.
 public ByteBuffer propagationOverride;
 
+/// Redis's proto-max-bulk-len default: 512MB per string value.
+private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
+
 /// Executes one client command, appending the reply to o.
 /// Returns false when the connection should be closed (QUIT).
 public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref Arena arena) @nogc nothrow
@@ -518,6 +521,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wrong)
             {
                 repWrongType(o);
+                break;
+            }
+            if (obj !is null && obj.str.s.length + args[1].str.length > MAX_STRING_LEN)
+            {
+                repError(o, "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
                 break;
             }
             if (obj is null)
@@ -1233,12 +1241,79 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "ZRANGE":
     case "ZREVRANGE":
         {
-            zrangeByIndex(ks, args, name.length != 6, o);
+            import dreads.zsetops : zrangeGeneric;
+
+            zrangeGeneric(ks, args, o, arena, name.length == 6 ? 0 : 1);
             break;
         }
     case "ZRANGEBYSCORE":
+    case "ZREVRANGEBYSCORE":
         {
-            zrangeByScore(ks, args, o);
+            import dreads.zsetops : zrangeGeneric;
+
+            zrangeGeneric(ks, args, o, arena, name.length == 13 ? 2 : 3);
+            break;
+        }
+    case "ZRANGEBYLEX":
+    case "ZREVRANGEBYLEX":
+        {
+            import dreads.zsetops : zrangeGeneric;
+
+            zrangeGeneric(ks, args, o, arena, name.length == 11 ? 4 : 5);
+            break;
+        }
+    case "ZRANGESTORE":
+        {
+            import dreads.zsetops : zrangestore;
+
+            zrangestore(ks, args, o, arena);
+            break;
+        }
+    case "ZLEXCOUNT":
+    case "ZREMRANGEBYLEX":
+        {
+            import dreads.zsetops : zlexRange;
+
+            zlexRange(ks, args, o, arena, name.length == 14);
+            break;
+        }
+    case "ZRANDMEMBER":
+        {
+            import dreads.zsetops : zrandmember;
+
+            zrandmember(ks, args, o);
+            break;
+        }
+    case "ZMPOP":
+        {
+            import dreads.zsetops : zmpop;
+
+            zmpop(ks, args, o, arena);
+            break;
+        }
+    case "ZUNION":
+    case "ZINTER":
+    case "ZDIFF":
+        {
+            import dreads.zsetops : zsetCombine;
+
+            zsetCombine(ks, args, o, arena, nbuf[1] == 'U' ? 'U' : (nbuf[1] == 'I' ? 'I' : 'D'), 0);
+            break;
+        }
+    case "ZUNIONSTORE":
+    case "ZINTERSTORE":
+    case "ZDIFFSTORE":
+        {
+            import dreads.zsetops : zsetCombine;
+
+            zsetCombine(ks, args, o, arena, nbuf[1] == 'U' ? 'U' : (nbuf[1] == 'I' ? 'I' : 'D'), 1);
+            break;
+        }
+    case "ZINTERCARD":
+        {
+            import dreads.zsetops : zsetCombine;
+
+            zsetCombine(ks, args, o, arena, 'I', 2);
             break;
         }
 
@@ -1374,6 +1449,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             auto newLen = cast(size_t) off + v.length > oldLen ? cast(size_t) off + v.length
                 : oldLen;
+            if (newLen > MAX_STRING_LEN)
+            {
+                repError(o, "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
+                break;
+            }
             auto buf = arena.allocArray!char(newLen);
             buf[] = '\0';
             if (oldLen)
@@ -2965,88 +3045,6 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
         repBulk(o, m);
 }
 
-private void zrangeByIndex(ref Keyspace ks, const(RVal)[] args, bool rev, ref ByteBuffer o) @nogc nothrow
-{
-    bool withScores = args.length == 4 && eqICWithScores(args[3].str);
-    if (args.length != 3 && !withScores)
-    {
-        if (args.length == 4)
-            repError(o, "ERR syntax error");
-        else
-            arityErr(o, rev ? "zrevrange" : "zrange");
-        return;
-    }
-    long start, stop;
-    if (!parseLong(args[1].str, start) || !parseLong(args[2].str, stop))
-    {
-        repError(o, "ERR value is not an integer or out of range");
-        return;
-    }
-    bool wrong;
-    auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
-    if (wrong)
-    {
-        repWrongType(o);
-        return;
-    }
-    auto len = obj is null ? 0 : cast(long) obj.zset.length;
-    normalizeRange(start, stop, len);
-    if (start > stop)
-    {
-        repArrayHeader(o, 0);
-        return;
-    }
-    auto n = cast(size_t)(stop - start + 1);
-    repArrayHeader(o, n * (withScores ? 2 : 1));
-    obj.zset.walkRange(cast(size_t) start, n, rev, (m, s) {
-        repBulk(o, m);
-        if (withScores)
-            repDouble(o, s);
-        return 0;
-    });
-}
-
-private void zrangeByScore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
-{
-    bool withScores = args.length == 4 && eqICWithScores(args[3].str);
-    if (args.length != 3 && !withScores)
-    {
-        if (args.length == 4)
-            repError(o, "ERR syntax error");
-        else
-            arityErr(o, "zrangebyscore");
-        return;
-    }
-    double min, max;
-    bool minExcl, maxExcl;
-    if (!parseScoreBound(args[1].str, min, minExcl) || !parseScoreBound(args[2].str, max, maxExcl))
-    {
-        repError(o, "ERR min or max is not a float");
-        return;
-    }
-    bool wrong;
-    auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
-    if (wrong)
-    {
-        repWrongType(o);
-        return;
-    }
-    if (obj is null)
-    {
-        repArrayHeader(o, 0);
-        return;
-    }
-    size_t n = 0;
-    obj.zset.walkScoreRange(min, minExcl, max, maxExcl, (m, s) { n++; return 0; });
-    repArrayHeader(o, n * (withScores ? 2 : 1));
-    obj.zset.walkScoreRange(min, minExcl, max, maxExcl, (m, s) {
-        repBulk(o, m);
-        if (withScores)
-            repDouble(o, s);
-        return 0;
-    });
-}
-
 // ---------------------------------------------------------------------------
 // Stream helpers
 // ---------------------------------------------------------------------------
@@ -3220,9 +3218,16 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         return true;
     }
 
-    // wrong-type check first (must error even when other streams have data)
+    // validate every id and stream type upfront (errors beat partial replies)
     foreach (k; 0 .. half)
     {
+        auto spec = rest[half + k].str;
+        StreamID ignored;
+        if (spec != "$" && !parseStreamId(spec, 0, ignored))
+        {
+            repError(o, "ERR Invalid stream ID specified as stream command argument");
+            return;
+        }
         bool wrong;
         ks.lookupTyped(rest[k].str, ObjType.stream, wrong);
         if (wrong)
@@ -3380,7 +3385,7 @@ private void propagateSet(scope const(char)[] key, scope const(char)[] val, ulon
 // ---------------------------------------------------------------------------
 
 /// LRANGE/ZRANGE index normalization: negatives count from the end, then clamp.
-private void normalizeRange(ref long start, ref long stop, long len) @nogc nothrow
+public void normalizeRange(ref long start, ref long stop, long len) @nogc nothrow
 {
     if (start < 0)
         start += len;
@@ -3445,7 +3450,7 @@ public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow
     return v == v; // reject NaN like Redis
 }
 
-private bool parseScoreBound(scope const(char)[] s, out double v, out bool excl) @nogc nothrow
+public bool parseScoreBound(scope const(char)[] s, out double v, out bool excl) @nogc nothrow
 {
     if (s.length > 0 && s[0] == '(')
     {
@@ -3528,8 +3533,9 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
     case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
-    case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX":
-    case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE":
+    case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
+    case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":
+    case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
     case "XADD", "XDEL", "XTRIM":
     case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
         return true;

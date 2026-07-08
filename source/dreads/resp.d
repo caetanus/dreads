@@ -73,6 +73,9 @@ private ParseStatus parseLineInt(scope const(ubyte)[] buf, ref size_t pos, out l
         ubyte c = buf[i];
         if (c < '0' || c > '9')
             return ParseStatus.protocolError;
+        // far above any valid length header; prevents silent wrap-around
+        if (v > 100_000_000_000_000_000)
+            return ParseStatus.protocolError;
         v = v * 10 + (c - '0');
     }
     value = neg ? -v : v;

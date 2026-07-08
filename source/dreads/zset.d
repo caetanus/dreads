@@ -222,6 +222,35 @@ public struct ZSet
         return 0;
     }
 
+    /// Lex iteration (assumes uniform scores, like Redis): ascending member
+    /// order, bounds optionally exclusive or infinite.
+    int walkLexRange(scope const(char)[] min, bool minExcl, bool minNegInf,
+            scope const(char)[] max, bool maxExcl, bool maxPosInf,
+            scope int delegate(const(char)[] m, double s) @nogc nothrow dg) const @nogc nothrow
+    {
+        if (header is null)
+            return 0;
+        for (auto n = cast(ZNode*) header.levels[0].forward; n !is null; n = n.levels[0].forward)
+        {
+            if (!minNegInf)
+            {
+                auto c = cmpMember(n.member, min);
+                if (c < 0 || (c == 0 && minExcl))
+                    continue;
+            }
+            if (!maxPosInf)
+            {
+                auto c = cmpMember(n.member, max);
+                if (c > 0 || (c == 0 && maxExcl))
+                    break;
+            }
+            auto r = dg(n.member, n.score);
+            if (r)
+                return r;
+        }
+        return 0;
+    }
+
     /// Iterates members with min <= score <= max (bounds optionally exclusive).
     int walkScoreRange(double min, bool minExcl, double max, bool maxExcl,
             scope int delegate(const(char)[] member, double score) @nogc nothrow dg) const @nogc nothrow
