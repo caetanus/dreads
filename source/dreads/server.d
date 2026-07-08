@@ -115,6 +115,7 @@ private void initReplication()
     cfg.seed = gConfig.raftNodeId * 2_654_435_761UL;
     cfg.electionTimeoutTicks = 10; // 20ms tick -> ~200-400ms randomized
     cfg.heartbeatTicks = 2; // ~40ms
+    cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
     string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
     gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gKeys);
@@ -440,6 +441,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     case "CONFIG":
         {
             configCmd(args, o);
+            return true;
+        }
+    case "RAFT":
+        {
+            raftCmd(args, o);
             return true;
         }
     case "BLPOP":
@@ -792,6 +798,107 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     }
     propagationOverride.clear();
     return keep;
+}
+
+/// RAFT STATUS | LEADER | ADDNODE id@host:port | REMOVENODE id
+/// Dynamic membership over joint consensus (dreads-specific admin command).
+private void raftCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    import core.stdc.stdio : snprintf;
+    import std.array : split;
+    import std.conv : to;
+
+    import raft.types : NodeId;
+    import raft.vibetransport : PeerAddress;
+
+    if (gReplicator is null)
+    {
+        repError(o, "ERR replication is not enabled (set raft-node-id)");
+        return;
+    }
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'raft' command");
+        return;
+    }
+    if (eqICDebug(args[0].str, "STATUS"))
+    {
+        auto ms = gReplicator.members;
+        repArrayHeader(o, 6);
+        repBulk(o, "role");
+        repBulk(o, gReplicator.isLeader ? "leader" : "follower");
+        repBulk(o, "leader");
+        repInt(o, cast(long) gReplicator.leaderId);
+        repBulk(o, "members");
+        repArrayHeader(o, ms.length);
+        foreach (m; ms)
+            repInt(o, cast(long) m);
+        return;
+    }
+    if (eqICDebug(args[0].str, "LEADER"))
+    {
+        repInt(o, cast(long) gReplicator.leaderId);
+        return;
+    }
+    if (!gReplicator.isLeader)
+    {
+        repError(o, "ERR membership changes must go through the leader");
+        return;
+    }
+    if (eqICDebug(args[0].str, "ADDNODE") && args.length == 2)
+    {
+        // id@host:port
+        try
+        {
+            auto at = (cast(string) args[1].str).split("@");
+            auto hp = at[1].split(":");
+            auto id = at[0].to!uint;
+            auto p = PeerAddress(id, hp[0].idup, hp[1].to!ushort);
+            NodeId[] target;
+            foreach (m; gReplicator.members)
+                target ~= m;
+            foreach (m; target)
+                if (m == id)
+                {
+                    repError(o, "ERR node already a member");
+                    return;
+                }
+            target ~= id;
+            PeerAddress[1] np = [p];
+            if (gReplicator.changeMembership(target, np[]))
+                repSimple(o, "OK");
+            else
+                repError(o, "ERR change already in flight");
+        }
+        catch (Exception)
+            repError(o, "ERR usage: RAFT ADDNODE id@host:port");
+        return;
+    }
+    if (eqICDebug(args[0].str, "REMOVENODE") && args.length == 2)
+    {
+        try
+        {
+            auto id = (cast(string) args[1].str).to!uint;
+            NodeId[] target;
+            foreach (m; gReplicator.members)
+                if (m != id)
+                    target ~= m;
+            if (target.length == gReplicator.members.length)
+            {
+                repError(o, "ERR node is not a member");
+                return;
+            }
+            PeerAddress[0] np;
+            if (gReplicator.changeMembership(target, np[]))
+                repSimple(o, "OK");
+            else
+                repError(o, "ERR change already in flight");
+        }
+        catch (Exception)
+            repError(o, "ERR usage: RAFT REMOVENODE id");
+        return;
+    }
+    repError(o, "ERR unknown RAFT subcommand");
 }
 
 /// CONFIG GET pattern | SET name value | REWRITE | RESETSTAT

@@ -23,6 +23,7 @@ public struct Config
     uint raftNodeId = 0; // 0 = replication disabled
     string raftPeers; // "2@host:port,3@host:port"
     ushort raftPort = 0; // 0 = port + 10000
+    bool raftJoin = false; // start as a passive learner (joining an existing cluster)
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -147,6 +148,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         try
             cfg.raftPort = value.to!ushort;
         catch (Exception)
+            return false;
+        return true;
+    case "raft-join":
+        if (value == "yes")
+            cfg.raftJoin = true;
+        else if (value == "no")
+            cfg.raftJoin = false;
+        else
             return false;
         return true;
     default:

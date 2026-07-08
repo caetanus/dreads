@@ -79,6 +79,24 @@ final class Replicator
         return node.currentLeader;
     }
 
+    /// Current voting members (for RAFT STATUS).
+    const(NodeId)[] members() nothrow
+    {
+        return node.members;
+    }
+
+    /// Adds a peer's address so we can reach it, then proposes a joint config
+    /// that includes it. Leader-only. `newMembers` is the full target set.
+    bool changeMembership(scope const(NodeId)[] newMembers, scope const(PeerAddress)[] newPeers)
+    {
+        nodeMtx.lock();
+        scope (exit)
+            nodeMtx.unlock();
+        foreach (ref p; newPeers)
+            transport.addPeer(p);
+        return node.changeMembership(newMembers);
+    }
+
     // --- client write: propose [clock][rawCmd], await commit+apply ---
 
     /// Returns false when this node is not the leader (caller redirects).
