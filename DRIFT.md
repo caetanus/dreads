@@ -62,8 +62,8 @@ These exist but do not match Redis exactly:
   runtime via CONFIG SET. Scripts also get a **throwaway `_ENV` per run**
   (globals they create die with the execution — fresh-interpreter isolation
   at shared-state cost) and the state is recycled past 32MB of heap.
-  Helper libraries: `cjson` (in-project D implementation), `redis.sha1hex`
-  and `bit` are provided; still missing: `cmsgpack` and `struct`, and
+  Helper libraries: `cjson` and `cmsgpack` (in-project D implementations),
+  `redis.sha1hex` and `bit` are provided; still missing: `struct`, and
   `SCRIPT KILL` (the time limit hard-aborts instead — with a single-threaded
   event loop no other command can arrive mid-script anyway); scripts log
   verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,

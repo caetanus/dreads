@@ -90,6 +90,7 @@ enum LUA_RIDX_GLOBALS = 2;
 int lua_next(lua_State* L, int idx);
 int lua_isinteger(lua_State* L, int idx);
 void lua_pushvalue(lua_State* L, int idx);
+int lua_checkstack(lua_State* L, int n);
 
 // per-run environment swap (upvalue 1 of a chunk is its _ENV)
 const(char)* lua_setupvalue(lua_State* L, int funcindex, int n);

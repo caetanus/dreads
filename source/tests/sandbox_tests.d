@@ -123,6 +123,40 @@ version (unittest)
         ks.evalRun(`return cjson.decode('1 trailing')`)[0].expect.to.equal('-');
     }
 
+    @("sandbox.cmsgpack")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // byte-exact wire format checks against the msgpack spec
+        ks.evalRun("return cmsgpack.pack(1)").expect.to.equal("$1\r\n\x01\r\n");
+        ks.evalRun("return cmsgpack.pack(true)").expect.to.equal("$1\r\n\xc3\r\n");
+        ks.evalRun("return cmsgpack.pack({1,2,3})")
+            .expect.to.equal("$4\r\n\x93\x01\x02\x03\r\n");
+        ks.evalRun("return cmsgpack.pack('')").expect.to.equal("$1\r\n\xa0\r\n");
+        ks.evalRun("return cmsgpack.pack(-1)").expect.to.equal("$1\r\n\xff\r\n");
+        ks.evalRun("return cmsgpack.pack(200)").expect.to.equal("$2\r\n\xcc\xc8\r\n");
+        // round trips: scalars, nesting, maps, doubles, negatives
+        ks.evalRun(`local b = cmsgpack.pack({a = {1, -300, 2.5, 'x'}, n = 70000})
+                    local t = cmsgpack.unpack(b)
+                    return {t.a[1], t.a[2], tostring(t.a[3]), t.a[4], t.n}`)
+            .expect.to.equal("*5\r\n:1\r\n:-300\r\n$3\r\n2.5\r\n$1\r\nx\r\n:70000\r\n");
+        // multiple values: pack(a, b) -> unpack returns both
+        ks.evalRun(`local a, b = cmsgpack.unpack(cmsgpack.pack(7, 'oi'))
+                    return {a, b}`).expect.to.equal("*2\r\n:7\r\n$2\r\noi\r\n");
+        // big string crosses the fixstr boundary and survives
+        ks.evalRun(`local s = string.rep('z', 100)
+                    return cmsgpack.unpack(cmsgpack.pack(s)) == s and 1 or 0`)
+            .expect.to.equal(":1\r\n");
+        // robustness: truncated input, unsupported tag, empty
+        ks.evalRun(`return cmsgpack.unpack(string.char(0xdc, 0x00))`)[0]
+            .expect.to.equal('-'); // truncated array16 header
+        ks.evalRun(`return cmsgpack.unpack(string.char(0xc1))`)[0].expect.to.equal('-');
+        ks.evalRun(`return cmsgpack.unpack('')`)[0].expect.to.equal('-');
+        ks.evalRun(`return cmsgpack.pack()`)[0].expect.to.equal('-');
+    }
+
     @("sandbox.sha1hex_and_bit")
     unittest
     {

@@ -130,8 +130,10 @@ private bool ensureState() nothrow
     // helper libraries scripts expect from Redis
     {
         import dreads.cjson : registerCjson;
+        import dreads.cmsgpack : registerCmsgpack;
 
         registerCjson(gL);
+        registerCmsgpack(gL);
     }
     registerBitLib(gL);
     // pre-create KEYS/ARGV so reading them never trips the protection
