@@ -85,6 +85,10 @@ int luaopen_math(lua_State* L);
 void lua_rawset(lua_State* L, int idx);
 enum LUA_RIDX_GLOBALS = 2;
 
+// per-run environment swap (upvalue 1 of a chunk is its _ENV)
+const(char)* lua_setupvalue(lua_State* L, int funcindex, int n);
+int lua_setmetatable(lua_State* L, int objindex);
+
 // instruction-count hook (script time limit)
 alias lua_Hook = void function(lua_State* L, void* ar) nothrow @nogc;
 void lua_sethook(lua_State* L, lua_Hook f, int mask, int count);

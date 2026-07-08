@@ -474,6 +474,15 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         gCtx.readOnly = false;
         gLuaDeadlineMsecs = 0;
         lua_settop(gL, 0);
+        // recycle: bound long-term growth by rebuilding the state once its
+        // heap passes the threshold (cost amortizes to ~zero per script)
+        enum RECYCLE_BYTES = 32UL * 1024 * 1024;
+        if (gLuaBytes > RECYCLE_BYTES)
+        {
+            lua_close(gL);
+            gL = null;
+            gLuaBytes = 0;
+        }
     }
 
     if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
@@ -481,6 +490,14 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         luaErrToResp(o, "ERR Error compiling script: ");
         return;
     }
+    // per-run _ENV: the script's globals live in a throwaway table chained to
+    // the shared base — the cheap equivalent of a fresh interpreter per run
+    lua_createtable(gL, 0, 8); // env
+    lua_createtable(gL, 0, 1); // env metatable
+    lua_rawgeti(gL, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+    lua_setfield(gL, -2, "__index");
+    lua_setmetatable(gL, -2);
+    lua_setupvalue(gL, -2, 1);
     if (lua_pcall(gL, 0, 1, 0) != LUA_OK)
     {
         luaErrToResp(o, "ERR Error running script: ");

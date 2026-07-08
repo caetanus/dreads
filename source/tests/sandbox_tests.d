@@ -56,15 +56,22 @@ version (unittest)
         return ks.evalRun("return tostring(" ~ global ~ ")");
     }
 
-    @("sandbox.protected_globals")
+    @("sandbox.per_run_environment")
     unittest
     {
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        auto created = ks.evalRun("leaked = 42 return 1");
-        created[0].expect.to.equal('-');
-        created.expect.to.contain("create global");
+        // globals live in a throwaway per-run _ENV: usable within the script...
+        ks.evalRun("leaked = 42 return leaked").expect.to.equal(":42\r\n");
+        // ...but gone on the next run (reads chain to the protected base)
+        auto next = ks.evalRun("return tostring(leaked)");
+        next[0].expect.to.equal('-');
+        next.expect.to.contain("nonexistent global");
+        // writing the shared base directly is still blocked
+        auto direct = ks.evalRun("_G.leaked = 42 return 1");
+        direct[0].expect.to.equal('-');
+        direct.expect.to.contain("create global");
         // locals are fine, and KEYS/ARGV still arrive
         ks.evalRun("local x = 42 return x").expect.to.equal(":42\r\n");
         ks.evalRun("return {KEYS[1], ARGV[1]}", "1", "k", "a")
