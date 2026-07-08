@@ -1933,6 +1933,62 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
 
+        // --- geo ---
+    case "GEOADD":
+        {
+            import dreads.geo : geoadd;
+
+            geoadd(ks, args, o);
+            break;
+        }
+    case "GEOPOS":
+        {
+            import dreads.geo : geopos;
+
+            geopos(ks, args, o);
+            break;
+        }
+    case "GEODIST":
+        {
+            import dreads.geo : geodist;
+
+            geodist(ks, args, o);
+            break;
+        }
+    case "GEOHASH":
+        {
+            import dreads.geo : geohashCmd;
+
+            geohashCmd(ks, args, o);
+            break;
+        }
+    case "GEOSEARCH":
+        {
+            import dreads.geo : geosearch;
+
+            geosearch(ks, args, o, arena);
+            break;
+        }
+    case "GEOSEARCHSTORE":
+        {
+            import dreads.geo : geosearchstore;
+
+            geosearchstore(ks, args, o, arena);
+            break;
+        }
+    case "GEORADIUS":
+    case "GEORADIUS_RO":
+    case "GEORADIUSBYMEMBER":
+    case "GEORADIUSBYMEMBER_RO":
+        {
+            import dreads.geo : georadius;
+
+            bool byMember = name.length == 17 || name.length == 20;
+            bool readOnly = name.length == 12 || name.length == 20;
+            georadius(ks, args, o, arena, byMember, readOnly);
+            break;
+        }
+
         // --- cursor iteration ---
     case "SCAN":
         {
@@ -2842,7 +2898,7 @@ private void scanReply(ref ByteBuffer o, size_t nextCursor, const(const(char)[])
         repBulk(o, it);
 }
 
-private bool eqICKeyword(scope const(char)[] s, scope const(char)[] upper) @nogc nothrow
+public bool eqICKeyword(scope const(char)[] s, scope const(char)[] upper) @nogc nothrow
 {
     if (s.length != upper.length)
         return false;
@@ -3166,6 +3222,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE":
     case "XADD", "XDEL", "XTRIM":
+    case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
         return true;
     default:
         return false;
