@@ -1,24 +1,31 @@
 .dub
+__dub_cache__/
 docs.json
 __dummy.html
 docs/
-/dedis
-dedis.so
-dedis.dylib
-dedis.dll
-dedis.a
-dedis.lib
-dedis-test-*
-dreads*
-build/*
-compile_commands.json
-build.ninja
+
+# build outputs
+/bin/
+/dreads
 libdreads*
-test_runner.d
-dub.selections.json
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
 *.exe
 *.pdb
 *.o
 *.obj
 *.lst
-*.ninja
+
+# reggae/ninja
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+.reggae/
+compile_commands.json
+
+# runtime state
+*.aof
