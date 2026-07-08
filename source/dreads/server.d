@@ -15,7 +15,7 @@ import core.time : seconds;
 import vibe.core.core : runEventLoop, setTimer;
 import vibe.core.net : TCPConnection, listenTCP;
 import vibe.core.stream : IOMode;
-import vibe.core.sync : TaskMutex;
+import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
@@ -39,6 +39,8 @@ private __gshared ulong gClientIds;
 // MONITOR feed: registered connections receive every executed command
 private __gshared Conn*[64] gMonitors;
 private __gshared size_t gMonitorCount;
+// blocked clients (BLPOP & co.) wake on any write and re-check their keys
+private __gshared LocalManualEvent gKeyActivity;
 
 public int runServer(ushort port, const(char)[] aofPath = null)
 {
@@ -58,6 +60,7 @@ public int runServer(ushort port, const(char)[] aofPath = null)
             return 1;
         }
     }
+    gKeyActivity = createManualEvent();
     {
         import dreads.obj : lruClock;
         import dreads.stream : nowMs;
@@ -394,6 +397,83 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             configCmd(args, o);
             return true;
         }
+    case "BLPOP":
+    case "BRPOP":
+        {
+            blockingPop(c, args, uname[1] == 'L', o, arena);
+            return true;
+        }
+    case "BZPOPMIN":
+    case "BZPOPMAX":
+        {
+            blockingZPop(c, args, uname == "BZPOPMAX", o, arena);
+            return true;
+        }
+    case "BLMOVE":
+    case "BRPOPLPUSH":
+        {
+            // rewrite into the non-blocking form and retry until data/timeout
+            if ((uname == "BLMOVE" && args.length != 5) || (uname == "BRPOPLPUSH"
+                    && args.length != 3))
+            {
+                repError(o, "ERR wrong number of arguments");
+                return true;
+            }
+            ulong timeoutMs;
+            if (!parseTimeout(args[$ - 1].str, timeoutMs))
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                return true;
+            }
+            blockingRetry(c, cmd.arr[0 .. $ - 1], uname == "BLMOVE" ? "LMOVE"
+                    : "RPOPLPUSH", "$-1\r\n", timeoutMs, o, arena);
+            return true;
+        }
+    case "XREAD":
+        {
+            // only the BLOCK form is handled here; plain XREAD dispatches
+            ptrdiff_t blockAt = -1;
+            foreach (i, ref a; args)
+            {
+                if (eqICDebug(a.str, "BLOCK"))
+                {
+                    blockAt = cast(ptrdiff_t) i;
+                    break;
+                }
+            }
+            if (blockAt < 0)
+                break;
+            import dreads.commands : parseLong;
+
+            long blockMs;
+            if (blockAt + 1 >= args.length || !parseLong(args[blockAt + 1].str, blockMs)
+                    || blockMs < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return true;
+            }
+            xreadBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
+            return true;
+        }
+    case "BLMPOP":
+    case "BZMPOP":
+        {
+            // B*MPOP timeout numkeys ... -> *MPOP numkeys ...
+            if (args.length < 3)
+            {
+                repError(o, "ERR wrong number of arguments");
+                return true;
+            }
+            ulong timeoutMs;
+            if (!parseTimeout(args[0].str, timeoutMs))
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                return true;
+            }
+            blockingRetry(c, cmd.arr[1 .. $], uname == "BLMPOP" ? "LMPOP" : "ZMPOP",
+                    "*-1\r\n", timeoutMs, o, arena, true);
+            return true;
+        }
     case "HELLO":
         {
             if (args.length >= 1 && args[0].str != "2")
@@ -594,7 +674,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // logging the whole EVAL.
             propagationOverride.clear();
             if (o.length > outBefore && o.data[outBefore] != '-')
+            {
                 gWriteEpoch++;
+                gKeyActivity.emit();
+            }
             if (gAof.enabled && o.length > outBefore && o.data[outBefore] != '-')
             {
                 if (!bySha)
@@ -627,7 +710,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     if (o.length > outBefore && o.data[outBefore] != '-')
     {
         if (isWriteCommand(uname) || !propagationOverride.empty)
+        {
             gWriteEpoch++; // WATCH visibility
+            gKeyActivity.emit(); // wake blocked BLPOP-family clients
+        }
         if (gAof.enabled)
         {
             if (!propagationOverride.empty)
@@ -846,6 +932,294 @@ private bool freeMemoryIfNeeded() nothrow
             return true;
     }
     return usedMemory() <= gConfig.maxmemory;
+}
+
+// ---------------------------------------------------------------------------
+// Blocking commands (BLPOP family, XREAD BLOCK)
+// ---------------------------------------------------------------------------
+
+/// Redis timeouts are seconds as a double; 0 = block forever.
+private bool parseTimeout(scope const(char)[] s, out ulong ms) nothrow
+{
+    import dreads.commands : parseDouble;
+
+    double secs;
+    if (!parseDouble(s, secs) || secs < 0 || secs > 1e9)
+        return false;
+    ms = cast(ulong)(secs * 1000);
+    return true;
+}
+
+/// True while the caller should keep waiting (updates the emit count).
+private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) nothrow
+{
+    import core.time : MonoTime, msecs;
+
+    if (timeoutMs != 0 && remainingMs <= 0)
+        return false;
+    auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs; // forever = 1h slices
+    auto before = MonoTime.currTime;
+    ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
+    if (timeoutMs != 0)
+        remainingMs -= (MonoTime.currTime - before).total!"msecs";
+    return true;
+}
+
+/// BLPOP / BRPOP: keys..., timeout. Reply *2 [key, value] or nil array.
+private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
+        ref ByteBuffer o, ref Arena arena) nothrow
+{
+    import dreads.obj : ObjType;
+
+    if (args.length < 2)
+    {
+        repError(o, "ERR wrong number of arguments");
+        return;
+    }
+    ulong timeoutMs;
+    if (!parseTimeout(args[$ - 1].str, timeoutMs))
+    {
+        repError(o, "ERR timeout is not a float or out of range");
+        return;
+    }
+    auto keys = args[0 .. $ - 1];
+    auto ec = gKeyActivity.emitCount;
+    long remaining = cast(long) timeoutMs;
+    for (;;)
+    {
+        foreach (ref k; keys)
+        {
+            bool wrong;
+            auto obj = gKeys.lookupTyped(k.str, ObjType.list, wrong);
+            if (wrong)
+            {
+                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                return;
+            }
+            if (obj is null || obj.list.length == 0)
+                continue;
+            repArrayHeader(o, 2);
+            repBulk(o, k.str);
+            repBulk(o, fromLeft ? obj.list.front : obj.list.back);
+            if (fromLeft)
+                obj.list.popFront();
+            else
+                obj.list.popBack();
+            gKeys.delIfEmpty(k.str, obj);
+            logEffect(fromLeft ? "LPOP" : "RPOP", k.str);
+            return;
+        }
+        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        {
+            o.append("*-1\r\n");
+            return;
+        }
+    }
+}
+
+/// BZPOPMIN / BZPOPMAX: keys..., timeout. Reply *3 [key, member, score] or nil.
+private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
+        ref ByteBuffer o, ref Arena arena) nothrow
+{
+    import dreads.commands : repDouble;
+    import dreads.obj : ObjType;
+
+    if (args.length < 2)
+    {
+        repError(o, "ERR wrong number of arguments");
+        return;
+    }
+    ulong timeoutMs;
+    if (!parseTimeout(args[$ - 1].str, timeoutMs))
+    {
+        repError(o, "ERR timeout is not a float or out of range");
+        return;
+    }
+    auto keys = args[0 .. $ - 1];
+    auto ec = gKeyActivity.emitCount;
+    long remaining = cast(long) timeoutMs;
+    for (;;)
+    {
+        foreach (ref k; keys)
+        {
+            bool wrong;
+            auto obj = gKeys.lookupTyped(k.str, ObjType.zset, wrong);
+            if (wrong)
+            {
+                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                return;
+            }
+            if (obj is null || obj.zset.length == 0)
+                continue;
+            const(char)[] victim;
+            repArrayHeader(o, 3);
+            repBulk(o, k.str);
+            obj.zset.walkRange(0, 1, popMax, (m, s) {
+                repBulk(o, m);
+                repDouble(o, s);
+                victim = arena.dupString(m);
+                return 0;
+            });
+            obj.zset.remove(victim);
+            gKeys.delIfEmpty(k.str, obj);
+            logEffect(popMax ? "ZPOPMAX" : "ZPOPMIN", k.str);
+            return;
+        }
+        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        {
+            o.append("*-1\r\n");
+            return;
+        }
+    }
+}
+
+/// Generic retry loop: rewrites the blocking command into its non-blocking
+/// form (parts = original tokens minus the timeout), dispatches it, and
+/// waits when the reply equals nilReply. The effective command is what the
+/// AOF sees (via the normal executeCommand path is bypassed here, so log it).
+private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
+        string nilReply, ulong timeoutMs, ref ByteBuffer o, ref Arena arena,
+        bool skipFirst = false) nothrow
+{
+    static ByteBuffer synth; // TLS: rebuilt command bytes
+    static ByteBuffer attempt; // TLS: attempt reply staging
+    synth.clear();
+    auto argTokens = skipFirst ? parts[1 .. $] : parts[1 .. $];
+    repArrayHeader(synth, 1 + argTokens.length);
+    repBulk(synth, verb);
+    foreach (ref p; argTokens)
+        repBulk(synth, p.str);
+
+    auto ec = gKeyActivity.emitCount;
+    long remaining = cast(long) timeoutMs;
+    for (;;)
+    {
+        attempt.clear();
+        RVal cmd2;
+        size_t pos = 0;
+        if (parseValue(synth.data, pos, arena, cmd2) != ParseStatus.ok)
+        {
+            repError(o, "ERR internal blocking rewrite failed");
+            return;
+        }
+        dispatch(cmd2, gKeys, attempt, arena);
+        propagationOverride.clear();
+        auto rep = cast(const(char)[]) attempt.data;
+        if (rep.length > 0 && rep[0] == '-')
+        {
+            o.append(attempt.data); // real error: surface it
+            return;
+        }
+        if (rep != nilReply)
+        {
+            o.append(attempt.data);
+            if (gAof.enabled)
+                gAof.append(synth.data);
+            gWriteEpoch++;
+            gKeyActivity.emit();
+            return;
+        }
+        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        {
+            o.append(nilReply);
+            return;
+        }
+    }
+}
+
+/// XREAD ... BLOCK ms ... : strips BLOCK, resolves "$" to each stream's
+/// current last id ONCE (Redis semantics), then retries until data/timeout.
+private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
+        ulong timeoutMs, ref ByteBuffer o, ref Arena arena) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    import dreads.obj : ObjType;
+
+    static ByteBuffer synth; // TLS
+    synth.clear();
+    // locate STREAMS to know where ids start
+    ptrdiff_t streamsAt = -1;
+    foreach (i, ref a; args)
+    {
+        if (eqICDebug(a.str, "STREAMS"))
+        {
+            streamsAt = cast(ptrdiff_t) i;
+            break;
+        }
+    }
+    if (streamsAt < 0 || (args.length - streamsAt - 1) % 2 != 0)
+    {
+        repError(o, "ERR syntax error");
+        return;
+    }
+    auto half = (args.length - streamsAt - 1) / 2;
+
+    // count synth tokens: original minus the BLOCK pair, plus the verb
+    repArrayHeader(synth, args.length - 2 + 1);
+    repBulk(synth, "XREAD");
+    foreach (i, ref a; args)
+    {
+        if (i == blockAt || i == blockAt + 1)
+            continue;
+        bool isIdSlot = i > cast(size_t) streamsAt + half;
+        if (isIdSlot && a.str == "$")
+        {
+            // resolve to the stream's current last id
+            auto keyIdx = i - half;
+            bool wrong;
+            auto obj = gKeys.lookupTyped(args[keyIdx].str, ObjType.stream, wrong);
+            char[48] b = void;
+            auto ms = obj is null ? 0 : obj.stream.lastId.ms;
+            auto seq = obj is null ? 0 : obj.stream.lastId.seq;
+            auto n = snprintf(b.ptr, b.length, "%llu-%llu", ms, seq);
+            repBulk(synth, b[0 .. n]);
+        }
+        else
+            repBulk(synth, a.str);
+    }
+
+    static ByteBuffer attempt; // TLS
+    auto ec = gKeyActivity.emitCount;
+    long remaining = cast(long) timeoutMs;
+    for (;;)
+    {
+        attempt.clear();
+        RVal cmd2;
+        size_t pos = 0;
+        if (parseValue(synth.data, pos, arena, cmd2) != ParseStatus.ok)
+        {
+            repError(o, "ERR internal blocking rewrite failed");
+            return;
+        }
+        dispatch(cmd2, gKeys, attempt, arena);
+        auto rep = cast(const(char)[]) attempt.data;
+        if (rep != "*-1\r\n")
+        {
+            o.append(attempt.data);
+            return;
+        }
+        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        {
+            o.append("*-1\r\n");
+            return;
+        }
+    }
+}
+
+/// Logs a single-key effect command (LPOP key / ZPOPMIN key ...) to the AOF.
+private void logEffect(string verb, scope const(char)[] key) nothrow
+{
+    gWriteEpoch++;
+    gKeyActivity.emit();
+    if (!gAof.enabled)
+        return;
+    static ByteBuffer eff; // TLS
+    eff.clear();
+    repArrayHeader(eff, 2);
+    repBulk(eff, verb);
+    repBulk(eff, key);
+    gAof.append(eff.data);
 }
 
 private void unregisterMonitor(Conn* c) nothrow
