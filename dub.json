@@ -2,28 +2,42 @@
 	"authors": [
 		"Marcelo Aires Caetano"
 	],
-	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
-	"targetType": "executable",
-	"targetPath": "bin",
-	"configurations": [{
-		"name": "executable"
-	},
-	        {
-            "name": "unittest",
-            "targetType": "executable",
+	"configurations": [
+		{
+			"name": "executable",
+			"targetType": "executable"
+		},
+		{
+			"dependencies": {
+				"fluent-asserts": "*",
+				"unit-threaded": "*"
+			},
+			"excludedSourceFiles": [
+				"src/main.d"
+			],
+			"mainSourceFile": "bin/ut.d",
+			"name": "unittest",
+			"preBuildCommands": [
+				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"
+			],
 			"targetName": "dreads_tests",
-            "preBuildCommands": ["$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"],
-            "mainSourceFile": "bin/ut.d",
-            "excludedSourceFiles": ["src/main.d"],
-            "dependencies": {
-                "unit-threaded": "*"
-            }
-        }
-
-],
-
-	
+			"targetType": "executable"
+		}
+	],
+	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
+	"dependencies": {
+		"automem": "~>0.6.11",
+		"vibe-core": "~>2.8"
+	},
 	"description": "a dlang redis implementation",
+	"libs": [
+		"lua5.4"
+	],
+	"libs-linux": [
+		"jemalloc"
+	],
 	"license": "MIT",
-	"name": "dreads"
+	"name": "dreads",
+	"targetPath": "bin",
+	"targetType": "executable"
 }

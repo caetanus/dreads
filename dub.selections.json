@@ -1,0 +1,17 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"automem": "0.6.11",
+		"during": "0.3.0",
+		"eventcore": "0.9.39",
+		"fluent-asserts": "2.0.5",
+		"libdparse": "0.25.1",
+		"silly": "1.1.1",
+		"stdx-allocator": "2.77.5",
+		"taggedalgebraic": "1.0.1",
+		"test_allocator": "0.3.4",
+		"unit-threaded": "2.2.3",
+		"vibe-container": "1.7.1",
+		"vibe-core": "2.14.0"
+	}
+}
