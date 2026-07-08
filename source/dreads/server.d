@@ -840,6 +840,17 @@ private void raftCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         repInt(o, cast(long) gReplicator.leaderId);
         return;
     }
+    if (eqICDebug(args[0].str, "COMPACT"))
+    {
+        try
+        {
+            gReplicator.forceCompact();
+            repSimple(o, "OK");
+        }
+        catch (Exception)
+            repError(o, "ERR compaction failed");
+        return;
+    }
     if (!gReplicator.isLeader)
     {
         repError(o, "ERR membership changes must go through the leader");

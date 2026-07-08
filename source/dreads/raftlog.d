@@ -8,8 +8,8 @@ module dreads.raftlog;
 // Log frame:  [u64 term][u64 index][u32 len][payload]
 // Meta file:  [u64 currentTerm][u32 votedFor]
 
-import core.stdc.stdio : FILE, fclose, fflush, fopen, fread, fseek, fwrite,
-    SEEK_END, SEEK_SET;
+import core.stdc.stdio : FILE, fclose, fflush, fopen, fread, fseek, ftell, fwrite,
+    rename, SEEK_END, SEEK_SET;
 import core.stdc.stdlib : crealloc = realloc, cfree = free;
 
 // POSIX-first by project decision; Windows is not a target for the server.
@@ -33,10 +33,16 @@ final class RaftLog : Storage
     private Term term_;
     private NodeId voted_;
     // in-memory working copy (payloads malloc'd)
-    private LogEntry* entries;
+    private LogEntry* entries; // in-memory entries with index > snapIdx_
     private size_t len;
     private size_t cap;
     private ulong[] offsets; // file offset of each entry (for truncation)
+    // snapshot / compaction
+    private Index snapIdx_; // lastIncludedIndex (0 = none)
+    private Term snapTerm_;
+    private const(char)[] snapData_; // malloc'd
+    private char[512] base_ = void;
+    private size_t baseLen_;
 
     /// Opens (creating if absent) <base>.raftlog and <base>.raftmeta,
     /// rebuilding the in-memory log. A torn tail from a crash mid-write is
@@ -47,6 +53,9 @@ final class RaftLog : Storage
         char[512] zp = void;
         if (base.length + 10 >= zp.length)
             return null;
+        self.base_[0 .. base.length] = base;
+        self.baseLen_ = base.length;
+        self.loadSnapshotFile();
 
         zp[0 .. base.length] = base;
         zp[base.length .. base.length + 10] = ".raftmeta\0";
@@ -102,6 +111,8 @@ final class RaftLog : Storage
             cfree(entries);
         entries = null;
         len = cap = 0;
+        snapData_.freeSlice;
+        snapData_ = null;
         if (logF !is null)
             fclose(logF);
         if (metaF !is null)
@@ -121,7 +132,7 @@ final class RaftLog : Storage
             auto term = readLE64(hdr[0 .. 8]);
             auto index = readLE64(hdr[8 .. 16]);
             auto plen = readLE32(hdr[16 .. 20]);
-            if (index != len + 1 || plen > 512 * 1024 * 1024)
+            if (index != snapIdx_ + len + 1 || plen > 512 * 1024 * 1024)
                 break; // corrupt or torn: stop here
             auto payload = cast(ubyte*) crealloc(null, plen ? plen : 1);
             if (fread(payload, 1, plen, logF) != plen)
@@ -178,22 +189,42 @@ nothrow:
 
     Index lastIndex()
     {
-        return len;
+        return snapIdx_ + len;
     }
 
     Term termAt(Index i)
     {
-        return i >= 1 && i <= len ? entries[cast(size_t) i - 1].term : 0;
+        if (i == snapIdx_)
+            return snapTerm_;
+        if (i > snapIdx_ && i <= snapIdx_ + len)
+            return entries[cast(size_t)(i - snapIdx_ - 1)].term;
+        return 0;
     }
 
     const(LogEntry)[] entriesFrom(Index from, size_t max)
     {
-        if (from < 1 || from > len)
+        if (from <= snapIdx_ || from > snapIdx_ + len)
             return null;
-        auto end = cast(size_t)(from - 1) + max;
+        auto start = cast(size_t)(from - snapIdx_ - 1);
+        auto end = start + max;
         if (end > len)
             end = len;
-        return entries[cast(size_t) from - 1 .. end];
+        return entries[start .. end];
+    }
+
+    Index snapshotIndex()
+    {
+        return snapIdx_;
+    }
+
+    Term snapshotTerm()
+    {
+        return snapTerm_;
+    }
+
+    const(ubyte)[] snapshotData()
+    {
+        return cast(const(ubyte)[]) snapData_;
     }
 
     void append(scope const(LogEntry)[] batch)
@@ -212,16 +243,16 @@ nothrow:
         }
         fflush(logF);
         if (durability_ !is null)
-            durability_.requestSync(len); // async: caller awaits before reply
+            durability_.requestSync(snapIdx_ + len); // async: caller awaits before reply
         else
             maybeFsync(logF); // sync path: "full" fdatasyncs before returning
     }
 
     void truncateFrom(Index from)
     {
-        if (from < 1 || from > len)
+        if (from <= snapIdx_ || from > snapIdx_ + len)
             return;
-        auto keep = cast(size_t)(from - 1);
+        auto keep = cast(size_t)(from - snapIdx_ - 1);
         foreach (i; keep .. len)
             (cast(const(char)[]) entries[i].payload).freeSlice;
         len = keep;
@@ -229,6 +260,103 @@ nothrow:
                 + FRAME_HDR + entries[keep - 1].payload.length));
         fseek(logF, 0, SEEK_END);
         maybeFsync(logF);
+    }
+
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data)
+    {
+        if (lastIncludedIndex <= snapIdx_)
+            return;
+        // drop the covered in-memory prefix, keeping entries after it
+        size_t drop = lastIncludedIndex >= snapIdx_ + len ? len
+            : cast(size_t)(lastIncludedIndex - snapIdx_);
+        foreach (i; 0 .. drop)
+            (cast(const(char)[]) entries[i].payload).freeSlice;
+        foreach (i; drop .. len)
+            entries[i - drop] = entries[i];
+        len -= drop;
+        snapIdx_ = lastIncludedIndex;
+        snapTerm_ = lastIncludedTerm;
+        snapData_.freeSlice;
+        snapData_ = mallocDup(cast(const(char)[]) data);
+        writeSnapshotFile();
+        rewriteLogFile(); // the on-disk log now holds only surviving entries
+    }
+
+    /// Snapshot file layout: [u64 lastIncludedIndex][u64 lastIncludedTerm][data]
+    private void loadSnapshotFile() nothrow
+    {
+        char[520] zp = void;
+        zp[0 .. baseLen_] = base_[0 .. baseLen_];
+        zp[baseLen_ .. baseLen_ + 10] = ".raftsnap\0";
+        auto f = fopen(zp.ptr, "rb");
+        if (f is null)
+            return;
+        ubyte[16] hdr;
+        if (fread(hdr.ptr, 1, 16, f) == 16)
+        {
+            snapIdx_ = readLE64(hdr[0 .. 8]);
+            snapTerm_ = readLE64(hdr[8 .. 16]);
+            fseek(f, 0, SEEK_END);
+            auto total = ftell(f);
+            auto dlen = total >= 16 ? cast(size_t)(total - 16) : 0;
+            if (dlen)
+            {
+                auto buf = cast(char*) crealloc(null, dlen);
+                fseek(f, 16, SEEK_SET);
+                if (fread(buf, 1, dlen, f) == dlen)
+                    snapData_ = buf[0 .. dlen];
+                else
+                    cfree(buf);
+            }
+        }
+        fclose(f);
+    }
+
+    private void writeSnapshotFile() nothrow
+    {
+        char[520] zp = void;
+        char[528] tmp = void;
+        zp[0 .. baseLen_] = base_[0 .. baseLen_];
+        zp[baseLen_ .. baseLen_ + 10] = ".raftsnap\0";
+        tmp[0 .. baseLen_] = base_[0 .. baseLen_];
+        tmp[baseLen_ .. baseLen_ + 14] = ".raftsnap.tmp\0";
+        auto f = fopen(tmp.ptr, "wb");
+        if (f is null)
+            return;
+        ubyte[16] hdr;
+        writeLE64(hdr[0 .. 8], snapIdx_);
+        writeLE64(hdr[8 .. 16], snapTerm_);
+        fwrite(hdr.ptr, 1, 16, f);
+        if (snapData_.length)
+            fwrite(snapData_.ptr, 1, snapData_.length, f);
+        fflush(f);
+        fdatasync(fileno(f));
+        fclose(f);
+        rename(tmp.ptr, zp.ptr); // atomic replace
+    }
+
+    /// Rewrites the .raftlog file with only the surviving in-memory entries,
+    /// rebuilding the offset table. Called after compaction.
+    private void rewriteLogFile() nothrow
+    {
+        fseek(logF, 0, SEEK_SET);
+        ftruncate(fileno(logF), 0);
+        offsets.length = 0;
+        ulong off = 0;
+        foreach (i; 0 .. len)
+        {
+            ubyte[FRAME_HDR] h;
+            writeLE64(h[0 .. 8], entries[i].term);
+            writeLE64(h[8 .. 16], entries[i].index);
+            writeLE32(h[16 .. 20], cast(uint) entries[i].payload.length);
+            fwrite(h.ptr, 1, FRAME_HDR, logF);
+            if (entries[i].payload.length)
+                fwrite(entries[i].payload.ptr, 1, entries[i].payload.length, logF);
+            offsets ~= off;
+            off += FRAME_HDR + entries[i].payload.length;
+        }
+        fflush(logF);
+        fdatasync(fileno(logF));
     }
 
     /// Periodic fsync for the "normal" durability level (host's 1s timer).

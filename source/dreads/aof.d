@@ -108,46 +108,20 @@ public struct Aof
     long lastFsyncUnix; // LASTSAVE
 }
 
-/// BGREWRITEAOF: rewrites the log as the minimal canonical command set that
-/// rebuilds the current keyspace (this is also what a Raft snapshot will
-/// ship). Runs synchronously — the event loop is single-threaded, so the
-/// keyspace cannot change under us. Reopens the live handle on success.
-public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) nothrow
+/// Serializes the whole keyspace as the minimal canonical command set that
+/// rebuilds it (SET/RPUSH/HSET/ZADD/XADD..., PEXPIREAT for live TTLs, expired
+/// keys skipped). This IS the compaction: dead history (SET-then-DEL,
+/// overwrites, expired) collapses into current state. Shared by BGREWRITEAOF
+/// and the Raft snapshot.
+public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
 {
-    import core.stdc.stdio : rename;
-
     import dreads.commands : fmtDouble;
     import dreads.obj : ObjType;
     import dreads.dict : StrVal;
     import dreads.stream : StreamID, nowMs;
 
-    enum CHUNK = 128; // elements per emitted command
-
-    char[512] zpath = void;
-    char[520] ztmp = void;
-    if (path.length == 0 || path.length >= zpath.length)
-        return false;
-    zpath[0 .. path.length] = path;
-    zpath[path.length] = 0;
-    ztmp[0 .. path.length] = path;
-    ztmp[path.length .. path.length + 9] = ".rewrite\0";
-
-    auto f = fopen(ztmp.ptr, "wb");
-    if (f is null)
-        return false;
-
-    ByteBuffer buf;
-    bool flushBuf()
-    {
-        if (buf.empty)
-            return true;
-        auto ok = fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
-        buf.clear();
-        return ok;
-    }
-
+    enum CHUNK = 128;
     auto now = nowMs();
-    bool ioOk = true;
     foreach (i; 0 .. ks.d.capacity)
     {
         if (!ks.d.slotLive(i))
@@ -286,10 +260,32 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) 
             auto elen = snprintf(eb.ptr, eb.length, "%llu", obj.expireAtMs);
             repBulk(buf, eb[0 .. elen]);
         }
-        if (buf.length > 256 * 1024)
-            ioOk = flushBuf() && ioOk;
     }
-    ioOk = flushBuf() && ioOk;
+}
+
+/// BGREWRITEAOF: rewrites the log as the canonical rebuild command set.
+/// Runs synchronously — the event loop is single-threaded, so the keyspace
+/// cannot change under us. Reopens the live handle on success.
+public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) nothrow
+{
+    import core.stdc.stdio : rename;
+
+    char[512] zpath = void;
+    char[520] ztmp = void;
+    if (path.length == 0 || path.length >= zpath.length)
+        return false;
+    zpath[0 .. path.length] = path;
+    zpath[path.length] = 0;
+    ztmp[0 .. path.length] = path;
+    ztmp[path.length .. path.length + 9] = ".rewrite\0";
+
+    auto f = fopen(ztmp.ptr, "wb");
+    if (f is null)
+        return false;
+
+    ByteBuffer buf;
+    dumpKeyspace(ks, buf);
+    bool ioOk = buf.empty || fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
     fflush(f);
     version (Posix)
         fsync(fileno(f));

@@ -85,6 +85,28 @@ final class Replicator
         return node.members;
     }
 
+    @property Index snapshotIndex() nothrow
+    {
+        return log.snapshotIndex;
+    }
+
+    /// Forces log compaction now (RAFT COMPACT / ops): snapshots the keyspace
+    /// and discards the covered entries.
+    void forceCompact()
+    {
+        import dreads.aof : dumpKeyspace;
+
+        auto upto = node.commitIndex;
+        if (upto == 0)
+            return;
+        static ByteBuffer dump;
+        dump.clear();
+        dumpKeyspace(*keys, dump);
+        nodeMtx.lock();
+        node.compact(upto, dump.data);
+        nodeMtx.unlock();
+    }
+
     /// Adds a peer's address so we can reach it, then proposes a joint config
     /// that includes it. Leader-only. `newMembers` is the full target set.
     bool changeMembership(scope const(NodeId)[] newMembers, scope const(PeerAddress)[] newPeers)
@@ -140,6 +162,9 @@ final class Replicator
 
     private void commitReady(Ready rd)
     {
+        // a leader's snapshot must replace the keyspace before anything else
+        if (rd.applySnapshot !is null)
+            loadSnapshot(rd.applySnapshot.data);
         if (rd.persistUpto > 0)
             log.awaitDurable(rd.persistUpto); // yields; loop serves others
         nodeMtx.lock();
@@ -149,6 +174,60 @@ final class Replicator
         foreach (ref m; rd.messages)
             transport.send(m);
         applyCommitted(committed);
+        maybeCompact();
+    }
+
+    /// Compacts the raft log once it grows past a threshold: dumps the
+    /// keyspace as a snapshot (the BGREWRITEAOF canonical form) and discards
+    /// the covered entries, collapsing dead history (SET-then-DEL, expired,
+    /// overwrites) into the minimal state.
+    private enum COMPACT_THRESHOLD = 10_000;
+    private void maybeCompact() nothrow
+    {
+        try
+        {
+            auto applied = node.commitIndex;
+            if (applied <= log.snapshotIndex + COMPACT_THRESHOLD)
+                return;
+            static ByteBuffer dump;
+            dump.clear();
+            import dreads.aof : dumpKeyspace;
+
+            dumpKeyspace(*keys, dump);
+            nodeMtx.lock();
+            node.compact(applied, dump.data);
+            nodeMtx.unlock();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    /// Replaces the keyspace with a snapshot (a canonical command dump).
+    private void loadSnapshot(scope const(ubyte)[] data) nothrow
+    {
+        try
+        {
+            keys.clear();
+            Arena arena;
+            ByteBuffer sink;
+            size_t pos = 0;
+            auto bytes = data;
+            while (pos < bytes.length)
+            {
+                RVal cmd;
+                if (parseValue(bytes, pos, arena, cmd) != ParseStatus.ok)
+                    break;
+                import dreads.commands : dispatch;
+
+                sink.clear();
+                dispatch(cmd, *keys, sink, arena);
+                arena.reset();
+            }
+        }
+        catch (Exception)
+        {
+        }
     }
 
     private void onTick() nothrow
@@ -192,6 +271,16 @@ final class Replicator
                 AppendEntriesReply m;
                 if (decodeAppendEntriesReply(body_, m))
                     node.onAppendEntriesReply(from, m);
+                break;
+            case MsgKind.installSnapshot:
+                InstallSnapshot m;
+                if (decodeInstallSnapshot(body_, m))
+                    node.onInstallSnapshot(from, m);
+                break;
+            case MsgKind.installSnapshotReply:
+                InstallSnapshotReply m;
+                if (decodeInstallSnapshotReply(body_, m))
+                    node.onInstallSnapshotReply(from, m);
                 break;
             }
             auto rd = node.takeReady();
