@@ -18,7 +18,8 @@ import vibe.core.stream : IOMode;
 import vibe.core.sync : TaskMutex;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
-import dreads.commands : dispatch, isWriteCommand, propagationOverride;
+import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
+import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.obj : Keyspace;
 import dreads.pubsub : PubSub, Subscriber;
@@ -56,7 +57,16 @@ public int runServer(ushort port, const(char)[] aofPath = null)
             printf("dreads: cannot open AOF for append\n");
             return 1;
         }
-        setTimer(1.seconds, delegate() @trusted nothrow { gAof.fsyncNow(); }, true);
+    }
+    {
+        import dreads.obj : lruClock;
+        import dreads.stream : nowMs;
+
+        lruClock = cast(uint)(nowMs() / 1000);
+        setTimer(1.seconds, delegate() @trusted nothrow {
+            lruClock = cast(uint)(nowMs() / 1000);
+            gAof.fsyncNow();
+        }, true);
     }
     listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
         serveClient(conn);
@@ -379,6 +389,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             clientCmd(c, args, o);
             return true;
         }
+    case "CONFIG":
+        {
+            configCmd(args, o);
+            return true;
+        }
     case "HELLO":
         {
             if (args.length >= 1 && args[0].str != "2")
@@ -602,6 +617,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         break;
     }
 
+    if (gConfig.maxmemory && isWriteCommand(uname) && !freeMemoryIfNeeded())
+    {
+        repError(o, "OOM command not allowed when used memory > 'maxmemory'.");
+        return true;
+    }
     auto outBefore = o.length;
     auto keep = dispatch(cmd, gKeys, o, arena);
     if (o.length > outBefore && o.data[outBefore] != '-')
@@ -618,6 +638,214 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     }
     propagationOverride.clear();
     return keep;
+}
+
+/// CONFIG GET pattern | SET name value | REWRITE | RESETSTAT
+private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'config' command");
+        return;
+    }
+    if (eqICDebug(args[0].str, "GET") && args.length >= 2)
+    {
+        // (name, value) pairs for every known directive matching the pattern
+        static immutable names = [
+            "port", "appendonly", "appendfilename", "dir", "maxmemory",
+            "maxmemory-policy",
+        ];
+        char[64] b = void;
+        size_t matches = 0;
+        foreach (nm; names)
+        {
+            foreach (ref pat; args[1 .. $])
+            {
+                if (globMatch(pat.str, nm))
+                {
+                    matches++;
+                    break;
+                }
+            }
+        }
+        repArrayHeader(o, matches * 2);
+        foreach (nm; names)
+        {
+            bool hit = false;
+            foreach (ref pat; args[1 .. $])
+            {
+                if (globMatch(pat.str, nm))
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+                continue;
+            repBulk(o, nm);
+            switch (nm)
+            {
+            case "port":
+                auto n = snprintf(b.ptr, b.length, "%u", cast(uint) gConfig.port);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "appendonly":
+                repBulk(o, gConfig.appendonly ? "yes" : "no");
+                break;
+            case "appendfilename":
+                repBulk(o, gConfig.appendfilename);
+                break;
+            case "dir":
+                repBulk(o, gConfig.dir);
+                break;
+            case "maxmemory":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.maxmemory);
+                repBulk(o, b[0 .. n]);
+                break;
+            default:
+                repBulk(o, gConfig.maxmemoryPolicy);
+            }
+        }
+        return;
+    }
+    if (eqICDebug(args[0].str, "SET") && args.length == 3)
+    {
+        // only runtime-safe parameters are settable
+        if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY"))
+        {
+            string name, value;
+            try
+            {
+                name = (cast(string) args[1].str).idup;
+                value = (cast(string) args[2].str).idup;
+            }
+            catch (Exception)
+            {
+            }
+            import std.uni : toLower;
+
+            bool ok = false;
+            try
+                ok = applyDirective(name.toLower, value, gConfig);
+            catch (Exception)
+            {
+            }
+            if (ok)
+                repSimple(o, "OK");
+            else
+                repError(o, "ERR Invalid argument");
+            return;
+        }
+        repError(o, "ERR Unsupported CONFIG parameter");
+        return;
+    }
+    if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))
+    {
+        repSimple(o, "OK");
+        return;
+    }
+    repError(o, "ERR Unknown CONFIG subcommand");
+}
+
+// ---------------------------------------------------------------------------
+// maxmemory / LRU eviction (jemalloc-backed accounting; Linux only)
+// ---------------------------------------------------------------------------
+
+version (linux)
+{
+    private extern (C) int mallctl(const(char)* name, void* oldp, size_t* oldlenp,
+            void* newp, size_t newlen) nothrow @nogc;
+
+    private ulong usedMemory() nothrow @nogc
+    {
+        ulong epoch = 1;
+        size_t esz = epoch.sizeof;
+        mallctl("epoch", &epoch, &esz, &epoch, epoch.sizeof);
+        size_t allocated;
+        size_t asz = allocated.sizeof;
+        if (mallctl("stats.allocated", &allocated, &asz, null, 0) != 0)
+            return 0;
+        return allocated;
+    }
+}
+else
+{
+    private ulong usedMemory() nothrow @nogc
+    {
+        return 0; // accounting unavailable: maxmemory is inert
+    }
+}
+
+private __gshared size_t gEvictCursor;
+
+/// Approximate LRU eviction: sample live keys, evict the coldest, repeat.
+/// Returns false when memory stays over the limit (noeviction, or nothing
+/// evictable under volatile-lru).
+private bool freeMemoryIfNeeded() nothrow
+{
+    import dreads.obj : RObj;
+
+    if (usedMemory() <= gConfig.maxmemory)
+        return true;
+    if (gConfig.maxmemoryPolicy == "noeviction")
+        return false;
+    bool volatileOnly = gConfig.maxmemoryPolicy == "volatile-lru";
+    bool randomPick = gConfig.maxmemoryPolicy == "allkeys-random";
+
+    static ByteBuffer delCmd; // TLS scratch for AOF propagation
+    foreach (_; 0 .. 128) // eviction budget per triggering command
+    {
+        auto cap = gKeys.d.capacity;
+        if (cap == 0 || gKeys.length == 0)
+            return false;
+        // sample up to 5 live keys from a rotating cursor
+        const(char)[] victim;
+        uint victimLru = uint.max;
+        size_t seen = 0;
+        size_t i = gEvictCursor % cap;
+        size_t scanned = 0;
+        while (seen < 5 && scanned < cap)
+        {
+            if (gKeys.d.slotLive(i))
+            {
+                auto obj = gKeys.d.valAt(i);
+                if (!volatileOnly || obj.expireAtMs != 0)
+                {
+                    seen++;
+                    if (randomPick)
+                    {
+                        victim = gKeys.d.keyAt(i);
+                        break;
+                    }
+                    if (obj.lruSecs <= victimLru)
+                    {
+                        victimLru = obj.lruSecs;
+                        victim = gKeys.d.keyAt(i);
+                    }
+                }
+            }
+            i = (i + 1) % cap;
+            scanned++;
+        }
+        gEvictCursor = i + 1;
+        if (victim is null)
+            return false; // nothing evictable
+        if (gAof.enabled)
+        {
+            delCmd.clear();
+            repArrayHeader(delCmd, 2);
+            repBulk(delCmd, "DEL");
+            repBulk(delCmd, victim);
+            gAof.append(delCmd.data);
+        }
+        gKeys.d.del(victim);
+        gWriteEpoch++;
+        if (usedMemory() <= gConfig.maxmemory)
+            return true;
+    }
+    return usedMemory() <= gConfig.maxmemory;
 }
 
 private void unregisterMonitor(Conn* c) nothrow

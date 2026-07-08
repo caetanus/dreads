@@ -1371,16 +1371,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR DB index is out of range");
             break;
         }
-    case "CONFIG":
-        {
-            if (args.length >= 1 && eqICKeyword(args[0].str, "GET"))
-                repArrayHeader(o, 0); // stub: no configurable parameters yet
-            else if (args.length >= 1 && eqICKeyword(args[0].str, "SET"))
-                repSimple(o, "OK");
-            else
-                repError(o, "ERR Unknown CONFIG subcommand");
-            break;
-        }
+        // CONFIG is handled at the server layer (it owns the live Config)
     case "INFO":
         {
             char[160] b = void;
@@ -3478,7 +3469,11 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     else if (eqICKeyword(sub, "REFCOUNT"))
         repInt(o, 1);
     else if (eqICKeyword(sub, "IDLETIME"))
-        repInt(o, 0);
+    {
+        import dreads.obj : lruClock;
+
+        repInt(o, lruClock >= obj.lruSecs ? lruClock - obj.lruSecs : 0);
+    }
     else if (eqICKeyword(sub, "FREQ"))
         repError(o, "ERR An LFU maxmemory policy is not selected, access frequency not tracked");
     else

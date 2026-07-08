@@ -18,10 +18,15 @@ public enum ObjType : ubyte
     stream
 }
 
+/// Coarse LRU clock in seconds, refreshed by the server's 1s timer — keeps
+/// per-lookup touching to a single store instead of a clock_gettime call.
+public __gshared uint lruClock;
+
 public struct RObj
 {
     ObjType type;
     ulong expireAtMs; // 0 = no expiry; absolute epoch ms otherwise
+    uint lruSecs; // last access, in lruClock units
     union
     {
         StrVal str;
@@ -179,6 +184,7 @@ public struct Keyspace
             d.del(k);
             return null;
         }
+        o.lruSecs = lruClock;
         return o;
     }
 

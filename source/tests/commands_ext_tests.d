@@ -68,8 +68,8 @@ version (unittest)
         time[0 .. 4].expect.to.equal("*2\r\n");
         ks.run("SELECT", "0").expect.to.equal("+OK\r\n");
         ks.run("SELECT", "3").expect.to.equal("-ERR DB index is out of range\r\n");
-        ks.run("CONFIG", "GET", "maxmemory").expect.to.equal("*0\r\n");
-        ks.run("CONFIG", "SET", "x", "y").expect.to.equal("+OK\r\n");
+        // CONFIG lives at the server layer; at dispatch level it is unknown
+        ks.run("CONFIG", "GET", "maxmemory")[0].expect.to.equal('-');
         ks.run("INFO").expect.to.contain("redis_version");
         ks.run("SET", "k", "v");
         ks.run("FLUSHDB").expect.to.equal("+OK\r\n");
