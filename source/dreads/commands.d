@@ -87,10 +87,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
 
         // --- keyspace ---
     case "DEL":
+    case "UNLINK": // same effect; our free is synchronous either way
         {
             if (args.length == 0)
             {
-                arityErr(o, "del");
+                arityErr(o, name.length == 3 ? "del" : "unlink");
                 break;
             }
             long n = 0;
@@ -1933,6 +1934,264 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
 
+        // --- generic / server batch ---
+    case "TOUCH":
+        {
+            if (args.length == 0)
+            {
+                arityErr(o, "touch");
+                break;
+            }
+            long n = 0;
+            foreach (ref a; args)
+                n += ks.exists(a.str) ? 1 : 0;
+            repInt(o, n);
+            break;
+        }
+    case "RANDOMKEY":
+        {
+            // deterministic "random": the first live, unexpired slot
+            auto now = nowMs();
+            foreach (i; 0 .. ks.d.capacity)
+            {
+                if (!ks.d.slotLive(i))
+                    continue;
+                auto obj = ks.d.valAt(i);
+                if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                    continue;
+                repBulk(o, ks.d.keyAt(i));
+                return true;
+            }
+            repNullBulk(o);
+            break;
+        }
+    case "COPY":
+        {
+            if (args.length < 2 || args.length > 3)
+            {
+                arityErr(o, "copy");
+                break;
+            }
+            bool replace = args.length == 3 && eqICKeyword(args[2].str, "REPLACE");
+            if (args.length == 3 && !replace)
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            auto src = ks.lookup(args[0].str);
+            if (src is null || (!replace && ks.exists(args[1].str)))
+            {
+                repInt(o, 0);
+                break;
+            }
+            auto copy = src.deepDup(); // src pointer dies on the next line's rehash
+            ks.d.set(args[1].str, copy);
+            repInt(o, 1);
+            break;
+        }
+    case "EXPIRETIME":
+    case "PEXPIRETIME":
+        {
+            if (args.length != 1)
+            {
+                arityErr(o, name.length == 10 ? "expiretime" : "pexpiretime");
+                break;
+            }
+            auto obj = ks.lookup(args[0].str);
+            if (obj is null)
+                repInt(o, -2);
+            else if (obj.expireAtMs == 0)
+                repInt(o, -1);
+            else
+                repInt(o, name.length == 10 ? cast(long)(obj.expireAtMs / 1000)
+                        : cast(long) obj.expireAtMs);
+            break;
+        }
+    case "MOVE":
+        {
+            if (args.length != 2)
+                arityErr(o, "move");
+            else if (args[1].str == "0")
+                repError(o, "ERR source and destination objects are the same");
+            else
+                repError(o, "ERR DB index is out of range");
+            break;
+        }
+    case "SWAPDB":
+        {
+            if (args.length == 2 && args[0].str == "0" && args[1].str == "0")
+                repSimple(o, "OK");
+            else
+                repError(o, "ERR DB index is out of range");
+            break;
+        }
+    case "WAIT":
+        {
+            repInt(o, 0); // no replicas until Raft lands
+            break;
+        }
+    case "OBJECT":
+        {
+            objectCmd(ks, args, o);
+            break;
+        }
+    case "LOLWUT":
+        {
+            repBulk(o, "dreads ⚡ Deadly Fast Redis in DLang\n");
+            break;
+        }
+    case "ROLE":
+        {
+            repArrayHeader(o, 3);
+            repBulk(o, "master");
+            repInt(o, 0);
+            repArrayHeader(o, 0);
+            break;
+        }
+    case "AUTH":
+        {
+            repError(o,
+                    "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+            break;
+        }
+    case "SLOWLOG":
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
+                repSimple(o, "OK");
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "LEN"))
+                repInt(o, 0);
+            else
+                repArrayHeader(o, 0); // GET / HELP
+            break;
+        }
+    case "LATENCY":
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
+                repInt(o, 0);
+            else
+                repArrayHeader(o, 0); // LATEST / HISTORY
+            break;
+        }
+    case "MODULE":
+        {
+            repArrayHeader(o, 0);
+            break;
+        }
+    case "ACL":
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "WHOAMI"))
+                repBulk(o, "default");
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "LIST"))
+            {
+                repArrayHeader(o, 1);
+                repBulk(o, "user default on nopass ~* &* +@all");
+            }
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "CAT"))
+                repArrayHeader(o, 0);
+            else
+                repError(o, "ERR Unknown ACL subcommand");
+            break;
+        }
+
+        // --- string extras (batch) ---
+    case "SUBSTR": // deprecated alias of GETRANGE
+        goto case "GETRANGE";
+    case "HMSET": // deprecated HSET variant replying +OK
+        {
+            if (args.length < 3 || (args.length - 1) % 2 != 0)
+            {
+                arityErr(o, "hmset");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.getOrCreate(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            for (size_t i = 1; i < args.length; i += 2)
+                obj.hash.set(args[i].str, StrVal.of(args[i + 1].str));
+            repSimple(o, "OK");
+            break;
+        }
+    case "LPUSHX":
+    case "RPUSHX":
+        {
+            if (args.length < 2)
+            {
+                arityErr(o, nbuf[0] == 'L' ? "lpushx" : "rpushx");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.list, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            if (obj is null)
+            {
+                repInt(o, 0);
+                break;
+            }
+            foreach (ref a; args[1 .. $])
+            {
+                if (nbuf[0] == 'L')
+                    obj.list.pushFront(a.str);
+                else
+                    obj.list.pushBack(a.str);
+            }
+            repInt(o, cast(long) obj.list.length);
+            break;
+        }
+    case "HINCRBYFLOAT":
+        {
+            if (args.length != 3)
+            {
+                arityErr(o, "hincrbyfloat");
+                break;
+            }
+            double delta;
+            if (!parseDouble(args[2].str, delta))
+            {
+                repError(o, "ERR value is not a valid float");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.getOrCreate(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            double cur = 0;
+            auto f = obj.hash.get(args[1].str);
+            if (f !is null && !parseDouble(f.s, cur))
+            {
+                repError(o, "ERR hash value is not a float");
+                break;
+            }
+            auto nv = cur + delta;
+            if (nv != nv || nv == double.infinity || nv == -double.infinity)
+            {
+                repError(o, "ERR increment would produce NaN or Infinity");
+                break;
+            }
+            char[40] b = void;
+            auto res = fmtDouble(b, nv);
+            obj.hash.set(args[1].str, StrVal.of(res));
+            repBulk(o, res);
+            // float math is logged as its result, never re-derived
+            propagationOverride.clear();
+            repArrayHeader(propagationOverride, 4);
+            repBulk(propagationOverride, "HSET");
+            repBulk(propagationOverride, args[0].str);
+            repBulk(propagationOverride, args[1].str);
+            repBulk(propagationOverride, res);
+            break;
+        }
+
         // --- geo ---
     case "GEOADD":
         {
@@ -3011,6 +3270,56 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
 }
 
+/// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
+private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+{
+    if (args.length != 2)
+    {
+        repError(o, "ERR wrong number of arguments for 'object' command");
+        return;
+    }
+    auto obj = ks.lookup(args[1].str);
+    if (obj is null)
+    {
+        repError(o, "ERR no such key");
+        return;
+    }
+    auto sub = args[0].str;
+    if (eqICKeyword(sub, "ENCODING"))
+    {
+        final switch (obj.type)
+        {
+        case ObjType.str:
+            long v;
+            repBulk(o, parseLong(obj.str.s, v) ? "int" : "raw");
+            break;
+        case ObjType.list:
+            repBulk(o, "linkedlist");
+            break;
+        case ObjType.hash:
+            repBulk(o, "hashtable");
+            break;
+        case ObjType.set:
+            repBulk(o, "hashtable");
+            break;
+        case ObjType.zset:
+            repBulk(o, "skiplist");
+            break;
+        case ObjType.stream:
+            repBulk(o, "stream");
+            break;
+        }
+    }
+    else if (eqICKeyword(sub, "REFCOUNT"))
+        repInt(o, 1);
+    else if (eqICKeyword(sub, "IDLETIME"))
+        repInt(o, 0);
+    else if (eqICKeyword(sub, "FREQ"))
+        repError(o, "ERR An LFU maxmemory policy is not selected, access frequency not tracked");
+    else
+        repError(o, "ERR Unknown OBJECT subcommand");
+}
+
 // ---------------------------------------------------------------------------
 // Expiry helpers
 // ---------------------------------------------------------------------------
@@ -3213,11 +3522,11 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     {
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
     case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX":
-    case "DEL", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX":
+    case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
-    case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM":
+    case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
-    case "HSET", "HDEL", "HINCRBY", "HSETNX":
+    case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE":

@@ -203,6 +203,62 @@ version (unittest)
         ks.run("EXISTS", "outD").expect.to.equal(":0\r\n");
     }
 
+    @("ext.generic_batch")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("SET", "a", "1");
+        ks.run("SET", "b", "2");
+        ks.run("UNLINK", "a", "ghost").expect.to.equal(":1\r\n");
+        ks.run("TOUCH", "b", "ghost").expect.to.equal(":1\r\n");
+        ks.run("RANDOMKEY").expect.to.equal("$1\r\nb\r\n");
+
+        // COPY deep-copies every type and keeps TTL
+        ks.run("RPUSH", "l", "x", "y");
+        ks.run("EXPIRE", "l", "500");
+        ks.run("COPY", "l", "l2").expect.to.equal(":1\r\n");
+        ks.run("LRANGE", "l2", "0", "-1").expect.to.equal("*2\r\n$1\r\nx\r\n$1\r\ny\r\n");
+        ks.run("TTL", "l2").expect.to.equal(":500\r\n");
+        ks.run("RPUSH", "l", "z"); // source and copy are independent
+        ks.run("LLEN", "l2").expect.to.equal(":2\r\n");
+        ks.run("COPY", "l", "l2").expect.to.equal(":0\r\n"); // no REPLACE
+        ks.run("COPY", "l", "l2", "REPLACE").expect.to.equal(":1\r\n");
+        ks.run("COPY", "ghost", "x").expect.to.equal(":0\r\n");
+
+        ks.run("PEXPIREAT", "b", "4102444800000");
+        ks.run("EXPIRETIME", "b").expect.to.equal(":4102444800\r\n");
+        ks.run("PEXPIRETIME", "b").expect.to.equal(":4102444800000\r\n");
+        ks.run("EXPIRETIME", "ghost").expect.to.equal(":-2\r\n");
+
+        ks.run("MOVE", "b", "0")[0].expect.to.equal('-');
+        ks.run("SWAPDB", "0", "0").expect.to.equal("+OK\r\n");
+        ks.run("WAIT", "0", "100").expect.to.equal(":0\r\n");
+        ks.run("ROLE")[0 .. 4].expect.to.equal("*3\r\n");
+        ks.run("AUTH", "x", "y")[0].expect.to.equal('-');
+        ks.run("SLOWLOG", "LEN").expect.to.equal(":0\r\n");
+        ks.run("LOLWUT").expect.to.contain("dreads");
+
+        ks.run("OBJECT", "ENCODING", "b").expect.to.equal("$3\r\nint\r\n");
+        ks.run("SET", "txt", "hello");
+        ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$3\r\nraw\r\n");
+        ks.run("OBJECT", "ENCODING", "l").expect.to.equal("$10\r\nlinkedlist\r\n");
+        ks.run("OBJECT", "REFCOUNT", "l").expect.to.equal(":1\r\n");
+        ks.run("OBJECT", "ENCODING", "ghost")[0].expect.to.equal('-');
+
+        ks.run("SUBSTR", "txt", "0", "1").expect.to.equal("$2\r\nhe\r\n");
+        ks.run("HMSET", "h", "f", "v").expect.to.equal("+OK\r\n");
+        ks.run("HGET", "h", "f").expect.to.equal("$1\r\nv\r\n");
+        ks.run("LPUSHX", "ghostl", "v").expect.to.equal(":0\r\n");
+        ks.run("RPUSHX", "l", "w")[0].expect.to.equal(':');
+        ks.run("HINCRBYFLOAT", "h", "n", "10.5").expect.to.equal("$4\r\n10.5\r\n");
+        ks.run("HINCRBYFLOAT", "h", "n", "-0.5").expect.to.equal("$2\r\n10\r\n");
+        // propagated as HSET of the result
+        (cast(string) propagationOverride.data).expect.to.contain("HSET");
+        ks.run("HINCRBYFLOAT", "h", "f", "1")[0].expect.to.equal('-');
+    }
+
     @("ext.scan_family")
     unittest
     {

@@ -264,6 +264,69 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             pubsubIntrospect(args, o);
             return true;
         }
+    case "WAITAOF":
+        {
+            gAof.flush();
+            gAof.fsyncNow();
+            repArrayHeader(o, 2);
+            repInt(o, gAof.enabled ? 1 : 0);
+            repInt(o, 0);
+            return true;
+        }
+    case "SAVE":
+    case "BGSAVE":
+        {
+            // no RDB: durability is the AOF, so force it out
+            gAof.flush();
+            gAof.fsyncNow();
+            if (uname.length == 4)
+                repSimple(o, "OK");
+            else
+                repSimple(o, "Background saving started");
+            return true;
+        }
+    case "LASTSAVE":
+        {
+            repInt(o, gAof.lastFsyncUnix);
+            return true;
+        }
+    case "SHUTDOWN":
+        {
+            import core.stdc.stdlib : exit;
+
+            gAof.flush();
+            gAof.fsyncNow();
+            exit(0);
+        }
+    case "DEBUG":
+        {
+            if (args.length >= 2 && eqICDebug(args[0].str, "SLEEP"))
+            {
+                import core.time : msecs;
+                import std.conv : to;
+                import vibe.core.core : vsleep = sleep;
+
+                double secs = 0;
+                try
+                    secs = (cast(string) args[1].str).to!double;
+                catch (Exception)
+                {
+                }
+                try
+                    vsleep(msecs(cast(long)(secs * 1000)));
+                catch (Exception)
+                {
+                }
+                repSimple(o, "OK");
+            }
+            else if (args.length >= 1 && eqICDebug(args[0].str, "SET-ACTIVE-EXPIRE"))
+                repSimple(o, "OK");
+            else if (args.length >= 1 && eqICDebug(args[0].str, "JMAP"))
+                repSimple(o, "OK");
+            else
+                repError(o, "ERR DEBUG subcommand not supported");
+            return true;
+        }
     case "EVAL":
     case "EVALSHA":
         {
@@ -307,6 +370,19 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     }
     propagationOverride.clear();
     return keep;
+}
+
+private bool eqICDebug(scope const(char)[] s, scope const(char)[] upper) @nogc nothrow
+{
+    if (s.length != upper.length)
+        return false;
+    foreach (i, c; s)
+    {
+        auto u = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+        if (u != upper[i])
+            return false;
+    }
+    return true;
 }
 
 /// *3 [verb][channel-or-nil][:active-subscription-count]

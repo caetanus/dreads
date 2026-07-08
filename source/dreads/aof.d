@@ -96,11 +96,16 @@ public struct Aof
     /// Called by the 1s timer; the only place paying fsync latency.
     void fsyncNow() @nogc nothrow
     {
+        import core.stdc.time : time;
+
         if (f is null || !dirty)
             return;
         fsync(fileno(f));
         dirty = false;
+        lastFsyncUnix = time(null);
     }
+
+    long lastFsyncUnix; // LASTSAVE
 }
 
 /// The server's logging policy, factored out so recovery tests exercise the

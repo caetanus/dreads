@@ -5,7 +5,7 @@ module dreads.obj;
 
 import dreads.dict : Dict, StrVal, Unit;
 import dreads.list : DList;
-import dreads.stream : Stream, nowMs;
+import dreads.stream : Stream, StreamID, nowMs;
 import dreads.zset : ZSet;
 
 public enum ObjType : ubyte
@@ -91,6 +91,52 @@ public struct RObj
         case ObjType.stream:
             return stream.length;
         }
+    }
+
+    /// Deep copy for COPY: fresh allocations for every element; keeps TTL.
+    RObj deepDup() const @nogc nothrow
+    {
+        RObj c;
+        c.type = type;
+        c.expireAtMs = expireAtMs;
+        final switch (type)
+        {
+        case ObjType.str:
+            c.str = StrVal.of(str.s);
+            break;
+        case ObjType.list:
+            foreach (v; list)
+                c.list.pushBack(v);
+            break;
+        case ObjType.hash:
+            foreach (i; 0 .. hash.capacity)
+            {
+                if (hash.slotLive(i))
+                    c.hash.set(hash.keyAt(i), StrVal.of(hash.valAt(i).s));
+            }
+            break;
+        case ObjType.set:
+            foreach (i; 0 .. set.capacity)
+            {
+                if (set.slotLive(i))
+                    c.set.set(set.keyAt(i), Unit());
+            }
+            break;
+        case ObjType.zset:
+            zset.walkRange(0, zset.length, false, (m, s) {
+                c.zset.add(s, m);
+                return 0;
+            });
+            break;
+        case ObjType.stream:
+            stream.walkRange(StreamID.minId, StreamID.maxId, 0, (id, pairs) {
+                c.stream.add(id, pairs);
+                return 0;
+            });
+            c.stream.lastId = stream.lastId; // survives an empty stream
+            break;
+        }
+        return c;
     }
 
     const(char)[] typeName() const @nogc nothrow
