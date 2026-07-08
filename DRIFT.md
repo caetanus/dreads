@@ -111,9 +111,15 @@ decision to avoid debugging consensus and reconfiguration at once):**
 - **`EVAL`-with-writes and `MULTI`/`EXEC` are not raft-routed yet** — they run
   locally on the leader (not replicated through the log).
 - **`ROLE`/`WAIT`/`REPLICAOF` still report standalone values** (not raft-aware).
-- **No snapshot transfer (InstallSnapshot)** — a far-behind or brand-new node
-  can't be caught up by a log-compacting leader yet (`BGREWRITEAOF` output is
-  the intended snapshot format).
+- Dynamic membership IS supported now (joint consensus §6): `RAFT ADDNODE
+  id@host:port` / `REMOVENODE id` / `STATUS`, join-mode learner
+  (`raft-join yes`). InstallSnapshot (§7) IS supported: `RAFT COMPACT` (and
+  auto-compaction past a log threshold) collapses dead history into a snapshot
+  and discards the log; a joining node whose needed entries were compacted
+  catches up via snapshot transfer. Remaining membership gaps: no PreVote
+  (a partitioned server rejoining can still bump terms), single-shot snapshot
+  (not chunked — a multi-GB snapshot is one message), and the disruptive-
+  removed-server edge is only handled by the not-in-config election guard.
 
 ## Roadmap beyond parity
 
