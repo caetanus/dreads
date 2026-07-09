@@ -236,14 +236,15 @@ final class Replicator
 
     // --- client write: propose [clock][rawCmd], await commit+apply ---
 
-    /// Returns false when this node is not the leader (caller redirects) or the
-    /// proposal is rejected because leadership was lost in flight.
-    bool proposeWrite(scope const(ubyte)[] rawCmd, ulong clock, ref ByteBuffer o)
+    /// Fire a write WITHOUT waiting; returns an opaque handle, or null if this
+    /// node is not the leader (caller redirects). Lets a connection pipeline its
+    /// consecutive writes: proposeAsync them all, then awaitWrite each in order.
+    /// The handle MUST be passed to awaitWrite exactly once (to reap the reply
+    /// and release the slot).
+    void* proposeAsync(scope const(ubyte)[] rawCmd, ulong clock) nothrow
     {
-        // Fast reject before touching the queue: a follower redirects.
         if (!atomicLoad(leaderFlag))
-            return false;
-
+            return null;
         auto slot = acquireSlot();
         // entry payload = 8-byte clock header + raw command bytes, built into
         // the slot's own buffer so it stays valid across a backpressure wait.
@@ -253,9 +254,16 @@ final class Replicator
             hdr[i] = cast(ubyte)(clock >> (8 * i));
         slot.reqBuf.append(hdr[]);
         slot.reqBuf.append(rawCmd);
-
         propQ.put(slot.reqBuf.data, cast(void*) slot, 0, CommitKind.apply);
+        return cast(void*) slot;
+    }
 
+    /// Wait for a proposeAsync handle to commit+apply, append its reply, release
+    /// the slot. Returns false when the proposal was rejected (leadership lost in
+    /// flight) — the caller redirects.
+    bool awaitWrite(void* handle, ref ByteBuffer o)
+    {
+        auto slot = cast(Pending*) handle;
         while (!slot.ready)
         {
             auto ec = slot.done.emitCount;
@@ -268,6 +276,17 @@ final class Replicator
             o.append(slot.reply.data);
         releaseSlot(slot);
         return !failed;
+    }
+
+    /// Synchronous write (used inside MULTI/EXEC and by non-pipelined callers).
+    /// Returns false when this node is not the leader or the proposal is rejected
+    /// because leadership was lost in flight.
+    bool proposeWrite(scope const(ubyte)[] rawCmd, ulong clock, ref ByteBuffer o)
+    {
+        auto h = proposeAsync(rawCmd, clock);
+        if (h is null)
+            return false;
+        return awaitWrite(h, o);
     }
 
     /// Leader-only membership change: adds the peer addresses so we can reach

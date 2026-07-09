@@ -133,6 +133,10 @@ private void initReplication()
             cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);
 }
 
+// Max raft writes a single connection can hold in flight before we reap them.
+// Bounds per-connection state (8 bytes each) and the group-commit batch depth.
+private enum PIPELINE_CAP = 256;
+
 private struct Conn
 {
     TCPConnection tcp;
@@ -148,6 +152,13 @@ private struct Conn
     // WATCH state: conservative — any write since WATCH aborts EXEC
     bool watching;
     ulong watchEpoch;
+    // Write pipelining (raft): consecutive writes are fired without blocking and
+    // reaped in order at the next flush point (before any non-write, or at the
+    // end of the read chunk). inExec forces the synchronous path so EXEC keeps
+    // its transaction reply shape.
+    void*[PIPELINE_CAP] pendingWrites;
+    size_t pendingCount;
+    bool inExec;
 
     @property size_t totalSubs() const @nogc nothrow
     {
@@ -228,6 +239,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 arena.reset();
             }
             inb.consume(pos);
+            // Reap the chunk's trailing run of pipelined writes (their replies
+            // come last, in order) before flushing the batch to the client.
+            if (c.pendingCount > 0)
+                flushPending(c, outb);
             gAof.flush();
 
             if (!outb.empty)
@@ -251,11 +266,50 @@ private void serveClient(TCPConnection tcp) nothrow
     }
 }
 
+// True when `cmd` is a raft write that may be pipelined (fired without blocking
+// and reaped later): replication configured, leader, and not inside a
+// transaction. Everything else is a "flush point".
+private bool isDeferrableWrite(ref Conn c, const ref RVal cmd) nothrow
+{
+    if (gReplicator is null || c.inMulti || c.inExec)
+        return false;
+    if (cmd.type != RType.Array || cmd.arr.length == 0)
+        return false;
+    auto name = cmd.arr[0].str;
+    if (name.length == 0 || name.length > 16)
+        return false;
+    char[16] nbuf = void;
+    foreach (i, ch; name)
+        nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+    return isWriteCommand(cast(string) nbuf[0 .. name.length]) && gReplicator.isLeader;
+}
+
+// Reap every in-flight pipelined write, appending its reply in order (so the
+// output stays in command order and a following read observes the writes).
+private void flushPending(ref Conn c, ref ByteBuffer o) nothrow
+{
+    foreach (i; 0 .. c.pendingCount)
+    {
+        try
+        {
+            if (!gReplicator.awaitWrite(c.pendingWrites[i], o))
+                repError(o, "READONLY You can't write against a read only replica.");
+        }
+        catch (Exception)
+            repError(o, "ERR replication error");
+    }
+    c.pendingCount = 0;
+}
+
 /// Transaction control plus queueing, then the executor. rawCmd holds the
 /// command's original RESP bytes for AOF logging and MULTI queueing.
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
+    // Pipelining flush point: anything that is not itself a pipelinable write
+    // must first reap all in-flight writes, in order.
+    if (c.pendingCount > 0 && !isDeferrableWrite(c, cmd))
+        flushPending(c, o);
     if (cmd.type != RType.Array || cmd.arr.length == 0)
         return dispatch(cmd, gKeys, o, arena);
     foreach (ref a; cmd.arr)
@@ -335,6 +389,9 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             repArrayHeader(o, c.multiCount);
             size_t qpos = 0;
             bool keep = true;
+            c.inExec = true; // queued writes stay synchronous inside EXEC
+            scope (exit)
+                c.inExec = false;
             foreach (_; 0 .. c.multiCount)
             {
                 RVal qcmd;
@@ -767,18 +824,34 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     {
         if (isWriteCommand(uname))
         {
-            if (!gReplicator.isLeader)
+            import dreads.stream : nowMs;
+
+            // Inside a transaction keep it synchronous (atomicity + EXEC reply
+            // shape); otherwise pipeline: fire without blocking and reap the
+            // reply at the next flush point, so a connection's consecutive
+            // writes are in flight together instead of one round-trip each.
+            if (c.inMulti || c.inExec)
+            {
+                if (!gReplicator.isLeader)
+                    repError(o, "READONLY You can't write against a read only replica.");
+                else
+                {
+                    try
+                        gReplicator.proposeWrite(rawCmd, nowMs(), o);
+                    catch (Exception)
+                        repError(o, "ERR replication error");
+                }
+                return true;
+            }
+            auto h = gReplicator.proposeAsync(rawCmd, nowMs());
+            if (h is null) // lost leadership since the flush-point check
             {
                 repError(o, "READONLY You can't write against a read only replica.");
                 return true;
             }
-            import dreads.stream : nowMs;
-
-            // log [clock][raw command] and block until it commits + applies
-            try
-                gReplicator.proposeWrite(rawCmd, nowMs(), o);
-            catch (Exception)
-                repError(o, "ERR replication error");
+            if (c.pendingCount == PIPELINE_CAP)
+                flushPending(c, o); // buffer full: reap in order, then continue
+            c.pendingWrites[c.pendingCount++] = h;
             return true;
         }
         // reads are served locally (leader or follower); no AOF in raft mode
