@@ -3,23 +3,28 @@ module dreads.raftq;
 // Cross-thread hand-off queues for the dedicated raft event loop.
 //
 // dreads runs consensus on its own event-loop thread so a client flood on the
-// main loop cannot starve raft ack-processing or delay heartbeats (which was
-// causing spurious elections and wild throughput spikes). The two threads talk
-// only through these FIFOs:
+// main loop cannot starve raft ack-processing or delay heartbeats. The two
+// threads talk only through these FIFOs:
 //
 //   main loop  --proposals-->  raft loop      (client writes to replicate)
 //   raft loop  --commits---->  main loop      (committed entries to apply)
 //
-// The keyspace stays single-threaded on the main loop: the raft loop never
-// touches gKeys, it only reaches consensus and ships committed payloads back.
+// Each queue has exactly ONE producer thread and ONE consumer thread (many
+// client fibers push propQ, but they all run on the one main-loop thread,
+// cooperatively scheduled, so they are a single logical producer). That makes
+// this the textbook single-producer/single-consumer case, so RingCore is a
+// LOCK-FREE Lamport ring: atomic head/tail with acquire/release, no mutex on
+// the push/take hot path.
 //
-// RingCore is the pure, @nogc, single-thread ring — fully unit-tested (the
-// "theory"). CrossQueue wraps it with a Mutex + two shared ManualEvents for
-// the actual cross-thread wakeups, reusing the same lost-wakeup-safe emitCount
-// protocol the durability syncer already relies on.
+// Wakeups (for the idle case only) use a shared ManualEvent, but the producer
+// emits ONLY when the consumer has actually parked (a flag it publishes before
+// sleeping). Under load the consumer never parks, so the hot path is pure ring
+// atomics — no lock, no syscall. The park/wake handshake uses seq_cst fences to
+// order "publish tail" vs "load parked" (and the mirror on the consumer side)
+// so a wakeup is never lost. Backpressure (a full ring) is the symmetric case.
 
+import core.atomic : atomicFence, atomicLoad, atomicStore, MemoryOrder;
 import core.stdc.stdlib : calloc, free;
-import core.sync.mutex : Mutex;
 
 import vibe.core.sync : createSharedManualEvent, ManualEvent;
 
@@ -37,15 +42,18 @@ private struct Slot
     uint kind; // consumer-defined discriminator (commitQ: apply/snapshot/fail)
 }
 
-/// Pure single-thread ring of `Slot`. No locks, no I/O — the concurrency lives
-/// entirely in CrossQueue. Kept separate so the index arithmetic (FIFO order,
-/// full/empty, power-of-two wraparound) is testable without a vibe event loop.
+/// Lock-free single-producer/single-consumer ring. The producer only writes
+/// `tail`, the consumer only writes `head`; each sits on its own cache line to
+/// avoid false sharing. The release-store of `tail` after filling a slot, paired
+/// with the acquire-load of `tail` before reading it, publishes the slot's
+/// contents cross-thread. Kept a plain struct so the FIFO/wrap logic stays unit-
+/// testable without a vibe loop (single-threaded, the atomics are sequential).
 struct RingCore
 {
     private Slot* slots;
     private size_t mask; // cap - 1 (cap is a power of two)
-    private size_t head; // pop cursor, monotonic
-    private size_t tail; // push cursor, monotonic
+    align(64) private shared size_t head_; // pop cursor (consumer-owned)
+    align(64) private shared size_t tail_; // push cursor (producer-owned)
 
     /// calloc gives zeroed memory, and a zeroed ByteBuffer (null,0,0) is a
     /// valid empty buffer — so every slot starts usable without construction.
@@ -55,63 +63,69 @@ struct RingCore
         slots = cast(Slot*) calloc(capPow2, Slot.sizeof);
         assert(slots !is null, "raftq: out of memory");
         mask = capPow2 - 1;
-        head = tail = 0;
+        atomicStore(head_, cast(size_t) 0);
+        atomicStore(tail_, cast(size_t) 0);
     }
 
     void teardown() @nogc nothrow
     {
         if (slots is null)
             return;
-        // Free each slot's owned buffer, then the array.
         foreach (i; 0 .. mask + 1)
             slots[i].buf.__dtor();
         free(slots);
         slots = null;
-        head = tail = mask = 0;
+        atomicStore(head_, cast(size_t) 0);
+        atomicStore(tail_, cast(size_t) 0);
+        mask = 0;
     }
 
     size_t length() const @nogc nothrow
     {
-        return tail - head;
+        return atomicLoad!(MemoryOrder.acq)(tail_) - atomicLoad!(MemoryOrder.acq)(head_);
     }
 
     bool empty() const @nogc nothrow
     {
-        return head == tail;
+        return atomicLoad!(MemoryOrder.acq)(head_) == atomicLoad!(MemoryOrder.acq)(tail_);
     }
 
     bool full() const @nogc nothrow
     {
-        return tail - head > mask;
+        return atomicLoad!(MemoryOrder.acq)(tail_) - atomicLoad!(MemoryOrder.acq)(head_) > mask;
     }
 
-    /// Copy `payload` into the tail slot. Returns false when full (the caller
-    /// applies backpressure). The bytes are copied, so the source may be reused
-    /// immediately after.
+    /// Producer: copy `payload` into the tail slot and publish it. Returns false
+    /// when full (the caller applies backpressure). The bytes are copied, so the
+    /// source may be reused immediately after.
     bool push(scope const(ubyte)[] payload, void* tag, ulong meta, uint kind = 0) @nogc nothrow
     {
-        if (full())
-            return false;
-        auto s = &slots[tail & mask];
+        const t = atomicLoad!(MemoryOrder.raw)(tail_); // producer owns tail
+        const h = atomicLoad!(MemoryOrder.acq)(head_); // see the consumer's progress
+        if (t - h > mask)
+            return false; // full
+        auto s = &slots[t & mask];
         s.buf.clear();
         if (payload.length)
             s.buf.append(payload);
         s.tag = tag;
         s.meta = meta;
         s.kind = kind;
-        ++tail;
+        atomicStore!(MemoryOrder.rel)(tail_, t + 1); // publish (release the fill)
         return true;
     }
 
-    /// Peek the head item without removing it. The returned slice stays valid
-    /// until pop(): a producer can never overwrite the head slot while it is
-    /// held, because a write to that slot index requires occupancy == cap,
-    /// which full() rejects. Returns false when empty.
+    /// Consumer: peek the head item. The returned slice stays valid until pop():
+    /// the producer can't overwrite the head slot while it is held, because a
+    /// write to that slot index needs occupancy == cap, which push() rejects.
+    /// Returns false when empty.
     bool front(out const(ubyte)[] payload, out void* tag, out ulong meta, out uint kind) @nogc nothrow
     {
-        if (empty())
-            return false;
-        auto s = &slots[head & mask];
+        const h = atomicLoad!(MemoryOrder.raw)(head_); // consumer owns head
+        const t = atomicLoad!(MemoryOrder.acq)(tail_); // see the producer's publish
+        if (h == t)
+            return false; // empty
+        auto s = &slots[h & mask];
         payload = s.buf.data;
         tag = s.tag;
         meta = s.meta;
@@ -121,114 +135,121 @@ struct RingCore
 
     void pop() @nogc nothrow
     {
-        assert(!empty(), "raftq: pop on empty");
-        ++head;
+        const h = atomicLoad!(MemoryOrder.raw)(head_);
+        atomicStore!(MemoryOrder.rel)(head_, h + 1); // free the slot for the producer
     }
 }
 
-/// Cross-thread FIFO: many producers on one event-loop thread, a single
-/// consumer on another. The Mutex serializes the ring; the two shared events
-/// wake a blocked consumer (notEmpty) or a back-pressured producer (notFull).
+/// SPSC cross-thread FIFO: a lock-free ring plus a park/wake handshake. The
+/// ManualEvents fire only when a side has parked, so the push/take hot path is
+/// pure ring atomics with no lock and no syscall.
 final class CrossQueue
 {
     private RingCore ring;
-    private Mutex mtx;
-    private shared(ManualEvent) notEmpty;
-    private shared(ManualEvent) notFull;
+    private shared(ManualEvent) notEmpty; // consumer parks here when ring empty
+    private shared(ManualEvent) notFull; // producer parks here when ring full
+    private shared bool consumerParked;
+    private shared bool producerParked;
 
     this(size_t capPow2)
     {
         ring.setup(capPow2);
-        mtx = new Mutex;
         notEmpty = createSharedManualEvent();
         notFull = createSharedManualEvent();
     }
 
     // --- producer side ---
 
-    /// Push, blocking (yielding the fiber) until there is room. Never drops:
-    /// a dropped proposal is a lost write, a dropped commit corrupts the state
+    /// Push, blocking (yielding the fiber) until there is room. Never drops: a
+    /// dropped proposal is a lost write, a dropped commit corrupts the state
     /// machine — both unacceptable.
     void put(scope const(ubyte)[] payload, void* tag, ulong meta, uint kind = 0) nothrow
     {
         for (;;)
         {
-            auto ec = notFull.emitCount;
-            bool ok;
+            if (ring.push(payload, tag, meta, kind))
             {
-                mtx.lock_nothrow();
-                scope (exit)
-                    mtx.unlock_nothrow();
-                ok = ring.push(payload, tag, meta, kind);
-            }
-            if (ok)
-            {
-                notEmpty.emit();
+                wakeConsumer();
                 return;
             }
-            notFull.waitUninterruptible(ec); // recheck via emitCount: no lost wakeup
+            // Full: park on notFull. Capture emitCount first so a drain between
+            // our recheck and the wait can't be missed; the seq_cst fence orders
+            // our parked publish before the recheck of full().
+            const ec = notFull.emitCount;
+            atomicStore(producerParked, true);
+            atomicFence(); // seq_cst
+            if (ring.full())
+                notFull.waitUninterruptible(ec);
+            atomicStore(producerParked, false);
         }
+    }
+
+    // Wake the consumer iff it has parked. The fence orders push()'s release of
+    // tail before this load of consumerParked, mirroring the consumer's
+    // park-then-recheck, so a wakeup is never lost.
+    private void wakeConsumer() nothrow
+    {
+        atomicFence(); // seq_cst: order the just-published tail before the load
+        if (atomicLoad(consumerParked))
+            notEmpty.emit();
     }
 
     // --- consumer side ---
 
-    /// Wait until at least one item is available, then leave it at the head for
-    /// drain(). Yields the fiber while empty.
+    /// Block until at least one item is available (yields the fiber while empty).
     void waitData() nothrow
     {
+        if (!ring.empty())
+            return; // fast path: no lock, no syscall
         for (;;)
         {
-            auto ec = notEmpty.emitCount;
-            bool has;
+            const ec = notEmpty.emitCount; // capture before parking (no lost emit)
+            atomicStore(consumerParked, true);
+            atomicFence(); // seq_cst: publish parked before rechecking the ring
+            if (!ring.empty())
             {
-                mtx.lock_nothrow();
-                scope (exit)
-                    mtx.unlock_nothrow();
-                has = !ring.empty();
+                atomicStore(consumerParked, false);
+                return; // producer's push became visible — don't sleep
             }
-            if (has)
+            notEmpty.waitUninterruptible(ec); // returns at once if emitCount moved
+            atomicStore(consumerParked, false);
+            if (!ring.empty())
                 return;
-            notEmpty.waitUninterruptible(ec);
         }
     }
 
     /// Pop the head into a caller-owned buffer (copied out so the slot frees
-    /// immediately for producers). Returns false when empty. `sink` is cleared
-    /// and filled with the payload.
+    /// immediately for the producer). Returns false when empty.
     bool take(ref ByteBuffer sink, out void* tag, out ulong meta, out uint kind) nothrow
     {
-        bool has;
-        {
-            mtx.lock_nothrow();
-            scope (exit)
-                mtx.unlock_nothrow();
-            const(ubyte)[] p;
-            has = ring.front(p, tag, meta, kind);
-            if (has)
-            {
-                sink.clear();
-                if (p.length)
-                    sink.append(p);
-                ring.pop();
-            }
-        }
-        if (has)
+        const(ubyte)[] p;
+        if (!ring.front(p, tag, meta, kind))
+            return false;
+        sink.clear();
+        if (p.length)
+            sink.append(p);
+        ring.pop();
+        wakeProducer();
+        return true;
+    }
+
+    private void wakeProducer() nothrow
+    {
+        atomicFence(); // seq_cst: order the freed slot before the load
+        if (atomicLoad(producerParked))
             notFull.emit();
-        return has;
     }
 
     size_t length() nothrow
     {
-        mtx.lock_nothrow();
-        scope (exit)
-            mtx.unlock_nothrow();
         return ring.length();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tests — RingCore is pure, so its FIFO/full/empty/wrap behaviour is fully
-// deterministic without any threads or event loop.
+// Tests — RingCore is single-threaded-deterministic (the atomics are sequential
+// on one thread), so its FIFO/full/empty/wrap behaviour is fully testable
+// without any threads or event loop.
 // ---------------------------------------------------------------------------
 
 version (unittest)
@@ -267,6 +288,7 @@ version (unittest)
         r.pop();
         r.front(p, tag, meta, kind).expect.to.equal(true);
         (cast(string) p).expect.to.equal("ccc");
+        meta.expect.to.equal(3UL);
         r.pop();
         r.empty.expect.to.equal(true);
         r.front(p, tag, meta, kind).expect.to.equal(false);
@@ -286,7 +308,6 @@ version (unittest)
         r.push(b("y"), null, 99).expect.to.equal(false); // rejected, not overwritten
         r.length.expect.to.equal(4UL);
 
-        // draining one makes room for exactly one more
         const(ubyte)[] p;
         void* tag;
         ulong meta;
@@ -306,8 +327,6 @@ version (unittest)
         scope (exit)
             r.teardown();
 
-        // Cycle far past capacity so tail/head wrap the power-of-two mask many
-        // times; FIFO + payload integrity must hold throughout.
         ulong next = 0;
         const(ubyte)[] p;
         void* tag;
@@ -334,7 +353,6 @@ version (unittest)
         scope (exit)
             r.teardown();
 
-        // Push 5, drain 2, push 4 (wraps), drain the rest — order preserved.
         foreach (i; 0 .. 5)
             r.push(b("p"), null, i).expect.to.equal(true);
         const(ubyte)[] p;
