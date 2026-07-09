@@ -34,6 +34,9 @@
 		"vibe-core": "~>2.8"
 	},
 	"description": "a dlang redis implementation",
+	"dflags-ldc": [
+		"-mcpu=x86-64-v3"
+	],
 	"libs": [
 		"lua5.4"
 	],
