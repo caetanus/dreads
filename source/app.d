@@ -73,8 +73,11 @@ else
 
         fwrite(logo.ptr, 1, logo.length, stdout);
 
-        // The data plane never allocates on the GC heap; disabling the
-        // collector guarantees vibe-core's startup allocations never pause us.
+        // Neither the data plane (malloc'd arenas) nor the Raft path (automem
+        // malloc vectors, pooled pending slots, malloc log) allocates on the GC
+        // heap per operation, so disabling the collector is safe under
+        // sustained load: vibe-core's own allocations are one-time / per
+        // connection (bounded), not per request. This guarantees no GC pauses.
         GC.disable();
 
         return runServer(gConfig.port, gConfig.appendonly ? gConfig.appendfilename : null);

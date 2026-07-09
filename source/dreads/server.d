@@ -13,7 +13,7 @@ import core.stdc.stdio : printf;
 import core.time : seconds;
 
 import vibe.core.core : runEventLoop, setTimer;
-import vibe.core.net : TCPConnection, listenTCP;
+import vibe.core.net : TCPConnection, listenTCP, TCPListenOptions;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
@@ -73,9 +73,12 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         }, true);
     }
     initReplication();
+    // SO_REUSEADDR + SO_REUSEPORT: without reusePort a restarted server can
+    // find the port stuck in TIME_WAIT for a long while (vibe's default only
+    // sets reuseAddress). Both let a fresh instance rebind immediately.
     listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
         serveClient(conn);
-    });
+    }, TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
     printf("dreads listening on port %u\n", cast(uint) port);
     return runEventLoop();
 }
@@ -113,7 +116,13 @@ private void initReplication()
     foreach (ref p; peers)
         cfg.peers ~= p.id;
     cfg.seed = gConfig.raftNodeId * 2_654_435_761UL;
-    cfg.electionTimeoutTicks = 10; // 20ms tick -> ~200-400ms randomized
+    // Election timeout must dwarf the heartbeat: the single-threaded event
+    // loop can starve the tick timer under heavy write load (measured
+    // heartbeat gaps of 120-370ms during a 5000-command burst), so a tight
+    // 200ms timeout triggers spurious elections and drops in-flight writes.
+    // 50 ticks -> ~1-2s randomized (etcd/Redis-Raft use ~1s) leaves ample
+    // margin for a busy leader; heartbeat stays at 40ms so ~25 fit per window.
+    cfg.electionTimeoutTicks = 50; // 20ms tick -> ~1000-2000ms randomized
     cfg.heartbeatTicks = 2; // ~40ms
     cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
