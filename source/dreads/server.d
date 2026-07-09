@@ -197,6 +197,7 @@ private void serveClient(TCPConnection tcp) nothrow
     }
     try
     {
+        tcp.tcpNoDelay = true; // small RESP replies must not wait on Nagle
         c.wlock = new TaskMutex;
         bool keep = true;
         while (keep && tcp.connected)

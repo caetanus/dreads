@@ -12,6 +12,7 @@ module dreads.syncer;
 // entries are durable — awaitDurable() gates the reply. The win is that the
 // wait does not block the loop, and one fsync amortizes many appends.
 
+import core.atomic : atomicLoad, atomicStore;
 import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
 import core.thread : Thread;
@@ -76,7 +77,7 @@ struct SyncState
 /// Threaded group-commit durability for one file descriptor.
 final class Durability
 {
-    private int fd;
+    private shared int fd; // atomic: retarget() swaps it after a log rotation
     private SyncState st;
     private Mutex mtx;
     private Condition cond; // wakes the fsync thread
@@ -93,7 +94,7 @@ final class Durability
 
     this(int fd, bool ioUring = false)
     {
-        this.fd = fd;
+        atomicStore(this.fd, fd);
         this.useIoUring = ioUring;
         mtx = new Mutex;
         cond = new Condition(mtx);
@@ -108,6 +109,7 @@ final class Durability
     // blocking syscall. Runs only on the fsync thread.
     private void doFsync() nothrow
     {
+        auto d = atomicLoad(fd); // may have been retargeted after a log rotation
         version (linux)
         {
             if (ringReady)
@@ -117,7 +119,7 @@ final class Durability
                     auto sqe = &ring.next();
                     *sqe = SubmissionEntry.init;
                     sqe.opcode = Operation.FSYNC;
-                    sqe.fd = fd;
+                    sqe.fd = d;
                     sqe.fsync_flags = FsyncFlags.DATASYNC; // fdatasync semantics
                     ring.submit(1); // submit + wait for the completion
                     if (!ring.empty)
@@ -131,7 +133,16 @@ final class Durability
             }
         }
         version (Posix)
-            fdatasync(fd);
+            fdatasync(d);
+    }
+
+    /// Point the fsync thread at a new fd after the log file was rotated
+    /// (compaction opens a fresh log file). The old fd is fsync'd harmlessly by
+    /// any in-flight call; the caller keeps it open until the next rotation so
+    /// this never races a close.
+    void retarget(int newFd) nothrow
+    {
+        atomicStore(fd, newFd);
     }
 
     private void notify() nothrow

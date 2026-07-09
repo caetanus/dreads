@@ -21,7 +21,9 @@ version (unittest)
     private void rm(string base)
     {
         remove((base ~ ".raftlog\0").ptr);
+        remove((base ~ ".raftlog.old\0").ptr);
         remove((base ~ ".raftmeta\0").ptr);
+        remove((base ~ ".raftsnap\0").ptr);
     }
 
     @("raftlog.roundtrip_and_reopen")
@@ -84,6 +86,114 @@ version (unittest)
         back.lastIndex.expect.to.equal(3);
         back.termAt(3).expect.to.equal(2);
         (cast(string) back.entriesFrom(3, 1)[0].payload).expect.to.equal("newer");
+        back.close();
+    }
+
+    @("raftlog.compaction_rotation_survives_reopen")
+    unittest
+    {
+        // Non-blocking compaction rotates the log (seal + fresh file, no
+        // rewrite-in-place, no fsync). Snapshot + surviving entries + entries
+        // appended after the rotation must all survive a clean reopen.
+        enum base = "/tmp/dreads_rl_comp";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        foreach (i; 1 .. 11)
+        {
+            LogEntry[1] e = [LogEntry(1, i, pay("v"))];
+            log.append(e[]);
+        }
+        log.lastIndex.expect.to.equal(10);
+        log.saveSnapshot(6, 1, pay("STATE@6")); // covers 1..6, keeps 7..10
+        log.snapshotIndex.expect.to.equal(6);
+        log.lastIndex.expect.to.equal(10);
+        (cast(string) log.entriesFrom(7, 10)[0].payload).expect.to.equal("v");
+        LogEntry[1] e2 = [LogEntry(2, 11, pay("post"))]; // append after rotation
+        log.append(e2[]);
+        log.close();
+
+        auto back = RaftLog.open(base);
+        back.snapshotIndex.expect.to.equal(6);
+        back.lastIndex.expect.to.equal(11);
+        (cast(string) back.snapshotData).expect.to.equal("STATE@6");
+        back.entriesFrom(6, 1).length.expect.to.equal(0); // covered by snapshot
+        (cast(string) back.entriesFrom(7, 1)[0].payload).expect.to.equal("v");
+        (cast(string) back.entriesFrom(11, 1)[0].payload).expect.to.equal("post");
+        back.termAt(11).expect.to.equal(2);
+        back.close();
+    }
+
+    @("raftlog.compaction_recovers_from_backup_on_crash")
+    unittest
+    {
+        // Simulate a crash right after a rotation: the .raftlog.old backup is
+        // still present (no clean close). Recovery must replay it + the active
+        // log and reconstruct the exact surviving tail.
+        enum base = "/tmp/dreads_rl_compcrash";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        foreach (i; 1 .. 9)
+        {
+            LogEntry[1] e = [LogEntry(1, i, pay("x"))];
+            log.append(e[]);
+        }
+        log.saveSnapshot(5, 1, pay("STATE@5")); // rotation leaves .raftlog.old
+        // deliberately DO NOT close(log): mimic a crash — the backup survives.
+
+        auto back = RaftLog.open(base);
+        back.snapshotIndex.expect.to.equal(5);
+        back.lastIndex.expect.to.equal(8); // 6,7,8 recovered
+        (cast(string) back.snapshotData).expect.to.equal("STATE@5");
+        back.entriesFrom(5, 1).length.expect.to.equal(0);
+        back.entriesFrom(6, 3).length.expect.to.equal(3);
+        // writable again after recovery
+        LogEntry[1] e = [LogEntry(2, 9, pay("resumed"))];
+        back.append(e[]);
+        back.lastIndex.expect.to.equal(9);
+        back.close();
+
+        auto again = RaftLog.open(base);
+        again.lastIndex.expect.to.equal(9);
+        (cast(string) again.entriesFrom(9, 1)[0].payload).expect.to.equal("resumed");
+        again.close();
+    }
+
+    @("raftlog.truncate_after_compaction")
+    unittest
+    {
+        // A conflict truncation after a compaction must operate on the fresh
+        // active segment and survive reopen.
+        enum base = "/tmp/dreads_rl_comptr";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        foreach (i; 1 .. 11)
+        {
+            LogEntry[1] e = [LogEntry(1, i, pay("a"))];
+            log.append(e[]);
+        }
+        log.saveSnapshot(6, 1, pay("S")); // keeps 7..10 in a fresh segment
+        LogEntry[1] e11 = [LogEntry(1, 11, pay("a"))];
+        log.append(e11[]);
+        log.truncateFrom(9); // drop 9,10,11 (all in the post-rotation segment)
+        log.lastIndex.expect.to.equal(8);
+        LogEntry[1] div = [LogEntry(3, 9, pay("branch"))];
+        log.append(div[]);
+        log.close();
+
+        auto back = RaftLog.open(base);
+        back.lastIndex.expect.to.equal(9);
+        back.termAt(9).expect.to.equal(3);
+        (cast(string) back.entriesFrom(9, 1)[0].payload).expect.to.equal("branch");
+        back.snapshotIndex.expect.to.equal(6);
         back.close();
     }
 
