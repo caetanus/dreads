@@ -94,6 +94,7 @@ private struct Pending
     ByteBuffer reqBuf; // [clock][rawCmd], stable across the propQ backpressure wait
     ByteBuffer reply;
     LocalManualEvent done;
+    Index idx; // log index this proposal was appended at (0 = not yet / control)
     bool ready;
     bool failed; // proposal rejected (leadership lost)
     bool ackResult; // membership-change outcome
@@ -225,6 +226,7 @@ final class Replicator
         p.ready = false;
         p.failed = false;
         p.ackResult = false;
+        p.idx = 0; // set when proposed; a reused slot must not carry a stale index
         p.reply.clear();
         return p;
     }
@@ -544,7 +546,11 @@ private final class RaftWorker
                                 failed[nFail++] = cast(Pending*) tag;
                         }
                         else
-                            pendingByIndex[idx % RING] = cast(Pending*) tag;
+                        {
+                            auto slot = cast(Pending*) tag;
+                            slot.idx = idx; // so a step-down can fail uncommitted ones
+                            pendingByIndex[idx % RING] = slot;
+                        }
                     }
                     node.flush();
                     auto rd = node.takeReady();
@@ -636,6 +642,11 @@ private final class RaftWorker
     // queue in propQ on the main loop, so group-commit batching is unaffected).
     private void processReadyLocked(ref Ready rd) nothrow
     {
+        // A conflicting append just truncated our uncommitted tail: those entries
+        // will never commit, so redirect their waiting clients (and clear the
+        // ring slots before the replacement entries reuse them).
+        if (rd.truncatedFrom > 0)
+            failTruncated(rd.truncatedFrom);
         // A leader's snapshot must reach the keyspace before its later entries:
         // ship it first, in order, through the same commit stream.
         if (rd.applySnapshot !is null)
@@ -694,6 +705,28 @@ private final class RaftWorker
         auto applied = cast(Index) atomicLoad(rep.appliedIndexPub);
         if (log.reclaimableBytes(applied) >= COMPACT_MIN_BYTES)
             atomicStore(rep.compactWanted, true);
+    }
+
+    // Fail every pending client write at index >= `from`: those log entries were
+    // just truncated (a new leader overwrote this node's uncommitted tail), so
+    // they will never commit — the waiting client must be redirected, not left
+    // hanging, and the slot must be cleared before the replacement entries reuse
+    // the same ring positions. This is driven by the node reporting the exact
+    // truncation point (Ready.truncatedFrom); step-down alone is NOT enough,
+    // since an uncommitted entry may still commit via a follower that had it.
+    private void failTruncated(Index from) nothrow
+    {
+        if (from == 0)
+            return;
+        foreach (i; 0 .. RING)
+        {
+            auto slot = pendingByIndex[i];
+            if (slot !is null && slot.idx >= from)
+            {
+                pendingByIndex[i] = null;
+                rep.commitQ.put(null, cast(void*) slot, 0, CommitKind.fail);
+            }
+        }
     }
 
     private void publishStatus() nothrow
