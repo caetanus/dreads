@@ -19,6 +19,9 @@ import core.thread : Thread;
 version (Posix)
     import core.sys.posix.unistd : fdatasync;
 
+version (linux)
+    import during;
+
 import vibe.core.sync : createSharedManualEvent, ManualEvent;
 
 /// Pure group-commit bookkeeping — no threads, no I/O, fully testable.
@@ -80,10 +83,18 @@ final class Durability
     private Thread thr;
     private shared bool running;
     private shared(ManualEvent) fiberEvent; // wakes waiting fibers, cross-thread
+    // fsync backend: the default is a blocking fdatasync on this dedicated
+    // thread (the "threadpool" fallback). Optionally io_uring submits the
+    // fdatasync to a per-thread ring — same group-commit shape, but the syscall
+    // path goes through the ring (Linux only; falls back if setup fails).
+    private bool useIoUring;
+    version (linux) private Uring ring;
+    private bool ringReady;
 
-    this(int fd)
+    this(int fd, bool ioUring = false)
     {
         this.fd = fd;
+        this.useIoUring = ioUring;
         mtx = new Mutex;
         cond = new Condition(mtx);
         fiberEvent = createSharedManualEvent();
@@ -91,6 +102,36 @@ final class Durability
         thr = new Thread(&loop);
         thr.isDaemon = true;
         thr.start();
+    }
+
+    // One fdatasync of `fd`, via io_uring when enabled+available, else the
+    // blocking syscall. Runs only on the fsync thread.
+    private void doFsync() nothrow
+    {
+        version (linux)
+        {
+            if (ringReady)
+            {
+                try
+                {
+                    auto sqe = &ring.next();
+                    *sqe = SubmissionEntry.init;
+                    sqe.opcode = Operation.FSYNC;
+                    sqe.fd = fd;
+                    sqe.fsync_flags = FsyncFlags.DATASYNC; // fdatasync semantics
+                    ring.submit(1); // submit + wait for the completion
+                    if (!ring.empty)
+                        ring.popFront();
+                    return;
+                }
+                catch (Exception)
+                {
+                    ringReady = false; // fall back permanently on error
+                }
+            }
+        }
+        version (Posix)
+            fdatasync(fd);
     }
 
     private void notify() nothrow
@@ -142,6 +183,14 @@ final class Durability
 
     private void loop() nothrow
     {
+        version (linux)
+            if (useIoUring)
+            {
+                try
+                    ringReady = ring.setup(8) == 0;
+                catch (Exception)
+                    ringReady = false;
+            }
         for (;;)
         {
             mtx.lock_nothrow();
@@ -158,8 +207,7 @@ final class Durability
             mtx.unlock_nothrow();
             if (stop_)
                 return;
-            version (Posix)
-                fdatasync(fd);
+            doFsync();
             mtx.lock_nothrow();
             st.complete();
             mtx.unlock_nothrow();

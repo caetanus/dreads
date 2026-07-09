@@ -19,6 +19,10 @@ public struct Config
     // SQLite-style durability: full = fsync per mutation (Raft-correct),
     // normal = flush per batch + periodic fsync, off = OS-buffered only
     string synchronous = "full";
+    // Group-commit fsync backend for the Raft log: "threadpool" (a dedicated
+    // OS thread running blocking fdatasync — the portable Posix default) or
+    // "io_uring" (Linux: submit the fdatasync to a ring on that same thread).
+    string fsyncBackend = "threadpool";
     // replication (Raft phase 1)
     uint raftNodeId = 0; // 0 = replication disabled
     string raftPeers; // "2@host:port,3@host:port"
@@ -131,6 +135,15 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         {
         case "off", "normal", "full":
             cfg.synchronous = value;
+            return true;
+        default:
+            return false;
+        }
+    case "fsync-backend":
+        switch (value)
+        {
+        case "threadpool", "io_uring":
+            cfg.fsyncBackend = value;
             return true;
         default:
             return false;

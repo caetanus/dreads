@@ -87,8 +87,10 @@ final class RaftLog : Storage
     /// with awaitDurable(). The fd is this log's own file.
     void enableAsyncDurability()
     {
+        import dreads.config : gConfig;
+
         if (durability_ is null && logF !is null)
-            durability_ = new Durability(fileno(logF));
+            durability_ = new Durability(fileno(logF), gConfig.fsyncBackend == "io_uring");
     }
 
     /// Fiber-side: yield until `index` is on disk (no-op when synchronous).
