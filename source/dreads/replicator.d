@@ -288,8 +288,22 @@ final class Replicator
     {
         try
         {
-            auto applied = node.commitIndex;
-            if (applied <= log.snapshotIndex + COMPACT_THRESHOLD)
+            auto commit = node.commitIndex;
+            auto snap = log.snapshotIndex;
+            if (commit <= snap + COMPACT_THRESHOLD)
+                return;
+            // The snapshot is the CURRENT keyspace, so we can only compact at
+            // commitIndex. Compacting there strands every follower behind commit
+            // (they'd need a snapshot). Under load followers always lag a little,
+            // and a just-joined node lags a lot — forcing them to snapshot, and
+            // if one is a required joint-config member, commits stall until it
+            // lands (chaos-membership regression). So DEFER: while a follower is
+            // still catching up through the retained log, keep the log and let
+            // it advance via AppendEntries. Emergency valve: if the log has
+            // grown far past the threshold, compact anyway (a dead / very slow
+            // follower must not grow the log without bound — it will snapshot).
+            enum EMERGENCY = 5 * COMPACT_THRESHOLD;
+            if (node.minFollowerMatch() < commit && (commit - snap) < EMERGENCY)
                 return;
             static ByteBuffer dump;
             dump.clear();
@@ -297,7 +311,7 @@ final class Replicator
 
             dumpKeyspace(*keys, dump);
             nodeMtx.lock();
-            node.compact(applied, dump.data);
+            node.compact(commit, dump.data);
             nodeMtx.unlock();
         }
         catch (Exception)
