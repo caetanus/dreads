@@ -399,11 +399,16 @@ nothrow:
             auto copy = mallocDup(cast(const(char)[]) e.payload);
             push(LogEntry(e.term, e.index, cast(const(ubyte)[]) copy));
         }
-        fflush(logF);
         if (durability_ !is null)
+        {
+            fflush(logF); // ensure the batch is in the OS before the fsync
             durability_.requestSync(snapIdx_ + len); // async: caller awaits before reply
-        else
-            maybeFsync(logF); // sync path: "full" fdatasyncs before returning
+        }
+        // else (off/normal): leave the batch in the stdio buffer — it flushes in
+        // ~BUFSIZ chunks or via the periodic fsync (normal) / clean close. This
+        // turns N tiny write syscalls per group-commit cycle into ~N/BUFSIZ,
+        // which is the bulk of the single-node raft-pipeline overhead. truncate/
+        // rotate/recover flush explicitly before touching the fd directly.
     }
 
     void truncateFrom(Index from)
@@ -414,6 +419,7 @@ nothrow:
         foreach (i; keep .. len)
             (cast(const(char)[]) entries[i].payload).freeSlice;
         len = keep;
+        fflush(logF); // sync stdio buffer with the fd before truncating it
         ftruncate(fileno(logF), cast(long)(keep == 0 ? 0 : offsets[keep - 1]
                 + FRAME_HDR + entries[keep - 1].payload.length));
         fseek(logF, 0, SEEK_END);
