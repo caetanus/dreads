@@ -36,7 +36,7 @@ final class RaftLog : Storage
     private LogEntry* entries; // in-memory entries with index > snapIdx_
     private size_t len;
     private size_t cap;
-    private ulong[] offsets; // file offset of each entry (for truncation)
+    private ulong* offsets; // file offset of each entry (malloc'd, shares len/cap with entries)
     // snapshot / compaction
     private Index snapIdx_; // lastIncludedIndex (0 = none)
     private Term snapTerm_;
@@ -110,6 +110,9 @@ final class RaftLog : Storage
         if (entries !is null)
             cfree(entries);
         entries = null;
+        if (offsets !is null)
+            cfree(offsets);
+        offsets = null;
         len = cap = 0;
         snapData_.freeSlice;
         snapData_ = null;
@@ -154,10 +157,10 @@ final class RaftLog : Storage
         {
             cap = cap ? cap * 2 : 64;
             entries = cast(LogEntry*) crealloc(entries, cap * LogEntry.sizeof);
-            assert(entries !is null, "out of memory");
+            offsets = cast(ulong*) crealloc(offsets, cap * ulong.sizeof);
+            assert(entries !is null && offsets !is null, "out of memory");
         }
         entries[len] = e;
-        offsets.length = len + 1;
         offsets[len] = len == 0 ? 0
             : offsets[len - 1] + FRAME_HDR + entries[len - 1].payload.length;
         len++;
@@ -341,9 +344,8 @@ nothrow:
     {
         fseek(logF, 0, SEEK_SET);
         ftruncate(fileno(logF), 0);
-        offsets.length = 0;
         ulong off = 0;
-        foreach (i; 0 .. len)
+        foreach (i; 0 .. len) // cap >= len, so offsets[i] is in bounds
         {
             ubyte[FRAME_HDR] h;
             writeLE64(h[0 .. 8], entries[i].term);
@@ -352,7 +354,7 @@ nothrow:
             fwrite(h.ptr, 1, FRAME_HDR, logF);
             if (entries[i].payload.length)
                 fwrite(entries[i].payload.ptr, 1, entries[i].payload.length, logF);
-            offsets ~= off;
+            offsets[i] = off;
             off += FRAME_HDR + entries[i].payload.length;
         }
         fflush(logF);
