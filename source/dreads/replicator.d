@@ -77,6 +77,9 @@ final class Replicator
     // Reused entry-payload buffer ([u64 clock][raw command]); filled under the
     // node lock, copied into the log by storage.append, then reused.
     private ByteVec payloadBuf;
+    // Group commit: writers append locally and signal this; one flusher fiber
+    // broadcasts all pending appends + does one durability fsync per cycle.
+    private LocalManualEvent flushEvent;
 
     this(Config cfg, PeerAddress[] peers, ushort raftPort, scope const(char)[] logBase, Keyspace* keys)
     {
@@ -89,12 +92,39 @@ final class Replicator
         transport = new VibeTransport(cfg.self, peers);
         transport.setHandler(&onWire);
         nodeMtx = new TaskMutex;
+        flushEvent = createManualEvent();
     }
 
     void start()
     {
         transport.start(raftPort);
         setTimer(20.msecs, () @trusted nothrow { onTick(); }, true);
+        runTask(() nothrow { flushLoop(); });
+    }
+
+    // Group-commit flusher: wakes when writers have appended entries, replicates
+    // them all with one broadcast + one durability fsync per cycle. Turns N
+    // concurrent per-write round-trips into one batched cycle (throughput).
+    private void flushLoop() nothrow
+    {
+        while (true)
+        {
+            try
+            {
+                auto ec = flushEvent.emitCount;
+                flushEvent.wait(ec);
+                nodeMtx.lock();
+                node.flush();
+                auto rd = node.takeReady();
+                RaftMessage[MSG_CAP] mbuf = void;
+                auto msgs = drainMsgs(rd, mbuf);
+                nodeMtx.unlock();
+                commitReady(rd, msgs);
+            }
+            catch (Exception)
+            {
+            }
+        }
     }
 
     @property bool isLeader() nothrow
@@ -186,7 +216,9 @@ final class Replicator
         foreach (i; 0 .. 8)
             payloadBuf.put(cast(ubyte)(clock >> (8 * i)));
         payloadBuf.put(rawCmd);
-        auto idx = node.propose(payloadBuf.data);
+        // Append only — the flusher fiber broadcasts + commits this and every
+        // other concurrently appended entry in one batched cycle (group commit).
+        auto idx = node.proposeLocal(payloadBuf.data);
         if (idx == 0)
         {
             nodeMtx.unlock();
@@ -194,12 +226,9 @@ final class Replicator
         }
         auto slot = acquireSlot(idx);
         ring[idx % RING] = slot;
-        auto rd = node.takeReady();
-        RaftMessage[MSG_CAP] mbuf = void;
-        auto msgs = drainMsgs(rd, mbuf);
         nodeMtx.unlock();
 
-        commitReady(rd, msgs);
+        flushEvent.emit(); // wake the flusher to replicate this batch
 
         // wait until our entry is committed and applied (its reply is filled)
         while (!slot.ready)
