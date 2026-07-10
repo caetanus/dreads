@@ -5,8 +5,21 @@ module dreads.pubsub;
 // write mutex and writes to the TCPConnection; in tests it appends to a
 // buffer. No GC allocations here — subscriber lists are malloc'd arrays and
 // messages are staged in a scratch ByteBuffer.
+//
+// Pattern matching is pre-matched at SUBSCRIBE time, not scanned at publish
+// (see PUBSUB.md). Each pattern is classified by its single `*` anchor:
+//   A*   prefix   — channel.startsWith(A)
+//   *B   suffix   — channel.endsWith(B)
+//   A*B  both     — startsWith(A) && endsWith(B) && len >= |A|+|B|  (no middle scan)
+//   A    exactPat — channel == A (a metachar-free PSUBSCRIBE)
+//   *    all      — matches everything
+//   ?/** general  — falls back to globMatch (exact glob semantics preserved)
+// Patterns with a non-empty header (exactPat/prefix/both) live in `headerIndex`
+// keyed by that header. A publish probes only the channel's own prefixes, so the
+// header is the discriminator: cost is O(len(channel)), independent of P.
 
 import core.stdc.stdlib : malloc, realloc, cfree = free;
+import core.stdc.string : memcpy;
 
 import dreads.commands : globMatch;
 import dreads.dict : Dict, Unit;
@@ -75,10 +88,157 @@ private struct SubList
     }
 }
 
+// --- pattern classification -------------------------------------------------
+
+private enum PatKind : ubyte
+{
+    exactPat, // no metachar: matches channel == pattern
+    prefix, // A*
+    both, // A*B
+    suffix, // *B
+    general, // ? or two-plus stars: globMatch fallback
+    all // bare "*"
+}
+
+/// A compiled pattern subscription. `raw` is an owned malloc copy of the pattern
+/// text (used for the pmessage reply and for equality on removal); `a`/`b` slice
+/// into it.
+private struct PatEntry
+{
+    Subscriber* sub;
+    char* raw;
+    uint rawLen;
+    PatKind kind;
+    uint aLen; // prefix literal = raw[0 .. aLen]
+    uint bOff; // suffix literal = raw[bOff .. bOff + bLen]
+    uint bLen;
+
+    const(char)[] pattern() const @nogc nothrow
+    {
+        return raw[0 .. rawLen];
+    }
+
+    const(char)[] b() const @nogc nothrow
+    {
+        return raw[bOff .. bOff + bLen];
+    }
+
+    void freeRaw() @nogc nothrow
+    {
+        if (raw !is null)
+            cfree(raw);
+        raw = null;
+    }
+}
+
+/// Classify without copying (used for both compile and removal lookup).
+private PatKind classify(scope const(char)[] p, out uint aLen, out uint bOff, out uint bLen) @nogc nothrow
+{
+    size_t starPos = size_t.max;
+    int stars = 0;
+    bool q = false;
+    foreach (i, c; p)
+    {
+        if (c == '*')
+        {
+            stars++;
+            if (starPos == size_t.max)
+                starPos = i;
+        }
+        else if (c == '?')
+            q = true;
+    }
+    if (stars == 0 && !q)
+    {
+        aLen = cast(uint) p.length;
+        return PatKind.exactPat;
+    }
+    if (q || stars >= 2)
+        return PatKind.general;
+    // exactly one star, no '?'
+    if (p.length == 1)
+        return PatKind.all; // "*"
+    if (starPos == 0)
+    {
+        bOff = 1;
+        bLen = cast(uint) p[1 .. $].length;
+        return PatKind.suffix;
+    }
+    if (starPos + 1 == p.length)
+    {
+        aLen = cast(uint) starPos;
+        return PatKind.prefix;
+    }
+    aLen = cast(uint) starPos;
+    bOff = cast(uint)(starPos + 1);
+    bLen = cast(uint) p[starPos + 1 .. $].length;
+    return PatKind.both;
+}
+
+private bool endsWith(scope const(char)[] s, scope const(char)[] suf) @nogc nothrow pure
+{
+    return s.length >= suf.length && s[$ - suf.length .. $] == suf;
+}
+
+/// A non-empty header qualifies a pattern for the header index (probed by the
+/// channel's prefixes); everything else goes to the linear fallback.
+private bool headed(PatKind k, uint aLen) @nogc nothrow
+{
+    return aLen > 0 && (k == PatKind.exactPat || k == PatKind.prefix || k == PatKind.both);
+}
+
+/// Growable malloc'd array of PatEntry (value type; owns each entry's raw copy).
+private struct PatBucket
+{
+    PatEntry* items;
+    size_t len;
+    size_t cap;
+
+    void add(PatEntry e) @nogc nothrow
+    {
+        if (len == cap)
+        {
+            cap = cap ? cap * 2 : 4;
+            items = cast(PatEntry*) realloc(items, cap * PatEntry.sizeof);
+            assert(items !is null, "out of memory");
+        }
+        items[len++] = e;
+    }
+
+    /// Remove the entry for (sub, pattern); frees its raw copy. Returns true if found.
+    bool removeMatching(Subscriber* s, scope const(char)[] pat) @nogc nothrow
+    {
+        foreach (i; 0 .. len)
+        {
+            if (items[i].sub is s && items[i].pattern == pat)
+            {
+                items[i].freeRaw();
+                items[i] = items[len - 1];
+                len--;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void free() @nogc nothrow
+    {
+        foreach (i; 0 .. len)
+            items[i].freeRaw();
+        if (items !is null)
+            cfree(items);
+        items = null;
+        len = cap = 0;
+    }
+}
+
 public struct PubSub
 {
     private Dict!SubList channels; // channel -> subscribers
-    private SubList patternSubs; // every subscriber holding at least one pattern
+    private Dict!PatBucket headerIndex; // header literal -> pattern entries (exactPat/prefix/both)
+    private PatBucket fallback; // suffix/general/all (empty-header patterns)
+    private size_t maxHeaderLen; // longest header present (bounds the prefix probe)
+    private size_t patternEntries; // total (subscriber, pattern) pairs
     private ByteBuffer scratch; // message staging, reused across publishes
 
     /// True when the channel subscription is new for this subscriber.
@@ -114,8 +274,7 @@ public struct PubSub
     {
         if (!s.patterns.set(pattern, Unit()))
             return false;
-        if (s.patterns.length == 1)
-            patternSubs.add(s);
+        insertPattern(s, pattern);
         return true;
     }
 
@@ -123,8 +282,7 @@ public struct PubSub
     {
         if (!s.patterns.del(pattern))
             return false;
-        if (s.patterns.length == 0)
-            patternSubs.remove(s);
+        removePattern(s, pattern);
         return true;
     }
 
@@ -142,9 +300,79 @@ public struct PubSub
             }
         }
         s.channels.clear();
-        if (s.patterns.length > 0)
-            patternSubs.remove(s);
+        foreach (pat, ref u; s.patterns)
+            removePattern(s, pat);
         s.patterns.clear();
+    }
+
+    // --- pattern index maintenance ---
+
+    private void insertPattern(Subscriber* s, scope const(char)[] p) @nogc nothrow
+    {
+        uint aLen, bOff, bLen;
+        auto kind = classify(p, aLen, bOff, bLen);
+        PatEntry e;
+        e.sub = s;
+        e.rawLen = cast(uint) p.length;
+        e.raw = cast(char*) malloc(p.length ? p.length : 1);
+        assert(e.raw !is null, "out of memory");
+        if (p.length)
+            memcpy(e.raw, p.ptr, p.length);
+        e.kind = kind;
+        e.aLen = aLen;
+        e.bOff = bOff;
+        e.bLen = bLen;
+
+        if (headed(kind, aLen))
+        {
+            auto hdr = p[0 .. aLen];
+            auto b = headerIndex.get(hdr);
+            if (b is null)
+            {
+                headerIndex.set(hdr, PatBucket());
+                b = headerIndex.get(hdr);
+            }
+            b.add(e);
+            if (aLen > maxHeaderLen)
+                maxHeaderLen = aLen;
+        }
+        else
+            fallback.add(e);
+        patternEntries++;
+    }
+
+    private void removePattern(Subscriber* s, scope const(char)[] p) @nogc nothrow
+    {
+        uint aLen, bOff, bLen;
+        auto kind = classify(p, aLen, bOff, bLen);
+        bool removed;
+        if (headed(kind, aLen))
+        {
+            auto hdr = p[0 .. aLen];
+            auto b = headerIndex.get(hdr);
+            if (b !is null && b.removeMatching(s, p))
+            {
+                removed = true;
+                if (b.len == 0)
+                    headerIndex.del(hdr);
+            }
+        }
+        else
+            removed = fallback.removeMatching(s, p);
+        if (removed)
+            patternEntries--;
+    }
+
+    private void emitPmessage(Subscriber* s, scope const(char)[] pat,
+            scope const(char)[] channel, scope const(char)[] payload) nothrow
+    {
+        scratch.clear();
+        repArrayHeader(scratch, 4);
+        repBulk(scratch, "pmessage");
+        repBulk(scratch, pat);
+        repBulk(scratch, channel);
+        repBulk(scratch, payload);
+        s.sink(s.ctx, scratch.data);
     }
 
     /// Delivers to channel and pattern subscribers; returns the receiver count.
@@ -168,25 +396,54 @@ public struct PubSub
                 receivers++;
             }
         }
-        foreach (i; 0 .. patternSubs.len)
+
+        // Header-indexed patterns: probe only the channel's own prefixes.
+        if (headerIndex.length)
         {
-            auto s = patternSubs.items[i];
-            // index iteration: the loop body calls the (non-@nogc) sink, so it
-            // cannot be an opApply delegate
-            foreach (pi; 0 .. s.patterns.capacity)
+            immutable L = channel.length;
+            immutable kmax = L < maxHeaderLen ? L : maxHeaderLen;
+            for (size_t k = 1; k <= kmax; k++)
             {
-                if (!s.patterns.slotLive(pi))
+                auto b = headerIndex.get(channel[0 .. k]);
+                if (b is null)
                     continue;
-                auto pat = s.patterns.keyAt(pi);
-                if (!globMatch(pat, channel))
-                    continue;
-                scratch.clear();
-                repArrayHeader(scratch, 4);
-                repBulk(scratch, "pmessage");
-                repBulk(scratch, pat);
-                repBulk(scratch, channel);
-                repBulk(scratch, payload);
-                s.sink(s.ctx, scratch.data);
+                foreach (i; 0 .. b.len)
+                {
+                    auto e = &b.items[i];
+                    bool m;
+                    final switch (e.kind)
+                    {
+                    case PatKind.exactPat:
+                        m = L == k; // header matched full channel
+                        break;
+                    case PatKind.prefix:
+                        m = true; // header is a prefix of the channel
+                        break;
+                    case PatKind.both:
+                        m = L >= e.aLen + e.bLen && endsWith(channel, e.b);
+                        break;
+                    case PatKind.suffix:
+                    case PatKind.general:
+                    case PatKind.all:
+                        m = false; // never live in the header index
+                        break;
+                    }
+                    if (m)
+                    {
+                        emitPmessage(e.sub, e.pattern, channel, payload);
+                        receivers++;
+                    }
+                }
+            }
+        }
+
+        // Empty-header patterns (suffix/general/all): exact glob, linear.
+        foreach (i; 0 .. fallback.len)
+        {
+            auto e = &fallback.items[i];
+            if (globMatch(e.pattern, channel))
+            {
+                emitPmessage(e.sub, e.pattern, channel, payload);
                 receivers++;
             }
         }
@@ -217,10 +474,7 @@ public struct PubSub
     /// Total pattern subscriptions (Redis counts unique patterns; see DRIFT).
     size_t patternCount() const @nogc nothrow
     {
-        size_t n = 0;
-        foreach (i; 0 .. patternSubs.len)
-            n += patternSubs.items[i].patterns.length;
-        return n;
+        return patternEntries;
     }
 }
 
@@ -285,7 +539,7 @@ unittest // subscribe/publish/unsubscribe flow
     assert(a.got == "");
 }
 
-unittest // pattern subscriptions
+unittest // pattern subscriptions (prefix)
 {
     PubSub ps;
     FakeClient p;
@@ -312,6 +566,94 @@ unittest // pattern subscriptions
     assert(ps.publish("user:42", "y") == 1); // only the channel subscriber now
 }
 
+unittest // both-bound A*B — the websockets:*:system1 case
+{
+    PubSub ps;
+    FakeClient p;
+    p.init_();
+    scope (exit)
+        p.sub.free();
+
+    assert(ps.psubscribe(&p.sub, "websockets:*:system1"));
+    // header + tail match, wildcard run is free
+    assert(ps.publish("websockets:connect:system1", "x") == 1);
+    p.received.clear();
+    // header matches but tail differs -> no delivery
+    assert(ps.publish("websockets:connect:system2", "x") == 0);
+    // tail matches but header differs -> no delivery
+    assert(ps.publish("http:connect:system1", "x") == 0);
+    // the star spans colons too (exact glob semantics)
+    assert(ps.publish("websockets:a:b:c:system1", "x") == 1);
+}
+
+unittest // header discriminates: nested and sibling headers each fire once
+{
+    PubSub ps;
+    FakeClient a, b, c;
+    a.init_();
+    b.init_();
+    c.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+        c.sub.free();
+    }
+    ps.psubscribe(&a.sub, "foo*"); // prefix, header "foo"
+    ps.psubscribe(&b.sub, "fo*"); // prefix, header "fo"
+    ps.psubscribe(&c.sub, "bar*"); // prefix, header "bar"
+
+    // "food" matches foo* and fo* but not bar*
+    assert(ps.publish("food", "x") == 2);
+    assert(a.got.length > 0 && b.got.length > 0 && c.got.length == 0);
+    // "bard" matches only bar*
+    a.received.clear();
+    b.received.clear();
+    assert(ps.publish("bard", "x") == 1);
+}
+
+unittest // suffix, general and match-all live in the fallback
+{
+    PubSub ps;
+    FakeClient s, g, all;
+    s.init_();
+    g.init_();
+    all.init_();
+    scope (exit)
+    {
+        s.sub.free();
+        g.sub.free();
+        all.sub.free();
+    }
+    ps.psubscribe(&s.sub, "*:done"); // suffix
+    ps.psubscribe(&g.sub, "job.?"); // general (has '?')
+    ps.psubscribe(&all.sub, "*"); // match-all
+
+    assert(ps.publish("task:done", "x") == 2); // suffix + all
+    assert(s.got.length > 0 && all.got.length > 0);
+    s.received.clear();
+    all.received.clear();
+    assert(ps.publish("job.7", "x") == 2); // general + all
+    assert(g.got.length > 0);
+
+    assert(ps.punsubscribe(&all.sub, "*"));
+    assert(ps.publish("job.7", "y") == 1); // only general now
+}
+
+unittest // exact metachar-free pattern matches only the identical channel
+{
+    PubSub ps;
+    FakeClient p;
+    p.init_();
+    scope (exit)
+        p.sub.free();
+    ps.psubscribe(&p.sub, "abc"); // exactPat, header "abc"
+    assert(ps.publish("abc", "x") == 1);
+    p.received.clear();
+    assert(ps.publish("abcd", "x") == 0); // header is a prefix but lengths differ
+    assert(ps.publish("ab", "x") == 0);
+}
+
 unittest // dropAll cleans every registration
 {
     PubSub ps;
@@ -322,11 +664,17 @@ unittest // dropAll cleans every registration
     ps.subscribe(&a.sub, "c1");
     ps.subscribe(&a.sub, "c2");
     ps.psubscribe(&a.sub, "p*");
-    assert(a.sub.subCount == 3);
+    ps.psubscribe(&a.sub, "x*y"); // both
+    ps.psubscribe(&a.sub, "*z"); // suffix (fallback)
+    assert(a.sub.subCount == 5);
+    assert(ps.patternCount == 3);
     ps.dropAll(&a.sub);
     assert(a.sub.subCount == 0);
+    assert(ps.patternCount == 0);
     assert(ps.publish("c1", "x") == 0);
     assert(ps.publish("pq", "x") == 0);
+    assert(ps.publish("xANYy", "x") == 0);
+    assert(ps.publish("endz", "x") == 0);
     size_t n;
     ps.eachChannel(null, (ch, cnt) { n++; return 0; });
     assert(n == 0);
