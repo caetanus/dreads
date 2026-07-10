@@ -1,4 +1,4 @@
-# PubSub performance plan — match at subscribe, not at publish
+# PubSub performance plan — pre-match at subscribe, fast-match at publish
 
 ## The problem
 
@@ -18,9 +18,17 @@ Redis asks, per publish: *"for each pattern, does it match this channel?"* —
 pattern-centric, O(P).
 
 We invert it: *"given this channel, which patterns match?"* — channel-centric,
-against an index built **over the subscriptions**. The organizing work happens
-**at SUBSCRIBE time** (index the pattern once); at publish the channel just
-probes the index and touches only patterns whose literal anchor already fits.
+against an index built **over the subscriptions**.
+
+The match still happens at publish — the channel only exists then. What moves to
+SUBSCRIBE time is a **pre-match**: each pattern is indexed once by its literal
+anchor. At publish this pre-work does more than skip the O(P) scan — it
+*accelerates the match itself*. Descending the channel through the prefix radix
+compares each shared prefix **once**, and every pattern anchored on it falls out
+together. So the per-publish cost drops below even a *single* glob, not just
+below P globs: matching patterns share their anchor comparison instead of each
+paying for it. Publish touches only patterns whose anchor already fits, and pays
+the anchor test once per shared prefix.
 
 ## Anchor taxonomy (single-star patterns)
 
