@@ -489,6 +489,9 @@ unittest // encode round-trip
 
 unittest // reply builders
 {
+    gRespProto = 2; // repNullBulk reads the global; pin it (parallel test runner)
+    scope (exit)
+        gRespProto = 2;
     ByteBuffer o;
     repSimple(o, "PONG");
     repInt(o, -3);

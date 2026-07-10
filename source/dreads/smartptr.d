@@ -60,6 +60,33 @@ struct Uniq(T, Allocator = Mallocator)
         return *_p;
     }
 
+    /// Rust `Box`/borrow: an immutable/mutable reference to the owned value
+    /// (borrow the box without taking ownership). Same as `get`.
+    alias borrow = get;
+
+    /// Rust `Box::into_inner`: consume the pointer, moving the value out by
+    /// value; the box is freed without running the value's destructor (it moved
+    /// out). Self is left null.
+    T intoInner()() @trusted
+    {
+        import core.lifetime : move;
+
+        T val = move(*_p); // *_p left in .init, dtor would be a no-op
+        Allocator.instance.deallocate((cast(void*) _p)[0 .. T.sizeof]);
+        _p = null;
+        return val;
+    }
+
+    /// Rust `Option::take`: transfer ownership out into the returned Uniq,
+    /// leaving self empty (null). Frees nothing — ownership just moves.
+    Uniq take() @trusted
+    {
+        Uniq u;
+        u._p = _p;
+        _p = null;
+        return u;
+    }
+
     bool isNull() const
     {
         return _p is null;
@@ -214,6 +241,22 @@ version (unittest) private struct Counter
         assert(a.isNull && b.get.v == 7 && Counter.live == 1);
     }
     assert(Counter.live == 0);
+}
+
+@nogc nothrow unittest // Uniq Rust semantics: borrow, take, into_inner
+{
+    import core.lifetime : move;
+
+    Counter.live = 0;
+    auto a = Uniq!Counter.make(11);
+    assert(a.borrow.v == 11); // borrow == get
+
+    auto b = a.take(); // Option::take: a emptied, b owns
+    assert(a.isNull && b.get.v == 11 && Counter.live == 1);
+
+    auto inner = b.intoInner(); // move the value out, free the box
+    assert(b.isNull && inner.v == 11 && Counter.live == 1); // still one live (moved)
+    // `inner` (a stack Counter) dies at scope end
 }
 
 @nogc nothrow unittest // Shared: copy bumps refcount, last owner frees
