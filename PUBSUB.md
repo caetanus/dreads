@@ -54,35 +54,61 @@ fits the channel — never a blind scan.
 
 ## Data structures
 
+The match happens at publish, but the pattern is **pre-matched** into a tree at
+subscribe. A pattern is split on its `*` stars into literal runs; those runs
+become the tree's nodes, with a wildcard link between them:
+
+```
+psubscribe websockets:*:system1
+    literals = ["websockets:", ":system1"], one star
+
+root
+ └─ "websockets:"        header node        (the discriminator)
+      └─ *               wildcard link      (consumes any run, no compare)
+           └─ ":system1" tail node  → { (compiled pattern, subscriber) ... }
+```
+
 1. **`exact`** — `hashmap<channel, subscriberSet>`. Exact `SUBSCRIBE` and
    metachar-free patterns. O(1) lookup.
-2. **`leftIndex`** — radix (compressed prefix) tree keyed by the literal prefix
-   `A`. Holds `A*` (confirm = true), `A*B` (store `B`, confirm = endsWith + len),
-   and general `A*...` (store the compiled tail matcher). Also the home of
-   general patterns' leading literal.
-3. **`rightIndex`** — radix tree keyed by `reverse(B)` for pure `*B`.
-4. **`matchAll`** — patterns that are exactly `*` (empty prefix). Delivered on
-   every publish; normally a tiny set.
+2. **`patternTree`** — the segment/topic tree. Edges are literal runs; a `*`
+   is a wildcard node linking one literal run to the next. A pattern's terminal
+   node holds `{compiled pattern, subscriber}` entries. The **header** (first
+   literal run) is the primary discriminator: a publish whose channel does not
+   start with a header is rejected on the first, short comparison.
+   - `A*`   → header `A`, wildcard, terminal (matches any tail).
+   - `*B`   → empty header (root wildcard), tail `B`.
+   - `A*B`  → header `A`, wildcard, tail `B` — exactly the example above.
+   - `A*B*C`→ header `A`, wildcard, `B`, wildcard, tail `C` (deeper path).
+3. **`general`** — patterns using `?` or `[...]` (positional/class wildcards that
+   don't align to run boundaries). Small list, pre-compiled, matched iteratively.
+   Still bucketed under their leading literal so they are candidates only when the
+   header fits.
+4. **`matchAll`** — the bare `*` pattern; delivered on every publish. Tiny set.
 
-A pattern lives in exactly one index. `A*B` picks the **more selective** anchor
-(the longer literal) for its index and stores the other end for the confirm
-step.
+**Semantics stay exactly Redis's.** A single-star `A*B` reduces to
+`C.startsWith(A) && C.endsWith(B) && len(C) >= len(A)+len(B)` — the star spans
+anything, colons included, so this is byte-for-byte the glob result, just reached
+by tree walk + two anchored compares instead of a backtracking matcher.
 
 ## Publish path
 
 ```
 publish(C, msg):
-    deliver to exact[C]                             # O(1) + O(subs)
-    cand  = leftIndex.walkPrefixes(C)               # O(len C): all A that prefix C
-          ∪ rightIndex.walkPrefixes(reverse(C))     # all B that suffix C
-          ∪ matchAll
-    for p in cand: if confirm(p, C): mark p          # endsWith / tail matcher
-    frame = encodeOnce(C, msg)                       # refcounted, one allocation
-    for s in subscribers(exact[C] ∪ marked): s.enqueue(frame)
+    deliver to exact[C]                       # O(1) + O(subs)
+    node = patternTree.root
+    walk C run-by-run:                         # descend by the channel's bytes
+        match literal edges against C          # header first — cheap reject
+        at a wildcard link, absorb the run up to the next literal (no compare)
+        collect entries at every terminal node reached
+    for p in general: if globMatch(p, C): collect
+    for p in matchAll: collect
+    frame = encodeOnce(C, msg)                 # one refcounted allocation
+    for s in collected ∪ exact[C]: s.enqueue(frame)
 ```
 
-`walkPrefixes(S)` descends the radix tree following `S`'s bytes; every node that
-terminates one or more patterns yields candidates. O(len S), independent of P.
+Descending the tree compares each **shared header once**: every pattern under a
+header is tested by that single comparison, and non-matching publishes die at the
+header. Cost is O(len C + entries actually reached) — independent of P.
 
 **Complexity:** from O(P × glob) to **O(len(C) + #patterns-that-actually-match)**.
 Publish throughput stays **flat as P grows** — precisely where Redis degrades
@@ -112,14 +138,16 @@ support patterns under sharded pubsub — which Redis 7's `SSUBSCRIBE` gave up o
 
 ## Phases
 
-- **P1 — indexed local matching:** anchor classification, `leftIndex` radix,
-  encode-once + drop backpressure. Kills the O(P) scan for the dominant `A*`
-  case on one node.
-- **P2 — full anchors + sharding:** `rightIndex`, `A*B` both-bound, general
-  tail matcher; channel→shard routing, `SSUBSCRIBE`/`SPUBLISH`, parallel fan-out.
+- **P1 — segment-tree matching:** compile patterns into literal runs, insert
+  into the pattern tree keyed by header, walk the channel to collect matches.
+  Replaces the O(P × glob) publish loop with a header-discriminated tree walk.
+  Keeps exact glob semantics (general `?`/`[...]` fall back to `globMatch`).
+- **P2 — fan-out + sharding:** encode-once refcounted frame, bounded per-sub
+  buffer + drop; channel→shard routing, `SSUBSCRIBE`/`SPUBLISH`, parallel
+  fan-out with the pattern tree replicated per shard.
 - **P3 — cross-node + keyspace notifications:** lightweight inter-node broadcast
   (non-Raft) for classic pubsub; wire keyspace-event notifications through the
-  same index.
+  same tree.
 
 ## Measurement
 
