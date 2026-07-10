@@ -34,6 +34,8 @@ public struct Config
     // host:port matches its own (matched by port on 127.0.0.1 for local runs).
     bool clusterEnabled = false;
     string clusterNodes;
+    // keyspace notifications: flag string like "KEA" ("" = disabled). See notify.d.
+    string notifyKeyspaceEvents;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -187,6 +189,9 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "cluster-nodes":
         cfg.clusterNodes = value.unquote;
+        return true;
+    case "notify-keyspace-events":
+        cfg.notifyKeyspaceEvents = value.unquote;
         return true;
     default:
         return false;

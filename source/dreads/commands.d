@@ -11,6 +11,7 @@ import core.stdc.string : memcpy;
 
 import dreads.dict : Dict, StrVal, Unit;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
+import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
@@ -106,7 +107,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             long n = 0;
             foreach (ref a; args)
-                n += ks.del(a.str) ? 1 : 0;
+                if (ks.del(a.str))
+                {
+                    n++;
+                    notifyKeyspaceEvent(NClass.generic, "del", a.str);
+                }
             repInt(o, n);
             break;
         }
@@ -204,6 +209,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             obj.expireAtMs = absMs <= 0 ? 1 : cast(ulong) absMs;
+            notifyKeyspaceEvent(NClass.generic, "expire", args[0].str);
             propagatePexpireat(args[0].str, obj.expireAtMs);
             repInt(o, 1);
             break;
@@ -350,6 +356,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 obj.expireAtMs = absExpire == 0 ? 1 : cast(ulong) absExpire;
             else if (keepttl)
                 obj.expireAtMs = kept;
+            notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             if (args.length > 2)
                 propagateSet(args[0].str, args[1].str, obj.expireAtMs);
             break;

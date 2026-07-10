@@ -26,6 +26,7 @@ import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
 import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
+import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.obj : Keyspace;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease;
 import dreads.replicator : gReplicator;
@@ -67,6 +68,14 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         }
     }
     gKeyActivity = createManualEvent();
+    {
+        import dreads.notify : gNotifyPublish, parseNotifyFlags;
+
+        cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
+        gNotifyPublish = (scope const(char)[] chan, scope const(char)[] msg) nothrow{
+            gPubSub.publish(chan, msg);
+        };
+    }
     {
         import dreads.cluster : initCluster;
 
@@ -371,6 +380,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     break;
                 }
                 keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                if (gNotifyFlags)
+                    flushPendingNotify(); // publish keyspace events the command queued
                 arena.reset();
             }
             inb.consume(pos);
