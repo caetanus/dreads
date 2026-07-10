@@ -1240,7 +1240,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 }
             }
         }
-        repArrayHeader(o, matches * 2);
+        repMapHeader(o, matches); // CONFIG GET is a map -> %N in RESP3
         foreach (nm; names)
         {
             bool hit = false;

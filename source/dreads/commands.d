@@ -1129,7 +1129,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            repArrayHeader(o, obj is null ? 0 : obj.set.length);
+            repSetHeader(o, obj is null ? 0 : obj.set.length); // ~N in RESP3
             if (obj !is null)
             {
                 foreach (m, ref u; obj.set)
@@ -1446,7 +1446,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto n = snprintf(b.ptr, b.length,
                     "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=0\r\n",
                     ks.length);
-            repBulk(o, b[0 .. n]);
+            repVerbatim(o, "txt", b[0 .. n]); // RESP3 verbatim (=txt:...), RESP2 bulk
             break;
         }
 
@@ -2263,7 +2263,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "LOLWUT":
         {
-            repBulk(o, "dreads ⚡ Deadly Fast Redis in DLang\n");
+            repVerbatim(o, "txt", "dreads ⚡ Deadly Fast Redis in DLang\n");
             break;
         }
     case "ROLE":
@@ -3255,7 +3255,7 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
     }
     if (base is null)
     {
-        repArrayHeader(o, 0);
+        repSetHeader(o, 0);
         return;
     }
     bool keepMember(const(char)[] m) @nogc nothrow
@@ -3275,7 +3275,7 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
         if (base.slotLive(i) && keepMember(base.keyAt(i)))
             n++;
     }
-    repArrayHeader(o, n);
+    repSetHeader(o, n); // SINTER/SDIFF are sets -> ~N in RESP3
     foreach (i; 0 .. base.capacity)
     {
         if (base.slotLive(i) && keepMember(base.keyAt(i)))
@@ -3307,7 +3307,7 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
         foreach (m, ref u; obj.set)
             acc.set(m, Unit());
     }
-    repArrayHeader(o, acc.length);
+    repSetHeader(o, acc.length); // SUNION is a set -> ~N in RESP3
     foreach (m, ref u; acc)
         repBulk(o, m);
 }
