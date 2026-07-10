@@ -10,6 +10,7 @@ import dreads.commands : eqICKeyword, normalizeRange, parseDouble, parseLong,
     parseScoreBound, repDouble;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.obj : Keyspace, ObjType, RObj;
+import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.resp;
 
 private struct MS
@@ -284,7 +285,8 @@ public void zrangestore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
         h.m = arena.dupString(h.m);
     if (hits.length == 0)
     {
-        ks.del(args[0].str);
+        if (ks.del(args[0].str))
+            notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
         repInt(o, 0);
         return;
     }
@@ -293,6 +295,7 @@ public void zrangestore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
     foreach (ref h; hits)
         obj.zset.add(h.s, h.m);
     ks.d.set(args[0].str, obj);
+    notifyKeyspaceEvent(NClass.zset, "zrangestore", args[0].str);
     repInt(o, cast(long) hits.length);
 }
 
@@ -336,6 +339,8 @@ public void zlexRange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     {
         foreach (m; victims[0 .. n])
             obj.zset.remove(m);
+        if (n > 0)
+            notifyKeyspaceEvent(NClass.zset, "zremrangebylex", args[0].str);
         ks.delIfEmpty(args[0].str, obj);
     }
     repInt(o, cast(long) n);
@@ -703,10 +708,15 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         if (card == 0)
         {
             acc.free();
-            ks.del(dst);
+            if (ks.del(dst))
+                notifyKeyspaceEvent(NClass.generic, "del", dst);
         }
         else
+        {
             ks.d.set(dst, acc); // ownership moves
+            notifyKeyspaceEvent(NClass.zset,
+                    op == 'U' ? "zunionstore" : (op == 'I' ? "zinterstore" : "zdiffstore"), dst);
+        }
         repInt(o, cast(long) card);
         return;
     }

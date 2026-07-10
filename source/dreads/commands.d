@@ -1610,8 +1610,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             auto len = cast(long) obj.list.length;
             normalizeRange(start, stop, len);
+            notifyKeyspaceEvent(NClass.list, "ltrim", args[0].str);
             if (start > stop)
+            {
                 ks.del(args[0].str);
+                notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+            }
             else
             {
                 foreach (_; 0 .. start)
@@ -1649,7 +1653,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, 0);
                 break;
             }
-            repInt(o, obj.list.insertAround(args[2].str, args[3].str, before));
+            auto ins = obj.list.insertAround(args[2].str, args[3].str, before);
+            if (ins > 0)
+                notifyKeyspaceEvent(NClass.list, "linsert", args[0].str);
+            repInt(o, ins);
             break;
         }
     case "LMOVE":
@@ -1914,6 +1921,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         "ERR The ID specified in XADD is equal or smaller than the target stream top item");
                 break;
             }
+            notifyKeyspaceEvent(NClass.stream, "xadd", args[0].str);
             repStreamId(o, id);
             if (autoId)
             {
@@ -2092,6 +2100,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (obj !is null && obj.stream.removeId(id))
                     n++;
             }
+            if (n > 0)
+                notifyKeyspaceEvent(NClass.stream, "xdel", args[0].str);
             repInt(o, n);
             break;
         }
@@ -2122,7 +2132,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            repInt(o, obj is null ? 0 : cast(long) obj.stream.trimMaxLen(cast(size_t) maxlen));
+            auto trimmed = obj is null ? 0 : cast(long) obj.stream.trimMaxLen(cast(size_t) maxlen);
+            if (trimmed > 0)
+                notifyKeyspaceEvent(NClass.stream, "xtrim", args[0].str);
+            repInt(o, trimmed);
             break;
         }
 
@@ -2178,6 +2191,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             auto copy = src.deepDup(); // src pointer dies on the next line's rehash
             ks.d.set(args[1].str, copy);
+            notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
             repInt(o, 1);
             break;
         }
@@ -2334,6 +2348,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 else
                     obj.list.pushBack(a.str);
             }
+            notifyKeyspaceEvent(NClass.list, nbuf[0] == 'L' ? "lpush" : "rpush", args[0].str);
             repInt(o, cast(long) obj.list.length);
             break;
         }
@@ -2373,6 +2388,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             char[40] b = void;
             auto res = fmtDouble(b, nv);
             obj.hash.set(args[1].str, StrVal.of(res));
+            notifyKeyspaceEvent(NClass.hash, "hincrbyfloat", args[0].str);
             repBulk(o, res);
             // float math is logged as its result, never re-derived
             propagationOverride.clear();
@@ -2807,12 +2823,14 @@ private void lmove(ref Keyspace ks, scope const(char)[] src, scope const(char)[]
         s.list.popFront();
     else
         s.list.popBack();
+    notifyKeyspaceEvent(NClass.list, fromLeft ? "lpop" : "rpop", src);
     bool w3;
     auto d = ks.getOrCreate(dst, ObjType.list, w3); // s is stale from here on
     if (toLeft)
         d.list.pushFront(v);
     else
         d.list.pushBack(v);
+    notifyKeyspaceEvent(NClass.list, toLeft ? "lpush" : "rpush", dst);
     auto s2 = ks.lookup(src);
     if (s2 !is null)
         ks.delIfEmpty(src, s2);
@@ -3070,7 +3088,8 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
     if (card == 0)
     {
         tmp.free();
-        ks.del(args[0].str);
+        if (ks.del(args[0].str))
+            notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
     }
     else
     {
@@ -3078,6 +3097,8 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
         obj.type = ObjType.set;
         obj.set = tmp; // ownership moves into the keyspace
         ks.d.set(args[0].str, obj);
+        notifyKeyspaceEvent(NClass.set,
+                op == 'I' ? "sinterstore" : (op == 'U' ? "sunionstore" : "sdiffstore"), args[0].str);
     }
     repInt(o, cast(long) card);
 }
@@ -3180,6 +3201,8 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
     }
     foreach (m; victims[0 .. n])
         obj.zset.remove(m);
+    if (n > 0)
+        notifyKeyspaceEvent(NClass.zset, byRank ? "zremrangebyrank" : "zremrangebyscore", args[0].str);
     ks.delIfEmpty(args[0].str, obj);
     repInt(o, cast(long) n);
 }

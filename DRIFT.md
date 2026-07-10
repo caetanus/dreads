@@ -71,16 +71,20 @@ These exist but do not match Redis exactly:
 - **Protocol**: RESP2 only — `HELLO 3` answers `NOPROTO`. No `AUTH`
   passwords (no `requirepass` yet).
 - **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
-  e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. Most
+  e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. All
   common write commands fire events — string (SET/SETNX/SETEX/GETSET/GETDEL/
   APPEND/SETRANGE/INCR*/DECR*/INCRBYFLOAT/MSET), generic (DEL/EXPIRE/PERSIST/
-  RENAME, plus `del` when a container empties), list (L/RPUSH, L/RPOP, LSET,
-  LREM), hash (HSET/HSETNX/HDEL/HINCRBY), set (SADD/SREM/SPOP/SMOVE), zset
-  (ZADD/ZREM/ZINCRBY/ZPOPMIN/ZPOPMAX), and `expired`. Still NOT instrumented:
-  LINSERT/LTRIM/RPOPLPUSH/LMOVE/LPUSHX/RPUSHX, HINCRBYFLOAT, the `*STORE` family
-  (S/Z inter/union/diff, ZRANGESTORE), ZREMRANGEBY*, COPY/MOVE, and stream ops.
-  Events fire only on the standalone path (not the Raft apply path), db is always
-  0, and `CONFIG SET notify-keyspace-events` is not wired (config-file only).
+  RENAME/COPY, plus `del` when a container empties), list (L/RPUSH, L/RPUSHX,
+  L/RPOP, LSET, LREM, LINSERT, LTRIM, LMOVE/RPOPLPUSH), hash (HSET/HSETNX/HDEL/
+  HINCRBY/HINCRBYFLOAT), set (SADD/SREM/SPOP/SMOVE, S{INTER,UNION,DIFF}STORE),
+  zset (ZADD/ZREM/ZINCRBY/ZPOPMIN/ZPOPMAX, Z{UNION,INTER,DIFF}STORE, ZRANGESTORE,
+  ZREMRANGEBY{RANK,SCORE,LEX}), stream (XADD/XDEL/XTRIM/XSETID), and `expired`.
+  Store/trim/remrange variants fire only when they actually mutate (empty result
+  emits `del` on the destination instead). Still NOT covered: `evicted`/`e`
+  (maxmemory eviction), `keymiss`/`m`, `new`/`n` key events, and stream
+  consumer-group events (XGROUP/XCLAIM). Events fire only on the standalone path
+  (not the Raft apply path), db is always 0, and `CONFIG SET
+  notify-keyspace-events` is not wired (config-file only).
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
   `allkeys-lfu`/`volatile-ttl` policies not implemented.

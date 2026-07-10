@@ -7,6 +7,7 @@ import core.stdc.stdio : snprintf;
 
 import dreads.commands : eqICKeyword, parseLong;
 import dreads.mem : Arena, ByteBuffer;
+import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
 import dreads.stream : FieldPair, Group, StreamID, nowMs;
@@ -174,6 +175,7 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         return;
     }
     obj.stream.lastId = id;
+    notifyKeyspaceEvent(NClass.stream, "xsetid", args[0].str);
     repSimple(o, "OK");
 }
 
