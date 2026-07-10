@@ -163,13 +163,19 @@ private struct PatEntry
     char* raw;
     uint rawLen;
     PatKind kind;
-    uint aLen; // prefix literal = raw[0 .. aLen]
-    uint bOff; // suffix literal = raw[bOff .. bOff + bLen]
+    uint aLen; // left literal  = raw[0 .. aLen]           (A in A*B)
+    uint bOff; // right literal = raw[bOff .. bOff + bLen]  (B in A*B)
     uint bLen;
+    uint visitGen; // intersection stamp: set in the left pass, checked in the right
 
     const(char)[] pattern() const @nogc nothrow
     {
         return raw[0 .. rawLen];
+    }
+
+    const(char)[] a() const @nogc nothrow
+    {
+        return raw[0 .. aLen];
     }
 
     const(char)[] b() const @nogc nothrow
@@ -234,39 +240,55 @@ private bool endsWith(scope const(char)[] s, scope const(char)[] suf) @nogc noth
     return s.length >= suf.length && s[$ - suf.length .. $] == suf;
 }
 
-/// A non-empty header qualifies a pattern for the header index (probed by the
-/// channel's prefixes); everything else goes to the linear fallback.
-private bool headed(PatKind k, uint aLen) @nogc nothrow
+/// Does this pattern get a left-anchor key (its literal prefix A)? exactPat is
+/// keyed by its whole text; prefix/both by A. All need aLen > 0.
+private bool leftKeyed(PatKind k, uint aLen) @nogc nothrow
 {
     return aLen > 0 && (k == PatKind.exactPat || k == PatKind.prefix || k == PatKind.both);
 }
 
-/// Growable malloc'd array of PatEntry (value type; owns each entry's raw copy).
-private struct PatBucket
+/// Does this pattern get a right-anchor key (its literal suffix B, reversed)?
+private bool rightKeyed(PatKind k, uint bLen) @nogc nothrow
 {
-    PatEntry* items;
+    return bLen > 0 && (k == PatKind.suffix || k == PatKind.both);
+}
+
+/// Reverse `s` into `buf` (cleared first); `buf.data` is then the reversed bytes.
+private void revInto(ref ByteBuffer buf, scope const(char)[] s) @nogc nothrow
+{
+    buf.clear();
+    foreach_reverse (c; s)
+        buf.appendByte(c);
+}
+
+/// Growable malloc'd array of PatEntry POINTERS. Entries are owned once (malloc'd
+/// in insertPattern, freed in removePattern); a both-anchored pattern is
+/// referenced from two buckets, so buckets store pointers and free() releases
+/// only the array, never the entries.
+private struct PtrBucket
+{
+    PatEntry** items;
     size_t len;
     size_t cap;
 
-    void add(PatEntry e) @nogc nothrow
+    void add(PatEntry* e) @nogc nothrow
     {
         if (len == cap)
         {
             cap = cap ? cap * 2 : 4;
-            items = cast(PatEntry*) realloc(items, cap * PatEntry.sizeof);
+            items = cast(PatEntry**) realloc(items, cap * (PatEntry*).sizeof);
             assert(items !is null, "out of memory");
         }
         items[len++] = e;
     }
 
-    /// Remove the entry for (sub, pattern); frees its raw copy. Returns true if found.
-    bool removeMatching(Subscriber* s, scope const(char)[] pat) @nogc nothrow
+    /// Remove by pointer identity (does not free the entry).
+    bool remove(PatEntry* e) @nogc nothrow
     {
         foreach (i; 0 .. len)
         {
-            if (items[i].sub is s && items[i].pattern == pat)
+            if (items[i] is e)
             {
-                items[i].freeRaw();
                 items[i] = items[len - 1];
                 len--;
                 return true;
@@ -275,10 +297,17 @@ private struct PatBucket
         return false;
     }
 
-    void free() @nogc nothrow
+    /// Find the entry for (sub, pattern) by identity of its text; null if absent.
+    PatEntry* find(Subscriber* s, scope const(char)[] pat) @nogc nothrow
     {
         foreach (i; 0 .. len)
-            items[i].freeRaw();
+            if (items[i].sub is s && items[i].pattern == pat)
+                return items[i];
+        return null;
+    }
+
+    void free() @nogc nothrow
+    {
         if (items !is null)
             cfree(items);
         items = null;
@@ -289,11 +318,23 @@ private struct PatBucket
 public struct PubSub
 {
     private Dict!SubList channels; // channel -> subscribers
-    private Dict!PatBucket headerIndex; // header literal -> pattern entries (exactPat/prefix/both)
-    private PatBucket fallback; // suffix/general/all (empty-header patterns)
-    private size_t maxHeaderLen; // longest header present (bounds the prefix probe)
+    // Dual-anchor pattern index (see PUBSUB.md): a single-star pattern is split
+    // at the '*' into a left literal A and a right literal B. leftIndex is keyed
+    // by A, rightIndex by reverse(B). A publish probes leftIndex over the
+    // channel's prefixes and rightIndex over the reversed channel's prefixes
+    // (== the channel's suffixes); a both-anchored A*B matches iff it is hit in
+    // BOTH passes (intersection via a per-publish generation stamp). This makes
+    // *B and A*B flat in pattern count, not just A*.
+    private Dict!PtrBucket leftIndex; // A -> entries (exactPat / prefix / both)
+    private Dict!PtrBucket rightIndex; // reverse(B) -> entries (suffix / both)
+    private PtrBucket matchAll; // the bare "*"
+    private PtrBucket fallback; // general only: '?' or two-plus stars
+    private size_t maxLeftLen; // longest A present (bounds the left probe)
+    private size_t maxRightLen; // longest B present (bounds the right probe)
+    private uint gen; // intersection generation, bumped per publish
     private size_t patternEntries; // total (subscriber, pattern) pairs
     private ByteBuffer scratch; // message staging, reused across publishes
+    private ByteBuffer revScratch; // reversed channel staging for the right probe
 
     /// True when the channel subscription is new for this subscriber.
     bool subscribe(Subscriber* s, scope const(char)[] channel) @nogc nothrow
@@ -361,11 +402,35 @@ public struct PubSub
 
     // --- pattern index maintenance ---
 
+    private PtrBucket* bucketFor(ref Dict!PtrBucket idx, scope const(char)[] key) @nogc nothrow
+    {
+        auto b = idx.get(key);
+        if (b is null)
+        {
+            idx.set(key, PtrBucket());
+            b = idx.get(key);
+        }
+        return b;
+    }
+
+    private void removeFrom(ref Dict!PtrBucket idx, scope const(char)[] key, PatEntry* e) @nogc nothrow
+    {
+        auto b = idx.get(key);
+        if (b !is null)
+        {
+            b.remove(e);
+            if (b.len == 0)
+                idx.del(key); // frees the (now empty) bucket array only
+        }
+    }
+
     private void insertPattern(Subscriber* s, scope const(char)[] p) @nogc nothrow
     {
         uint aLen, bOff, bLen;
         auto kind = classify(p, aLen, bOff, bLen);
-        PatEntry e;
+        auto e = cast(PatEntry*) malloc(PatEntry.sizeof);
+        assert(e !is null, "out of memory");
+        *e = PatEntry.init;
         e.sub = s;
         e.rawLen = cast(uint) p.length;
         e.raw = cast(char*) malloc(p.length ? p.length : 1);
@@ -377,21 +442,24 @@ public struct PubSub
         e.bOff = bOff;
         e.bLen = bLen;
 
-        if (headed(kind, aLen))
+        bool placed;
+        if (leftKeyed(kind, aLen))
         {
-            auto hdr = p[0 .. aLen];
-            auto b = headerIndex.get(hdr);
-            if (b is null)
-            {
-                headerIndex.set(hdr, PatBucket());
-                b = headerIndex.get(hdr);
-            }
-            b.add(e);
-            if (aLen > maxHeaderLen)
-                maxHeaderLen = aLen;
+            bucketFor(leftIndex, e.a).add(e);
+            if (aLen > maxLeftLen)
+                maxLeftLen = aLen;
+            placed = true;
         }
-        else
-            fallback.add(e);
+        if (rightKeyed(kind, bLen))
+        {
+            revInto(revScratch, e.b);
+            bucketFor(rightIndex, cast(const(char)[]) revScratch.data).add(e);
+            if (bLen > maxRightLen)
+                maxRightLen = bLen;
+            placed = true;
+        }
+        if (!placed)
+            (kind == PatKind.all ? matchAll : fallback).add(e);
         patternEntries++;
     }
 
@@ -399,22 +467,40 @@ public struct PubSub
     {
         uint aLen, bOff, bLen;
         auto kind = classify(p, aLen, bOff, bLen);
-        bool removed;
-        if (headed(kind, aLen))
+        immutable lk = leftKeyed(kind, aLen);
+        immutable rk = rightKeyed(kind, bLen);
+
+        // Locate the shared entry via whichever index holds it.
+        PatEntry* e;
+        if (lk)
         {
-            auto hdr = p[0 .. aLen];
-            auto b = headerIndex.get(hdr);
-            if (b !is null && b.removeMatching(s, p))
-            {
-                removed = true;
-                if (b.len == 0)
-                    headerIndex.del(hdr);
-            }
+            if (auto b = leftIndex.get(p[0 .. aLen]))
+                e = b.find(s, p);
+        }
+        else if (rk)
+        {
+            revInto(revScratch, p[bOff .. bOff + bLen]);
+            if (auto b = rightIndex.get(cast(const(char)[]) revScratch.data))
+                e = b.find(s, p);
         }
         else
-            removed = fallback.removeMatching(s, p);
-        if (removed)
-            patternEntries--;
+            e = (kind == PatKind.all ? matchAll : fallback).find(s, p);
+        if (e is null)
+            return;
+
+        // Unlink from every index referencing it, then free the entry once.
+        if (lk)
+            removeFrom(leftIndex, e.a, e);
+        if (rk)
+        {
+            revInto(revScratch, e.b);
+            removeFrom(rightIndex, cast(const(char)[]) revScratch.data, e);
+        }
+        if (!lk && !rk)
+            (kind == PatKind.all ? matchAll : fallback).remove(e);
+        e.freeRaw();
+        cfree(e);
+        patternEntries--;
     }
 
     private void emitPmessage(Subscriber* s, scope const(char)[] pat,
@@ -455,50 +541,100 @@ public struct PubSub
             rcRelease(m); // drop the publisher's reference; sinks retained their own
         }
 
-        // Header-indexed patterns: probe only the channel's own prefixes.
-        if (headerIndex.length)
+        // --- pattern delivery: dual-anchor probe + intersection ---
+        gen++;
+        immutable L = channel.length;
+
+        // LEFT pass: leftIndex probed over the channel's own prefixes. exactPat
+        // and prefix deliver here; a both-anchored entry is only STAMPED (the
+        // right pass decides), so nothing is delivered twice.
+        if (leftIndex.length)
         {
-            immutable L = channel.length;
-            immutable kmax = L < maxHeaderLen ? L : maxHeaderLen;
+            immutable kmax = L < maxLeftLen ? L : maxLeftLen;
             for (size_t k = 1; k <= kmax; k++)
             {
-                auto b = headerIndex.get(channel[0 .. k]);
+                auto b = leftIndex.get(channel[0 .. k]);
                 if (b is null)
                     continue;
                 foreach (i; 0 .. b.len)
                 {
-                    auto e = &b.items[i];
-                    bool m;
+                    auto e = b.items[i];
                     final switch (e.kind)
                     {
                     case PatKind.exactPat:
-                        m = L == k; // header matched full channel
+                        if (L == k) // A == whole channel
+                        {
+                            emitPmessage(e.sub, e.pattern, channel, payload);
+                            receivers++;
+                        }
                         break;
                     case PatKind.prefix:
-                        m = true; // header is a prefix of the channel
+                        emitPmessage(e.sub, e.pattern, channel, payload);
+                        receivers++;
                         break;
                     case PatKind.both:
-                        m = L >= e.aLen + e.bLen && endsWith(channel, e.b);
+                        e.visitGen = gen; // seen on the left; await the right pass
                         break;
                     case PatKind.suffix:
                     case PatKind.general:
                     case PatKind.all:
-                        m = false; // never live in the header index
-                        break;
-                    }
-                    if (m)
-                    {
-                        emitPmessage(e.sub, e.pattern, channel, payload);
-                        receivers++;
+                        break; // never in leftIndex
                     }
                 }
             }
         }
 
-        // Empty-header patterns (suffix/general/all): exact glob, linear.
+        // RIGHT pass: rightIndex probed over the reversed channel's prefixes
+        // (== the channel's suffixes). suffix delivers; both delivers iff it was
+        // also stamped on the left AND the anchors don't overlap.
+        if (rightIndex.length)
+        {
+            revInto(revScratch, channel);
+            auto cr = cast(const(char)[]) revScratch.data;
+            immutable kmax = L < maxRightLen ? L : maxRightLen;
+            for (size_t k = 1; k <= kmax; k++)
+            {
+                auto b = rightIndex.get(cr[0 .. k]);
+                if (b is null)
+                    continue;
+                foreach (i; 0 .. b.len)
+                {
+                    auto e = b.items[i];
+                    final switch (e.kind)
+                    {
+                    case PatKind.suffix:
+                        emitPmessage(e.sub, e.pattern, channel, payload);
+                        receivers++;
+                        break;
+                    case PatKind.both:
+                        if (e.visitGen == gen && L >= e.aLen + e.bLen)
+                        {
+                            emitPmessage(e.sub, e.pattern, channel, payload);
+                            receivers++;
+                        }
+                        break;
+                    case PatKind.exactPat:
+                    case PatKind.prefix:
+                    case PatKind.general:
+                    case PatKind.all:
+                        break; // never in rightIndex
+                    }
+                }
+            }
+        }
+
+        // bare "*" matches everything
+        foreach (i; 0 .. matchAll.len)
+        {
+            auto e = matchAll.items[i];
+            emitPmessage(e.sub, e.pattern, channel, payload);
+            receivers++;
+        }
+
+        // general fallback ('?', two-plus stars): exact glob, linear (rare)
         foreach (i; 0 .. fallback.len)
         {
-            auto e = &fallback.items[i];
+            auto e = fallback.items[i];
             if (globMatch(e.pattern, channel))
             {
                 emitPmessage(e.sub, e.pattern, channel, payload);
@@ -686,7 +822,7 @@ unittest // multiple distinct-header patterns on ONE subscriber all match
     assert(ps.publish("c:1", "x") == 1);
 }
 
-unittest // suffix, general and match-all live in the fallback
+unittest // suffix (rightIndex), general (fallback) and match-all
 {
     PubSub ps;
     FakeClient s, g, all;
@@ -699,8 +835,8 @@ unittest // suffix, general and match-all live in the fallback
         g.sub.free();
         all.sub.free();
     }
-    ps.psubscribe(&s.sub, "*:done"); // suffix
-    ps.psubscribe(&g.sub, "job.?"); // general (has '?')
+    ps.psubscribe(&s.sub, "*:done"); // suffix -> rightIndex
+    ps.psubscribe(&g.sub, "job.?"); // general (has '?') -> fallback
     ps.psubscribe(&all.sub, "*"); // match-all
 
     assert(ps.publish("task:done", "x") == 2); // suffix + all
@@ -709,9 +845,49 @@ unittest // suffix, general and match-all live in the fallback
     all.received.clear();
     assert(ps.publish("job.7", "x") == 2); // general + all
     assert(g.got.length > 0);
+    // suffix must NOT match a non-suffix channel
+    assert(ps.publish("done:task", "x") == 1); // only match-all
 
     assert(ps.punsubscribe(&all.sub, "*"));
     assert(ps.publish("job.7", "y") == 1); // only general now
+}
+
+unittest // dual-anchor A*B intersection: BOTH anchors required, no overlap
+{
+    PubSub ps;
+    FakeClient p;
+    p.init_();
+    scope (exit)
+        p.sub.free();
+    ps.psubscribe(&p.sub, "a*z"); // both: A="a", B="z"
+    assert(ps.publish("abcz", "x") == 1); // prefix a + suffix z
+    assert(ps.publish("az", "x") == 1); // star matches empty (len 2 >= 1+1)
+    assert(ps.publish("abc", "x") == 0); // prefix a, but no z suffix
+    assert(ps.publish("xyz", "x") == 0); // z suffix, but no a prefix
+    assert(ps.publish("z", "x") == 0); // suffix only, len 1 < |a|+|z|
+    assert(ps.publish("a", "x") == 0); // prefix only
+}
+
+unittest // sameheader: many A*B share header A; only the right tail fires
+{
+    PubSub ps;
+    FakeClient a, b, c;
+    a.init_();
+    b.init_();
+    c.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+        c.sub.free();
+    }
+    ps.psubscribe(&a.sub, "sh:*:t1"); // all three share header "sh:"
+    ps.psubscribe(&b.sub, "sh:*:t2");
+    ps.psubscribe(&c.sub, "sh:*:t3");
+    assert(ps.publish("sh:x:t2", "y") == 1); // only b (tail :t2), not a/c
+    assert(b.got.length > 0 && a.got.length == 0 && c.got.length == 0);
+    assert(ps.publish("sh:x:t9", "y") == 0); // header matches, no tail matches
+    assert(ps.publish("other:t2", "y") == 0); // tail matches, header doesn't
 }
 
 unittest // exact metachar-free pattern matches only the identical channel
