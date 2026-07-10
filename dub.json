@@ -22,6 +22,15 @@
 			],
 			"targetName": "dreads_tests",
 			"targetType": "executable"
+		},
+		{
+			"name": "pubsub-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/pubsub_bench.d",
+			"targetName": "pubsub_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
