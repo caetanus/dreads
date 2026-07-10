@@ -251,6 +251,43 @@ public struct ZSet
         return 0;
     }
 
+    /// Like walkLexRange but descends the skiplist to the lower bound instead of
+    /// scanning from the head — O(log n + hits). Assumes uniform scores (the set
+    /// is used as a plain ordered string set, e.g. the pub/sub channel index).
+    int walkLexFrom(scope const(char)[] min, bool minExcl, bool minNegInf,
+            scope const(char)[] max, bool maxExcl, bool maxPosInf,
+            scope int delegate(const(char)[] m, double s) @nogc nothrow dg) const @nogc nothrow
+    {
+        if (count == 0)
+            return 0;
+        auto x = cast(ZNode*) header;
+        if (!minNegInf)
+        {
+            for (int i = levelCount - 1; i >= 0; i--)
+                while (x.levels[i].forward !is null)
+                {
+                    auto c = cmpMember(x.levels[i].forward.member, min);
+                    if (c < 0 || (c == 0 && minExcl))
+                        x = cast(ZNode*) x.levels[i].forward;
+                    else
+                        break;
+                }
+        }
+        for (auto n = cast(ZNode*) x.levels[0].forward; n !is null; n = cast(ZNode*) n.levels[0].forward)
+        {
+            if (!maxPosInf)
+            {
+                auto c = cmpMember(n.member, max);
+                if (c > 0 || (c == 0 && maxExcl))
+                    break;
+            }
+            auto r = dg(n.member, n.score);
+            if (r)
+                return r;
+        }
+        return 0;
+    }
+
     /// Iterates members with min <= score <= max (bounds optionally exclusive).
     int walkScoreRange(double min, bool minExcl, double max, bool maxExcl,
             scope int delegate(const(char)[] member, double score) @nogc nothrow dg) const @nogc nothrow

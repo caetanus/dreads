@@ -25,6 +25,7 @@ import dreads.commands : globMatch;
 import dreads.dict : Dict, Unit;
 import dreads.mem : ByteBuffer;
 import dreads.resp : repArrayHeader, repBulk;
+import dreads.zset : ZSet;
 
 /// Refcounted message frame: encode once, share across every matched subscriber
 /// (no per-subscriber copy). The event loop is single-threaded, so `refs` is a
@@ -356,8 +357,14 @@ public struct PubSub
     private size_t maxLeftOnlyLen, maxRightOnlyLen; // probe bounds per index
     private size_t maxBothLeftLen, maxBothRightLen;
     private size_t patternEntries; // total (subscriber, pattern) pairs
+    // Active-channel index for PUBSUB CHANNELS <pat>: ordered (skiplist) sets of
+    // channel names, normal and reversed, so a pattern's prefix/suffix becomes a
+    // lexicographic range (find-left / find-right) instead of an O(channels) scan.
+    private ZSet chanByName; // channel -> ordered by name
+    private ZSet chanByRev; // reverse(channel) -> ordered by suffix
     private ByteBuffer scratch; // message staging, reused across publishes
     private ByteBuffer revScratch; // reversed channel staging for the right probe
+    private ByteBuffer boundBuf; // upper-bound (prefix successor) staging
 
     /// True when the channel subscription is new for this subscriber.
     bool subscribe(Subscriber* s, scope const(char)[] channel) @nogc nothrow
@@ -369,9 +376,24 @@ public struct PubSub
         {
             channels.set(channel, SubList());
             list = channels.get(channel);
+            activateChannel(channel); // first subscriber -> index the channel
         }
         list.add(s);
         return true;
+    }
+
+    private void activateChannel(scope const(char)[] ch) @nogc nothrow
+    {
+        chanByName.add(0, ch);
+        revInto(revScratch, ch);
+        chanByRev.add(0, cast(const(char)[]) revScratch.data);
+    }
+
+    private void deactivateChannel(scope const(char)[] ch) @nogc nothrow
+    {
+        chanByName.remove(ch);
+        revInto(revScratch, ch);
+        chanByRev.remove(cast(const(char)[]) revScratch.data);
     }
 
     bool unsubscribe(Subscriber* s, scope const(char)[] channel) @nogc nothrow
@@ -383,7 +405,10 @@ public struct PubSub
         {
             list.remove(s);
             if (list.len == 0)
+            {
                 channels.del(channel);
+                deactivateChannel(channel);
+            }
         }
         return true;
     }
@@ -414,7 +439,10 @@ public struct PubSub
             {
                 list.remove(s);
                 if (list.len == 0)
+                {
                     channels.del(ch);
+                    deactivateChannel(ch);
+                }
             }
         }
         s.channels.clear();
@@ -742,19 +770,59 @@ public struct PubSub
         return receivers;
     }
 
-    /// PUBSUB CHANNELS [pattern]
+    // Smallest string strictly greater than every string with prefix `p`: p with
+    // its last non-0xFF byte incremented. false if p is all 0xFF (no upper bound).
+    private bool prefixSucc(ref ByteBuffer buf, scope const(char)[] p) @nogc nothrow
+    {
+        size_t cut = p.length;
+        while (cut > 0 && cast(ubyte) p[cut - 1] == 0xFF)
+            cut--;
+        if (cut == 0)
+            return false;
+        buf.clear();
+        foreach (i; 0 .. cut - 1)
+            buf.appendByte(p[i]);
+        buf.appendByte(cast(char)(cast(ubyte) p[cut - 1] + 1));
+        return true;
+    }
+
+    /// PUBSUB CHANNELS [pattern]. Uses the ordered channel index: the pattern's
+    /// literal prefix (or suffix) becomes a lexicographic range (find-left /
+    /// find-right), then globMatch verifies the middle. Falls back to a full
+    /// ordered walk only for anchorless patterns ("*", *x*).
     int eachChannel(scope const(char)[] pattern,
             scope int delegate(const(char)[] channel, size_t nsubs) @nogc nothrow dg) @nogc nothrow
     {
-        foreach (ch, ref list; channels)
+        if (pattern.length)
         {
-            if (pattern.length && !globMatch(pattern, ch))
-                continue;
-            auto r = dg(ch, list.len);
-            if (r)
-                return r;
+            uint aLen, bOff, bLen;
+            cast(void) classify(pattern, aLen, bOff, bLen);
+            if (aLen > 0) // find-left: channels in [A, prefixSucc(A))
+            {
+                auto a = pattern[0 .. aLen];
+                immutable hasHi = prefixSucc(boundBuf, a);
+                auto hi = cast(const(char)[]) boundBuf.data;
+                return chanByName.walkLexFrom(a, false, false, hi, true, !hasHi, (m, s) {
+                    return globMatch(pattern, m) ? dg(m, channelSubCount(m)) : 0;
+                });
+            }
+            if (bLen > 0) // find-right: reversed channels in [revB, prefixSucc(revB))
+            {
+                revInto(revScratch, pattern[bOff .. bOff + bLen]);
+                auto rb = cast(const(char)[]) revScratch.data;
+                immutable hasHi = prefixSucc(boundBuf, rb);
+                auto hi = cast(const(char)[]) boundBuf.data;
+                return chanByRev.walkLexFrom(rb, false, false, hi, true, !hasHi, (m, s) {
+                    revInto(scratch, m); // un-reverse to the real channel name
+                    auto ch = cast(const(char)[]) scratch.data;
+                    return globMatch(pattern, ch) ? dg(ch, channelSubCount(ch)) : 0;
+                });
+            }
         }
-        return 0;
+        // no pattern, or anchorless: ordered full walk
+        return chanByName.walkLexFrom(null, false, true, null, false, true, (m, s) {
+            return (pattern.length == 0 || globMatch(pattern, m)) ? dg(m, channelSubCount(m)) : 0;
+        });
     }
 
     size_t channelSubCount(scope const(char)[] channel) @nogc nothrow
@@ -1026,4 +1094,33 @@ unittest // dropAll cleans every registration
     size_t n;
     ps.eachChannel(null, (ch, cnt) { n++; return 0; });
     assert(n == 0);
+}
+
+unittest // PUBSUB CHANNELS: find-left / find-right over the ordered channel index
+{
+    PubSub ps;
+    FakeClient c;
+    c.init_();
+    scope (exit)
+        c.sub.free();
+    foreach (ch; ["news:sport", "news:tech", "chat:room1", "other:tech"])
+        ps.subscribe(&c.sub, ch);
+
+    static size_t count(ref PubSub p, const(char)[] pat)
+    {
+        size_t n;
+        p.eachChannel(pat, (ch, cnt) { n++; return 0; });
+        return n;
+    }
+
+    assert(count(ps, null) == 4); // all
+    assert(count(ps, "news:*") == 2); // find-left prefix "news:"
+    assert(count(ps, "*:tech") == 2); // find-right suffix ":tech" -> news:tech, other:tech
+    assert(count(ps, "news:*ch") == 1); // find-left + glob middle -> news:tech only
+    assert(count(ps, "*room1") == 1); // find-right -> chat:room1
+    assert(count(ps, "nomatch:*") == 0); // empty prefix range
+    assert(count(ps, "chat:room1") == 1); // exact
+    // channel goes away when its last subscriber leaves
+    ps.unsubscribe(&c.sub, "news:tech");
+    assert(count(ps, "news:*") == 1); // only news:sport left
 }
