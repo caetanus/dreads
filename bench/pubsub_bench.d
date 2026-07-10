@@ -11,21 +11,16 @@ import std.stdio : writefln, writeln;
 import std.conv : to;
 import core.time : MonoTime;
 
-import dreads.pubsub : PubSub, Subscriber;
+import dreads.pubsub : PubSub, Subscriber, RcMsg, rcData;
 import dreads.commands : globMatch;
 
 __gshared ulong g_sink; // defeat dead-code elimination
 
-extern (C) void noopSink(void* ctx, scope const(ubyte)[] b) nothrow
-{
-    g_sink += b.length;
-}
-
 void main()
 {
-    static void sink(void* ctx, scope const(ubyte)[] b) nothrow
+    static void sink(void* ctx, RcMsg* m) nothrow
     {
-        g_sink += b.length;
+        g_sink += rcData(m).length;
     }
 
     immutable size_t[] Ns = [100, 1000, 10_000, 100_000];
@@ -71,5 +66,27 @@ void main()
         auto naiveNs = (MonoTime.currTime - t1).total!"nsecs" / cast(double) iters;
 
         writefln("%7d   %11.1f   %13.1f   %6.1fx", N, newNs, naiveNs, naiveNs / newNs);
+    }
+
+    // Delivery cost: exact-channel publish builds one shared RcMsg and fans it
+    // out. Isolates the frame alloc+build+deliver+free per publish (what a
+    // FreeList would touch). One alloc per publish regardless of fan-out K.
+    writeln("\n   fanoutK   deliver (ns/pub)");
+    foreach (K; [1, 8, 64])
+    {
+        auto subs = new Subscriber[](K);
+        PubSub ps;
+        foreach (i; 0 .. K)
+        {
+            subs[i].sink = &sink;
+            ps.subscribe(&subs[i], "room");
+        }
+        enum iters = 2_000_000;
+        g_sink = 0;
+        auto t0 = MonoTime.currTime;
+        foreach (it; 0 .. iters)
+            ps.publish("room", "hello world payload");
+        auto ns = (MonoTime.currTime - t0).total!"nsecs" / cast(double) iters;
+        writefln("%9d   %12.1f", K, ns);
     }
 }
