@@ -31,17 +31,21 @@ import dreads.resp : repArrayHeader, repBulk;
 /// plain counter. The frame bytes are stored inline after the header, so the
 /// whole message is one allocation.
 ///
-/// NOTE — there are now two refcount mechanisms in the tree: std.typecons
-/// SafeRefCounted (containers.d) and this RcMsg. This is deliberate, not an
-/// oversight. RcMsg is NOT reusing automem/SafeRefCounted because the lifecycle
-/// here is manual and cross-fiber — the publisher fiber stashes the pointer in a
-/// raw malloc'd ring and a different (writer) fiber releases it later. RAII
-/// value-refcounts (which retain on copy / release on scope exit) fight that
-/// pattern: they can't live in a raw ring without emplace/destroy gymnastics,
-/// and RefCounted!(Vector!ubyte) would be two allocations (control block + the
-/// vector's buffer) instead of the one inline allocation here. Manual
-/// retain/release maps 1:1 onto enqueue/drain. If a general refcount ever gets
-/// standardised for the malloc data plane, fold this into it.
+/// NOTE — this coexists with std.typecons SafeRefCounted (containers.d), and
+/// that is deliberate: automem/SafeRefCounted does not provide what this needs.
+/// Two grounded reasons (verified against automem's ref_counted.d):
+///   1. One allocation. RcMsg stores the frame bytes inline after the header,
+///      so a frame is a single malloc. automem RefCounted's Impl holds the
+///      payload inline too, but a variable-length payload (Vector!ubyte) keeps
+///      its buffer separately -> two allocations per frame. The frame alloc is
+///      ~3% of a publish (bench/rcalloc_bench.d: 7.4 ns malloc/free), so halving
+///      the alloc count matters more than swapping the allocator (a FreeList was
+///      measured 72% faster per op but only ~2% of a publish -> not worth it).
+///   2. Manual, cross-fiber lifetime. The publisher fiber stashes the pointer in
+///      a raw ring; a different writer fiber releases it later. RAII value-
+///      refcounts (retain-on-copy / release-on-scope) can't live in a raw ring
+///      without emplace/destroy gymnastics; manual retain/release maps 1:1 onto
+///      enqueue/drain. The refcount itself is three trivial lines.
 public struct RcMsg
 {
     uint refs;
