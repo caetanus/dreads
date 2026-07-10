@@ -114,10 +114,14 @@ void flushPendingNotify() nothrow
         {
             immutable cl = d[p] | (d[p + 1] << 8) | (d[p + 2] << 16) | (d[p + 3] << 24);
             p += 4;
+            if (p + cl + 4 > d.length) // truncated/corrupt frame: stop, don't over-slice
+                break;
             auto chan = cast(const(char)[]) d[p .. p + cl];
             p += cl;
             immutable ml = d[p] | (d[p + 1] << 8) | (d[p + 2] << 16) | (d[p + 3] << 24);
             p += 4;
+            if (p + ml > d.length)
+                break;
             auto msg = cast(const(char)[]) d[p .. p + ml];
             p += ml;
             gNotifyPublish(chan, msg);
