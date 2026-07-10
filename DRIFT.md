@@ -69,7 +69,15 @@ These exist but do not match Redis exactly:
   verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,
   `XADD *`) can drift on replay.
 - **Protocol**: RESP2 only — `HELLO 3` answers `NOPROTO`. No `AUTH`
-  passwords (no `requirepass` yet); no keyspace notifications.
+  passwords (no `requirepass` yet).
+- **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
+  e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work, but
+  only a subset of write commands is instrumented so far (SET, DEL, EXPIRE,
+  PERSIST, RENAME, LPUSH/RPUSH, HSET, SADD/SREM, ZADD/ZREM, and `expired`). The
+  rest (INCR/APPEND/GETSET/GETDEL, LPOP/RPOP/LSET/LREM, HDEL/HINCRBY, SPOP/S*STORE,
+  ZINCRBY/ZPOP*, COPY/MOVE, stream ops) do not fire events yet. Events fire only
+  on the standalone execution path (not yet on the Raft apply path), db is always
+  0, and `CONFIG SET notify-keyspace-events` is not wired (config-file only).
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
   `allkeys-lfu`/`volatile-ttl` policies not implemented.
