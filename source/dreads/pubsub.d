@@ -1147,6 +1147,123 @@ unittest // matching edge cases: anchor overlap, star-eats-empty, multi-star, '?
     assert(hits("x*", "x*y") == 1);
 }
 
+unittest // exact-channel SUBSCRIBE: matched by equality; metachars are literal
+{
+    PubSub ps;
+    FakeClient a, b, p;
+    a.init_();
+    b.init_();
+    p.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+        p.sub.free();
+    }
+    ps.subscribe(&a.sub, "foo:*"); // a channel literally NAMED "foo:*"
+    ps.subscribe(&b.sub, "foo:bar");
+
+    // exact channels match by equality — the name is never globbed
+    assert(ps.publish("foo:*", "x") == 1); // only a
+    assert(ps.publish("foo:bar", "x") == 1); // only b
+    assert(ps.publish("foo:baz", "x") == 0); // neither
+    assert(!ps.subscribe(&a.sub, "foo:*")); // dup on same sub
+
+    // an exact and a pattern subscriber both fire on one publish
+    ps.psubscribe(&p.sub, "foo:*"); // a real pattern
+    a.received.clear();
+    b.received.clear();
+    p.received.clear();
+    assert(ps.publish("foo:bar", "x") == 2); // b (exact) + p (pattern)
+    assert(b.got.length > 0 && p.got.length > 0);
+    assert(ps.publish("foo:*", "x") == 2); // a (exact "foo:*") + p (pattern matches)
+
+    // '?' in an exact channel name is literal too
+    ps.subscribe(&a.sub, "a?c");
+    assert(ps.publish("a?c", "y") == 1); // exact
+    assert(ps.publish("abc", "y") == 0); // not globbed
+
+    // PUBSUB CHANNELS lists exact-subscribed channels; pattern-only never appears
+    FakeClient q;
+    q.init_();
+    scope (exit)
+        q.sub.free();
+    ps.psubscribe(&q.sub, "ghost:*"); // pattern only -> no channel entry
+    size_t g;
+    ps.eachChannel("ghost:*", (ch, cnt) { g++; return 0; });
+    assert(g == 0);
+
+    // a channel leaves the index when its last exact subscriber unsubscribes
+    ps.unsubscribe(&a.sub, "foo:*");
+    size_t n;
+    ps.eachChannel("foo:*", (ch, cnt) { n++; return 0; }); // glob -> foo:bar only
+    assert(n == 1);
+}
+
+unittest // channel SubList dropped when the last subscriber leaves; shared stays
+{
+    PubSub ps;
+    FakeClient a, b;
+    a.init_();
+    b.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+    }
+    ps.subscribe(&a.sub, "room");
+    ps.subscribe(&b.sub, "room"); // two subscribers, one channel
+    ps.subscribe(&a.sub, "aonly");
+    assert(ps.channelSubCount("room") == 2);
+
+    // one of two leaves: the list survives, channel stays indexed
+    ps.unsubscribe(&a.sub, "room");
+    assert(ps.channelSubCount("room") == 1);
+    assert(ps.publish("room", "x") == 1);
+    size_t n;
+    ps.eachChannel("room", (ch, cnt) { n++; return 0; });
+    assert(n == 1);
+
+    // the last one leaves: list is dropped, channel gone from publish and index
+    ps.unsubscribe(&b.sub, "room");
+    assert(ps.channelSubCount("room") == 0);
+    assert(ps.publish("room", "x") == 0);
+    n = 0;
+    ps.eachChannel("room", (ch, cnt) { n++; return 0; });
+    assert(n == 0);
+}
+
+unittest // disconnect (dropAll): removes this sub everywhere; shared channels survive
+{
+    PubSub ps;
+    FakeClient a, b;
+    a.init_();
+    b.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+    }
+    ps.subscribe(&a.sub, "shared");
+    ps.subscribe(&b.sub, "shared"); // b is also on "shared"
+    ps.subscribe(&a.sub, "aonly");
+    ps.psubscribe(&a.sub, "a:*");
+    ps.psubscribe(&b.sub, "b:*");
+
+    ps.dropAll(&a.sub); // a disconnects
+
+    assert(a.sub.subCount == 0);
+    assert(ps.channelSubCount("aonly") == 0); // a's exclusive channel is gone
+    assert(ps.channelSubCount("shared") == 1); // shared survives (b remains)
+    assert(ps.publish("shared", "x") == 1); // delivered to b
+    size_t n;
+    ps.eachChannel(null, (ch, cnt) { n++; return 0; });
+    assert(n == 1); // only "shared" is still indexed
+    assert(ps.publish("a:x", "x") == 0); // a's pattern gone
+    assert(ps.publish("b:x", "x") == 1); // b's pattern remains
+    assert(ps.patternCount == 1);
+}
+
 unittest // complex interleaved metachars: foo:*:bar:?:num:*:baz
 {
     static size_t hits(scope const(char)[] pat, scope const(char)[] chan)
