@@ -387,6 +387,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             ks.setStr(args[0].str, args[2].str);
             auto obj = ks.lookup(args[0].str);
             obj.expireAtMs = cast(ulong) absMs;
+            notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             propagateSet(args[0].str, args[2].str, obj.expireAtMs);
             repSimple(o, "OK");
             break;
@@ -468,6 +469,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             repBulk(o, obj.str.s);
             ks.del(args[0].str);
+            notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
             break;
         }
     case "SETNX":
@@ -482,6 +484,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
             {
                 ks.setStr(args[0].str, args[1].str);
+                notifyKeyspaceEvent(NClass.str, "set", args[0].str);
                 repInt(o, 1);
             }
             break;
@@ -522,6 +525,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
                 repBulk(o, obj.str.s);
             ks.setStr(args[0].str, args[1].str);
+            notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             break;
         }
     case "APPEND":
@@ -553,6 +557,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 obj.str.s = mallocAppend(obj.str.s, args[1].str);
                 repInt(o, cast(long) obj.str.s.length);
             }
+            notifyKeyspaceEvent(NClass.str, "append", args[0].str);
             break;
         }
     case "STRLEN":
@@ -575,7 +580,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (args.length != 1)
                 arityErr(o, "incr");
             else
-                incrDecr(ks, args[0].str, 1, o);
+                incrDecr(ks, args[0].str, 1, "incrby", o);
             break;
         }
     case "DECR":
@@ -583,7 +588,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (args.length != 1)
                 arityErr(o, "decr");
             else
-                incrDecr(ks, args[0].str, -1, o);
+                incrDecr(ks, args[0].str, -1, "decrby", o);
             break;
         }
     case "INCRBY":
@@ -600,7 +605,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR value is not an integer or out of range");
                 break;
             }
-            incrDecr(ks, args[0].str, nbuf[0] == 'I' ? delta : -delta, o);
+            incrDecr(ks, args[0].str, nbuf[0] == 'I' ? delta : -delta,
+                    nbuf[0] == 'I' ? "incrby" : "decrby", o);
             break;
         }
     case "MSET":
@@ -611,7 +617,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             for (size_t i = 0; i < args.length; i += 2)
+            {
                 ks.setStr(args[i].str, args[i + 1].str);
+                notifyKeyspaceEvent(NClass.str, "set", args[i].str);
+            }
             repSimple(o, "OK");
             break;
         }
@@ -764,7 +773,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else if (obj is null)
                 repError(o, "ERR no such key");
             else if (obj.list.setAt(idx, args[2].str))
+            {
+                notifyKeyspaceEvent(NClass.list, "lset", args[0].str);
                 repSimple(o, "OK");
+            }
             else
                 repError(o, "ERR index out of range");
             break;
@@ -795,6 +807,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto removed = obj.list.remove(rcount, args[2].str);
+            if (removed > 0)
+                notifyKeyspaceEvent(NClass.list, "lrem", args[0].str);
             ks.delIfEmpty(args[0].str, obj);
             repInt(o, removed);
             break;
@@ -890,6 +904,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long n = 0;
             foreach (ref a; args[1 .. $])
                 n += obj.hash.del(a.str) ? 1 : 0;
+            if (n > 0)
+                notifyKeyspaceEvent(NClass.hash, "hdel", args[0].str);
             ks.delIfEmpty(args[0].str, obj);
             repInt(o, n);
             break;
@@ -993,6 +1009,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             char[24] buf = void;
             auto blen = snprintf(buf.ptr, buf.length, "%lld", nv);
             obj.hash.set(args[1].str, StrVal.of(buf[0 .. blen]));
+            notifyKeyspaceEvent(NClass.hash, "hincrby", args[0].str);
             repInt(o, nv);
             break;
         }
@@ -1220,6 +1237,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             double cur = 0;
             obj.zset.score(args[2].str, cur);
             obj.zset.add(cur + delta, args[2].str);
+            notifyKeyspaceEvent(NClass.zset, "zincr", args[0].str);
             repDouble(o, cur + delta);
             break;
         }
@@ -1489,6 +1507,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 obj.str.s.freeSlice;
                 obj.str.s = buf.mallocDup;
             }
+            notifyKeyspaceEvent(NClass.str, "setrange", args[0].str);
             repInt(o, cast(long) newLen);
             break;
         }
@@ -1536,6 +1555,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 obj.str.s.freeSlice;
                 obj.str.s = res.mallocDup;
             }
+            notifyKeyspaceEvent(NClass.str, "incrbyfloat", args[0].str);
             repBulk(o, res);
             // float math is logged as its result, never re-derived
             propagateSet(args[0].str, res, keptTtl);
@@ -1679,6 +1699,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
             {
                 obj.hash.set(args[1].str, StrVal.of(args[2].str));
+                notifyKeyspaceEvent(NClass.hash, "hset", args[0].str);
                 repInt(o, 1);
             }
             break;
@@ -1734,9 +1755,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             src.set.del(args[2].str);
+            notifyKeyspaceEvent(NClass.set, "srem", args[0].str);
             bool w3;
             auto dst = ks.getOrCreate(args[1].str, ObjType.set, w3); // may rehash: src is stale now
             dst.set.set(args[2].str, Unit());
+            notifyKeyspaceEvent(NClass.set, "sadd", args[1].str);
             auto src2 = ks.lookup(args[0].str);
             if (src2 !is null)
                 ks.delIfEmpty(args[0].str, src2);
@@ -2676,7 +2699,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
 // Command helpers
 // ---------------------------------------------------------------------------
 
-private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta, ref ByteBuffer o) @nogc nothrow
+private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
+        scope const(char)[] event, ref ByteBuffer o) @nogc nothrow
 {
     bool wrong;
     auto obj = ks.lookupTyped(key, ObjType.str, wrong);
@@ -2701,6 +2725,7 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta, ref 
     char[24] buf = void;
     auto n = snprintf(buf.ptr, buf.length, "%lld", nv);
     ks.setStr(key, buf[0 .. n]);
+    notifyKeyspaceEvent(NClass.str, event, key);
     repInt(o, nv);
 }
 
@@ -2744,6 +2769,8 @@ private void listPop(ref Keyspace ks, const(RVal)[] args, bool fromHead, ref Byt
         else
             obj.list.popBack();
     }
+    if (n > 0)
+        notifyKeyspaceEvent(NClass.list, fromHead ? "lpop" : "rpop", args[0].str);
     ks.delIfEmpty(args[0].str, obj);
 }
 
@@ -2846,6 +2873,8 @@ private void spop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Are
         repBulk(propagationOverride, m);
         obj.set.del(m);
     }
+    if (n > 0)
+        notifyKeyspaceEvent(NClass.set, "spop", args[0].str);
     ks.delIfEmpty(args[0].str, obj);
 }
 
@@ -3089,6 +3118,8 @@ private void zpop(ref Keyspace ks, const(RVal)[] args, bool popMax,
         });
         obj.zset.remove(victim);
     }
+    if (n > 0)
+        notifyKeyspaceEvent(NClass.zset, popMax ? "zpopmax" : "zpopmin", args[0].str);
     if (obj !is null)
         ks.delIfEmpty(args[0].str, obj);
 }

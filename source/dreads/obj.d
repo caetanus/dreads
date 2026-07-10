@@ -256,7 +256,10 @@ public struct Keyspace
     void delIfEmpty(scope const(char)[] k, const(RObj)* o) @nogc nothrow
     {
         if (o.type != ObjType.str && o.type != ObjType.stream && o.containerLen == 0)
+        {
             d.del(k);
+            notifyKeyspaceEvent(NClass.generic, "del", k); // emptied container is removed
+        }
     }
 
     void clear() @nogc nothrow
