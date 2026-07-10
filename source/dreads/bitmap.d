@@ -488,10 +488,15 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         bool signed;
         uint width;
         ulong off;
-        if (!parseFieldType(args[i + 1].str, signed, width)
-                || !parseFieldOffset(args[i + 2].str, width, off))
+        if (!parseFieldType(args[i + 1].str, signed, width))
         {
-            repError(o, "ERR Invalid bitfield type or offset");
+            repError(o, "ERR Invalid bitfield type. Use something like i16 u8." ~
+                    " Note that u64 is not supported but i64 is.");
+            return;
+        }
+        if (!parseFieldOffset(args[i + 2].str, width, off))
+        {
+            repError(o, "ERR bit offset is not an integer or out of range");
             return;
         }
         long val;

@@ -239,7 +239,7 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
         }
         return;
     }
-    repError(o, "ERR Unknown XINFO subcommand");
+    repUnknownSubcommand(o, "XINFO", args.length ? args[0].str : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repInt(o, removed);
         return;
     }
-    repError(o, "ERR Unknown XGROUP subcommand");
+    repUnknownSubcommand(o, "XGROUP", sub);
 }
 
 /// XREADGROUP GROUP g c [COUNT n] [NOACK] STREAMS key [key...] id [id...]

@@ -2295,7 +2295,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else if (args.length >= 1 && eqICKeyword(args[0].str, "CAT"))
                 repArrayHeader(o, 0);
             else
-                repError(o, "ERR Unknown ACL subcommand");
+                repUnknownSubcommand(o, "ACL", args.length ? args[0].str : "");
             break;
         }
 
@@ -3600,7 +3600,7 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         repInt(o, cast(long) ks.length);
         return;
     }
-    repError(o, "ERR Unknown MEMORY subcommand");
+    repUnknownSubcommand(o, "MEMORY", args.length ? args[0].str : "");
 }
 
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
@@ -3654,7 +3654,7 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     else if (eqICKeyword(sub, "FREQ"))
         repError(o, "ERR An LFU maxmemory policy is not selected, access frequency not tracked");
     else
-        repError(o, "ERR Unknown OBJECT subcommand");
+        repUnknownSubcommand(o, "OBJECT", sub);
 }
 
 // ---------------------------------------------------------------------------

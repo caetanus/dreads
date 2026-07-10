@@ -539,7 +539,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     {
         if (args[0].str.length != 40)
         {
-            repError(o, "NOSCRIPT No matching script. Please use EVAL.");
+            repError(o, "NOSCRIPT No matching script.");
             return;
         }
         foreach (i, c; args[0].str)
@@ -547,7 +547,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         auto cached = gScripts.get(sha[]);
         if (cached is null)
         {
-            repError(o, "NOSCRIPT No matching script. Please use EVAL.");
+            repError(o, "NOSCRIPT No matching script.");
             return;
         }
         body_ = cached.s;
@@ -695,7 +695,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
     char[8] sbuf = void;
     if (sub.length > sbuf.length)
     {
-        repError(o, "ERR Unknown SCRIPT subcommand");
+        repUnknownSubcommand(o, "SCRIPT", sub);
         return;
     }
     foreach (i, c; sub)
@@ -758,7 +758,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
             return;
         }
     default:
-        repError(o, "ERR Unknown SCRIPT subcommand");
+        repUnknownSubcommand(o, "SCRIPT", sub);
     }
 }
 

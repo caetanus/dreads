@@ -410,7 +410,7 @@ public void lcs(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena
     auto o2 = ks.lookupTyped(args[1].str, ObjType.str, w2);
     if (w1 || w2)
     {
-        repError(o, "WRONGTYPE The specified keys must contain string values");
+        repError(o, "ERR The specified keys must contain string values");
         return;
     }
     auto a = o1 is null ? "" : o1.str.s;

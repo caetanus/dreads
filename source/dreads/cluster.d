@@ -147,7 +147,7 @@ bool clusterCommand(scope const(RVal)[] args, ref ByteBuffer o) nothrow
     auto sub = args[1].str;
     if (sub.length > ub.length)
     {
-        o.append("-ERR Unknown CLUSTER subcommand\r\n");
+        repUnknownSubcommand(o, "CLUSTER", sub);
         return true;
     }
     foreach (i, c; sub)
@@ -212,7 +212,7 @@ bool clusterCommand(scope const(RVal)[] args, ref ByteBuffer o) nothrow
         o.append("+OK\r\n");
         return true;
     default:
-        o.append("-ERR Unknown CLUSTER subcommand or wrong number of arguments\r\n");
+        repUnknownSubcommand(o, "CLUSTER", sub);
         return true;
     }
 }

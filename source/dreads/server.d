@@ -1284,7 +1284,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         repSimple(o, "OK");
         return;
     }
-    repError(o, "ERR Unknown CONFIG subcommand");
+    repUnknownSubcommand(o, "CONFIG", args.length ? args[0].str : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,7 +1764,7 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
     else
-        repError(o, "ERR Unknown CLIENT subcommand");
+        repUnknownSubcommand(o, "CLIENT", sub);
 }
 
 private bool eqICDebug(scope const(char)[] s, scope const(char)[] upper) @nogc nothrow
@@ -1804,7 +1804,7 @@ private void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
     char[16] sbuf = void;
     if (sub.length > sbuf.length)
     {
-        repError(o, "ERR Unknown PUBSUB subcommand");
+        repUnknownSubcommand(o, "PUBSUB", sub);
         return;
     }
     foreach (i, ch; sub)
@@ -1856,6 +1856,6 @@ private void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
             break;
         }
     default:
-        repError(o, "ERR Unknown PUBSUB subcommand");
+        repUnknownSubcommand(o, "PUBSUB", sub);
     }
 }

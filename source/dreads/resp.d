@@ -219,6 +219,20 @@ public void repNullBulk(ref ByteBuffer o) @nogc nothrow
     o.append("$-1\r\n");
 }
 
+/// Valkey's canonical container-command error: names the offending subcommand
+/// and points at HELP. `parent` is the UPPERCASE command name (e.g. "CLIENT"),
+/// `sub` is the subcommand token as the client typed it (truncated to 128, as
+/// Valkey does with %.128s). See THIRD_PARTY_NOTICES.md.
+public void repUnknownSubcommand(ref ByteBuffer o, scope const(char)[] parent,
+        scope const(char)[] sub) @nogc nothrow
+{
+    o.append("-ERR unknown subcommand or wrong number of arguments for '");
+    o.append(sub.length > 128 ? sub[0 .. 128] : sub);
+    o.append("'. Try ");
+    o.append(parent);
+    o.append(" HELP.\r\n");
+}
+
 public void repArrayHeader(ref ByteBuffer o, size_t n) @nogc nothrow
 {
     o.appendByte('*');
