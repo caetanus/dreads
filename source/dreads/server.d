@@ -3,19 +3,25 @@ module dreads.server;
 // TCP front-end on vibe-core (fiber per connection, single-threaded event
 // loop) feeding the @nogc data plane: ByteBuffer I/O staging, zero-copy RESP
 // parsing with a per-connection Arena, and command dispatch against the typed
-// keyspace. Pub/sub pushes are written by the publisher's fiber directly to
-// the subscriber's socket, serialized by a per-connection write mutex.
+// keyspace. Non-subscriber connections write replies synchronously (the hot
+// path). Once a connection subscribes it flips to an async output queue drained
+// by a dedicated writer fiber: the publisher never blocks on a slow subscriber's
+// socket, output stays ordered (replies and messages share the one queue), and
+// the bounded queue drops on overflow (pub/sub is fire-and-forget). See PUBSUB.md.
 // vibe-core owns only the socket lifecycle; nothing here allocates on the GC
 // heap per request (the mutex and TCPConnection are one-time per connection).
 
 import core.stdc.stdio : printf;
+import core.stdc.stdlib : malloc, cfree = free;
+import core.stdc.string : memcpy;
 
 import core.time : seconds;
 
-import vibe.core.core : runEventLoop, setTimer;
+import vibe.core.core : runEventLoop, runTask, setTimer;
 import vibe.core.net : TCPConnection, listenTCP, TCPListenOptions;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
+import vibe.core.task : Task;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
@@ -168,6 +174,14 @@ private struct Conn
     void*[PIPELINE_CAP] pendingWrites;
     size_t pendingCount;
     bool inExec;
+    // Async output, engaged on first (P)SUBSCRIBE (see PUBSUB.md fan-out): once
+    // `subMode` is set, all output (replies and pub/sub messages) is enqueued on
+    // `oq` and drained by the `oqWriter` fiber, so the publisher never blocks.
+    bool subMode;
+    OutQueue oq;
+    LocalManualEvent oqEvt;
+    Task oqWriter;
+    bool oqClosing;
 
     @property size_t totalSubs() const @nogc nothrow
     {
@@ -175,21 +189,139 @@ private struct Conn
     }
 }
 
-/// Pub/sub delivery sink: runs on the *publisher's* fiber, so it must take
-/// the target connection's write lock to avoid interleaving with its replies.
-private void connSink(void* ctx, scope const(ubyte)[] bytes) nothrow
+private enum OUTQ_CAP = 4096; // buffered messages before a slow subscriber drops
+
+// Bounded ring of malloc'd output frames for a subscriber connection. Single
+// event-loop thread, so no locking: the request/publisher fibers push, the
+// writer fiber pops; neither yields between the index updates.
+private struct OutQueue
 {
-    auto c = cast(Conn*) ctx;
+    private static struct Buf
+    {
+        ubyte* p;
+        uint len;
+    }
+
+    private Buf* ring;
+    private size_t cap, head, tail, count;
+    ulong dropped;
+
+    void setup(size_t capacity) @nogc nothrow
+    {
+        cap = capacity;
+        ring = cast(Buf*) malloc(cap * Buf.sizeof);
+        assert(ring !is null, "out of memory");
+        head = tail = count = 0;
+    }
+
+    /// Copy-enqueue; returns false (and counts a drop) when full.
+    bool push(scope const(ubyte)[] bytes) @nogc nothrow
+    {
+        if (count == cap)
+        {
+            dropped++;
+            return false;
+        }
+        auto p = cast(ubyte*) malloc(bytes.length ? bytes.length : 1);
+        assert(p !is null, "out of memory");
+        if (bytes.length)
+            memcpy(p, bytes.ptr, bytes.length);
+        ring[tail] = Buf(p, cast(uint) bytes.length);
+        tail = (tail + 1) % cap;
+        count++;
+        return true;
+    }
+
+    bool pop(out Buf b) @nogc nothrow
+    {
+        if (count == 0)
+            return false;
+        b = ring[head];
+        head = (head + 1) % cap;
+        count--;
+        return true;
+    }
+
+    void free() @nogc nothrow
+    {
+        Buf b;
+        while (pop(b))
+            cfree(b.p);
+        if (ring !is null)
+            cfree(ring);
+        ring = null;
+        cap = head = tail = count = 0;
+    }
+}
+
+// Drains a subscriber connection's output queue to its socket. The only writer
+// of that socket once subMode is on, so writes stay ordered without a lock.
+private void oqWriterLoop(Conn* c) nothrow
+{
     try
     {
-        c.wlock.lock();
-        scope (exit)
-            c.wlock.unlock();
-        c.tcp.write(bytes);
+        while (true)
+        {
+            immutable ec = c.oqEvt.emitCount;
+            OutQueue.Buf b;
+            while (c.oq.pop(b))
+            {
+                try
+                {
+                    if (c.tcp.connected)
+                        c.tcp.write(b.p[0 .. b.len]);
+                }
+                catch (Exception)
+                {
+                }
+                cfree(b.p);
+            }
+            if (c.oqClosing)
+                break;
+            c.oqEvt.wait(ec); // returns immediately if an emit raced the drain
+        }
     }
     catch (Exception)
     {
     }
+}
+
+// Flip a connection to async output on its first subscription.
+private void enterSubMode(ref Conn c) nothrow
+{
+    if (c.subMode)
+        return;
+    c.subMode = true;
+    c.oq.setup(OUTQ_CAP);
+    c.oqEvt = createManualEvent();
+    c.oqWriter = runTask(&oqWriterLoop, &c);
+}
+
+// Stop the writer fiber and free the queue at connection teardown. A plain
+// nothrow function because scope(exit) may not contain a catch.
+private void shutdownOutput(ref Conn c) nothrow
+{
+    if (!c.subMode)
+        return;
+    c.oqClosing = true;
+    c.oqEvt.emit();
+    try
+        c.oqWriter.join();
+    catch (Exception)
+    {
+    }
+    c.oq.free();
+}
+
+/// Pub/sub delivery sink: runs on the *publisher's* fiber. It only enqueues on
+/// the target's output queue (never touches the socket), so a slow subscriber
+/// can never stall the publisher; the subscriber's writer fiber does the write.
+/// A subscribed connection is always in subMode, so its queue is live here.
+private void connSink(void* ctx, scope const(ubyte)[] bytes) nothrow
+{
+    auto c = cast(Conn*) ctx;
+    if (c.subMode && c.oq.push(bytes))
+        c.oqEvt.emit();
 }
 
 private void serveClient(TCPConnection tcp) nothrow
@@ -206,8 +338,9 @@ private void serveClient(TCPConnection tcp) nothrow
     c.shardSub.sink = &connSink;
     scope (exit)
     {
-        gPubSub.dropAll(&c.sub);
+        gPubSub.dropAll(&c.sub); // no further connSink after this
         gShardPubSub.dropAll(&c.shardSub);
+        shutdownOutput(c);
         c.sub.free();
         c.shardSub.free();
         unregisterMonitor(&c);
@@ -256,10 +389,20 @@ private void serveClient(TCPConnection tcp) nothrow
 
             if (!outb.empty)
             {
-                c.wlock.lock();
-                scope (exit)
-                    c.wlock.unlock();
-                tcp.write(outb.data);
+                if (c.subMode)
+                {
+                    // Share the one ordered output path with pub/sub messages so
+                    // a subscribe confirmation can never trail a later message.
+                    if (c.oq.push(outb.data))
+                        c.oqEvt.emit();
+                }
+                else
+                {
+                    c.wlock.lock();
+                    scope (exit)
+                        c.wlock.unlock();
+                    tcp.write(outb.data);
+                }
                 outb.clear();
             }
         }
@@ -490,6 +633,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'ssubscribe' command");
                 return true;
             }
+            enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
                 gShardPubSub.subscribe(&c.shardSub, a.str);
@@ -649,6 +793,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                         : "ERR wrong number of arguments for 'subscribe' command");
                 return true;
             }
+            enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
                 if (pattern)
