@@ -81,6 +81,19 @@ public void rcRelease(RcMsg* m) @nogc nothrow
         cfree(m);
 }
 
+/// RESP3 subscribers receive pub/sub frames as a Push (`>`) rather than an
+/// Array (`*`); the frame is otherwise byte-identical, so clone and patch the
+/// leading type byte. Returns a fresh frame (refs=1) owned by the caller. Only
+/// the (typically fewer) RESP3 subscribers pay this copy — RESP2 subscribers
+/// keep sharing the one encode-once frame.
+public RcMsg* rcAsPush(const(RcMsg)* m) @nogc nothrow
+{
+    auto n = rcFromBytes(rcData(m));
+    if (n.len > 0)
+        (cast(ubyte*)(n + 1))[0] = '>';
+    return n;
+}
+
 /// One connected client from the registry's point of view.
 public struct Subscriber
 {

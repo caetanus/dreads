@@ -28,7 +28,7 @@ import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.obj : Keyspace;
-import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease;
+import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
 import dreads.scripting : cachedScript, evalCommand, scriptCommand;
@@ -323,7 +323,18 @@ private void shutdownOutput(ref Conn c) nothrow
 private void connSink(void* ctx, RcMsg* msg) nothrow
 {
     auto c = cast(Conn*) ctx;
-    if (c.subMode && c.oq.push(msg)) // push retains; publisher owns the release
+    if (!c.subMode)
+        return;
+    if (c.resp3)
+    {
+        // RESP3 wants Push framing; hand the queue our own reframed copy.
+        auto pm = rcAsPush(msg);
+        if (c.oq.push(pm)) // push retains -> queue holds a ref
+            c.oqEvt.emit();
+        rcRelease(pm); // drop our ref: queue owns it, or it's freed if unqueued
+        return;
+    }
+    if (c.oq.push(msg)) // push retains; publisher owns the release
         c.oqEvt.emit();
 }
 
@@ -1815,7 +1826,7 @@ private bool eqICDebug(scope const(char)[] s, scope const(char)[] upper) @nogc n
 private void subReply(ref ByteBuffer o, scope const(char)[] verb,
         scope const(char)[] channel, size_t count) @nogc nothrow
 {
-    repArrayHeader(o, 3);
+    repPushHeader(o, 3); // RESP3 delivers (un)subscribe confirmations as pushes
     repBulk(o, verb);
     if (channel is null)
         repNullBulk(o);
