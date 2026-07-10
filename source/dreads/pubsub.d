@@ -670,6 +670,22 @@ unittest // header discriminates: nested and sibling headers each fire once
     assert(ps.publish("bard", "x") == 1);
 }
 
+unittest // multiple distinct-header patterns on ONE subscriber all match
+{
+    PubSub ps;
+    FakeClient p;
+    p.init_();
+    scope (exit)
+        p.sub.free();
+    assert(ps.psubscribe(&p.sub, "a:*"));
+    assert(ps.psubscribe(&p.sub, "b:*"));
+    assert(ps.psubscribe(&p.sub, "c:*"));
+    assert(ps.patternCount == 3);
+    assert(ps.publish("a:1", "x") == 1); // each header must still be found
+    assert(ps.publish("b:1", "x") == 1);
+    assert(ps.publish("c:1", "x") == 1);
+}
+
 unittest // suffix, general and match-all live in the fallback
 {
     PubSub ps;
