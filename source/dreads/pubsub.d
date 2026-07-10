@@ -26,11 +26,61 @@ import dreads.dict : Dict, Unit;
 import dreads.mem : ByteBuffer;
 import dreads.resp : repArrayHeader, repBulk;
 
+/// Refcounted message frame: encode once, share across every matched subscriber
+/// (no per-subscriber copy). The event loop is single-threaded, so `refs` is a
+/// plain counter. The frame bytes are stored inline after the header, so the
+/// whole message is one allocation.
+///
+/// NOTE — there are now two refcount mechanisms in the tree: std.typecons
+/// SafeRefCounted (containers.d) and this RcMsg. This is deliberate, not an
+/// oversight. RcMsg is NOT reusing automem/SafeRefCounted because the lifecycle
+/// here is manual and cross-fiber — the publisher fiber stashes the pointer in a
+/// raw malloc'd ring and a different (writer) fiber releases it later. RAII
+/// value-refcounts (which retain on copy / release on scope exit) fight that
+/// pattern: they can't live in a raw ring without emplace/destroy gymnastics,
+/// and RefCounted!(Vector!ubyte) would be two allocations (control block + the
+/// vector's buffer) instead of the one inline allocation here. Manual
+/// retain/release maps 1:1 onto enqueue/drain. If a general refcount ever gets
+/// standardised for the malloc data plane, fold this into it.
+public struct RcMsg
+{
+    uint refs;
+    uint len;
+}
+
+/// Build a refcounted frame from staged bytes (refs starts at 1: the caller's).
+public RcMsg* rcFromBytes(scope const(ubyte)[] bytes) @nogc nothrow
+{
+    auto m = cast(RcMsg*) malloc(RcMsg.sizeof + (bytes.length ? bytes.length : 1));
+    assert(m !is null, "out of memory");
+    m.refs = 1;
+    m.len = cast(uint) bytes.length;
+    if (bytes.length)
+        memcpy(cast(ubyte*)(m + 1), bytes.ptr, bytes.length);
+    return m;
+}
+
+public const(ubyte)[] rcData(const(RcMsg)* m) @nogc nothrow
+{
+    return (cast(const(ubyte)*)(m + 1))[0 .. m.len];
+}
+
+public void rcRetain(RcMsg* m) @nogc nothrow
+{
+    m.refs++;
+}
+
+public void rcRelease(RcMsg* m) @nogc nothrow
+{
+    if (--m.refs == 0)
+        cfree(m);
+}
+
 /// One connected client from the registry's point of view.
 public struct Subscriber
 {
     void* ctx;
-    void function(void* ctx, scope const(ubyte)[] bytes) nothrow sink;
+    void function(void* ctx, RcMsg* msg) nothrow sink;
     Dict!Unit channels;
     Dict!Unit patterns;
 
@@ -372,7 +422,9 @@ public struct PubSub
         repBulk(scratch, pat);
         repBulk(scratch, channel);
         repBulk(scratch, payload);
-        s.sink(s.ctx, scratch.data);
+        auto m = rcFromBytes(scratch.data);
+        s.sink(s.ctx, m);
+        rcRelease(m);
     }
 
     /// Delivers to channel and pattern subscribers; returns the receiver count.
@@ -389,12 +441,14 @@ public struct PubSub
             repBulk(scratch, verb);
             repBulk(scratch, channel);
             repBulk(scratch, payload);
+            auto m = rcFromBytes(scratch.data); // encode once, share across subscribers
             foreach (i; 0 .. list.len)
             {
                 auto s = list.items[i];
-                s.sink(s.ctx, scratch.data);
+                s.sink(s.ctx, m);
                 receivers++;
             }
+            rcRelease(m); // drop the publisher's reference; sinks retained their own
         }
 
         // Header-indexed patterns: probe only the channel's own prefixes.
@@ -489,9 +543,9 @@ version (unittest)
         Subscriber sub;
         ByteBuffer received;
 
-        static void sinkFn(void* ctx, scope const(ubyte)[] bytes) nothrow
+        static void sinkFn(void* ctx, RcMsg* m) nothrow
         {
-            (cast(FakeClient*) ctx).received.append(bytes);
+            (cast(FakeClient*) ctx).received.append(rcData(m));
         }
 
         void init_()

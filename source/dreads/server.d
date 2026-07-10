@@ -13,7 +13,6 @@ module dreads.server;
 
 import core.stdc.stdio : printf;
 import core.stdc.stdlib : malloc, cfree = free;
-import core.stdc.string : memcpy;
 
 import core.time : seconds;
 
@@ -28,7 +27,7 @@ import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverrid
 import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.obj : Keyspace;
-import dreads.pubsub : PubSub, Subscriber;
+import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease;
 import dreads.replicator : gReplicator;
 import dreads.resp;
 import dreads.scripting : cachedScript, evalCommand, scriptCommand;
@@ -191,52 +190,46 @@ private struct Conn
 
 private enum OUTQ_CAP = 4096; // buffered messages before a slow subscriber drops
 
-// Bounded ring of malloc'd output frames for a subscriber connection. Single
+// Bounded ring of refcounted output frames for a subscriber connection. Single
 // event-loop thread, so no locking: the request/publisher fibers push, the
-// writer fiber pops; neither yields between the index updates.
+// writer fiber pops; neither yields between the index updates. The ring holds a
+// reference per slot (push retains, pop's consumer releases), so the shared
+// frame outlives every subscriber's queue without a per-subscriber copy.
 private struct OutQueue
 {
-    private static struct Buf
-    {
-        ubyte* p;
-        uint len;
-    }
-
-    private Buf* ring;
+    private RcMsg** ring;
     private size_t cap, head, tail, count;
     ulong dropped;
 
     void setup(size_t capacity) @nogc nothrow
     {
         cap = capacity;
-        ring = cast(Buf*) malloc(cap * Buf.sizeof);
+        ring = cast(RcMsg**) malloc(cap * (RcMsg*).sizeof);
         assert(ring !is null, "out of memory");
         head = tail = count = 0;
     }
 
-    /// Copy-enqueue; returns false (and counts a drop) when full.
-    bool push(scope const(ubyte)[] bytes) @nogc nothrow
+    /// Enqueue a reference to the shared frame; returns false (and counts a
+    /// drop) when full. Retains on success.
+    bool push(RcMsg* m) @nogc nothrow
     {
         if (count == cap)
         {
             dropped++;
             return false;
         }
-        auto p = cast(ubyte*) malloc(bytes.length ? bytes.length : 1);
-        assert(p !is null, "out of memory");
-        if (bytes.length)
-            memcpy(p, bytes.ptr, bytes.length);
-        ring[tail] = Buf(p, cast(uint) bytes.length);
+        rcRetain(m);
+        ring[tail] = m;
         tail = (tail + 1) % cap;
         count++;
         return true;
     }
 
-    bool pop(out Buf b) @nogc nothrow
+    bool pop(out RcMsg* m) @nogc nothrow
     {
         if (count == 0)
             return false;
-        b = ring[head];
+        m = ring[head];
         head = (head + 1) % cap;
         count--;
         return true;
@@ -244,9 +237,9 @@ private struct OutQueue
 
     void free() @nogc nothrow
     {
-        Buf b;
-        while (pop(b))
-            cfree(b.p);
+        RcMsg* m;
+        while (pop(m))
+            rcRelease(m);
         if (ring !is null)
             cfree(ring);
         ring = null;
@@ -263,18 +256,18 @@ private void oqWriterLoop(Conn* c) nothrow
         while (true)
         {
             immutable ec = c.oqEvt.emitCount;
-            OutQueue.Buf b;
-            while (c.oq.pop(b))
+            RcMsg* m;
+            while (c.oq.pop(m))
             {
                 try
                 {
                     if (c.tcp.connected)
-                        c.tcp.write(b.p[0 .. b.len]);
+                        c.tcp.write(rcData(m));
                 }
                 catch (Exception)
                 {
                 }
-                cfree(b.p);
+                rcRelease(m);
             }
             if (c.oqClosing)
                 break;
@@ -317,10 +310,10 @@ private void shutdownOutput(ref Conn c) nothrow
 /// the target's output queue (never touches the socket), so a slow subscriber
 /// can never stall the publisher; the subscriber's writer fiber does the write.
 /// A subscribed connection is always in subMode, so its queue is live here.
-private void connSink(void* ctx, scope const(ubyte)[] bytes) nothrow
+private void connSink(void* ctx, RcMsg* msg) nothrow
 {
     auto c = cast(Conn*) ctx;
-    if (c.subMode && c.oq.push(bytes))
+    if (c.subMode && c.oq.push(msg)) // push retains; publisher owns the release
         c.oqEvt.emit();
 }
 
@@ -393,8 +386,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 {
                     // Share the one ordered output path with pub/sub messages so
                     // a subscribe confirmation can never trail a later message.
-                    if (c.oq.push(outb.data))
+                    auto m = rcFromBytes(outb.data);
+                    if (c.oq.push(m))
                         c.oqEvt.emit();
+                    rcRelease(m); // push retained; drop our creating reference
                 }
                 else
                 {
@@ -883,6 +878,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             if (gMonitorCount < gMonitors.length)
             {
+                enterSubMode(c); // monitors receive an async stream, like subscribers
                 gMonitors[gMonitorCount++] = &c;
                 repSimple(o, "OK");
             }
@@ -1706,11 +1702,13 @@ private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
         line.appendByte('"');
     }
     line.append("\r\n");
+    auto m = rcFromBytes(line.data); // encode once, share across monitors
     foreach (i; 0 .. gMonitorCount)
     {
         if (gMonitors[i] !is &from)
-            connSink(cast(void*) gMonitors[i], line.data);
+            connSink(cast(void*) gMonitors[i], m);
     }
+    rcRelease(m);
 }
 
 /// CLIENT GETNAME/SETNAME/ID/INFO/NO-EVICT/NO-TOUCH/LIST (minimal).
