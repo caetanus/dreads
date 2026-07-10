@@ -20,11 +20,43 @@ import core.lifetime : forward, move, moveEmplace;
 import core.stdc.stdio : snprintf;
 import core.stdc.stdlib : realloc, free;
 
+import std.experimental.allocator.mallocator : Mallocator;
+
 import dreads.smartptr : Uniq;
 import dreads.mem : ByteBuffer;
 
-/// A reply-tree node, uniquely owned by its parent.
-alias RV = Uniq!RVariant;
+/// A pool for reply-tree nodes: an intrusive free list of fixed-size blocks
+/// (every RVariant node is the same size). Freeing a node returns it to the
+/// list instead of the OS, so the next reply reuses it — the benchmark showed
+/// this is ~10-16x cheaper per node than malloc, taking the oracle from ~1.5x
+/// to ~1.25x of direct emit. Single event-loop thread, so a plain __gshared
+/// list is race-free (same model as the deferred notify queue).
+struct NodePool
+{
+    private __gshared void* freeHead;
+    __gshared NodePool instance;
+
+    void[] allocate(size_t n) @nogc nothrow @trusted
+    {
+        if (freeHead !is null)
+        {
+            auto p = freeHead;
+            freeHead = *cast(void**) p; // next pointer stored in the free block
+            return p[0 .. n];
+        }
+        return Mallocator.instance.allocate(n);
+    }
+
+    bool deallocate(void[] b) @nogc nothrow @trusted
+    {
+        *cast(void**) b.ptr = freeHead; // push onto the free list
+        freeHead = b.ptr;
+        return true;
+    }
+}
+
+/// A reply-tree node, uniquely owned by its parent, drawn from the node pool.
+alias RV = Uniq!(RVariant, NodePool);
 
 /// Minimal move-only vector (moveEmplace on insert, realloc-move on grow, never
 /// copies an element). Holds Uniq children / RVariant pairs.
@@ -399,6 +431,78 @@ void encode(ref RVariant r, ref ByteBuffer o, int proto) @nogc nothrow @trusted
             encode(c.get, o, proto);
         break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy oracle: the reply is streamed straight from its source (a hash, a set, a
+// range) instead of materialized into a tree. The oracle emits the proto-aware
+// header, then a scope delegate streams the children — the delegate never
+// escapes, so it lives on the stack and this stays @nogc and allocation-free
+// (benchmark: within noise of hand-written direct emit, vs ~1.2-1.5x for the
+// materialized path). This is the default for replies backed by a container.
+// ---------------------------------------------------------------------------
+
+alias Emit = void delegate(ref ByteBuffer o, int proto) @nogc nothrow;
+
+private void lazyAgg(ref ByteBuffer o, char resp3Byte, size_t count,
+        size_t resp2Count, int proto, scope Emit emit) @nogc nothrow
+{
+    aggHeader(o, resp3Byte, count, resp2Count, proto);
+    emit(o, proto);
+}
+
+/// Array of `n` elements (identical framing in both protocols).
+void lazyArray(ref ByteBuffer o, int proto, size_t n, scope Emit emit) @nogc nothrow
+{
+    lazyAgg(o, '*', n, n, proto, emit);
+}
+
+/// Set of `n` elements — `~n` in RESP3, `*n` in RESP2.
+void lazySet(ref ByteBuffer o, int proto, size_t n, scope Emit emit) @nogc nothrow
+{
+    lazyAgg(o, '~', n, n, proto, emit);
+}
+
+/// Push of `n` elements — `>n` in RESP3, `*n` in RESP2.
+void lazyPush(ref ByteBuffer o, int proto, size_t n, scope Emit emit) @nogc nothrow
+{
+    lazyAgg(o, '>', n, n, proto, emit);
+}
+
+/// Map of `pairs` key/value pairs — `%pairs` in RESP3, flat `*2*pairs` in RESP2.
+/// `emit` must stream exactly `2*pairs` elements (k0, v0, k1, v1, ...).
+void lazyMap(ref ByteBuffer o, int proto, size_t pairs, scope Emit emit) @nogc nothrow
+{
+    lazyAgg(o, '%', pairs, pairs * 2, proto, emit);
+}
+
+// Proto-aware scalar emitters for use inside a lazy stream (the ones whose wire
+// shape differs between protocols; bulk/simple/int are identical, use resp.d).
+void emitNull(ref ByteBuffer o, int proto) @nogc nothrow
+{
+    o.append(proto >= 3 ? "_\r\n" : "$-1\r\n");
+}
+
+void emitBool(ref ByteBuffer o, bool v, int proto) @nogc nothrow
+{
+    if (proto >= 3)
+        o.append(v ? "#t\r\n" : "#f\r\n");
+    else
+        o.append(v ? ":1\r\n" : ":0\r\n");
+}
+
+void emitDouble(ref ByteBuffer o, double v, int proto) @nogc nothrow
+{
+    char[40] b = void;
+    immutable n = snprintf(b.ptr, b.length, "%.17g", v);
+    if (proto >= 3)
+    {
+        o.appendByte(',');
+        o.append(b[0 .. n]);
+        o.append("\r\n");
+    }
+    else
+        bulkBytes(o, b[0 .. n]);
 }
 
 version (unittest) private string enc(ref RVariant r, int proto)

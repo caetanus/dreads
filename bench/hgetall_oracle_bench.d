@@ -8,11 +8,26 @@ import std.stdio;
 import std.format : sformat;
 import core.time : MonoTime;
 import core.lifetime : move;
+import core.stdc.stdio : snprintf;
 
 import dreads.dict : Dict, StrVal;
 import dreads.mem : ByteBuffer;
 import dreads.resp : repArrayHeader, repBulk;
 import dreads.respvariant : MapT, Bulk, rv, encode;
+
+// Lazy oracle: emit the proto-aware map header, then stream children on demand
+// through a scope delegate — no tree materialized, no allocation, no leak. The
+// scope delegate never escapes, so it stays on the stack (@nogc).
+void lazyMap(ref ByteBuffer o, int proto, size_t pairs,
+        scope void delegate(ref ByteBuffer, int) @nogc nothrow emit) @nogc nothrow
+{
+    o.appendByte(proto >= 3 ? '%' : '*');
+    char[24] b = void;
+    immutable n = snprintf(b.ptr, b.length, "%lld", cast(long)(proto >= 3 ? pairs : pairs * 2));
+    o.append(b[0 .. n]);
+    o.append("\r\n");
+    emit(o, proto);
+}
 
 void main()
 {
@@ -58,8 +73,23 @@ void main()
         }
         immutable oracleNs = (MonoTime.currTime - t1).total!"nsecs" / cast(double) ITERS;
 
-        writefln("N=%4d fields | direct %7.1f ns | oracle %7.1f ns | %.1fx slower | +%.0f ns/field",
-                N, directNs, oracleNs, oracleNs / directNs, (oracleNs - directNs) / N);
+        // lazy oracle: proto-aware header + stream from the hash, no tree
+        auto t2 = MonoTime.currTime;
+        foreach (_; 0 .. ITERS)
+        {
+            o.clear();
+            lazyMap(o, 3, h.length, (ref oo, p) {
+                foreach (k, ref val; h)
+                {
+                    repBulk(oo, k);
+                    repBulk(oo, val.s);
+                }
+            });
+        }
+        immutable lazyNs = (MonoTime.currTime - t2).total!"nsecs" / cast(double) ITERS;
+
+        writefln("N=%4d | direct %7.1f | materialized %7.1f (%.1fx) | lazy %7.1f (%.2fx) ns",
+                N, directNs, oracleNs, oracleNs / directNs, lazyNs, lazyNs / directNs);
         stdout.flush();
     }
 }

@@ -962,17 +962,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wantKeys && wantVals)
             {
                 // HGETALL is a map in RESP3 (%N), a flat array in RESP2 — the
-                // reply oracle owns that distinction. PILOT: build a typed
-                // RVariant map and let encode() frame it per protocol.
-                import dreads.respvariant : RVariant, MapT, Bulk, rv, encode;
-                import core.lifetime : move;
+                // reply oracle owns that distinction. Lazy: stream the pairs
+                // straight from the hash, no materialized tree (zero alloc,
+                // ~1x direct emit).
+                import dreads.respvariant : lazyMap;
 
-                MapT m;
-                if (obj !is null)
-                    foreach (k, ref v; obj.hash)
-                        m.add(Bulk(k), Bulk(v.s));
-                auto reply = rv(move(m));
-                encode(reply, o, gRespProto);
+                lazyMap(o, gRespProto, len, (ref oo, p) {
+                    if (obj !is null)
+                        foreach (k, ref v; obj.hash)
+                        {
+                            repBulk(oo, k);
+                            repBulk(oo, v.s);
+                        }
+                });
             }
             else
             {
