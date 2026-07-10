@@ -28,6 +28,12 @@ public struct Config
     string raftPeers; // "2@host:port,3@host:port"
     ushort raftPort = 0; // 0 = port + 10000
     bool raftJoin = false; // start as a passive learner (joining an existing cluster)
+    // sharding (phase 2a): static slot-range topology. Each node owns a slot
+    // range and MOVED-redirects the rest. cluster-nodes lists the whole map:
+    // "lo-hi@host:port,lo-hi@host:port,..."; this node is the entry whose
+    // host:port matches its own (matched by port on 127.0.0.1 for local runs).
+    bool clusterEnabled = false;
+    string clusterNodes;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -170,6 +176,17 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.raftJoin = false;
         else
             return false;
+        return true;
+    case "cluster-enabled":
+        if (value == "yes")
+            cfg.clusterEnabled = true;
+        else if (value == "no")
+            cfg.clusterEnabled = false;
+        else
+            return false;
+        return true;
+    case "cluster-nodes":
+        cfg.clusterNodes = value.unquote;
         return true;
     default:
         return false;

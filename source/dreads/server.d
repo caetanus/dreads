@@ -63,6 +63,15 @@ public int runServer(ushort port, const(char)[] aofPath = null)
     }
     gKeyActivity = createManualEvent();
     {
+        import dreads.cluster : initCluster;
+
+        if (gConfig.clusterEnabled)
+        {
+            initCluster();
+            printf("dreads: cluster mode\n");
+        }
+    }
+    {
         import dreads.obj : lruClock;
         import dreads.stream : nowMs;
 
@@ -440,6 +449,18 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
+
+    // cluster (phase 2a): serve CLUSTER, and MOVED-redirect keys this shard
+    // doesn't own so a cluster-aware client re-routes.
+    if (gConfig.clusterEnabled)
+    {
+        import dreads.cluster : redirectIfForeign, clusterCommand;
+
+        if (uname == "CLUSTER")
+            return clusterCommand(cmd.arr, o);
+        if (redirectIfForeign(uname, cmd.arr, o))
+            return true;
+    }
 
     if (gMonitorCount > 0)
         feedMonitors(c, cmd);
