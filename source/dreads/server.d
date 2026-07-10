@@ -168,6 +168,7 @@ private struct Conn
     Subscriber shardSub;
     ulong id;
     const(char)[] clientName; // malloc'd
+    bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     size_t multiCount;
@@ -379,6 +380,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     keep = false;
                     break;
                 }
+                gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
                 keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
                 if (gNotifyFlags)
                     flushPendingNotify(); // publish keyspace events the command queued
@@ -765,19 +767,48 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "HELLO":
         {
-            if (args.length >= 1 && args[0].str != "2")
+            import dreads.mem : freeSlice, mallocDup;
+
+            int ver = c.resp3 ? 3 : 2;
+            if (args.length >= 1)
             {
-                repError(o,
-                        "NOPROTO unsupported protocol version");
-                return true;
+                if (args[0].str == "2")
+                    ver = 2;
+                else if (args[0].str == "3")
+                    ver = 3;
+                else
+                {
+                    repError(o, "NOPROTO unsupported protocol version");
+                    return true;
+                }
             }
-            repArrayHeader(o, 14);
+            // optional [AUTH user pass] [SETNAME name]; dreads has no auth, so
+            // AUTH is accepted and ignored (no requirepass), SETNAME is applied.
+            for (size_t i = 1; i < args.length;)
+            {
+                if (eqICDebug(args[i].str, "AUTH") && i + 2 < args.length)
+                    i += 3;
+                else if (eqICDebug(args[i].str, "SETNAME") && i + 1 < args.length)
+                {
+                    c.clientName.freeSlice;
+                    c.clientName = mallocDup(args[i + 1].str);
+                    i += 2;
+                }
+                else
+                {
+                    repError(o, "ERR Syntax error in HELLO");
+                    return true;
+                }
+            }
+            c.resp3 = ver == 3;
+            gRespProto = ver; // the HELLO reply itself is encoded in the new proto
+            repMapHeader(o, 7);
             repBulk(o, "server");
             repBulk(o, "redis");
             repBulk(o, "version");
             repBulk(o, "7.4.0");
             repBulk(o, "proto");
-            repInt(o, 2);
+            repInt(o, ver);
             repBulk(o, "id");
             repInt(o, cast(long) c.id);
             repBulk(o, "mode");

@@ -214,9 +214,93 @@ public void repBulk(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
     o.append("\r\n");
 }
 
+// Negotiated protocol version of the connection currently being served. The
+// event loop is single-threaded, so a global set once per command dispatch is
+// race-free (same pattern as the deferred keyspace-notify queue). 2 = RESP2
+// (default), 3 = RESP3. Reply builders whose *shape* differs between versions
+// consult this; pub/sub delivery to OTHER connections cannot use it (it frames
+// per-subscriber — see repPushHeader / connSink).
+public __gshared int gRespProto = 2;
+
 public void repNullBulk(ref ByteBuffer o) @nogc nothrow
 {
-    o.append("$-1\r\n");
+    o.append(gRespProto >= 3 ? "_\r\n" : "$-1\r\n");
+}
+
+/// Null in an array position. RESP2 uses the null *array* `*-1`; RESP3 unifies
+/// all nulls to `_`.
+public void repNullArray(ref ByteBuffer o) @nogc nothrow
+{
+    o.append(gRespProto >= 3 ? "_\r\n" : "*-1\r\n");
+}
+
+/// Map header: N field/value pairs follow (2N elements). RESP3 `%N`; RESP2
+/// degrades to a flat array of 2N elements `*2N`.
+public void repMapHeader(ref ByteBuffer o, size_t pairs) @nogc nothrow
+{
+    o.appendByte(gRespProto >= 3 ? '%' : '*');
+    appendInt(o, cast(long)(gRespProto >= 3 ? pairs : pairs * 2));
+    o.append("\r\n");
+}
+
+/// Set header: N unordered elements. RESP3 `~N`; RESP2 degrades to array `*N`.
+public void repSetHeader(ref ByteBuffer o, size_t n) @nogc nothrow
+{
+    o.appendByte(gRespProto >= 3 ? '~' : '*');
+    appendInt(o, cast(long) n);
+    o.append("\r\n");
+}
+
+/// Push header: out-of-band message (pub/sub, invalidation). RESP3 `>N`; RESP2
+/// degrades to array `*N`. NOTE: this consults the global proto, so it is only
+/// correct for the connection being served synchronously — pub/sub fan-out to
+/// other connections frames per-subscriber in connSink, not here.
+public void repPushHeader(ref ByteBuffer o, size_t n) @nogc nothrow
+{
+    o.appendByte(gRespProto >= 3 ? '>' : '*');
+    appendInt(o, cast(long) n);
+    o.append("\r\n");
+}
+
+/// Boolean. RESP3 `#t`/`#f`; RESP2 degrades to integer `:1`/`:0`.
+public void repBool(ref ByteBuffer o, bool b) @nogc nothrow
+{
+    if (gRespProto >= 3)
+        o.append(b ? "#t\r\n" : "#f\r\n");
+    else
+        o.append(b ? ":1\r\n" : ":0\r\n");
+}
+
+/// Big number (arbitrary-precision integer as decimal text). RESP3 `(digits`;
+/// RESP2 degrades to a bulk string. `s` must be a valid signed decimal.
+public void repBigNumber(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
+{
+    if (gRespProto >= 3)
+    {
+        o.appendByte('(');
+        o.append(s);
+        o.append("\r\n");
+    }
+    else
+        repBulk(o, s);
+}
+
+/// Verbatim string with a 3-char format hint (e.g. "txt", "mkd"). RESP3
+/// `=len\r\nfmt:payload`; RESP2 degrades to a plain bulk string of the payload.
+public void repVerbatim(ref ByteBuffer o, scope const(char)[] fmt3, scope const(char)[] s) @nogc nothrow
+{
+    if (gRespProto >= 3)
+    {
+        o.appendByte('=');
+        appendInt(o, cast(long)(s.length + 4)); // "fmt:" + payload
+        o.append("\r\n");
+        o.append(fmt3);
+        o.appendByte(':');
+        o.append(s);
+        o.append("\r\n");
+    }
+    else
+        repBulk(o, s);
 }
 
 /// Valkey's canonical container-command error: names the offending subcommand
@@ -412,4 +496,46 @@ unittest // reply builders
     repNullBulk(o);
     repArrayHeader(o, 2);
     assert(cast(string) o.data == "+PONG\r\n:-3\r\n$2\r\nhi\r\n$-1\r\n*2\r\n");
+}
+
+unittest // RESP2 vs RESP3 shape-dependent encoders
+{
+    scope (exit)
+        gRespProto = 2;
+
+    // RESP2 degradations
+    gRespProto = 2;
+    {
+        ByteBuffer o;
+        repNullBulk(o);
+        repNullArray(o);
+        repMapHeader(o, 2); // 2 pairs -> flat *4
+        repSetHeader(o, 3);
+        repPushHeader(o, 3);
+        repBool(o, true);
+        repBool(o, false);
+        repBigNumber(o, "123");
+        repVerbatim(o, "txt", "hello");
+        assert(cast(string) o.data ==
+                "$-1\r\n" ~ "*-1\r\n" ~ "*4\r\n" ~ "*3\r\n" ~ "*3\r\n" ~
+                ":1\r\n" ~ ":0\r\n" ~ "$3\r\n123\r\n" ~ "$5\r\nhello\r\n");
+    }
+
+    // RESP3 native types
+    gRespProto = 3;
+    {
+        ByteBuffer o;
+        repNullBulk(o);
+        repNullArray(o);
+        repMapHeader(o, 2);
+        repSetHeader(o, 3);
+        repPushHeader(o, 3);
+        repBool(o, true);
+        repBool(o, false);
+        repBigNumber(o, "123");
+        repVerbatim(o, "txt", "hello");
+        assert(cast(string) o.data ==
+                "_\r\n" ~ "_\r\n" ~ "%2\r\n" ~ "~3\r\n" ~ ">3\r\n" ~
+                "#t\r\n" ~ "#f\r\n" ~ "(123\r\n" ~ "=9\r\ntxt:hello\r\n");
+    }
 }

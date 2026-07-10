@@ -3820,7 +3820,16 @@ public const(char)[] fmtDouble(return ref char[40] buf, double d) @nogc nothrow
 public void repDouble(ref ByteBuffer o, double d) @nogc nothrow
 {
     char[40] buf = void;
-    repBulk(o, fmtDouble(buf, d));
+    auto s = fmtDouble(buf, d); // "inf" / "-inf" / "nan" for the extremes
+    if (gRespProto >= 3)
+    {
+        // RESP3 native double: ,<value>\r\n (same text for inf/-inf/nan)
+        o.appendByte(',');
+        o.append(s);
+        o.append("\r\n");
+    }
+    else
+        repBulk(o, s);
 }
 
 private void repWrongType(ref ByteBuffer o) @nogc nothrow
