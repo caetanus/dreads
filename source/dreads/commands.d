@@ -959,15 +959,33 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto len = obj is null ? 0 : obj.hash.length;
             bool wantKeys = nbuf[1] == 'K' || nbuf[1] == 'G';
             bool wantVals = nbuf[1] == 'V' || nbuf[1] == 'G';
-            repArrayHeader(o, len * (wantKeys && wantVals ? 2 : 1));
-            if (obj !is null)
+            if (wantKeys && wantVals)
             {
-                foreach (k, ref v; obj.hash)
+                // HGETALL is a map in RESP3 (%N), a flat array in RESP2 — the
+                // reply oracle owns that distinction. PILOT: build a typed
+                // RVariant map and let encode() frame it per protocol.
+                import dreads.respvariant : RVariant, MapT, Bulk, rv, encode;
+                import core.lifetime : move;
+
+                MapT m;
+                if (obj !is null)
+                    foreach (k, ref v; obj.hash)
+                        m.add(Bulk(k), Bulk(v.s));
+                auto reply = rv(move(m));
+                encode(reply, o, gRespProto);
+            }
+            else
+            {
+                repArrayHeader(o, len);
+                if (obj !is null)
                 {
-                    if (wantKeys)
-                        repBulk(o, k);
-                    if (wantVals)
-                        repBulk(o, v.s);
+                    foreach (k, ref v; obj.hash)
+                    {
+                        if (wantKeys)
+                            repBulk(o, k);
+                        if (wantVals)
+                            repBulk(o, v.s);
+                    }
                 }
             }
             break;

@@ -1,34 +1,33 @@
 module dreads.respvariant;
 
-// The RESP reply oracle. A reply is built as a typed value (an RVariant tree),
-// and ONE encoder — `encode(o, proto)` — resolves it to RESP2 or RESP3 bytes.
-// The protocol lives here and nowhere else: command handlers declare *what* the
-// reply is (a map, a set, a double, a null), never *how* it is framed on the
-// wire. Zero-overhead abstraction in D: a SumType tag (jump table, no vtable),
-// match! for the encoder, and Unique children — a reply tree has single
-// ownership (each child belongs to exactly one parent, no sharing), so
-// unique_ptr is the right tool; freeing the root cascades, no manual dispose.
+// The RESP reply oracle (dreads domain). A reply is built as a typed RVariant
+// tree, and ONE encoder — encode(o, proto) — resolves it to RESP2 or RESP3
+// bytes. The protocol lives here alone; handlers declare *what* the reply is
+// (map/set/double/null/push), never *how* it frames.
 //
-// automem.Vector can't hold move-only elements (its internal shift copies), so
-// the child list is a tiny move-aware vector (moveEmplace, never copies). The
-// value automem gives here is the smart pointer, not the container.
+// RVariant is a hand-rolled tagged union (enum Kind + union), not std.sumtype:
+// std.sumtype breaks on recursive move-only members (a tree of unique_ptr
+// children) under forward references — reproduced with both our Uniq and
+// automem's Unique. The manual union is zero-overhead (a `final switch` is a
+// jump table, no vtable), C++/Rust in spirit, and fully under our control.
+//
+// Children are Uniq (unique_ptr): a reply tree is single-ownership, freeing the
+// root cascades. The child list is a small move-aware vector (MVec) — automem's
+// Vector can't hold move-only elements. Both are slated to move into the
+// vendored dlang-non-gc-data-structures library; RVariant stays here (dreads).
 
-import std.sumtype : SumType, match;
 import core.lifetime : forward, move, moveEmplace;
 import core.stdc.stdio : snprintf;
-import core.stdc.stdlib : malloc, realloc, free;
+import core.stdc.stdlib : realloc, free;
 
-import automem.unique : Unique;
-import std.experimental.allocator.mallocator : Mallocator;
-
+import dreads.smartptr : Uniq;
 import dreads.mem : ByteBuffer;
 
 /// A reply-tree node, uniquely owned by its parent.
-alias RV = Unique!(RVariant, Mallocator);
+alias RV = Uniq!RVariant;
 
-/// Minimal move-only vector: append + index + iterate, never copies an element
-/// (moveEmplace on insert, bitwise realloc-move on grow — valid for Unique,
-/// which is a pointer+allocator with no self-references). Frees its elements.
+/// Minimal move-only vector (moveEmplace on insert, realloc-move on grow, never
+/// copies an element). Holds Uniq children / RVariant pairs.
 struct MVec(T)
 {
     private T* p;
@@ -48,6 +47,20 @@ struct MVec(T)
         len++;
     }
 
+    void opAssign(MVec rhs) @nogc nothrow @trusted
+    {
+        // move-assign: swap buffers, rhs's destructor frees ours
+        auto tp = p;
+        auto tl = len;
+        auto tc = cap;
+        p = rhs.p;
+        len = rhs.len;
+        cap = rhs.cap;
+        rhs.p = tp;
+        rhs.len = tl;
+        rhs.cap = tc;
+    }
+
     inout(T)[] opSlice() inout @nogc nothrow @trusted return
     {
         return p[0 .. len];
@@ -61,14 +74,13 @@ struct MVec(T)
     ~this() @nogc nothrow @trusted
     {
         foreach (i; 0 .. len)
-            destroy!false(p[i]); // run element dtor (releases the Unique); no re-init
+            destroy!false(p[i]);
         if (p !is null)
             free(p);
     }
 }
 
-// Each RESP type is a distinct payload struct — SumType disambiguates by type,
-// and distinct wrappers also dodge implicit conversions (e.g. bool<->long).
+// Payload wrapper structs — the builder vocabulary (rv(Bulk("x")), node(Num(1))).
 struct Nil
 {
 }
@@ -114,6 +126,7 @@ struct Bool
     bool v;
 }
 
+/// Aggregate builders: append children, then wrap with rv()/node() (moved in).
 struct Arr
 {
     MVec!RV items;
@@ -141,30 +154,120 @@ struct Push
     }
 }
 
-/// One key/value edge of a map; insertion order is preserved (RESP map replies
-/// keep source order, not sorted order).
-struct Pair
-{
-    RV key;
-    RV val;
-}
-
+/// A map builder — children are stored flattened (k0, v0, k1, v1, ...), which
+/// preserves insertion order and needs no Pair type.
 struct MapT
 {
-    MVec!Pair pairs;
-    void add(KP, VP)(auto ref KP keyPayload, auto ref VP valPayload) @nogc nothrow
+    MVec!RV kids;
+    void add(K, V)(auto ref K keyPayload, auto ref V valPayload) @nogc nothrow
     {
-        pairs.put(Pair(node(forward!keyPayload), node(forward!valPayload)));
+        kids.put(node(forward!keyPayload));
+        kids.put(node(forward!valPayload));
     }
 }
 
+enum Kind : ubyte
+{
+    nil,
+    simple,
+    err,
+    bulk,
+    verbatim,
+    bignum,
+    num,
+    dbl,
+    boolean,
+    arr,
+    set,
+    push,
+    map
+}
+
+/// Tagged union. Move-only (owns its children through `kids`). The union holds
+/// only POD (slices/scalars), so it needs no destructor; `kids` carries the
+/// children and its own destructor cascades the free.
 struct RVariant
 {
-    SumType!(Nil, Simple, Err, Bulk, Verbatim, BigNum, Num, Dbl, Bool, Arr, SetT, Push, MapT) v;
-
-    this(P)(auto ref P payload) @nogc nothrow
+    Kind kind = Kind.nil;
+    union
     {
-        v = move(payload);
+        const(char)[] str; // simple / err / bulk / bignum
+        Verbatim vb; // verbatim
+        long i; // num
+        double d; // dbl
+        bool b; // boolean
+    }
+
+    MVec!RV kids; // arr/set/push children, or flattened map pairs
+
+    @disable this(this);
+
+    this(P)(auto ref P payload) @nogc nothrow @trusted
+    {
+        static if (is(P == Nil))
+            kind = Kind.nil;
+        else static if (is(P == Simple))
+        {
+            kind = Kind.simple;
+            str = payload.s;
+        }
+        else static if (is(P == Err))
+        {
+            kind = Kind.err;
+            str = payload.s;
+        }
+        else static if (is(P == Bulk))
+        {
+            kind = Kind.bulk;
+            str = payload.s;
+        }
+        else static if (is(P == BigNum))
+        {
+            kind = Kind.bignum;
+            str = payload.digits;
+        }
+        else static if (is(P == Verbatim))
+        {
+            kind = Kind.verbatim;
+            vb = payload;
+        }
+        else static if (is(P == Num))
+        {
+            kind = Kind.num;
+            i = payload.v;
+        }
+        else static if (is(P == Dbl))
+        {
+            kind = Kind.dbl;
+            d = payload.v;
+        }
+        else static if (is(P == Bool))
+        {
+            kind = Kind.boolean;
+            b = payload.v;
+        }
+        else static if (is(P == Arr))
+        {
+            kind = Kind.arr;
+            kids = move(payload.items);
+        }
+        else static if (is(P == SetT))
+        {
+            kind = Kind.set;
+            kids = move(payload.items);
+        }
+        else static if (is(P == Push))
+        {
+            kind = Kind.push;
+            kids = move(payload.items);
+        }
+        else static if (is(P == MapT))
+        {
+            kind = Kind.map;
+            kids = move(payload.kids);
+        }
+        else
+            static assert(false, "not a RESP payload: " ~ P.stringof);
     }
 }
 
@@ -174,11 +277,10 @@ RVariant rv(P)(auto ref P payload) @nogc nothrow
     return RVariant(forward!payload);
 }
 
-/// A heap child node. Built in place from its payload — never by copying a
-/// RVariant.
+/// A heap child node, built in place from its payload.
 RV node(P)(auto ref P payload) @nogc nothrow
 {
-    return RV(forward!payload);
+    return RV.make(forward!payload);
 }
 
 // --- the oracle: one place that knows RESP2 vs RESP3 framing ---------------
@@ -190,14 +292,6 @@ private void appendLong(ref ByteBuffer o, long v) @nogc nothrow
     o.append(tmp[0 .. n]);
 }
 
-private void aggHeader(ref ByteBuffer o, char resp3Byte, size_t count,
-        size_t resp2Count, int proto) @nogc nothrow
-{
-    o.appendByte(proto >= 3 ? resp3Byte : '*');
-    appendLong(o, cast(long)(proto >= 3 ? count : resp2Count));
-    o.append("\r\n");
-}
-
 private void bulkBytes(ref ByteBuffer o, const(char)[] s) @nogc nothrow
 {
     o.appendByte('$');
@@ -207,119 +301,103 @@ private void bulkBytes(ref ByteBuffer o, const(char)[] s) @nogc nothrow
     o.append("\r\n");
 }
 
-// Non-capturing type probe: the match lambdas reference only the payload, so
-// no closure is allocated (unlike capturing o/proto in the encoder itself).
-private T* peek(T)(ref RVariant r) @nogc nothrow @trusted
+private void aggHeader(ref ByteBuffer o, char resp3Byte, size_t count,
+        size_t resp2Count, int proto) @nogc nothrow
 {
-    return r.v.match!((ref T x) => &x, (ref _) => cast(T*) null);
+    o.appendByte(proto >= 3 ? resp3Byte : '*');
+    appendLong(o, cast(long)(proto >= 3 ? count : resp2Count));
+    o.append("\r\n");
 }
 
-// Per-type serialization, chosen at compile time — a plain templated function,
-// so it captures nothing and stays @nogc. Aggregates recurse through encode().
-private void emit(T)(ref T x, ref ByteBuffer o, int proto) @nogc nothrow @trusted
+/// Serialize the reply tree to `o` in the negotiated protocol (2 or 3).
+void encode(ref RVariant r, ref ByteBuffer o, int proto) @nogc nothrow @trusted
 {
-    static if (is(T == Nil))
+    final switch (r.kind)
+    {
+    case Kind.nil:
         o.append(proto >= 3 ? "_\r\n" : "$-1\r\n");
-    else static if (is(T == Simple))
-    {
+        break;
+    case Kind.simple:
         o.appendByte('+');
-        o.append(x.s);
+        o.append(r.str);
         o.append("\r\n");
-    }
-    else static if (is(T == Err))
-    {
+        break;
+    case Kind.err:
         o.appendByte('-');
-        o.append(x.s);
+        o.append(r.str);
         o.append("\r\n");
-    }
-    else static if (is(T == Bulk))
-        bulkBytes(o, x.s);
-    else static if (is(T == Verbatim))
-    {
-        if (proto >= 3)
-        {
-            o.appendByte('=');
-            appendLong(o, cast(long)(x.s.length + 4));
-            o.append("\r\n");
-            o.append(x.fmt[]);
-            o.appendByte(':');
-            o.append(x.s);
-            o.append("\r\n");
-        }
-        else
-            bulkBytes(o, x.s);
-    }
-    else static if (is(T == BigNum))
-    {
+        break;
+    case Kind.bulk:
+        bulkBytes(o, r.str);
+        break;
+    case Kind.bignum:
         if (proto >= 3)
         {
             o.appendByte('(');
-            o.append(x.digits);
+            o.append(r.str);
             o.append("\r\n");
         }
         else
-            bulkBytes(o, x.digits);
-    }
-    else static if (is(T == Num))
-    {
+            bulkBytes(o, r.str);
+        break;
+    case Kind.verbatim:
+        if (proto >= 3)
+        {
+            o.appendByte('=');
+            appendLong(o, cast(long)(r.vb.s.length + 4));
+            o.append("\r\n");
+            o.append(r.vb.fmt[]);
+            o.appendByte(':');
+            o.append(r.vb.s);
+            o.append("\r\n");
+        }
+        else
+            bulkBytes(o, r.vb.s);
+        break;
+    case Kind.num:
         o.appendByte(':');
-        appendLong(o, x.v);
+        appendLong(o, r.i);
         o.append("\r\n");
-    }
-    else static if (is(T == Dbl))
-    {
-        char[40] b = void;
-        immutable n = snprintf(b.ptr, b.length, "%.17g", x.v);
+        break;
+    case Kind.dbl:
+        char[40] db = void;
+        immutable n = snprintf(db.ptr, db.length, "%.17g", r.d);
         if (proto >= 3)
         {
             o.appendByte(',');
-            o.append(b[0 .. n]);
+            o.append(db[0 .. n]);
             o.append("\r\n");
         }
         else
-            bulkBytes(o, b[0 .. n]);
-    }
-    else static if (is(T == Bool))
-    {
+            bulkBytes(o, db[0 .. n]);
+        break;
+    case Kind.boolean:
         if (proto >= 3)
-            o.append(x.v ? "#t\r\n" : "#f\r\n");
+            o.append(r.b ? "#t\r\n" : "#f\r\n");
         else
-            o.append(x.v ? ":1\r\n" : ":0\r\n");
-    }
-    else static if (is(T == Arr) || is(T == SetT) || is(T == Push))
-    {
-        static if (is(T == SetT))
-            enum char h3 = '~';
-        else static if (is(T == Push))
-            enum char h3 = '>';
-        else
-            enum char h3 = '*';
-        aggHeader(o, h3, x.items.length, x.items.length, proto);
-        foreach (ref c; x.items[])
-            encode(*c.borrow, o, proto);
-    }
-    else static if (is(T == MapT))
-    {
-        // RESP3 map = %N pairs; RESP2 flat array of 2N elements.
-        aggHeader(o, '%', x.pairs.length, x.pairs.length * 2, proto);
-        foreach (ref pr; x.pairs[])
-        {
-            encode(*pr.key.borrow, o, proto);
-            encode(*pr.val.borrow, o, proto);
-        }
-    }
-    else
-        static assert(false, "unhandled RESP payload " ~ T.stringof);
-}
-
-/// Serialize the reply tree to `o` in the negotiated protocol (2 or 3). One
-/// place owns the RESP2-vs-RESP3 framing; handlers never see the protocol.
-void encode(ref RVariant r, ref ByteBuffer o, int proto) @nogc nothrow @trusted
-{
-    static foreach (T; typeof(RVariant.v).Types)
-    {
-        if (auto p = peek!T(r))
-            return emit(*p, o, proto);
+            o.append(r.b ? ":1\r\n" : ":0\r\n");
+        break;
+    case Kind.arr:
+        aggHeader(o, '*', r.kids.length, r.kids.length, proto);
+        foreach (ref c; r.kids[])
+            encode(c.get, o, proto);
+        break;
+    case Kind.set:
+        aggHeader(o, '~', r.kids.length, r.kids.length, proto);
+        foreach (ref c; r.kids[])
+            encode(c.get, o, proto);
+        break;
+    case Kind.push:
+        aggHeader(o, '>', r.kids.length, r.kids.length, proto);
+        foreach (ref c; r.kids[])
+            encode(c.get, o, proto);
+        break;
+    case Kind.map:
+        // RESP3 %N pairs; RESP2 flat *2N. kids is flattened k0,v0,k1,v1,...
+        aggHeader(o, '%', r.kids.length / 2, r.kids.length, proto);
+        foreach (ref c; r.kids[])
+            encode(c.get, o, proto);
+        break;
     }
 }
 
@@ -357,7 +435,7 @@ unittest // aggregates: array / set / push / map degrade correctly
     a.add(Bulk("x"));
     auto ra = rv(move(a));
     assert(enc(ra, 2) == "*2\r\n:1\r\n$1\r\nx\r\n");
-    assert(enc(ra, 3) == "*2\r\n:1\r\n$1\r\nx\r\n"); // arrays same in both
+    assert(enc(ra, 3) == "*2\r\n:1\r\n$1\r\nx\r\n");
 
     SetT st;
     st.add(Num(1));
