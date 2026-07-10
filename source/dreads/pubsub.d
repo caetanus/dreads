@@ -1096,6 +1096,77 @@ unittest // dropAll cleans every registration
     assert(n == 0);
 }
 
+unittest // matching edge cases: anchor overlap, star-eats-empty, multi-star, '?'
+{
+    static size_t hits(scope const(char)[] pat, scope const(char)[] chan)
+    {
+        PubSub ps;
+        FakeClient p;
+        p.init_();
+        scope (exit)
+            p.sub.free();
+        ps.psubscribe(&p.sub, pat);
+        return cast(size_t) ps.publish(chan, "x");
+    }
+
+    // A*B: the star matches zero chars, but the anchors must not overlap.
+    assert(hits("a*z", "az") == 1); // star = "" (len 2 == |a|+|z|)
+    assert(hits("a*z", "z") == 0); // len 1 < 2: 'a' has nowhere to sit
+    assert(hits("a*z", "a") == 0); // no 'z' suffix
+    assert(hits("ab*yz", "abyz") == 1); // touching anchors, star empty
+    assert(hits("ab*yz", "abz") == 0); // len 3 < 4
+    assert(hits("ab*ab", "abab") == 1); // A==B, overlap check keeps it honest
+    assert(hits("ab*ab", "aba") == 0);
+
+    // prefix/suffix stars eating the whole channel
+    assert(hits("foo*", "foo") == 1); // trailing star = ""
+    assert(hits("*foo", "foo") == 1); // leading star = ""
+    assert(hits("foo*", "fo") == 0);
+    assert(hits("*foo", "oo") == 0);
+
+    // multi-star (bothScan): anchors gate, then globMatch checks the middle order
+    assert(hits("foo*bar*baz", "fooXbarYbaz") == 1);
+    assert(hits("foo*bar*baz", "foobarbaz") == 1); // both stars empty
+    assert(hits("foo*bar*baz", "fooYbaz") == 0); // no "bar" in the middle
+    assert(hits("foo*bar*baz", "foo:baz") == 0);
+    assert(hits("a*b*c", "axbxc") == 1);
+    assert(hits("a*b*c", "axc") == 0); // missing b
+
+    // '?' matches exactly one char (bothScan / leftScan / rightScan)
+    assert(hits("a?c", "abc") == 1);
+    assert(hits("a?c", "ac") == 0); // ? needs one char
+    assert(hits("a?c", "abbc") == 0); // ? is exactly one
+    assert(hits("ab?", "abc") == 1); // leftScan
+    assert(hits("ab?", "ab") == 0);
+    assert(hits("?bc", "abc") == 1); // rightScan
+    assert(hits("?bc", "bc") == 0);
+
+    // channels containing literal metacharacters
+    assert(hits("a?c", "a*c") == 1); // ? matches the literal '*'
+    assert(hits("a*c", "a*c") == 1); // pattern star matches the literal '*'
+    assert(hits("x*", "x*y") == 1);
+}
+
+unittest // multiple subscribers, same pattern, all receive; dedup per subscriber
+{
+    PubSub ps;
+    FakeClient a, b;
+    a.init_();
+    b.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+    }
+    assert(ps.psubscribe(&a.sub, "ev:*:hot"));
+    assert(ps.psubscribe(&b.sub, "ev:*:hot")); // same pattern, different sub
+    assert(!ps.psubscribe(&a.sub, "ev:*:hot")); // dup on the same sub
+    assert(ps.publish("ev:x:hot", "y") == 2); // both a and b, once each
+    assert(a.got.length > 0 && b.got.length > 0);
+    assert(ps.punsubscribe(&a.sub, "ev:*:hot"));
+    assert(ps.publish("ev:x:hot", "y") == 1); // only b remains
+}
+
 unittest // PUBSUB CHANNELS: find-left / find-right over the ordered channel index
 {
     PubSub ps;
@@ -1123,4 +1194,41 @@ unittest // PUBSUB CHANNELS: find-left / find-right over the ordered channel ind
     // channel goes away when its last subscriber leaves
     ps.unsubscribe(&c.sub, "news:tech");
     assert(count(ps, "news:*") == 1); // only news:sport left
+}
+
+unittest // PUBSUB CHANNELS edge cases: prefix boundary, suffix vs delimiter, nesting
+{
+    PubSub ps;
+    FakeClient c;
+    c.init_();
+    scope (exit)
+        c.sub.free();
+    foreach (ch; ["news", "news:", "news:x", "newsX", "a:tech", "tech", "z"])
+        ps.subscribe(&c.sub, ch);
+
+    static size_t count(ref PubSub p, const(char)[] pat)
+    {
+        size_t n;
+        p.eachChannel(pat, (ch, cnt) { n++; return 0; });
+        return n;
+    }
+
+    // find-left range must not leak past the prefix boundary. "news:*" covers
+    // "news:" and "news:x" but NOT "news" (shorter) or "newsX" (past ':').
+    assert(count(ps, "news:*") == 2); // news: , news:x
+    assert(count(ps, "news*") == 4); // news, news:, news:x, newsX
+    assert(count(ps, "news") == 1); // exact only
+
+    // find-right: suffix with the delimiter is stricter than the bare word.
+    assert(count(ps, "*:tech") == 1); // a:tech (has ":tech"), not "tech"
+    assert(count(ps, "*tech") == 2); // a:tech and tech
+
+    // "*" and null are all channels
+    assert(count(ps, null) == 7);
+    assert(count(ps, "*") == 7);
+
+    // single-char channel at a range boundary
+    assert(count(ps, "z*") == 1);
+    assert(count(ps, "z") == 1);
+    assert(count(ps, "zz*") == 0);
 }
