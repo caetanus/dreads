@@ -1147,6 +1147,32 @@ unittest // matching edge cases: anchor overlap, star-eats-empty, multi-star, '?
     assert(hits("x*", "x*y") == 1);
 }
 
+unittest // complex interleaved metachars: foo:*:bar:?:num:*:baz
+{
+    static size_t hits(scope const(char)[] pat, scope const(char)[] chan)
+    {
+        PubSub ps;
+        FakeClient p;
+        p.init_();
+        scope (exit)
+            p.sub.free();
+        ps.psubscribe(&p.sub, pat);
+        return cast(size_t) ps.publish(chan, "x");
+    }
+    // A="foo:", B=":baz"; middle "*:bar:?:num:*" is verified by globMatch.
+    enum pat = "foo:*:bar:?:num:*:baz";
+    assert(hits(pat, "foo:aa:bar:c:num:dd:baz") == 1); // *=aa, ?=c, *=dd
+    assert(hits(pat, "foo::bar:c:num::baz") == 1); // both stars eat empty
+    assert(hits(pat, "foo:x:y:bar:z:num:w:baz") == 1); // first * eats "x:y"
+    assert(hits(pat, "foo:aa:bar:cc:num:dd:baz") == 0); // '?' needs exactly one char
+    assert(hits(pat, "foo:aa:bar::num:dd:baz") == 0); // '?' got zero chars
+    assert(hits(pat, "foo:aa:XXX:c:num:dd:baz") == 0); // no ":bar:" segment
+    assert(hits(pat, "xoo:aa:bar:c:num:dd:baz") == 0); // wrong prefix (anchor A)
+    assert(hits(pat, "foo:aa:bar:c:num:dd:qux") == 0); // wrong suffix (anchor B)
+    assert(hits(pat, "foo:aa:bar:c:num:dd:baz:x") == 0); // suffix must END the channel
+    assert(hits(pat, "foo:bar:c:num:baz") == 0); // missing the literal ":bar:"/":num:" run
+}
+
 unittest // multiple subscribers, same pattern, all receive; dedup per subscriber
 {
     PubSub ps;
