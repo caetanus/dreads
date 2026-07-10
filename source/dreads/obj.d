@@ -7,6 +7,7 @@ import dreads.dict : Dict, StrVal, Unit;
 import dreads.list : DList;
 import dreads.stream : Stream, StreamID, nowMs;
 import dreads.det : detNow = now;
+import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.zset : ZSet;
 
 public enum ObjType : ubyte
@@ -183,6 +184,7 @@ public struct Keyspace
         if (o.expireAtMs != 0 && detNow() >= o.expireAtMs)
         {
             d.del(k);
+            notifyKeyspaceEvent(NClass.expired, "expired", k);
             return null;
         }
         o.lruSecs = lruClock;

@@ -251,6 +251,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (obj !is null && obj.expireAtMs != 0)
             {
                 obj.expireAtMs = 0;
+                notifyKeyspaceEvent(NClass.generic, "persist", args[0].str);
                 repInt(o, 1);
             }
             else
@@ -656,6 +657,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 else
                     obj.list.pushBack(a.str);
             }
+            notifyKeyspaceEvent(NClass.list, nbuf[0] == 'L' ? "lpush" : "rpush", args[0].str);
             repInt(o, cast(long) obj.list.length);
             break;
         }
@@ -816,6 +818,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long added = 0;
             for (size_t i = 1; i < args.length; i += 2)
                 added += obj.hash.set(args[i].str, StrVal.of(args[i + 1].str)) ? 1 : 0;
+            notifyKeyspaceEvent(NClass.hash, "hset", args[0].str);
             repInt(o, added);
             break;
         }
@@ -1012,6 +1015,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long n = 0;
             foreach (ref a; args[1 .. $])
                 n += obj.set.set(a.str, Unit()) ? 1 : 0;
+            if (n > 0)
+                notifyKeyspaceEvent(NClass.set, "sadd", args[0].str);
             repInt(o, n);
             break;
         }
@@ -1037,6 +1042,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long n = 0;
             foreach (ref a; args[1 .. $])
                 n += obj.set.del(a.str) ? 1 : 0;
+            if (n > 0)
+                notifyKeyspaceEvent(NClass.set, "srem", args[0].str);
             ks.delIfEmpty(args[0].str, obj);
             repInt(o, n);
             break;
@@ -1137,6 +1144,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 parseDouble(args[i].str, s);
                 added += obj.zset.add(s, args[i + 1].str) ? 1 : 0;
             }
+            notifyKeyspaceEvent(NClass.zset, "zadd", args[0].str);
             repInt(o, added);
             break;
         }
@@ -1162,6 +1170,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long n = 0;
             foreach (ref a; args[1 .. $])
                 n += obj.zset.remove(a.str) ? 1 : 0;
+            if (n > 0)
+                notifyKeyspaceEvent(NClass.zset, "zrem", args[0].str);
             ks.delIfEmpty(args[0].str, obj);
             repInt(o, n);
             break;
@@ -1340,7 +1350,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             if (ks.rename(args[0].str, args[1].str))
+            {
+                notifyKeyspaceEvent(NClass.generic, "rename_from", args[0].str);
+                notifyKeyspaceEvent(NClass.generic, "rename_to", args[1].str);
                 repSimple(o, "OK");
+            }
             else
                 repError(o, "ERR no such key");
             break;
@@ -1363,6 +1377,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             ks.rename(args[0].str, args[1].str);
+            notifyKeyspaceEvent(NClass.generic, "rename_from", args[0].str);
+            notifyKeyspaceEvent(NClass.generic, "rename_to", args[1].str);
             repInt(o, 1);
             break;
         }
