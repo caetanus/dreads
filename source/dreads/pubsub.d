@@ -144,14 +144,23 @@ private struct SubList
 
 // --- pattern classification -------------------------------------------------
 
+// A pattern is split at its OUTER metacharacters into a literal prefix A (up to
+// the first '*'/'?') and a literal suffix B (after the last). It is indexed by
+// whichever of A/B is non-empty, and a publish intersects the A-hits and B-hits.
+// "scan" kinds carry extra middle complexity ('?' or a second '*'), so after the
+// anchors narrow the candidate subgroup, globMatch verifies the middle — but
+// only over that small subgroup, never over all patterns.
 private enum PatKind : ubyte
 {
-    exactPat, // no metachar: matches channel == pattern
-    prefix, // A*
-    both, // A*B
-    suffix, // *B
-    general, // ? or two-plus stars: globMatch fallback
-    all // bare "*"
+    exact, // no metachar: matches iff channel == pattern (left-only, len check)
+    prefix, // A* : left-only, left match is sufficient
+    suffix, // *B : right-only, right match is sufficient
+    both, // A*B (single '*'): both-anchored, anchors + length are exact
+    leftScan, // left-anchored, needs globMatch (e.g. A?x, A*x*)
+    rightScan, // right-anchored, needs globMatch (e.g. x?B, *x*B)
+    bothScan, // both-anchored + middle: A*x*B, A?B — intersect then globMatch
+    matchAll, // bare "*"
+    noAnchor // no outer literal on either side: *x*, ?x? — global glob scan
 }
 
 /// A compiled pattern subscription. `raw` is an owned malloc copy of the pattern
@@ -166,7 +175,6 @@ private struct PatEntry
     uint aLen; // left literal  = raw[0 .. aLen]           (A in A*B)
     uint bOff; // right literal = raw[bOff .. bOff + bLen]  (B in A*B)
     uint bLen;
-    uint visitGen; // intersection stamp: set in the left pass, checked in the right
 
     const(char)[] pattern() const @nogc nothrow
     {
@@ -191,48 +199,52 @@ private struct PatEntry
     }
 }
 
-/// Classify without copying (used for both compile and removal lookup).
+/// Classify without copying. Splits at the OUTER metacharacters: aLen is the
+/// literal prefix length (up to the first '*'/'?'), bOff/bLen the literal suffix
+/// (after the last). The kind records how much middle work remains.
 private PatKind classify(scope const(char)[] p, out uint aLen, out uint bOff, out uint bLen) @nogc nothrow
 {
-    size_t starPos = size_t.max;
+    size_t firstMeta = size_t.max, lastMeta = size_t.max;
     int stars = 0;
     bool q = false;
     foreach (i, c; p)
     {
-        if (c == '*')
+        if (c == '*' || c == '?')
         {
-            stars++;
-            if (starPos == size_t.max)
-                starPos = i;
+            if (firstMeta == size_t.max)
+                firstMeta = i;
+            lastMeta = i;
+            if (c == '*')
+                stars++;
+            else
+                q = true;
         }
-        else if (c == '?')
-            q = true;
     }
-    if (stars == 0 && !q)
+    if (firstMeta == size_t.max) // no metachar
     {
         aLen = cast(uint) p.length;
-        return PatKind.exactPat;
+        return PatKind.exact;
     }
-    if (q || stars >= 2)
-        return PatKind.general;
-    // exactly one star, no '?'
-    if (p.length == 1)
-        return PatKind.all; // "*"
-    if (starPos == 0)
-    {
-        bOff = 1;
-        bLen = cast(uint) p[1 .. $].length;
-        return PatKind.suffix;
-    }
-    if (starPos + 1 == p.length)
-    {
-        aLen = cast(uint) starPos;
-        return PatKind.prefix;
-    }
-    aLen = cast(uint) starPos;
-    bOff = cast(uint)(starPos + 1);
-    bLen = cast(uint) p[starPos + 1 .. $].length;
-    return PatKind.both;
+    if (p.length == 1) // "*" or "?"
+        return stars == 1 ? PatKind.matchAll : PatKind.noAnchor;
+
+    aLen = cast(uint) firstMeta; // literal prefix p[0 .. firstMeta]
+    bOff = cast(uint)(lastMeta + 1); // literal suffix p[lastMeta+1 .. $]
+    bLen = cast(uint) p[lastMeta + 1 .. $].length;
+    immutable simple = stars == 1 && !q; // single '*', no '?' -> anchors are exact
+
+    if (aLen > 0 && bLen > 0)
+        return simple ? PatKind.both : PatKind.bothScan;
+    if (aLen > 0)
+        return simple ? PatKind.prefix : PatKind.leftScan;
+    if (bLen > 0)
+        return simple ? PatKind.suffix : PatKind.rightScan;
+    return PatKind.noAnchor; // *x*, ?x? : nothing to anchor on
+}
+
+private bool startsWith(scope const(char)[] s, scope const(char)[] pre) @nogc nothrow pure
+{
+    return s.length >= pre.length && s[0 .. pre.length] == pre;
 }
 
 private bool endsWith(scope const(char)[] s, scope const(char)[] suf) @nogc nothrow pure
@@ -240,17 +252,24 @@ private bool endsWith(scope const(char)[] s, scope const(char)[] suf) @nogc noth
     return s.length >= suf.length && s[$ - suf.length .. $] == suf;
 }
 
-/// Does this pattern get a left-anchor key (its literal prefix A)? exactPat is
-/// keyed by its whole text; prefix/both by A. All need aLen > 0.
-private bool leftKeyed(PatKind k, uint aLen) @nogc nothrow
+/// Left-anchored kinds carry a literal prefix A (indexed by A).
+private bool leftKeyed(PatKind k) @nogc nothrow
 {
-    return aLen > 0 && (k == PatKind.exactPat || k == PatKind.prefix || k == PatKind.both);
+    return k == PatKind.exact || k == PatKind.prefix || k == PatKind.leftScan
+        || k == PatKind.both || k == PatKind.bothScan;
 }
 
-/// Does this pattern get a right-anchor key (its literal suffix B, reversed)?
-private bool rightKeyed(PatKind k, uint bLen) @nogc nothrow
+/// Right-anchored kinds carry a literal suffix B (indexed by reverse(B)).
+private bool rightKeyed(PatKind k) @nogc nothrow
 {
-    return bLen > 0 && (k == PatKind.suffix || k == PatKind.both);
+    return k == PatKind.suffix || k == PatKind.rightScan
+        || k == PatKind.both || k == PatKind.bothScan;
+}
+
+/// Both-anchored kinds go through the intersection (in bothLeft AND bothRight).
+private bool bothAnchored(PatKind k) @nogc nothrow
+{
+    return k == PatKind.both || k == PatKind.bothScan;
 }
 
 /// Reverse `s` into `buf` (cleared first); `buf.data` is then the reversed bytes.
@@ -318,20 +337,24 @@ private struct PtrBucket
 public struct PubSub
 {
     private Dict!SubList channels; // channel -> subscribers
-    // Dual-anchor pattern index (see PUBSUB.md): a single-star pattern is split
-    // at the '*' into a left literal A and a right literal B. leftIndex is keyed
-    // by A, rightIndex by reverse(B). A publish probes leftIndex over the
-    // channel's prefixes and rightIndex over the reversed channel's prefixes
-    // (== the channel's suffixes); a both-anchored A*B matches iff it is hit in
-    // BOTH passes (intersection via a per-publish generation stamp). This makes
-    // *B and A*B flat in pattern count, not just A*.
-    private Dict!PtrBucket leftIndex; // A -> entries (exactPat / prefix / both)
-    private Dict!PtrBucket rightIndex; // reverse(B) -> entries (suffix / both)
+    // Anchor-indexed pattern matcher (see PUBSUB.md). Every pattern is split at
+    // its outer metachars into a literal prefix A and suffix B. Single-anchor
+    // patterns (A* / *B) live in leftOnly / rightOnly and deliver on one probe.
+    // Both-anchored patterns (A*B, A*x*B, A?B) live in BOTH bothLeft (keyed by A)
+    // and bothRight (keyed by reverse(B)); a publish probes each over the channel
+    // prefixes / reversed-channel prefixes, then INTERSECTS by iterating the
+    // SMALLER hit set and verifying the opposite anchor — so a shared anchor
+    // never forces an O(P) walk. "scan" kinds then run globMatch over just that
+    // small subgroup to check the middle. Only anchorless *x* patterns fall to a
+    // global glob scan.
+    private Dict!PtrBucket leftOnly; // A -> exact / prefix / leftScan
+    private Dict!PtrBucket rightOnly; // reverse(B) -> suffix / rightScan
+    private Dict!PtrBucket bothLeft; // A -> both / bothScan (also in bothRight)
+    private Dict!PtrBucket bothRight; // reverse(B) -> both / bothScan
     private PtrBucket matchAll; // the bare "*"
-    private PtrBucket fallback; // general only: '?' or two-plus stars
-    private size_t maxLeftLen; // longest A present (bounds the left probe)
-    private size_t maxRightLen; // longest B present (bounds the right probe)
-    private uint gen; // intersection generation, bumped per publish
+    private PtrBucket fallback; // noAnchor: *x*, ?x?
+    private size_t maxLeftOnlyLen, maxRightOnlyLen; // probe bounds per index
+    private size_t maxBothLeftLen, maxBothRightLen;
     private size_t patternEntries; // total (subscriber, pattern) pairs
     private ByteBuffer scratch; // message staging, reused across publishes
     private ByteBuffer revScratch; // reversed channel staging for the right probe
@@ -442,24 +465,31 @@ public struct PubSub
         e.bOff = bOff;
         e.bLen = bLen;
 
-        bool placed;
-        if (leftKeyed(kind, aLen))
+        if (bothAnchored(kind))
         {
-            bucketFor(leftIndex, e.a).add(e);
-            if (aLen > maxLeftLen)
-                maxLeftLen = aLen;
-            placed = true;
+            bucketFor(bothLeft, e.a).add(e);
+            if (aLen > maxBothLeftLen)
+                maxBothLeftLen = aLen;
+            revInto(revScratch, e.b);
+            bucketFor(bothRight, cast(const(char)[]) revScratch.data).add(e);
+            if (bLen > maxBothRightLen)
+                maxBothRightLen = bLen;
         }
-        if (rightKeyed(kind, bLen))
+        else if (leftKeyed(kind)) // exact / prefix / leftScan (bLen == 0)
+        {
+            bucketFor(leftOnly, e.a).add(e);
+            if (aLen > maxLeftOnlyLen)
+                maxLeftOnlyLen = aLen;
+        }
+        else if (rightKeyed(kind)) // suffix / rightScan (aLen == 0)
         {
             revInto(revScratch, e.b);
-            bucketFor(rightIndex, cast(const(char)[]) revScratch.data).add(e);
-            if (bLen > maxRightLen)
-                maxRightLen = bLen;
-            placed = true;
+            bucketFor(rightOnly, cast(const(char)[]) revScratch.data).add(e);
+            if (bLen > maxRightOnlyLen)
+                maxRightOnlyLen = bLen;
         }
-        if (!placed)
-            (kind == PatKind.all ? matchAll : fallback).add(e);
+        else
+            (kind == PatKind.matchAll ? matchAll : fallback).add(e);
         patternEntries++;
     }
 
@@ -467,37 +497,46 @@ public struct PubSub
     {
         uint aLen, bOff, bLen;
         auto kind = classify(p, aLen, bOff, bLen);
-        immutable lk = leftKeyed(kind, aLen);
-        immutable rk = rightKeyed(kind, bLen);
 
         // Locate the shared entry via whichever index holds it.
         PatEntry* e;
-        if (lk)
+        if (bothAnchored(kind))
         {
-            if (auto b = leftIndex.get(p[0 .. aLen]))
+            if (auto b = bothLeft.get(p[0 .. aLen]))
                 e = b.find(s, p);
         }
-        else if (rk)
+        else if (leftKeyed(kind))
+        {
+            if (auto b = leftOnly.get(p[0 .. aLen]))
+                e = b.find(s, p);
+        }
+        else if (rightKeyed(kind))
         {
             revInto(revScratch, p[bOff .. bOff + bLen]);
-            if (auto b = rightIndex.get(cast(const(char)[]) revScratch.data))
+            if (auto b = rightOnly.get(cast(const(char)[]) revScratch.data))
                 e = b.find(s, p);
         }
         else
-            e = (kind == PatKind.all ? matchAll : fallback).find(s, p);
+            e = (kind == PatKind.matchAll ? matchAll : fallback).find(s, p);
         if (e is null)
             return;
 
         // Unlink from every index referencing it, then free the entry once.
-        if (lk)
-            removeFrom(leftIndex, e.a, e);
-        if (rk)
+        if (bothAnchored(kind))
+        {
+            removeFrom(bothLeft, e.a, e);
+            revInto(revScratch, e.b);
+            removeFrom(bothRight, cast(const(char)[]) revScratch.data, e);
+        }
+        else if (leftKeyed(kind))
+            removeFrom(leftOnly, e.a, e);
+        else if (rightKeyed(kind))
         {
             revInto(revScratch, e.b);
-            removeFrom(rightIndex, cast(const(char)[]) revScratch.data, e);
+            removeFrom(rightOnly, cast(const(char)[]) revScratch.data, e);
         }
-        if (!lk && !rk)
-            (kind == PatKind.all ? matchAll : fallback).remove(e);
+        else
+            (kind == PatKind.matchAll ? matchAll : fallback).remove(e);
         e.freeRaw();
         cfree(e);
         patternEntries--;
@@ -515,6 +554,50 @@ public struct PubSub
         auto m = rcFromBytes(scratch.data);
         s.sink(s.ctx, m);
         rcRelease(m);
+    }
+
+    /// Total entries across `idx` buckets whose key is a prefix of `probe`.
+    /// Used to pick the smaller side of the both-anchored intersection.
+    private size_t anchorCount(ref Dict!PtrBucket idx, scope const(char)[] probe,
+            size_t maxLen) @nogc nothrow
+    {
+        size_t n = 0;
+        immutable kmax = probe.length < maxLen ? probe.length : maxLen;
+        for (size_t k = 1; k <= kmax; k++)
+            if (auto b = idx.get(probe[0 .. k]))
+                n += b.len;
+        return n;
+    }
+
+    /// Drive the both-anchored intersection from `driveIdx` (probed by
+    /// `driveProbe`): verify the opposite anchor, run the middle glob for
+    /// bothScan, deliver. fromLeft = driven by A (verify B is a suffix), else by B.
+    private long bothDeliver(scope const(char)[] channel, scope const(char)[] payload,
+            ref Dict!PtrBucket driveIdx, scope const(char)[] driveProbe, size_t driveMax,
+            bool fromLeft) nothrow
+    {
+        long n = 0;
+        immutable L = channel.length;
+        immutable kmax = driveProbe.length < driveMax ? driveProbe.length : driveMax;
+        for (size_t k = 1; k <= kmax; k++)
+        {
+            auto b = driveIdx.get(driveProbe[0 .. k]);
+            if (b is null)
+                continue;
+            foreach (i; 0 .. b.len)
+            {
+                auto e = b.items[i];
+                if (L < e.aLen + e.bLen) // anchors would overlap
+                    continue;
+                if (fromLeft ? !endsWith(channel, e.b) : !startsWith(channel, e.a))
+                    continue; // opposite anchor fails
+                if (e.kind == PatKind.bothScan && !globMatch(e.pattern, channel))
+                    continue; // anchors pass, the middle does not
+                emitPmessage(e.sub, e.pattern, channel, payload);
+                n++;
+            }
+        }
+        return n;
     }
 
     /// Delivers to channel and pattern subscribers; returns the receiver count.
@@ -541,86 +624,101 @@ public struct PubSub
             rcRelease(m); // drop the publisher's reference; sinks retained their own
         }
 
-        // --- pattern delivery: dual-anchor probe + intersection ---
-        gen++;
+        // --- pattern delivery: anchor-indexed matching ---
         immutable L = channel.length;
+        revInto(revScratch, channel); // reversed channel for every right-side probe
+        auto cr = cast(const(char)[]) revScratch.data;
 
-        // LEFT pass: leftIndex probed over the channel's own prefixes. exactPat
-        // and prefix deliver here; a both-anchored entry is only STAMPED (the
-        // right pass decides), so nothing is delivered twice.
-        if (leftIndex.length)
+        // Left-only (exact / prefix / leftScan): probe the channel's prefixes.
+        if (leftOnly.length)
         {
-            immutable kmax = L < maxLeftLen ? L : maxLeftLen;
+            immutable kmax = L < maxLeftOnlyLen ? L : maxLeftOnlyLen;
             for (size_t k = 1; k <= kmax; k++)
             {
-                auto b = leftIndex.get(channel[0 .. k]);
+                auto b = leftOnly.get(channel[0 .. k]);
                 if (b is null)
                     continue;
                 foreach (i; 0 .. b.len)
                 {
                     auto e = b.items[i];
+                    bool ok;
                     final switch (e.kind)
                     {
-                    case PatKind.exactPat:
-                        if (L == k) // A == whole channel
-                        {
-                            emitPmessage(e.sub, e.pattern, channel, payload);
-                            receivers++;
-                        }
+                    case PatKind.exact:
+                        ok = L == k; // A == whole channel
                         break;
                     case PatKind.prefix:
-                        emitPmessage(e.sub, e.pattern, channel, payload);
-                        receivers++;
+                        ok = true;
                         break;
-                    case PatKind.both:
-                        e.visitGen = gen; // seen on the left; await the right pass
+                    case PatKind.leftScan:
+                        ok = globMatch(e.pattern, channel);
                         break;
                     case PatKind.suffix:
-                    case PatKind.general:
-                    case PatKind.all:
-                        break; // never in leftIndex
+                    case PatKind.rightScan:
+                    case PatKind.both:
+                    case PatKind.bothScan:
+                    case PatKind.matchAll:
+                    case PatKind.noAnchor:
+                        break; // never in leftOnly
+                    }
+                    if (ok)
+                    {
+                        emitPmessage(e.sub, e.pattern, channel, payload);
+                        receivers++;
                     }
                 }
             }
         }
 
-        // RIGHT pass: rightIndex probed over the reversed channel's prefixes
-        // (== the channel's suffixes). suffix delivers; both delivers iff it was
-        // also stamped on the left AND the anchors don't overlap.
-        if (rightIndex.length)
+        // Right-only (suffix / rightScan): probe the reversed channel's prefixes.
+        if (rightOnly.length)
         {
-            revInto(revScratch, channel);
-            auto cr = cast(const(char)[]) revScratch.data;
-            immutable kmax = L < maxRightLen ? L : maxRightLen;
+            immutable kmax = L < maxRightOnlyLen ? L : maxRightOnlyLen;
             for (size_t k = 1; k <= kmax; k++)
             {
-                auto b = rightIndex.get(cr[0 .. k]);
+                auto b = rightOnly.get(cr[0 .. k]);
                 if (b is null)
                     continue;
                 foreach (i; 0 .. b.len)
                 {
                     auto e = b.items[i];
+                    bool ok;
                     final switch (e.kind)
                     {
                     case PatKind.suffix:
+                        ok = true;
+                        break;
+                    case PatKind.rightScan:
+                        ok = globMatch(e.pattern, channel);
+                        break;
+                    case PatKind.exact:
+                    case PatKind.prefix:
+                    case PatKind.leftScan:
+                    case PatKind.both:
+                    case PatKind.bothScan:
+                    case PatKind.matchAll:
+                    case PatKind.noAnchor:
+                        break; // never in rightOnly
+                    }
+                    if (ok)
+                    {
                         emitPmessage(e.sub, e.pattern, channel, payload);
                         receivers++;
-                        break;
-                    case PatKind.both:
-                        if (e.visitGen == gen && L >= e.aLen + e.bLen)
-                        {
-                            emitPmessage(e.sub, e.pattern, channel, payload);
-                            receivers++;
-                        }
-                        break;
-                    case PatKind.exactPat:
-                    case PatKind.prefix:
-                    case PatKind.general:
-                    case PatKind.all:
-                        break; // never in rightIndex
                     }
                 }
             }
+        }
+
+        // Both-anchored (A*B, A*x*B, A?B): intersect the A-hits and B-hits,
+        // driven by the SMALLER side so a shared anchor is never an O(P) walk.
+        if (bothLeft.length)
+        {
+            immutable leftN = anchorCount(bothLeft, channel, maxBothLeftLen);
+            immutable rightN = anchorCount(bothRight, cr, maxBothRightLen);
+            if (leftN != 0 && rightN != 0)
+                receivers += (leftN <= rightN)
+                    ? bothDeliver(channel, payload, bothLeft, channel, maxBothLeftLen, true)
+                    : bothDeliver(channel, payload, bothRight, cr, maxBothRightLen, false);
         }
 
         // bare "*" matches everything
@@ -631,7 +729,7 @@ public struct PubSub
             receivers++;
         }
 
-        // general fallback ('?', two-plus stars): exact glob, linear (rare)
+        // anchorless (*x*, ?x?): global glob scan (rare)
         foreach (i; 0 .. fallback.len)
         {
             auto e = fallback.items[i];
