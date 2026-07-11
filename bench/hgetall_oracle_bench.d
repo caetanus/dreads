@@ -1,23 +1,20 @@
-// Microbenchmark: HGETALL reply encoding cost, oracle (materialized RVariant
-// map) vs direct streaming emit. Isolates the encode path (no sockets) so the
-// per-node allocation cost of the reply IR is visible. Run:
-//   ldc2 -O3 -I<automem>/source -I<stdx>/source bench/hgetall_oracle_bench.d \
-//        source/dreads/mem.d source/dreads/dict.d source/dreads/resp.d \
-//        source/dreads/respvariant.d -of=/tmp/hb && /tmp/hb
+// Microbenchmark: HGETALL reply encoding — the lazy oracle vs hand-written
+// direct emit. The lazy oracle streams the reply from the hash through a scope
+// delegate (no materialized tree), so it should match direct emit. Run:
+//   ldc2 -O3 bench/hgetall_oracle_bench.d source/dreads/mem.d source/dreads/dict.d \
+//        source/dreads/resp.d -of=/tmp/hb && /tmp/hb
 import std.stdio;
 import std.format : sformat;
 import core.time : MonoTime;
-import core.lifetime : move;
 import core.stdc.stdio : snprintf;
 
 import dreads.dict : Dict, StrVal;
 import dreads.mem : ByteBuffer;
 import dreads.resp : repArrayHeader, repBulk;
-import dreads.respvariant : MapT, Bulk, rv, encode;
 
-// Lazy oracle: emit the proto-aware map header, then stream children on demand
-// through a scope delegate — no tree materialized, no allocation, no leak. The
-// scope delegate never escapes, so it stays on the stack (@nogc).
+// The lazy oracle primitive (same as dreads.respvariant.lazyMap): proto-aware
+// header + a scope delegate that streams the pairs. Stack-allocated delegate,
+// no materialized tree, no allocation.
 void lazyMap(ref ByteBuffer o, int proto, size_t pairs,
         scope void delegate(ref ByteBuffer, int) @nogc nothrow emit) @nogc nothrow
 {
@@ -42,11 +39,9 @@ void main()
             h.set(k, StrVal.of(v));
         }
 
-        enum ITERS = 100_000;
+        enum ITERS = 300_000;
         ByteBuffer o;
 
-        // warmup + direct streaming emit (RESP3 array header is identical to
-        // RESP2 for a flat list; measures the zero-alloc path)
         auto t0 = MonoTime.currTime;
         foreach (_; 0 .. ITERS)
         {
@@ -60,21 +55,7 @@ void main()
         }
         immutable directNs = (MonoTime.currTime - t0).total!"nsecs" / cast(double) ITERS;
 
-        // oracle: build a MapT tree then encode (RESP3 %N)
         auto t1 = MonoTime.currTime;
-        foreach (_; 0 .. ITERS)
-        {
-            o.clear();
-            MapT m;
-            foreach (k, ref val; h)
-                m.add(Bulk(k), Bulk(val.s));
-            auto reply = rv(move(m));
-            encode(reply, o, 3);
-        }
-        immutable oracleNs = (MonoTime.currTime - t1).total!"nsecs" / cast(double) ITERS;
-
-        // lazy oracle: proto-aware header + stream from the hash, no tree
-        auto t2 = MonoTime.currTime;
         foreach (_; 0 .. ITERS)
         {
             o.clear();
@@ -86,10 +67,9 @@ void main()
                 }
             });
         }
-        immutable lazyNs = (MonoTime.currTime - t2).total!"nsecs" / cast(double) ITERS;
+        immutable lazyNs = (MonoTime.currTime - t1).total!"nsecs" / cast(double) ITERS;
 
-        writefln("N=%4d | direct %7.1f | materialized %7.1f (%.1fx) | lazy %7.1f (%.2fx) ns",
-                N, directNs, oracleNs, oracleNs / directNs, lazyNs, lazyNs / directNs);
+        writefln("N=%4d | direct %8.1f ns | lazy %8.1f ns (%.2fx)", N, directNs, lazyNs, lazyNs / directNs);
         stdout.flush();
     }
 }

@@ -1,4 +1,4 @@
-module dreads.smartptr;
+module emplace.smartptr;
 
 // Our own smart pointers, modeled on libc++'s <memory> (unique_ptr / shared_ptr
 // semantics), allocated through Alexandrescu's std.experimental.allocator so any

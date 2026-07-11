@@ -1,4 +1,4 @@
-module dreads.map;
+module emplace.map;
 
 // @nogc ordered containers — a classic CLRS red-black tree, plus an OrderedSet
 // built on it. Neither automem nor Phobos offers a @nogc associative container

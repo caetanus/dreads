@@ -1,0 +1,7 @@
+{
+	"name": "emplace",
+	"description": "GC-free, allocator-aware containers and smart pointers for D — C++/Rust-grade, so non-GC D no longer means C-isms. Vector, Map/OrderedSet (red-black), Uniq/Shared/Weak.",
+	"authors": ["Marcelo Aires Caetano"],
+	"license": "MIT",
+	"targetType": "library"
+}
