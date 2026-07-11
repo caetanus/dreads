@@ -2263,7 +2263,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "LOLWUT":
         {
-            repVerbatim(o, "txt", "dreads ⚡ Deadly Fast Redis in DLang\n");
+            repVerbatim(o, "txt", "DREADS ⚡ DREADS Replicated Event-driven Arena Data Store\n");
             break;
         }
     case "ROLE":
