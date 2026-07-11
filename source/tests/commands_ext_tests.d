@@ -259,6 +259,36 @@ version (unittest)
         ks.run("HINCRBYFLOAT", "h", "f", "1")[0].expect.to.equal('-');
     }
 
+    @("ext.expiry_visibility")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("SET", "live", "1");
+        ks.run("SET", "gone", "2");
+        ks.lookup("gone").expireAtMs = 1; // epoch ms = 1: always in the past
+        ks.armExpire("gone", 1);
+
+        // KEYS filters logically-expired keys even before the 1s timer reaps them
+        ks.run("KEYS", "*").expect.to.equal("*1\r\n$4\r\nlive\r\n");
+        // lazy expiry on access still drops it
+        ks.run("EXISTS", "gone").expect.to.equal(":0\r\n");
+    }
+
+    @("ext.info_keyspace")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("SET", "a", "1");
+        ks.run("SET", "b", "2");
+        ks.run("EXPIRE", "b", "10000"); // b becomes volatile
+        // Redis-shaped db0:keys=<raw>,expires=<volatile>
+        ks.run("INFO").expect.to.contain("keys=2,expires=1");
+    }
+
     @("ext.scan_family")
     unittest
     {

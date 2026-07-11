@@ -150,12 +150,16 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             size_t n = 0;
             foreach (k, ref v; ks)
             {
+                if (v.expired()) // Redis skips logically-expired keys (no sweep needed)
+                    continue;
                 if (globMatch(pat, k))
                     n++;
             }
             repArrayHeader(o, n);
             foreach (k, ref v; ks)
             {
+                if (v.expired())
+                    continue;
                 if (globMatch(pat, k))
                     repBulk(o, k);
             }
@@ -164,7 +168,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "DBSIZE":
         {
             if (args.length == 0)
-                repInt(o, cast(long) ks.length);
+                repInt(o, cast(long) ks.length); // raw count, like Redis (the 1s timer reaps)
             else
                 arityErr(o, "dbsize");
             break;
@@ -208,7 +212,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR invalid expire time");
                 break;
             }
-            obj.expireAtMs = absMs <= 0 ? 1 : cast(ulong) absMs;
+            immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
+            ks.retimeExpire(args[0].str, obj.expireAtMs, newAt); // re-EXPIRE: drop the old deadline
+            obj.expireAtMs = newAt;
             notifyKeyspaceEvent(NClass.generic, "expire", args[0].str);
             propagatePexpireat(args[0].str, obj.expireAtMs);
             repInt(o, 1);
@@ -250,6 +256,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto obj = ks.lookup(args[0].str);
             if (obj !is null && obj.expireAtMs != 0)
             {
+                ks.retimeExpire(args[0].str, obj.expireAtMs, 0); // PERSIST drops the deadline
                 obj.expireAtMs = 0;
                 notifyKeyspaceEvent(NClass.generic, "persist", args[0].str);
                 repInt(o, 1);
@@ -351,12 +358,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
                 repSimple(o, "OK");
             ulong kept = keepttl && existing !is null ? existing.expireAtMs : 0;
+            immutable ulong oldTtl = existing !is null ? existing.expireAtMs : 0;
             ks.setStr(args[0].str, args[1].str);
             auto obj = ks.lookup(args[0].str);
+            ulong newTtl = 0;
             if (absExpire >= 0)
-                obj.expireAtMs = absExpire == 0 ? 1 : cast(ulong) absExpire;
+                newTtl = absExpire == 0 ? 1 : cast(ulong) absExpire;
             else if (keepttl)
-                obj.expireAtMs = kept;
+                newTtl = kept;
+            if (oldTtl != 0 || newTtl != 0) // plain SET on a non-volatile key never touches the index
+                ks.retimeExpire(args[0].str, oldTtl, newTtl);
+            obj.expireAtMs = newTtl;
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             if (args.length > 2)
                 propagateSet(args[0].str, args[1].str, obj.expireAtMs);
@@ -384,8 +396,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         : "ERR invalid expire time in 'psetex' command");
                 break;
             }
+            auto prior = ks.lookup(args[0].str);
+            immutable ulong oldTtl = prior !is null ? prior.expireAtMs : 0;
             ks.setStr(args[0].str, args[2].str);
             auto obj = ks.lookup(args[0].str);
+            ks.retimeExpire(args[0].str, oldTtl, cast(ulong) absMs);
             obj.expireAtMs = cast(ulong) absMs;
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             propagateSet(args[0].str, args[2].str, obj.expireAtMs);
@@ -438,12 +453,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repBulk(o, obj.str.s);
             if (doPersist && obj.expireAtMs != 0)
             {
+                ks.retimeExpire(args[0].str, obj.expireAtMs, 0);
                 obj.expireAtMs = 0;
                 propagatePersist(args[0].str);
             }
             else if (absMs >= 0)
             {
-                obj.expireAtMs = absMs == 0 ? 1 : cast(ulong) absMs;
+                immutable ulong newAt = absMs == 0 ? 1 : cast(ulong) absMs;
+                ks.retimeExpire(args[0].str, obj.expireAtMs, newAt);
+                obj.expireAtMs = newAt;
                 propagatePexpireat(args[0].str, obj.expireAtMs);
             }
             break;
@@ -1442,10 +1460,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // CONFIG is handled at the server layer (it owns the live Config)
     case "INFO":
         {
+            size_t volatileKeys = 0;
+            foreach (k, ref v; ks)
+                if (v.expireAtMs != 0)
+                    volatileKeys++;
             char[160] b = void;
             auto n = snprintf(b.ptr, b.length,
-                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=0\r\n",
-                    ks.length);
+                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=%zu\r\n",
+                    ks.length, volatileKeys);
             repVerbatim(o, "txt", b[0 .. n]); // RESP3 verbatim (=txt:...), RESP2 bulk
             break;
         }
@@ -2211,6 +2233,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             auto copy = src.deepDup(); // src pointer dies on the next line's rehash
             ks.d.set(args[1].str, copy);
+            ks.armExpire(args[1].str, copy.expireAtMs); // the copy keeps the TTL
             notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
             repInt(o, 1);
             break;

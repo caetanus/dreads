@@ -36,6 +36,12 @@ public struct Config
     string clusterNodes;
     // keyspace notifications: flag string like "KEA" ("" = disabled). See notify.d.
     string notifyKeyspaceEvents;
+    // active expiration: run the drop-soon timer that proactively reclaims keys
+    // past their deadline. Off (default) = lazy-only expiry — a key is dropped
+    // when next accessed (and KEYS/SCAN skip it), which keeps the SET-with-TTL
+    // hot path free of index maintenance. On = bounded memory for TTL-heavy
+    // workloads that never re-touch their keys, at a per-SET-EX cost.
+    bool activeExpire = false;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -115,6 +121,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "appendfilename":
         cfg.appendfilename = value.unquote;
+        return true;
+    case "active-expire":
+        if (value == "yes")
+            cfg.activeExpire = true;
+        else if (value == "no")
+            cfg.activeExpire = false;
+        else
+            return false;
         return true;
     case "dir":
         cfg.dir = value.unquote;

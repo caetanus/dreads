@@ -9,6 +9,8 @@ import dreads.stream : Stream, StreamID, nowMs;
 import dreads.det : detNow = now;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.zset : ZSet;
+import emplace.map : Map;
+import emplace.vector : Vector;
 
 public enum ObjType : ubyte
 {
@@ -23,6 +25,11 @@ public enum ObjType : ubyte
 /// Coarse LRU clock in seconds, refreshed by the server's 1s timer — keeps
 /// per-lookup touching to a single store instead of a clock_gettime call.
 public __gshared uint lruClock;
+
+/// Whether the drop-soon active-expiration timer runs (mirrors
+/// Config.activeExpire). Off = lazy-only expiry — the fast default. Gates every
+/// index-maintenance path, so SET-with-TTL pays nothing when active expiry is off.
+public __gshared bool gActiveExpire;
 
 public struct RObj
 {
@@ -78,6 +85,13 @@ public struct RObj
         RObj o;
         o.type = t;
         return o;
+    }
+
+    /// Logically expired right now (deadline set and reached). Read-only — the
+    /// caller decides whether to drop it.
+    bool expired() const @nogc nothrow
+    {
+        return expireAtMs != 0 && detNow() >= expireAtMs;
     }
 
     /// Element count of container types (0 for strings).
@@ -170,9 +184,116 @@ public struct Keyspace
 {
     Dict!RObj d;
 
+    /// The "drop-soon" index for active expiration: absolute deadline (ms) ->
+    /// the keys that expire at exactly that instant. Ordered by deadline, so a
+    /// sweep visits only the buckets that have come due (`bisect_right(now)` =
+    /// `foreachRange(0, now)`), never the whole keyspace. It owns its own copies
+    /// of the key strings. Purely local reclamation: the deadline is already
+    /// replicated as an absolute PEXPIREAT, so every node/replay expires
+    /// deterministically off its own copy — no DEL is propagated.
+    private Map!(ulong, Vector!(const(char)[])) expires;
+
+    @disable this(this);
+
+    ~this() @nogc nothrow
+    {
+        freeExpiresIndex();
+    }
+
     @property size_t length() const @nogc nothrow
     {
         return d.length;
+    }
+
+    /// Record that `k` expires at absolute `at` (ms); no-op for at == 0.
+    void armExpire(scope const(char)[] k, ulong at) @nogc nothrow
+    {
+        if (!gActiveExpire || at == 0)
+            return;
+        auto sk = d.storedKey(k); // the Dict's own stable key bytes — no dup
+        if (sk is null)
+            return; // not in the keyspace, nothing to expire
+        auto bucket = expires.getOrPut(at, Vector!(const(char)[]).init); // one descent
+        bucket.put(sk); // non-owning slice into Dict-owned memory
+    }
+
+    /// Remove `k`'s entry from the bucket at `at`, freeing its key copy; drops
+    /// the bucket when it empties. No-op if the entry isn't there.
+    void disarmExpire(scope const(char)[] k, ulong at) @nogc nothrow
+    {
+        if (!gActiveExpire || at == 0)
+            return;
+        auto bucket = expires.get(at);
+        if (bucket is null)
+            return;
+        foreach (i; 0 .. bucket.length)
+        {
+            if ((*bucket)[i] == k)
+            {
+                (*bucket)[i] = (*bucket)[bucket.length - 1]; // swap-remove: order is irrelevant
+                bucket.popBack();
+                break;
+            }
+        }
+        if (bucket.length == 0)
+            expires.remove(at); // the empty Vector's array is freed by its dtor
+    }
+
+    /// Move `k` from deadline `oldAt` to `newAt` in the index (0 = none). Used
+    /// on re-EXPIRE / PERSIST so the map never keeps a stale deadline for a key.
+    void retimeExpire(scope const(char)[] k, ulong oldAt, ulong newAt) @nogc nothrow
+    {
+        if (!gActiveExpire || oldAt == newAt)
+            return;
+        disarmExpire(k, oldAt);
+        armExpire(k, newAt);
+    }
+
+    /// Active expiration: drop every key whose deadline has passed. Returns how
+    /// many were dropped. A bucket entry only fires when the key's *live*
+    /// deadline still equals it — so any residual entry (an overwrite/DEL that
+    /// bypassed disarm) self-heals here instead of resurrecting a key.
+    size_t activeExpireCycle() @nogc nothrow
+    {
+        if (!gActiveExpire || expires.empty)
+            return 0;
+        immutable now = detNow();
+        Vector!ulong due; // materialise first — we can't remove nodes mid-walk
+        foreach (e; expires[]) // ascending by deadline; stop once we pass `now`
+        {
+            if (e.key > now)
+                break;
+            due.put(e.key);
+        }
+        size_t dropped = 0;
+        foreach (i; 0 .. due.length)
+        {
+            immutable at = due[i];
+            if (auto bucket = expires.get(at))
+            {
+                foreach (j; 0 .. bucket.length)
+                {
+                    auto key = (*bucket)[j];
+                    auto obj = d.get(key);
+                    if (obj !is null && obj.expireAtMs == at) // still the live TTL
+                    {
+                        notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
+                        d.del(key);
+                        dropped++;
+                    }
+                    // key is a non-owning slice into Dict memory — nothing to free
+                }
+            }
+            expires.remove(at);
+        }
+        return dropped;
+    }
+
+    private void freeExpiresIndex() @nogc nothrow
+    {
+        // buckets hold non-owning slices into Dict key memory — only the tree
+        // and its bucket arrays need releasing
+        expires.clear();
     }
 
     /// Live object or null — lazily drops the key when its TTL has passed.
@@ -181,8 +302,9 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return null;
-        if (o.expireAtMs != 0 && detNow() >= o.expireAtMs)
+        if (o.expired())
         {
+            disarmExpire(k, o.expireAtMs);
             d.del(k);
             notifyKeyspaceEvent(NClass.expired, "expired", k);
             return null;
@@ -231,7 +353,11 @@ public struct Keyspace
     bool del(scope const(char)[] k) @nogc nothrow
     {
         // an already-expired key must read as missing, not as deleted-now
-        return lookup(k) !is null && d.del(k);
+        auto o = lookup(k);
+        if (o is null)
+            return false;
+        disarmExpire(k, o.expireAtMs); // drop its pending drop-soon entry
+        return d.del(k);
     }
 
     bool exists(scope const(char)[] k) @nogc nothrow
@@ -243,11 +369,17 @@ public struct Keyspace
     /// destination. False when the source is missing.
     bool rename(scope const(char)[] from, scope const(char)[] to) @nogc nothrow
     {
-        if (lookup(from) is null) // also drops it if expired
+        auto src = lookup(from); // also drops it if expired
+        if (src is null)
             return false;
+        immutable ttl = src.expireAtMs;
+        disarmExpire(from, ttl);
+        if (auto dst = lookup(to)) // overwriting a live destination drops its TTL entry
+            disarmExpire(to, dst.expireAtMs);
         RObj obj;
         d.steal(from, obj);
         d.set(to, obj);
+        armExpire(to, ttl);
         return true;
     }
 
@@ -257,6 +389,7 @@ public struct Keyspace
     {
         if (o.type != ObjType.str && o.type != ObjType.stream && o.containerLen == 0)
         {
+            disarmExpire(k, o.expireAtMs);
             d.del(k);
             notifyKeyspaceEvent(NClass.generic, "del", k); // emptied container is removed
         }
@@ -325,4 +458,53 @@ unittest // every type frees through the union without leaking valgrind-wise
     assert(ks.length == 5);
     ks.clear();
     assert(ks.length == 0);
+}
+
+@nogc nothrow unittest // drop-soon index: active expiration, self-heal, disarm
+{
+    import dreads.det : gClock;
+
+    Keyspace ks;
+    scope (exit)
+    {
+        ks.d.free();
+        gClock = 0;
+        gActiveExpire = false;
+    }
+    gActiveExpire = true; // this test exercises the active path
+    gClock = 1_000_000; // freeze "now" at t = 1e6 ms
+
+    ks.setStr("due", "1");
+    ks.lookup("due").expireAtMs = 900_000; // already past now
+    ks.armExpire("due", 900_000);
+    ks.setStr("later", "2");
+    ks.lookup("later").expireAtMs = 1_500_000; // future
+    ks.armExpire("later", 1_500_000);
+    ks.setStr("forever", "3"); // no TTL
+
+    assert(ks.length == 3); // raw count still includes the expired-but-unswept key
+    assert(ks.activeExpireCycle() == 1); // only "due" has come due
+    assert(ks.length == 2 && !ks.exists("due") && ks.exists("later"));
+
+    gClock = 2_000_000; // "later" now comes due
+    assert(ks.activeExpireCycle() == 1);
+    assert(!ks.exists("later") && ks.length == 1);
+
+    // PERSIST/retime disarms: no stale entry ever fires
+    ks.lookup("forever").expireAtMs = 2_500_000;
+    ks.armExpire("forever", 2_500_000);
+    ks.retimeExpire("forever", 2_500_000, 0); // PERSIST
+    ks.lookup("forever").expireAtMs = 0;
+    gClock = 3_000_000;
+    assert(ks.activeExpireCycle() == 0); // disarmed, nothing dropped
+    assert(ks.exists("forever") && ks.length == 1);
+
+    // re-EXPIRE moves the key to a new deadline without leaving the old one
+    ks.lookup("forever").expireAtMs = 3_500_000;
+    ks.armExpire("forever", 3_500_000);
+    ks.retimeExpire("forever", 3_500_000, 5_000_000); // pushed further out
+    ks.lookup("forever").expireAtMs = 5_000_000;
+    gClock = 4_000_000; // past the OLD deadline but not the new one
+    assert(ks.activeExpireCycle() == 0); // old entry was disarmed
+    assert(ks.exists("forever"));
 }

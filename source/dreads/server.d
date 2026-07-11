@@ -86,12 +86,15 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         }
     }
     {
-        import dreads.obj : lruClock;
+        import dreads.obj : lruClock, gActiveExpire;
         import dreads.stream : nowMs;
 
+        gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
+            gKeys.activeExpireCycle(); // drop-soon sweep: reclaim keys past their deadline
+            flushPendingNotify(); // deliver the "expired" events the sweep queued
             gAof.fsyncNow();
         }, true);
     }
@@ -1225,7 +1228,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         // (name, value) pairs for every known directive matching the pattern
         static immutable names = [
             "port", "appendonly", "appendfilename", "dir", "maxmemory",
-            "maxmemory-policy", "lua-time-limit", "lua-memory-limit",
+            "maxmemory-policy", "lua-time-limit", "lua-memory-limit", "active-expire",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -1264,6 +1267,9 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             case "appendonly":
                 repBulk(o, gConfig.appendonly ? "yes" : "no");
                 break;
+            case "active-expire":
+                repBulk(o, gConfig.activeExpire ? "yes" : "no");
+                break;
             case "appendfilename":
                 repBulk(o, gConfig.appendfilename);
                 break;
@@ -1293,7 +1299,8 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         // only runtime-safe parameters are settable
         if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY")
                 || eqICDebug(args[1].str, "LUA-TIME-LIMIT")
-                || eqICDebug(args[1].str, "LUA-MEMORY-LIMIT"))
+                || eqICDebug(args[1].str, "LUA-MEMORY-LIMIT")
+                || eqICDebug(args[1].str, "ACTIVE-EXPIRE"))
         {
             string name, value;
             try
@@ -1313,7 +1320,12 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             {
             }
             if (ok)
+            {
+                import dreads.obj : gActiveExpire;
+
+                gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
                 repSimple(o, "OK");
+            }
             else
                 repError(o, "ERR Invalid argument");
             return;
