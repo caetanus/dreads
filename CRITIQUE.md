@@ -39,6 +39,11 @@ in notification-related command files. Treat the exact dirty-file list as
 ephemeral; re-run `git status --short` before using this section as a release
 gate.
 
+> **Resolved (2026-07-11).** `flushPendingNotify()` is fixed (bounds-checked) and
+> the suite is green — **176 tests, 0 failed**. The inline-protocol gap surfaced
+> during benchmarking is also fixed (see #5/#10). Performance was measured
+> head-to-head against Valkey 9.1 — see [`bench/valkey-comparison.md`](bench/valkey-comparison.md).
+
 ## What looks strong
 
 - The project is not a toy clone. It has real implementations for the data
@@ -89,6 +94,15 @@ Each mismatch should be classified as:
 - oracle gap;
 - dreads crash/assert/protocol violation.
 
+> **Response (2026-07-11).** The *performance* blackbox exists —
+> [`bench/redis-bench.sh`](bench/redis-bench.sh) + [`bench/mqtt-bench.sh`](bench/mqtt-bench.sh)
+> compare data ops (min/med/max), transactions, AOF, and pub/sub (fan-out +
+> pattern scaling) against Valkey 9.1 and Mosquitto, one-server-at-a-time, pinned.
+> It already caught real bugs: a per-message write syscall in fan-out (fixed,
+> ~87×) and the missing inline protocol. The *correctness* blackbox (diffing RESP
+> shape / error class / final state against a live Valkey oracle) is still the
+> single highest-value open item.
+
 ### 2. Documentation drift is already visible
 
 Some docs appear stale or internally inconsistent relative to the current
@@ -106,6 +120,11 @@ Examples:
 
 For a drop-in goal, stale drift docs are dangerous because they blur whether a
 difference is deliberate, fixed, or unknown.
+
+> **Partly done.** RESP3 is implemented (handshake, encoders, pub/sub push) and
+> benchmarked; the expiry and RESP3 lines in `DRIFT.md` are updated. Remaining:
+> reconcile the Raft "phase-1 gaps" wording against the current membership/snapshot
+> support.
 
 ### 3. Expiry semantics: remaining visible gaps
 
@@ -127,6 +146,16 @@ Remaining likely drift:
 For drop-in behavior, `DBSIZE`, `KEYS`, `INFO`, and eviction interaction deserve
 explicit tests against Valkey.
 
+> **Fixed (commit `be4952b`).** Active expiration is now implemented as an opt-in
+> **drop-soon index** (deadline → keys, swept by a 1s timer), gated by the
+> `active-expire` config (default **off** — measured ~40% SET-EX cost, so lazy
+> stays the fast default; on = bounded memory). Command semantics are now
+> Redis-shaped regardless of the setting: **`KEYS` skips logically-expired keys**,
+> **`INFO` reports real `db0:keys=N,expires=M`**, and **`DBSIZE` stays raw** (Redis
+> counts unreaped-expired too). Unit tests added (`ext.expiry_visibility`,
+> `ext.info_keyspace`, drop-soon Keyspace test). Still open: maxmemory-eviction ↔
+> expiry interaction, and a Valkey blackbox for these.
+
 ### 4. Keyspace notifications need hardening
 
 Keyspace notifications are important because they are both user-visible behavior
@@ -143,6 +172,12 @@ Current concerns:
 For drop-in compatibility, notification behavior should be blackbox-tested as a
 first-class output stream, not only inferred from command replies.
 
+> **Improved.** The failing flush test is fixed. Active-cycle expiry now exists:
+> when `active-expire` is on, the 1s drop-soon sweep fires `expired` events (it
+> reuses the same deferred-publish queue and flushes them). Still open: events
+> through the Raft apply path, wider event-class coverage, and a pub/sub
+> side-channel blackbox test.
+
 ### 5. RESP3 must be treated as a compatibility matrix, not a checkbox
 
 If RESP3 is implemented, the next risk is surface completeness:
@@ -157,6 +192,13 @@ If RESP3 is implemented, the next risk is surface completeness:
 
 Drop-in means common Redis clients can negotiate and continue normally. A small
 RESP3 subset may work for hand tests but still break real clients.
+
+> **Advancing.** RESP3 handshake, the map/set/push/double/null encoders, and the
+> lazy reply oracle are implemented; pub/sub push framing is per-subscriber. A
+> real gap was just closed: the parser rejected **inline commands** (any request
+> not starting with a RESP marker) with a hard protocol error, so `redis-cli
+> --pipe` and inline clients failed — now supported (commit `76df819`). A full
+> client-library compatibility matrix + client-tracking decision remain TODO.
 
 ### 6. Lua compatibility remains high-risk
 
@@ -178,6 +220,9 @@ Areas to blackbox heavily:
 If dreads intentionally diverges here, it should be documented as product drift,
 not accidental compatibility.
 
+> **Unchanged.** Still system Lua 5.4 + custom sandbox — accepted product drift,
+> not yet audited against Redis's Lua 5.1 semantics.
+
 ### 7. Transactions and watch semantics are intentionally stricter
 
 `WATCH` is documented as using a global write epoch, so any write can abort
@@ -186,6 +231,9 @@ not accidental compatibility.
 This can break real clients that use `WATCH` under concurrent unrelated writes.
 For drop-in behavior, this is one of the more important semantic gaps to close
 or clearly mark as accepted drift.
+
+> **Open.** Global-epoch WATCH is unchanged — still safe-but-stricter than Redis.
+> Not yet decided/closed; the most important remaining *semantic* gap.
 
 ### 8. SCAN behavior is filtered but cursor semantics differ
 
@@ -202,6 +250,9 @@ Potential effects:
 This may be acceptable in practice, but it should be blackbox-tested under
 mutation and resizing.
 
+> **Unchanged.** Cursor is still a slot index; not yet blackbox-tested under
+> rehash/mutation.
+
 ### 9. "Random" commands are deterministic
 
 Commands such as `RANDOMKEY`, `SPOP`, `SRANDMEMBER`, `ZRANDMEMBER`, and
@@ -210,6 +261,9 @@ Commands such as `RANDOMKEY`, `SPOP`, `SRANDMEMBER`, `ZRANDMEMBER`, and
 This is often fine for persistence and testing, but it is visible behavior.
 Some clients use these commands expecting sampling behavior. For drop-in
 compatibility, deterministic selection is a real semantic difference.
+
+> **Accepted drift.** These stay deterministic — required by the deterministic
+> AOF/Raft propagation model (the resolved-command log). Documented, not a bug.
 
 ### 10. INFO, ROLE, WAIT, and operational command surfaces matter
 
@@ -231,6 +285,11 @@ High-value surfaces:
 Even when a feature is intentionally unsupported, the exact Redis/Valkey-style
 failure mode matters for client compatibility.
 
+> **Partial.** `INFO`'s keyspace line is fixed; `CONFIG GET/SET` gained
+> `active-expire`; the inline protocol is fixed (affects any tool that probes over
+> inline). `ROLE`/`WAIT`/`COMMAND`/`CLIENT`/`ACL`/`SAVE`/`BGSAVE`/`LASTSAVE` still
+> need the exact Redis failure-mode audit against a live oracle.
+
 ### 11. Raft is a product differentiator but not Redis replication
 
 Raft replication can be better than Redis async replication for durability and
@@ -249,20 +308,26 @@ Drop-in risks:
 The right message is not "same replication as Redis"; it is "Redis-compatible
 single-node command surface with a stronger, different replication model".
 
+> **Unchanged framing.** Still positioned exactly that way. This cycle's
+> performance work was single-node; the Raft-surface drop-in audit (ROLE/WAIT
+> semantics, stale-read policy, txn/script routing) is future work.
+
 ## Suggested near-term fixes
 
-1. Fix the current `flushPendingNotify()` test failure before expanding
-   notification coverage further.
-2. Update `DRIFT.md` so it reflects current RESP3, expiry, Raft, and
-   notification behavior.
-3. Add Valkey blackbox cases for `DBSIZE`, `KEYS`, `SCAN`, `INFO`, and expired
-   keys that are never directly read.
-4. Add notification blackbox tests where Pub/Sub output is captured alongside
-   command replies.
-5. Decide whether global-epoch `WATCH` is temporary or accepted drift.
-6. Build a compatibility matrix by command family with three states:
-   compatible, accepted drift, unknown.
-7. Run compatibility sequences through restart/AOF rewrite, not only in-memory.
+1. ~~Fix the current `flushPendingNotify()` test failure~~ — **done** (suite green, 176 tests).
+2. Update `DRIFT.md` for RESP3/expiry/Raft/notifications — **partly done** (RESP3 + expiry updated; Raft wording pending).
+3. Add Valkey blackbox for `DBSIZE`/`KEYS`/`SCAN`/`INFO`/untouched-expired — **behavior fixed + unit tests**; the live-oracle blackbox is still TODO.
+4. Notification blackbox (pub/sub captured with replies) — **TODO**.
+5. Decide global-epoch `WATCH` (temporary vs accepted drift) — **open**.
+6. Compatibility matrix by command family (compatible / drift / unknown) — **TODO**.
+7. Run sequences through restart/AOF rewrite — AOF write path is **benchmarked**; correctness-through-restart blackbox is **TODO**.
+
+**Delivered this cycle (2026-07):** RESP3 + lazy reply oracle; inline protocol;
+active expiration (opt-in drop-soon index) + `KEYS`/`INFO`/`DBSIZE` semantics;
+keyspace-notification flush fix; pub/sub fan-out batching (~87×) and shared `*`
+pmessage; INCR buffer reuse; and a reusable performance blackbox (`bench/`) with a
+full Valkey 9.1 + MQTT comparison. **The dominant open item remains the
+*correctness* blackbox against a live Valkey oracle** — items 3, 4, 6, 7.
 
 ## Bottom line
 
