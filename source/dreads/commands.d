@@ -623,6 +623,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR value is not an integer or out of range");
                 break;
             }
+            if (nbuf[0] != 'I' && delta == long.min) // DECRBY LLONG_MIN: -delta overflows
+            {
+                repError(o, "ERR decrement would overflow");
+                break;
+            }
             incrDecr(ks, args[0].str, nbuf[0] == 'I' ? delta : -delta,
                     nbuf[0] == 'I' ? "incrby" : "decrby", o);
             break;

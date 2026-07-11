@@ -1,8 +1,11 @@
 # dreads ⚡
 
-**Deadly Fast Redis in DLang.** A Redis-compatible in-memory data store built
-around three commitments: zero GC in the data plane, arena memory, and one
-purpose — speed.
+**A performance-focused, Redis-compatible alternative, in D.** An in-memory data
+store built around three commitments: zero GC in the data plane, arena memory,
+and one purpose — speed. It speaks RESP2/RESP3 and matches Redis/Valkey on the
+supported command surface (see [DRIFT.md](DRIFT.md)) — it is *not yet* a verified
+drop-in replacement; full blackbox compatibility against a live Valkey oracle is
+still in progress.
 
 ```
 ⟜ Ultra-light. Thread-isolated DBs.
