@@ -264,23 +264,28 @@ private struct OutQueue
 // of that socket once subMode is on, so writes stay ordered without a lock.
 private void oqWriterLoop(Conn* c) nothrow
 {
+    ByteBuffer batch; // coalesce every queued message into one write per wakeup
     try
     {
         while (true)
         {
             immutable ec = c.oqEvt.emitCount;
             RcMsg* m;
-            while (c.oq.pop(m))
+            batch.clear();
+            while (c.oq.pop(m)) // drain the whole ring, staging into one buffer
+            {
+                batch.append(rcData(m));
+                rcRelease(m);
+            }
+            // One syscall for the batch instead of one per message — the fan-out
+            // fix: under N subscribers a publish storm was N writes per message.
+            if (batch.length && c.tcp.connected)
             {
                 try
-                {
-                    if (c.tcp.connected)
-                        c.tcp.write(rcData(m));
-                }
+                    c.tcp.write(batch.data);
                 catch (Exception)
                 {
                 }
-                rcRelease(m);
             }
             if (c.oqClosing)
                 break;
