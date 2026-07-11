@@ -1004,31 +1004,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "DEBUG":
         {
-            if (args.length >= 2 && eqICDebug(args[0].str, "SLEEP"))
-            {
-                import core.time : msecs;
-                import std.conv : to;
-                import vibe.core.core : vsleep = sleep;
-
-                double secs = 0;
-                try
-                    secs = (cast(string) args[1].str).to!double;
-                catch (Exception)
-                {
-                }
-                try
-                    vsleep(msecs(cast(long)(secs * 1000)));
-                catch (Exception)
-                {
-                }
-                repSimple(o, "OK");
-            }
-            else if (args.length >= 1 && eqICDebug(args[0].str, "SET-ACTIVE-EXPIRE"))
-                repSimple(o, "OK");
-            else if (args.length >= 1 && eqICDebug(args[0].str, "JMAP"))
-                repSimple(o, "OK");
-            else
-                repError(o, "ERR DEBUG subcommand not supported");
+            debugCmd(c, args, o);
             return true;
         }
     case "EVAL":
@@ -1254,6 +1230,84 @@ private void repLong(ref ByteBuffer o, scope char[] buf, long v) nothrow
 
     auto n = snprintf(buf.ptr, buf.length, "%lld", v);
     repBulk(o, buf[0 .. n]);
+}
+
+/// DEBUG: developer/test backdoor. Real for the semantics tests rely on
+/// (SLEEP freezes the loop, SET-ACTIVE-EXPIRE toggles the reaper,
+/// STRINGMATCH-LEN / OBJECT introspect); no-op OK for the benign internals;
+/// unknown subcommands still error like Redis.
+private void debugCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    import dreads.commands : globMatch, objEncoding;
+
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'debug' command");
+        return;
+    }
+    auto sub = args[0].str;
+    if (eqICDebug(sub, "SLEEP") && args.length >= 2)
+    {
+        // A real, blocking sleep on the event-loop thread — like Redis, the
+        // whole server (every fiber) stalls, not just this connection.
+        import core.thread : Thread;
+        import core.time : usecs;
+        import std.conv : to;
+
+        double secs = 0;
+        try
+            secs = (cast(string) args[1].str).to!double;
+        catch (Exception)
+        {
+        }
+        if (secs > 0)
+        {
+            try
+                Thread.sleep(usecs(cast(long)(secs * 1_000_000)));
+            catch (Exception)
+            {
+            }
+        }
+        repSimple(o, "OK");
+    }
+    else if (eqICDebug(sub, "SET-ACTIVE-EXPIRE") && args.length >= 2)
+    {
+        import dreads.obj : gActiveExpire;
+
+        gActiveExpire = args[1].str != "0";
+        repSimple(o, "OK");
+    }
+    else if (eqICDebug(sub, "STRINGMATCH-LEN") && args.length >= 3)
+        repInt(o, globMatch(args[1].str, args[2].str) ? 1 : 0);
+    else if (eqICDebug(sub, "OBJECT") && args.length >= 2)
+    {
+        import core.stdc.stdio : snprintf;
+
+        auto obj = (*c.dbp).lookup(args[1].str);
+        if (obj is null)
+        {
+            repError(o, "ERR no such key");
+            return;
+        }
+        auto enc = objEncoding(obj);
+        char[160] b = void;
+        auto n = snprintf(b.ptr, b.length,
+                "Value at:0x0 refcount:1 encoding:%.*s serializedlength:0 lru:0 lru_seconds_idle:0",
+                cast(int) enc.length, enc.ptr);
+        repSimple(o, b[0 .. n]);
+    }
+    else if (eqICDebug(sub, "JMAP") || eqICDebug(sub, "RELOAD") || eqICDebug(sub, "LOADAOF")
+            || eqICDebug(sub, "FLUSHALL") || eqICDebug(sub, "CHANGE-REPL-ID")
+            || eqICDebug(sub, "QUICKLIST-PACKED-THRESHOLD") || eqICDebug(sub, "LISTPACK")
+            || eqICDebug(sub, "LISTPACK-ENTRIES") || eqICDebug(sub, "MALLOC-STATS")
+            || eqICDebug(sub, "DEBUG") || eqICDebug(sub, "SET-ACTIVE-EXPIRE"))
+    {
+        // No-ops: dreads keeps everything in memory, so RELOAD/LOADAOF are
+        // trivially data-preserving; the rest are storage-internal knobs.
+        repSimple(o, "OK");
+    }
+    else
+        repError(o, "ERR DEBUG subcommand not supported");
 }
 
 /// CONFIG GET pattern | SET name value | REWRITE | RESETSTAT

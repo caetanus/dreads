@@ -3708,6 +3708,28 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     repUnknownSubcommand(o, "MEMORY", args.length ? args[0].str : "");
 }
 
+/// The encoding name dreads reports for an object (its real, single encoding
+/// per type — not Redis's size-tiered listpack/intset/quicklist tiers).
+public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
+{
+    final switch (obj.type)
+    {
+    case ObjType.str:
+        long v;
+        return parseLong(obj.str.s, v) ? "int" : "raw";
+    case ObjType.list:
+        return "linkedlist";
+    case ObjType.hash:
+        return "hashtable";
+    case ObjType.set:
+        return "hashtable";
+    case ObjType.zset:
+        return "skiplist";
+    case ObjType.stream:
+        return "stream";
+    }
+}
+
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
 private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
@@ -3724,30 +3746,7 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     }
     auto sub = args[0].str;
     if (eqICKeyword(sub, "ENCODING"))
-    {
-        final switch (obj.type)
-        {
-        case ObjType.str:
-            long v;
-            repBulk(o, parseLong(obj.str.s, v) ? "int" : "raw");
-            break;
-        case ObjType.list:
-            repBulk(o, "linkedlist");
-            break;
-        case ObjType.hash:
-            repBulk(o, "hashtable");
-            break;
-        case ObjType.set:
-            repBulk(o, "hashtable");
-            break;
-        case ObjType.zset:
-            repBulk(o, "skiplist");
-            break;
-        case ObjType.stream:
-            repBulk(o, "stream");
-            break;
-        }
-    }
+        repBulk(o, objEncoding(obj));
     else if (eqICKeyword(sub, "REFCOUNT"))
         repInt(o, 1);
     else if (eqICKeyword(sub, "IDLETIME"))
