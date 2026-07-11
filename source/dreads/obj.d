@@ -31,6 +31,13 @@ public __gshared uint lruClock;
 /// index-maintenance path, so SET-with-TTL pays nothing when active expiry is off.
 public __gshared bool gActiveExpire;
 
+/// The logical databases (Redis SELECT 0..15). The *current* db is per-client
+/// (`Conn.db`); the connection dispatches against `gDbs[conn.db]`, SELECT just
+/// moves that per-connection index, and the replay/apply path takes the db from
+/// the log. Default db 0, so single-DB workloads are unchanged.
+public enum NUM_DBS = 16;
+public __gshared Keyspace[NUM_DBS] gDbs;
+
 public struct RObj
 {
     ObjType type;

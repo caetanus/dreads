@@ -12,7 +12,7 @@ import core.stdc.string : memcpy;
 import dreads.dict : Dict, StrVal, Unit;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
-import dreads.obj : Keyspace, ObjType, RObj;
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
@@ -173,10 +173,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "dbsize");
             break;
         }
-    case "FLUSHALL":
-    case "FLUSHDB": // single database: same thing
+    case "FLUSHDB":
         {
-            ks.clear();
+            ks.clear(); // current database only
+            repSimple(o, "OK");
+            break;
+        }
+    case "FLUSHALL":
+        {
+            ks.clear(); // the current db (which may be a detached test keyspace)
+            foreach (ref d; gDbs) // every database
+                d.clear();
             repSimple(o, "OK");
             break;
         }
@@ -1456,8 +1463,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "SELECT":
         {
-            if (args.length == 1 && args[0].str == "0")
-                repSimple(o, "OK"); // single database
+            // the real per-connection db switch happens at the server layer; this
+            // path (MULTI replay / apply) only validates the index.
+            long n;
+            if (args.length == 1 && parseLong(args[0].str, n) && n >= 0 && n < NUM_DBS)
+                repSimple(o, "OK");
             else
                 repError(o, "ERR DB index is out of range");
             break;
@@ -2264,19 +2274,63 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "MOVE":
         {
             if (args.length != 2)
+            {
                 arityErr(o, "move");
-            else if (args[1].str == "0")
-                repError(o, "ERR source and destination objects are the same");
-            else
+                break;
+            }
+            long dst;
+            if (!parseLong(args[1].str, dst) || dst < 0 || dst >= NUM_DBS)
+            {
                 repError(o, "ERR DB index is out of range");
+                break;
+            }
+            int curIdx = -1; // which db is `ks`? (not in gDbs when unit-tested)
+            foreach (i, ref d; gDbs)
+                if (&d is &ks)
+                {
+                    curIdx = cast(int) i;
+                    break;
+                }
+            if (curIdx < 0 || dst == curIdx) // same db, or a detached keyspace
+            {
+                repError(o, "ERR source and destination objects are the same");
+                break;
+            }
+            auto src = ks.lookup(args[0].str);
+            if (src is null || gDbs[cast(size_t) dst].exists(args[0].str))
+            {
+                repInt(o, 0); // no such key, or the destination already has it
+                break;
+            }
+            immutable ttl = src.expireAtMs;
+            ks.disarmExpire(args[0].str, ttl);
+            RObj obj;
+            ks.d.steal(args[0].str, obj);
+            gDbs[cast(size_t) dst].d.set(args[0].str, obj);
+            gDbs[cast(size_t) dst].armExpire(args[0].str, ttl);
+            repInt(o, 1);
             break;
         }
     case "SWAPDB":
         {
-            if (args.length == 2 && args[0].str == "0" && args[1].str == "0")
-                repSimple(o, "OK");
-            else
+            long a, b;
+            if (args.length != 2 || !parseLong(args[0].str, a) || !parseLong(args[1].str, b))
+            {
+                repError(o, "ERR invalid first DB index or second DB index");
+                break;
+            }
+            if (a < 0 || a >= NUM_DBS || b < 0 || b >= NUM_DBS)
+            {
                 repError(o, "ERR DB index is out of range");
+                break;
+            }
+            if (a != b)
+            {
+                import std.algorithm.mutation : swap;
+
+                swap(gDbs[cast(size_t) a], gDbs[cast(size_t) b]);
+            }
+            repSimple(o, "OK");
             break;
         }
     case "WAIT":

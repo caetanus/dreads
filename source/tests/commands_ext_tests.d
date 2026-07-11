@@ -67,7 +67,8 @@ version (unittest)
         auto time = ks.run("TIME");
         time[0 .. 4].expect.to.equal("*2\r\n");
         ks.run("SELECT", "0").expect.to.equal("+OK\r\n");
-        ks.run("SELECT", "3").expect.to.equal("-ERR DB index is out of range\r\n");
+        ks.run("SELECT", "3").expect.to.equal("+OK\r\n"); // 16 dbs now
+        ks.run("SELECT", "99").expect.to.equal("-ERR DB index is out of range\r\n");
         // CONFIG lives at the server layer; at dispatch level it is unknown
         ks.run("CONFIG", "GET", "maxmemory")[0].expect.to.equal('-');
         ks.run("INFO").expect.to.contain("redis_version");

@@ -23,11 +23,11 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
-import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
+import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
 import dreads.config : applyDirective, gConfig, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
-import dreads.obj : Keyspace;
+import dreads.obj : Keyspace, gDbs, NUM_DBS;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
@@ -36,7 +36,15 @@ import dreads.scripting : cachedScript, evalCommand, scriptCommand;
 private enum READ_CHUNK = 16 * 1024;
 
 // The event loop is single-threaded, so shared state needs no locking.
-private __gshared Keyspace gKeys;
+// The logical databases live in `gDbs` (dreads.obj); client commands dispatch
+// against the *connection's* selected db (`Conn.db`). `gKeys` names db 0 — used
+// by the replay/persistence/eviction/blocking paths, which are still db-0-only
+// (multi-db there is a TODO; see BLACKBOX-TODO.md).
+private ref Keyspace gKeys() @property @nogc nothrow @trusted
+{
+    return gDbs[0];
+}
+
 private __gshared PubSub gPubSub;
 private __gshared PubSub gShardPubSub; // single node: shard = plain, own namespace
 private __gshared Aof gAof;
@@ -93,7 +101,8 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         lruClock = cast(uint)(nowMs() / 1000);
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
-            gKeys.activeExpireCycle(); // drop-soon sweep: reclaim keys past their deadline
+            foreach (ref d; gDbs) // drop-soon sweep across every database
+                d.activeExpireCycle();
             flushPendingNotify(); // deliver the "expired" events the sweep queued
             gAof.fsyncNow();
         }, true);
@@ -153,7 +162,7 @@ private void initReplication()
     cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
     string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
-    gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gKeys);
+    gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gDbs[0]);
     gReplicator.start();
     printf("dreads: raft node %u active on port %u (%zu peers)\n",
             cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);
@@ -170,6 +179,7 @@ private struct Conn
     Subscriber sub;
     Subscriber shardSub;
     ulong id;
+    Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
     const(char)[] clientName; // malloc'd
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // MULTI state: queued raw commands, back to back
@@ -354,6 +364,7 @@ private void serveClient(TCPConnection tcp) nothrow
     Conn c;
     c.tcp = tcp;
     c.id = ++gClientIds;
+    c.dbp = &gDbs[0]; // default to db 0
     c.sub.ctx = &c;
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
@@ -492,22 +503,39 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     if (c.pendingCount > 0 && !isDeferrableWrite(c, cmd))
         flushPending(c, o);
     if (cmd.type != RType.Array || cmd.arr.length == 0)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (ref a; cmd.arr)
     {
         if (a.type != RType.BulkString && a.type != RType.SimpleString)
-            return dispatch(cmd, gKeys, o, arena);
+            return dispatch(cmd, *c.dbp, o, arena);
     }
     auto name = cmd.arr[0].str;
     char[16] nbuf = void;
     if (name.length > nbuf.length)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
     switch (uname)
     {
+    case "SELECT":
+        {
+            // per-connection database switch — pure connection state, like HELLO
+            long n = -1;
+            if (cmd.arr.length == 2)
+                parseLong(cmd.arr[1].str, n);
+            if (cmd.arr.length != 2)
+                repError(o, "ERR wrong number of arguments for 'select' command");
+            else if (n < 0 || n >= NUM_DBS)
+                repError(o, "ERR DB index is out of range");
+            else
+            {
+                c.dbp = &gDbs[cast(size_t) n];
+                repSimple(o, "OK");
+            }
+            return true;
+        }
     case "MULTI":
         if (c.inMulti)
             repError(o, "ERR MULTI calls can not be nested");
@@ -617,7 +645,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     auto args = cmd.arr[1 .. $];
     char[16] nbuf = void;
     if (name.length > nbuf.length)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
@@ -1011,7 +1039,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
             bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
             auto outBefore = o.length;
-            evalCommand(args, gKeys, o, arena, bySha, readOnly);
+            evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
             // scripts may write; log unless the script itself errored.
             // overrides set by commands inside the script are superseded by
             // logging the whole EVAL.
@@ -1088,7 +1116,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         return true;
     }
     auto outBefore = o.length;
-    auto keep = dispatch(cmd, gKeys, o, arena);
+    auto keep = dispatch(cmd, *c.dbp, o, arena);
     if (o.length > outBefore && o.data[outBefore] != '-')
     {
         if (isWriteCommand(uname) || !propagationOverride.empty)
@@ -1817,8 +1845,9 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "INFO") || eqICDebug(sub, "LIST"))
     {
         char[160] b = void;
-        auto n = snprintf(b.ptr, b.length, "id=%llu addr=? name=%.*s db=0 cmd=client\n",
-                c.id, cast(int) c.clientName.length, c.clientName.ptr);
+        auto n = snprintf(b.ptr, b.length, "id=%llu addr=? name=%.*s db=%d cmd=client\n",
+                c.id, cast(int) c.clientName.length, c.clientName.ptr,
+                cast(int)(c.dbp - &gDbs[0]));
         repBulk(o, b[0 .. n]);
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
