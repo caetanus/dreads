@@ -10,6 +10,16 @@ purpose — speed.
 ⟜ Geo indexing. Custom types. One purpose: Speed.
 ```
 
+## Origin
+
+dreads started as an experiment with a single question: **would D's fibers give
+a real edge for a Redis-like server?** Redis is single-threaded and bound on
+multiplexing many connections; D's lightweight fibers on a single-threaded
+event loop (vibe-core) promised a fiber-per-connection model without the weight
+of OS threads. The numbers below are what that experiment grew into once the
+answer looked like *yes* — the zero-GC data plane, arena memory, and the Raft
+log all came from taking that first result seriously.
+
 ## Why
 
 Competitive with real Redis, measured with `redis-benchmark` against the
