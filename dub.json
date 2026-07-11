@@ -36,6 +36,9 @@
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
 	"dependencies": {
 		"during": "~>0.3",
+		"emplace": {
+			"path": "vendor/emplace"
+		},
 		"draft": {
 			"path": "vendor/raft"
 		},
