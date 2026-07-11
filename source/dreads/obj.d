@@ -36,6 +36,7 @@ public struct RObj
     ObjType type;
     ulong expireAtMs; // 0 = no expiry; absolute epoch ms otherwise
     uint lruSecs; // last access, in lruClock units
+    uint expireSlot; // active expiry: this key's index in its deadline bucket (O(1) removal within it)
     union
     {
         StrVal str;
@@ -191,7 +192,8 @@ public struct Keyspace
     /// of the key strings. Purely local reclamation: the deadline is already
     /// replicated as an absolute PEXPIREAT, so every node/replay expires
     /// deterministically off its own copy — no DEL is propagated.
-    private Map!(ulong, Vector!(const(char)[])) expires;
+    private alias ExpBucket = Vector!(const(char)[]);
+    private Map!(ulong, ExpBucket) expires;
 
     @disable this(this);
 
@@ -205,36 +207,49 @@ public struct Keyspace
         return d.length;
     }
 
-    /// Record that `k` expires at absolute `at` (ms); no-op for at == 0.
+    /// Record that `k` expires at absolute `at` (ms); no-op for at == 0. Stashes
+    /// the key's slot in its bucket on the object, so removing it from the bucket
+    /// is O(1) (disarm is then just the O(log n) tree lookup, not O(bucket)).
     void armExpire(scope const(char)[] k, ulong at) @nogc nothrow
     {
         if (!gActiveExpire || at == 0)
             return;
-        auto sk = d.storedKey(k); // the Dict's own stable key bytes — no dup
-        if (sk is null)
+        auto o = d.get(k);
+        if (o is null)
             return; // not in the keyspace, nothing to expire
-        auto bucket = expires.getOrPut(at, Vector!(const(char)[]).init); // one descent
+        auto sk = d.storedKey(k); // the Dict's own stable key bytes — no dup
+        auto bucket = expires.getOrPut(at, ExpBucket.init); // one descent
+        o.expireSlot = cast(uint) bucket.length; // its position, for O(1) removal
         bucket.put(sk); // non-owning slice into Dict-owned memory
     }
 
-    /// Remove `k`'s entry from the bucket at `at`, freeing its key copy; drops
-    /// the bucket when it empties. No-op if the entry isn't there.
+    /// Remove `k`'s entry from its deadline bucket. O(log n) to find the bucket
+    /// (the RB-tree lookup), then O(1) to remove within it: swap the tail into the
+    /// key's stored slot (fixing up the moved key's slot) and pop — no O(bucket)
+    /// scan. Drops the bucket node when it empties. No-op if the entry isn't there
+    /// (e.g. armed while active expiry was off, then toggled on) — byte-compare guards it.
     void disarmExpire(scope const(char)[] k, ulong at) @nogc nothrow
     {
         if (!gActiveExpire || at == 0)
             return;
+        auto o = d.get(k);
+        if (o is null)
+            return; // key already gone; a stale bucket entry self-heals in the sweep
         auto bucket = expires.get(at);
         if (bucket is null)
             return;
-        foreach (i; 0 .. bucket.length)
+        immutable slot = o.expireSlot;
+        if (slot >= bucket.length || (*bucket)[slot] != k)
+            return; // not actually indexed here
+        immutable last = bucket.length - 1;
+        if (slot != last)
         {
-            if ((*bucket)[i] == k)
-            {
-                (*bucket)[i] = (*bucket)[bucket.length - 1]; // swap-remove: order is irrelevant
-                bucket.popBack();
-                break;
-            }
+            auto moved = (*bucket)[last];
+            (*bucket)[slot] = moved;
+            if (auto mo = d.get(moved)) // the relocated key learns its new slot
+                mo.expireSlot = cast(uint) slot;
         }
+        bucket.popBack();
         if (bucket.length == 0)
             expires.remove(at); // the empty Vector's array is freed by its dtor
     }
@@ -258,33 +273,23 @@ public struct Keyspace
         if (!gActiveExpire || expires.empty)
             return 0;
         immutable now = detNow();
-        Vector!ulong due; // materialise first — we can't remove nodes mid-walk
-        foreach (e; expires[]) // ascending by deadline; stop once we pass `now`
-        {
-            if (e.key > now)
-                break;
-            due.put(e.key);
-        }
         size_t dropped = 0;
-        foreach (i; 0 .. due.length)
+        // removeRight is a consuming range: it drains every deadline <= now in one
+        // pass, yielding each bucket live just before its node is dropped.
+        foreach (e; expires.removeRight(now))
         {
-            immutable at = due[i];
-            if (auto bucket = expires.get(at))
+            foreach (j; 0 .. e.value.length)
             {
-                foreach (j; 0 .. bucket.length)
+                auto key = e.value[j];
+                auto obj = d.get(key);
+                if (obj !is null && obj.expireAtMs == e.key) // still the live TTL
                 {
-                    auto key = (*bucket)[j];
-                    auto obj = d.get(key);
-                    if (obj !is null && obj.expireAtMs == at) // still the live TTL
-                    {
-                        notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
-                        d.del(key);
-                        dropped++;
-                    }
-                    // key is a non-owning slice into Dict memory — nothing to free
+                    notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
+                    d.del(key);
+                    dropped++;
                 }
+                // key is a non-owning slice into Dict memory — nothing to free
             }
-            expires.remove(at);
         }
         return dropped;
     }
