@@ -762,12 +762,25 @@ public struct PubSub
                     : bothDeliver(channel, payload, bothRight, cr, maxBothRightLen, false);
         }
 
-        // bare "*" matches everything
-        foreach (i; 0 .. matchAll.len)
+        // bare "*" matches everything — every matchAll subscriber shares the
+        // identical "*" pmessage, so encode it once and fan out the shared
+        // refcounted message (like channel delivery), not once per subscriber.
+        if (matchAll.len > 0)
         {
-            auto e = matchAll.items[i];
-            emitPmessage(e.sub, e.pattern, channel, payload);
-            receivers++;
+            scratch.clear();
+            repArrayHeader(scratch, 4);
+            repBulk(scratch, "pmessage");
+            repBulk(scratch, "*");
+            repBulk(scratch, channel);
+            repBulk(scratch, payload);
+            auto m = rcFromBytes(scratch.data);
+            foreach (i; 0 .. matchAll.len)
+            {
+                auto e = matchAll.items[i];
+                e.sub.sink(e.sub.ctx, m);
+                receivers++;
+            }
+            rcRelease(m);
         }
 
         // anchorless (*x*, ?x?): global glob scan (rare)
