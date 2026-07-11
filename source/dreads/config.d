@@ -42,6 +42,24 @@ public struct Config
     // hot path free of index maintenance. On = bounded memory for TTL-heavy
     // workloads that never re-touch their keys, at a per-SET-EX cost.
     bool activeExpire = false;
+    // Data-structure encoding thresholds. dreads uses a single encoding per
+    // type, so these are advisory: they are accepted, stored and echoed so the
+    // Redis/Valkey test suite's CONFIG SET/GET round-trips (and encoding
+    // fixtures) work. Defaults mirror Redis. `-ziplist-` names alias these.
+    long hashMaxListpackEntries = 128;
+    long hashMaxListpackValue = 64;
+    long listMaxListpackSize = 128;
+    long listCompressDepth = 0;
+    long setMaxIntsetEntries = 512;
+    long setMaxListpackEntries = 128;
+    long setMaxListpackValue = 64;
+    long zsetMaxListpackEntries = 128;
+    long zsetMaxListpackValue = 64;
+    long streamNodeMaxEntries = 100;
+    ulong streamNodeMaxBytes = 4096;
+    ulong protoMaxBulkLen = 512UL * 1024 * 1024;
+    ulong clientQueryBufferLimit = 1024UL * 1024 * 1024;
+    bool lazyfreeLazyServerDel = false;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -206,6 +224,97 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "notify-keyspace-events":
         cfg.notifyKeyspaceEvents = value.unquote;
+        return true;
+        // encoding thresholds (advisory; stored for CONFIG round-trips).
+    case "hash-max-listpack-entries", "hash-max-ziplist-entries":
+        return parseLongCfg(value, cfg.hashMaxListpackEntries);
+    case "hash-max-listpack-value", "hash-max-ziplist-value":
+        return parseLongCfg(value, cfg.hashMaxListpackValue);
+    case "list-max-listpack-size", "list-max-ziplist-size":
+        return parseLongCfg(value, cfg.listMaxListpackSize);
+    case "list-compress-depth":
+        return parseLongCfg(value, cfg.listCompressDepth);
+    case "set-max-intset-entries":
+        return parseLongCfg(value, cfg.setMaxIntsetEntries);
+    case "set-max-listpack-entries":
+        return parseLongCfg(value, cfg.setMaxListpackEntries);
+    case "set-max-listpack-value":
+        return parseLongCfg(value, cfg.setMaxListpackValue);
+    case "zset-max-listpack-entries", "zset-max-ziplist-entries":
+        return parseLongCfg(value, cfg.zsetMaxListpackEntries);
+    case "zset-max-listpack-value", "zset-max-ziplist-value":
+        return parseLongCfg(value, cfg.zsetMaxListpackValue);
+    case "stream-node-max-entries":
+        return parseLongCfg(value, cfg.streamNodeMaxEntries);
+    case "stream-node-max-bytes":
+        return parseMemory(value, cfg.streamNodeMaxBytes);
+    case "proto-max-bulk-len":
+        return parseMemory(value, cfg.protoMaxBulkLen);
+    case "client-query-buffer-limit":
+        return parseMemory(value, cfg.clientQueryBufferLimit);
+    case "lazyfree-lazy-server-del":
+        if (value == "yes")
+            cfg.lazyfreeLazyServerDel = true;
+        else if (value == "no")
+            cfg.lazyfreeLazyServerDel = false;
+        else
+            return false;
+        return true;
+        // accepted no-ops: dreads is never a replica and has no import mode,
+        // but the test suite flips these in start_server overrides.
+    case "import-mode":
+        return value == "yes" || value == "no";
+    case "replica-read-only", "slave-read-only":
+        return value == "yes" || value == "no";
+    case "save": // RDB snapshotting is not implemented; accept & ignore
+        return true;
+    case "hz": // background-task frequency; dreads uses a fixed timer
+        try
+            return value.to!int >= 0;
+        catch (Exception)
+            return false;
+    case "appendfsync":
+        return value == "always" || value == "everysec" || value == "no";
+    case "repl-ping-replica-period", "repl-ping-slave-period":
+        try
+            return value.to!int >= 0;
+        catch (Exception)
+            return false;
+    default:
+        return false;
+    }
+}
+
+private bool parseLongCfg(string value, ref long dst) nothrow
+{
+    import std.conv : to;
+
+    try
+        dst = value.to!long;
+    catch (Exception)
+        return false;
+    return true;
+}
+
+/// Parameters that CONFIG SET may change at runtime. Startup-only settings
+/// (port, dir, raft/cluster topology, appendonly) are excluded.
+public bool isRuntimeSettable(string lname) nothrow
+{
+    switch (lname)
+    {
+    case "maxmemory", "maxmemory-policy", "lua-time-limit", "lua-memory-limit",
+        "active-expire", "notify-keyspace-events", "lazyfree-lazy-server-del",
+        "appendonly", "import-mode", "replica-read-only", "slave-read-only",
+        "save", "hz", "appendfsync",
+        "repl-ping-replica-period", "repl-ping-slave-period",
+        "hash-max-listpack-entries", "hash-max-ziplist-entries",
+        "hash-max-listpack-value", "hash-max-ziplist-value",
+        "list-max-listpack-size", "list-max-ziplist-size", "list-compress-depth",
+        "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
+        "zset-max-listpack-entries", "zset-max-ziplist-entries",
+        "zset-max-listpack-value", "zset-max-ziplist-value",
+        "stream-node-max-entries", "stream-node-max-bytes",
+        "proto-max-bulk-len", "client-query-buffer-limit":
         return true;
     default:
         return false;

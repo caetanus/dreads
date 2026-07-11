@@ -24,7 +24,7 @@ import vibe.core.task : Task;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
-import dreads.config : applyDirective, gConfig, parseMemory;
+import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.obj : Keyspace, gDbs, NUM_DBS;
@@ -1248,6 +1248,14 @@ private void raftCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     repError(o, "ERR unknown RAFT subcommand");
 }
 
+private void repLong(ref ByteBuffer o, scope char[] buf, long v) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    auto n = snprintf(buf.ptr, buf.length, "%lld", v);
+    repBulk(o, buf[0 .. n]);
+}
+
 /// CONFIG GET pattern | SET name value | REWRITE | RESETSTAT
 private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
 {
@@ -1264,6 +1272,15 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         static immutable names = [
             "port", "appendonly", "appendfilename", "dir", "maxmemory",
             "maxmemory-policy", "lua-time-limit", "lua-memory-limit", "active-expire",
+            "notify-keyspace-events", "lazyfree-lazy-server-del",
+            "hash-max-listpack-entries", "hash-max-listpack-value",
+            "hash-max-ziplist-entries", "hash-max-ziplist-value",
+            "list-max-listpack-size", "list-max-ziplist-size", "list-compress-depth",
+            "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
+            "zset-max-listpack-entries", "zset-max-listpack-value",
+            "zset-max-ziplist-entries", "zset-max-ziplist-value",
+            "stream-node-max-entries", "stream-node-max-bytes",
+            "proto-max-bulk-len", "client-query-buffer-limit",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -1322,50 +1339,98 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 auto n = snprintf(b.ptr, b.length, "%lld", gConfig.luaTimeLimitMs);
                 repBulk(o, b[0 .. n]);
                 break;
-            default:
+            case "lua-memory-limit":
                 auto n = snprintf(b.ptr, b.length, "%llu", gConfig.luaMemoryLimit);
                 repBulk(o, b[0 .. n]);
+                break;
+            case "notify-keyspace-events":
+                repBulk(o, gConfig.notifyKeyspaceEvents);
+                break;
+            case "lazyfree-lazy-server-del":
+                repBulk(o, gConfig.lazyfreeLazyServerDel ? "yes" : "no");
+                break;
+            case "hash-max-listpack-entries", "hash-max-ziplist-entries":
+                repLong(o, b, gConfig.hashMaxListpackEntries);
+                break;
+            case "hash-max-listpack-value", "hash-max-ziplist-value":
+                repLong(o, b, gConfig.hashMaxListpackValue);
+                break;
+            case "list-max-listpack-size", "list-max-ziplist-size":
+                repLong(o, b, gConfig.listMaxListpackSize);
+                break;
+            case "list-compress-depth":
+                repLong(o, b, gConfig.listCompressDepth);
+                break;
+            case "set-max-intset-entries":
+                repLong(o, b, gConfig.setMaxIntsetEntries);
+                break;
+            case "set-max-listpack-entries":
+                repLong(o, b, gConfig.setMaxListpackEntries);
+                break;
+            case "set-max-listpack-value":
+                repLong(o, b, gConfig.setMaxListpackValue);
+                break;
+            case "zset-max-listpack-entries", "zset-max-ziplist-entries":
+                repLong(o, b, gConfig.zsetMaxListpackEntries);
+                break;
+            case "zset-max-listpack-value", "zset-max-ziplist-value":
+                repLong(o, b, gConfig.zsetMaxListpackValue);
+                break;
+            case "stream-node-max-entries":
+                repLong(o, b, gConfig.streamNodeMaxEntries);
+                break;
+            case "stream-node-max-bytes":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.streamNodeMaxBytes);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "proto-max-bulk-len":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.protoMaxBulkLen);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "client-query-buffer-limit":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.clientQueryBufferLimit);
+                repBulk(o, b[0 .. n]);
+                break;
+            default:
+                repBulk(o, ""); // known name with no value formatter
             }
         }
         return;
     }
     if (eqICDebug(args[0].str, "SET") && args.length == 3)
     {
-        // only runtime-safe parameters are settable
-        if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY")
-                || eqICDebug(args[1].str, "LUA-TIME-LIMIT")
-                || eqICDebug(args[1].str, "LUA-MEMORY-LIMIT")
-                || eqICDebug(args[1].str, "ACTIVE-EXPIRE"))
+        import std.uni : toLower;
+
+        string name, value, lname;
+        try
         {
-            string name, value;
-            try
-            {
-                name = (cast(string) args[1].str).idup;
-                value = (cast(string) args[2].str).idup;
-            }
-            catch (Exception)
-            {
-            }
-            import std.uni : toLower;
-
-            bool ok = false;
-            try
-                ok = applyDirective(name.toLower, value, gConfig);
-            catch (Exception)
-            {
-            }
-            if (ok)
-            {
-                import dreads.obj : gActiveExpire;
-
-                gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
-                repSimple(o, "OK");
-            }
-            else
-                repError(o, "ERR Invalid argument");
+            name = (cast(string) args[1].str).idup;
+            value = (cast(string) args[2].str).idup;
+            lname = name.toLower;
+        }
+        catch (Exception)
+        {
+        }
+        if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
+        {
+            repError(o, "ERR Unsupported CONFIG parameter");
             return;
         }
-        repError(o, "ERR Unsupported CONFIG parameter");
+        bool ok = false;
+        try
+            ok = applyDirective(lname, value, gConfig);
+        catch (Exception)
+        {
+        }
+        if (ok)
+        {
+            import dreads.obj : gActiveExpire;
+
+            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
+            repSimple(o, "OK");
+        }
+        else
+            repError(o, "ERR CONFIG SET failed - unable to set the value");
         return;
     }
     if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))
