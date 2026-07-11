@@ -22,6 +22,26 @@ public struct StrVal
         return StrVal(mallocDup(v));
     }
 
+    /// Overwrite the value, reusing the current allocation when `v` fits in it
+    /// (its bytes were malloc'd at >= the current length, so `v.length <= s.length`
+    /// is always safe). No malloc/free when the length is unchanged — the INCR /
+    /// counter common case. Falls back to a fresh dup when `v` is longer.
+    void assign(scope const(char)[] v) @nogc nothrow @trusted
+    {
+        import core.stdc.string : memcpy;
+
+        if (s.ptr !is null && v.length <= s.length)
+        {
+            memcpy(cast(void*) s.ptr, v.ptr, v.length);
+            s = s.ptr[0 .. v.length];
+        }
+        else
+        {
+            freeSlice(s);
+            s = mallocDup(v);
+        }
+    }
+
     void free() @nogc nothrow
     {
         freeSlice(s);

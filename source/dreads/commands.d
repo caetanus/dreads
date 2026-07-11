@@ -2783,7 +2783,10 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
     }
     char[24] buf = void;
     auto n = snprintf(buf.ptr, buf.length, "%lld", nv);
-    ks.setStr(key, buf[0 .. n]);
+    if (obj !is null)
+        obj.str.assign(buf[0 .. n]); // reuse the buffer: no malloc when the digit count is unchanged
+    else
+        ks.setStr(key, buf[0 .. n]);
     notifyKeyspaceEvent(NClass.str, event, key);
     repInt(o, nv);
 }
