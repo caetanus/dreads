@@ -2,7 +2,9 @@
 	"fileVersion": 1,
 	"versions": {
 		"automem": "0.6.11",
+		"draft": {"path":"vendor/raft"},
 		"during": "0.3.0",
+		"emplace": {"path":"vendor/emplace"},
 		"eventcore": "0.9.39",
 		"fluent-asserts": "2.0.5",
 		"libdparse": "0.25.1",

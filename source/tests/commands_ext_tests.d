@@ -238,7 +238,7 @@ version (unittest)
         ks.run("ROLE")[0 .. 4].expect.to.equal("*3\r\n");
         ks.run("AUTH", "x", "y")[0].expect.to.equal('-');
         ks.run("SLOWLOG", "LEN").expect.to.equal(":0\r\n");
-        ks.run("LOLWUT").expect.to.contain("dreads");
+        ks.run("LOLWUT").expect.to.contain("DREADS");
 
         ks.run("OBJECT", "ENCODING", "b").expect.to.equal("$3\r\nint\r\n");
         ks.run("SET", "txt", "hello");
