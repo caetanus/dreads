@@ -169,8 +169,65 @@ public ParseStatus parseValue(scope const(ubyte)[] buf, ref size_t pos,
             return ParseStatus.ok;
         }
     default:
-        return ParseStatus.protocolError;
+        return parseInline(buf, pos, arena, val);
     }
+}
+
+// Redis inline commands: a request line that does not start with a RESP marker
+// is a plain, whitespace-separated command (e.g. "PING\r\n", "SET k v\r\n").
+// Terminated by \n; a preceding \r is trimmed. Zero-copy — each token is a slice
+// into the buffer. Capped like Redis to reject an unbounded line with no newline.
+private enum MAX_INLINE = 64 * 1024;
+
+private ParseStatus parseInline(scope const(ubyte)[] buf, ref size_t pos,
+        ref Arena arena, out RVal val) @nogc nothrow
+{
+    size_t nl = pos;
+    while (nl < buf.length && buf[nl] != '\n')
+        nl++;
+    if (nl >= buf.length) // no line terminator yet
+        return buf.length - pos > MAX_INLINE ? ParseStatus.protocolError : ParseStatus.incomplete;
+    size_t stop = nl;
+    if (stop > pos && buf[stop - 1] == '\r')
+        stop--; // trim the CR of CRLF
+
+    static bool isSpace(ubyte c) @nogc nothrow
+    {
+        return c == ' ' || c == '\t';
+    }
+
+    size_t count = 0, i = pos;
+    while (i < stop) // count whitespace-separated tokens
+    {
+        while (i < stop && isSpace(buf[i]))
+            i++;
+        if (i >= stop)
+            break;
+        count++;
+        while (i < stop && !isSpace(buf[i]))
+            i++;
+    }
+
+    auto items = arena.allocArray!RVal(count);
+    size_t idx = 0;
+    i = pos;
+    while (i < stop && idx < count)
+    {
+        while (i < stop && isSpace(buf[i]))
+            i++;
+        if (i >= stop)
+            break;
+        immutable s = i;
+        while (i < stop && !isSpace(buf[i]))
+            i++;
+        items[idx].type = RType.BulkString;
+        items[idx].str = cast(const(char)[]) buf[s .. i];
+        idx++;
+    }
+    val.type = RType.Array;
+    val.arr = items;
+    pos = nl + 1; // consume through the newline
+    return ParseStatus.ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +486,51 @@ unittest // arrays
     assert(v.arr.length == 2 && v.arr[0].str == "hello\n" && v.arr[1].integer == -1);
 }
 
+unittest // inline commands (Redis inline protocol): non-'*' line -> whitespace split
+{
+    Arena a;
+    auto v = parseOne("PING\r\n", a);
+    assert(v.type == RType.Array && v.arr.length == 1 && v.arr[0].str == "PING");
+    assert(v.arr[0].type == RType.BulkString);
+
+    // args + runs of whitespace collapse
+    v = parseOne("  SET   k   v  \r\n", a);
+    assert(v.arr.length == 3 && v.arr[0].str == "SET" && v.arr[1].str == "k" && v.arr[2].str == "v");
+
+    // \n-only terminator (no \r), and tab as a separator
+    v = parseOne("PING\n", a);
+    assert(v.arr.length == 1 && v.arr[0].str == "PING");
+    v = parseOne("GET\tfoo\r\n", a);
+    assert(v.arr.length == 2 && v.arr[0].str == "GET" && v.arr[1].str == "foo");
+
+    // blank line -> empty array (the server loop skips it, like Redis)
+    v = parseOne("\r\n", a);
+    assert(v.type == RType.Array && v.arr.length == 0);
+
+    // no terminator yet -> incomplete, not a protocol error
+    parseOne("SET k v", a, ParseStatus.incomplete);
+}
+
+unittest // pipelined inline commands parse one at a time; inline + RESP interleave
+{
+    Arena a;
+    RVal v;
+    auto buf = cast(const(ubyte)[]) "MULTI\r\nSET k v\r\nINCR c\r\nEXEC\r\n";
+    size_t pos = 0;
+    foreach (w; ["MULTI", "SET", "INCR", "EXEC"])
+    {
+        assert(parseValue(buf, pos, a, v) == ParseStatus.ok);
+        assert(v.type == RType.Array && v.arr[0].str == w);
+    }
+    assert(pos == buf.length);
+
+    buf = cast(const(ubyte)[]) "PING\r\n*1\r\n$4\r\nPING\r\nPING\r\n";
+    pos = 0;
+    foreach (_; 0 .. 3)
+        assert(parseValue(buf, pos, a, v) == ParseStatus.ok && v.arr[0].str == "PING");
+    assert(pos == buf.length);
+}
+
 unittest // every proper prefix of a valid message is incomplete, never an error
 {
     Arena a;
@@ -448,7 +550,11 @@ unittest // every proper prefix of a valid message is incomplete, never an error
 unittest // protocol errors
 {
     Arena a;
-    parseOne("x", a, ParseStatus.protocolError);
+    // a bare non-'*' token with no newline is now an incomplete INLINE command
+    // (wait for the line terminator), not a protocol error
+    parseOne("x", a, ParseStatus.incomplete);
+    auto x = parseOne("x\r\n", a);
+    assert(x.type == RType.Array && x.arr.length == 1 && x.arr[0].str == "x");
     parseOne("$abc\r\n", a, ParseStatus.protocolError);
     parseOne(":\r\n", a, ParseStatus.protocolError);
     parseOne(":12x\r\n", a, ParseStatus.protocolError);

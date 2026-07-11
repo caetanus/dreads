@@ -399,6 +399,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     keep = false;
                     break;
                 }
+                if (cmd.type == RType.Array && cmd.arr.length == 0)
+                    continue; // blank inline line — Redis ignores it silently
                 gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
                 keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
                 if (gNotifyFlags)

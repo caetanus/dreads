@@ -52,13 +52,19 @@ version (unittest)
         foreach (bad; [
             "$99999999999999999999\r\n", "*99999999999999999999\r\n",
             "$18446744073709551617\r\n", ":999999999999999999999999\r\n",
-            "$-2\r\n", "*-2\r\n", "!oops\r\n", "\x00\x01\x02",
+            "$-2\r\n", "*-2\r\n",
         ])
         {
             size_t pos = 0;
             parseValue(cast(const(ubyte)[]) bad, pos, a, v)
                 .expect.to.equal(ParseStatus.protocolError);
         }
+        // a line not starting with a RESP marker is the inline protocol, not an
+        // error: "!oops" is a (bogus) inline command; binary with no newline waits
+        size_t ip = 0;
+        parseValue(cast(const(ubyte)[]) "!oops\r\n", ip, a, v).expect.to.equal(ParseStatus.ok);
+        ip = 0;
+        parseValue(cast(const(ubyte)[]) "\x00\x01\x02", ip, a, v).expect.to.equal(ParseStatus.incomplete);
         // huge-but-valid bulk header: incomplete (waits for data), not error
         size_t pos = 0;
         parseValue(cast(const(ubyte)[]) "$1048576\r\nabc", pos, a, v)
