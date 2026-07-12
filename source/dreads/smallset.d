@@ -1,36 +1,42 @@
 module dreads.smallset;
 
-// A byte-string set with an LLVM-SmallSet-style small-size optimization: below a
-// cache-fitting threshold it is a contiguous array of members with linear scan
-// (one allocation, no per-element hash nodes — cache-friendly, prefetchable);
-// above it, it spills one-way to a Dict. The memory win is on the many-tiny-sets
-// case; the API mirrors `Dict!Unit` exactly so RObj call sites are unchanged.
+// A byte-string set with an LLVM-SmallSet / Redis-listpack-style small-size
+// optimization: below a cache-fitting threshold ALL member bytes live packed in
+// one contiguous blob (with a parallel offset index for O(1) keyAt), so a
+// membership scan walks a single cache-resident buffer instead of chasing a
+// pointer to a separately-malloc'd member per element — that pointer-chase is
+// what perf showed dominates; O(n) inside the cache beats O(n) wandering RAM.
+// Past the threshold it spills one-way to a Dict. API mirrors `Dict!Unit` so
+// RObj call sites are unchanged.
 //
-// Design notes: see the `small-collections-llvm` memory. Starts in dreads; may
-// move to emplace once proven. RObj holds this by value in its union, so — like
-// the emplace containers — it uses free()/RAII-by-convention, NOT a destructor
-// (a union field may not have one). That rules out emplace.Vector (it has a
-// ~this), so the small array is a raw malloc'd buffer managed here.
+// Design notes: see `small-collections-llvm` memory. Starts in dreads; may move
+// to emplace. RObj holds this by value in its union, so it uses free()/RAII-by-
+// convention, NOT a destructor (a union field may not have one).
 
 import dreads.dict : canonicalInt, Dict, Unit;
-import dreads.mem : mallocDup, freeSlice;
 
 struct SmallSet
 {
-    // Redis thresholds. An all-integer set stays a compact array (intset) up to
-    // MAX_INTSET; a set with any non-int member is bounded by the listpack
-    // limits (MAX_ENTRIES / MAX_MEMBER). Either way the array fits L1, so the
-    // linear scan stays hot. Past the limit it spills one-way to a Dict.
+    // Redis thresholds. An all-integer set stays compact (intset) up to
+    // MAX_INTSET; any non-int member drops it to the listpack limits
+    // (MAX_ENTRIES / MAX_MEMBER). Either way the blob fits L1. Then it spills.
     enum size_t MAX_ENTRIES = 128; // set-max-listpack-entries
     enum size_t MAX_MEMBER = 64; // set-max-listpack-value
     enum size_t MAX_INTSET = 512; // set-max-intset-entries
 
-    private bool big; // false = small array, true = Dict
-    private bool hasNonInt; // a non-int member was added (drops intset -> listpack).
+    private struct Ent
+    {
+        uint pos, len;
+    } // member = blob[pos .. pos+len]
+
+    private bool big; // false = packed blob, true = Dict
+    private bool hasNonInt; // a non-int member was added (intset -> listpack).
     // NOTE: inverted (not `allInt`) on purpose — RObj holds this in a zero-init
     // union, so a field's `= true` default would NOT apply; zero must mean intset.
-    private const(char)[]* items; // malloc'd array of owned member slices (small)
-    private size_t len, cap;
+    private ubyte* blob; // packed member bytes, back to back
+    private size_t blen, bcap;
+    private Ent* ents; // one entry per member, into the blob
+    private size_t count, ecap;
     private Dict!Unit large; // large mode
 
     /// The Redis-equivalent encoding, backed by the real small/large state.
@@ -41,40 +47,46 @@ struct SmallSet
         return hasNonInt ? "listpack" : "intset";
     }
 
+    private const(char)[] at(size_t i) const @nogc nothrow @trusted
+    {
+        return cast(const(char)[]) blob[ents[i].pos .. ents[i].pos + ents[i].len];
+    }
+
     // ----- queries -----
 
     @property size_t length() const @nogc nothrow
     {
-        return big ? large.length : len;
+        return big ? large.length : count;
     }
 
     bool contains(scope const(char)[] m) const @nogc nothrow
     {
         if (big)
             return large.contains(m);
-        foreach (i; 0 .. len)
-            if (items[i] == m)
+        // scan the contiguous blob — cache-resident, no per-member pointer chase
+        foreach (i; 0 .. count)
+            if (at(i) == m)
                 return true;
         return false;
     }
 
     alias exists = contains;
 
-    // ----- slot view (SCAN / SRANDMEMBER / SPOP cursor) -----
+    // ----- slot view (SCAN / SRANDMEMBER / SPOP cursor); keyAt is O(1) -----
 
     @property size_t capacity() const @nogc nothrow
     {
-        return big ? large.capacity : len;
+        return big ? large.capacity : count;
     }
 
     bool slotLive(size_t i) const @nogc nothrow
     {
-        return big ? large.slotLive(i) : i < len;
+        return big ? large.slotLive(i) : i < count;
     }
 
     const(char)[] keyAt(size_t i) const @nogc nothrow
     {
-        return big ? large.keyAt(i) : items[i];
+        return big ? large.keyAt(i) : at(i);
     }
 
     // ----- mutations -----
@@ -85,36 +97,43 @@ struct SmallSet
     {
         if (big)
             return large.set(m, Unit());
-        foreach (i; 0 .. len)
-            if (items[i] == m)
+        foreach (i; 0 .. count)
+            if (at(i) == m)
                 return false;
-        // an int-only set stays intset (up to 512); any non-int member (or a
-        // too-long one) drops it to listpack limits. Spill past the limit.
         long iv;
         immutable mIsInt = canonicalInt(m, iv);
         immutable staysInt = !hasNonInt && mIsInt;
         immutable limit = staysInt ? MAX_INTSET : MAX_ENTRIES;
-        if (len >= limit || (!mIsInt && m.length > MAX_MEMBER))
+        if (count >= limit || (!mIsInt && m.length > MAX_MEMBER))
         {
             spill();
             return large.set(m, Unit());
         }
-        pushSmall(mallocDup(m)); // own the member bytes
+        append(m);
         if (!mIsInt)
             hasNonInt = true;
         return true;
     }
 
-    bool remove(scope const(char)[] m) @nogc nothrow
+    bool remove(scope const(char)[] m) @nogc nothrow @trusted
     {
         if (big)
             return large.remove(m);
-        foreach (i; 0 .. len)
-            if (items[i] == m)
+        import core.stdc.string : memmove;
+
+        foreach (i; 0 .. count)
+            if (at(i) == m)
             {
-                freeSlice(items[i]);
-                items[i] = items[len - 1]; // swap-remove
-                len--;
+                immutable pos = ents[i].pos, mlen = ents[i].len;
+                // close the blob hole, then fix up every offset past it
+                memmove(blob + pos, blob + pos + mlen, blen - pos - mlen);
+                blen -= mlen;
+                foreach (j; 0 .. count)
+                    if (ents[j].pos > pos)
+                        ents[j].pos -= mlen;
+                foreach (j; i .. count - 1) // drop entry i, keep order
+                    ents[j] = ents[j + 1];
+                count--;
                 return true;
             }
         return false;
@@ -128,8 +147,8 @@ struct SmallSet
     {
         if (big)
             return large.opApply((const(char)[] k, ref Unit) => dg(k));
-        foreach (i; 0 .. len)
-            if (auto r = dg(items[i]))
+        foreach (i; 0 .. count)
+            if (auto r = dg(at(i)))
                 return r;
         return 0;
     }
@@ -139,16 +158,16 @@ struct SmallSet
         if (big)
             return large.opApply(dg);
         Unit u;
-        foreach (i; 0 .. len)
-            if (auto r = dg(items[i], u))
+        foreach (i; 0 .. count)
+            if (auto r = dg(at(i), u))
                 return r;
         return 0;
     }
 
     // ----- lifecycle -----
 
-    /// Independent deep copy (dups member bytes). Used by RObj.deepDup / COPY.
-    SmallSet dup() const @nogc nothrow
+    /// Independent deep copy. Used by RObj.deepDup / COPY.
+    SmallSet dup() const @nogc nothrow @trusted
     {
         SmallSet c;
         if (big)
@@ -156,10 +175,21 @@ struct SmallSet
             foreach (i; 0 .. large.capacity)
                 if (large.slotLive(i))
                     c.set(large.keyAt(i), Unit());
+            return c;
         }
-        else
-            foreach (i; 0 .. len)
-                c.set(items[i], Unit());
+        // fast path: one blob copy + one entry-array copy
+        import core.stdc.stdlib : malloc;
+
+        if (count)
+        {
+            c.blob = cast(ubyte*) malloc(blen);
+            c.blob[0 .. blen] = blob[0 .. blen]; // slice copy
+            c.bcap = c.blen = blen;
+            c.ents = cast(Ent*) malloc(count * Ent.sizeof);
+            c.ents[0 .. count] = ents[0 .. count];
+            c.ecap = c.count = count;
+        }
+        c.hasNonInt = hasNonInt;
         return c;
     }
 
@@ -167,53 +197,63 @@ struct SmallSet
     {
         if (big)
             large.free();
-        else
-            foreach (i; 0 .. len)
-                freeSlice(items[i]);
-        len = 0;
+        count = blen = 0;
         big = false;
         hasNonInt = false;
     }
 
     void free() @nogc nothrow @trusted
     {
-        clear();
-        if (items !is null)
-        {
-            import core.stdc.stdlib : cfree = free;
+        import core.stdc.stdlib : cfree = free;
 
-            cfree(items);
-            items = null;
-            cap = 0;
+        clear();
+        if (blob !is null)
+        {
+            cfree(blob);
+            blob = null;
+            bcap = 0;
+        }
+        if (ents !is null)
+        {
+            cfree(ents);
+            ents = null;
+            ecap = 0;
         }
     }
 
-    // one-way small -> large: hand every member to the Dict (which dups the key),
-    // then free the array's owned copies.
+    // one-way small -> large: hand every member to the Dict (which dups the key)
     private void spill() @nogc nothrow
     {
-        foreach (i; 0 .. len)
-        {
-            large.set(items[i], Unit());
-            freeSlice(items[i]);
-        }
-        len = 0;
+        foreach (i; 0 .. count)
+            large.set(at(i), Unit());
+        count = blen = 0;
         big = true;
     }
 
-    // append to the small array, growing the buffer 2x as needed
-    private void pushSmall(const(char)[] owned) @nogc nothrow @trusted
+    // append member bytes to the blob + an entry, growing both 2x as needed
+    private void append(scope const(char)[] m) @nogc nothrow @trusted
     {
         import core.stdc.stdlib : realloc;
 
-        if (len == cap)
+        if (blen + m.length > bcap)
         {
-            immutable nc = cap ? cap * 2 : 8;
-            items = cast(const(char)[]*) realloc(items, nc * (const(char)[]).sizeof);
-            assert(items !is null, "out of memory");
-            cap = nc;
+            auto nc = bcap ? bcap * 2 : 16; // small first cap: tiny sets stay tiny
+            while (nc < blen + m.length)
+                nc *= 2;
+            blob = cast(ubyte*) realloc(blob, nc);
+            assert(blob !is null, "out of memory");
+            bcap = nc;
         }
-        items[len++] = owned;
+        if (count == ecap)
+        {
+            immutable nc = ecap ? ecap * 2 : 4;
+            ents = cast(Ent*) realloc(ents, nc * Ent.sizeof);
+            assert(ents !is null, "out of memory");
+            ecap = nc;
+        }
+        blob[blen .. blen + m.length] = cast(const(ubyte)[]) m[]; // slice copy
+        ents[count++] = Ent(cast(uint) blen, cast(uint) m.length);
+        blen += m.length;
     }
 }
 

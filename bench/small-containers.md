@@ -6,25 +6,34 @@ SmallSet (contiguous linear-scan array below the Redis set-max-listpack/intset
 thresholds, spilling one-way to a Dict). Memory is the server process VmRSS
 delta after loading, measured from `/proc/<pid>/status`.
 
+The small set stores **all member bytes packed in one contiguous blob** (with a
+parallel offset index for O(1) `keyAt`), so a scan walks a single cache-resident
+buffer instead of chasing a pointer to a separately-malloc'd member per element.
+perf on SISMEMBER showed that per-member pointer-chase — O(n) inside the cache
+beats O(n) wandering RAM — was the cost; an earlier slice-array version (members
+in separate mallocs) is shown for comparison.
+
 ## Memory — 100 000 sets × 5 members each (the many-tiny-sets case)
 
-| members | OLD (hashtable) | NEW | reduction |
-|---|---|---|---|
-| 5 short strings | 104.8 MB | **56.8 MB** (listpack) | **−46% (1.85×)** |
-| 5 integers      | 104.8 MB | **56.8 MB** (intset)   | **−46% (1.85×)** |
+| members | OLD (hashtable) | slice-array | NEW blob | reduction |
+|---|---|---|---|---|
+| 5 short strings | 104.8 MB | 56.8 MB | **51.7 MB** (listpack) | **−51%** |
+| 5 integers      | 104.8 MB | 56.8 MB | **51.8 MB** (intset)   | **−51%** |
 
 The headline: roughly **half the memory** for small sets. OLD pays a full open-
-addressing hash table + per-entry overhead per set; NEW is one contiguous array
-of member slices — one allocation, no per-element nodes.
+addressing hash table + per-entry overhead per set; the blob is one member-byte
+buffer + a small offset array — no per-element malloc header at all.
 
 ## Throughput
 
-| op | OLD | NEW small | NEW big |
+| op | OLD | slice-array | NEW blob |
 |---|---|---|---|
-| insertion (load 100k×5) | 0.13 s | **0.11 s** | — |
-| SMEMBERS (iterate 100-member set) | 157k rps | **174k rps** (+11%) | — |
-| SISMEMBER (lookup, 100-member set) | **1.65M rps** | 1.36M rps (−18%) | — |
-| SISMEMBER (lookup, 2000-member set) | 1.63M rps | — | 1.65M rps (=) |
+| SMEMBERS (iterate 100-member set) | 157k rps | 174k | **173k rps** (+10%) |
+| SISMEMBER (lookup, 100-member set) | **1.65M rps** | 1.36M | 1.42M rps (−14%) |
+| SISMEMBER (lookup, 2000-member set, spilled) | 1.63M rps | — | 1.65M rps (=) |
+
+The contiguous blob recovered part of the lookup gap over the slice-array
+(1.36M → 1.42M) by removing the per-member cache miss.
 
 ## Reading the result (honest tradeoff)
 
