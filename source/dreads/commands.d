@@ -10,6 +10,7 @@ import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
+import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
@@ -1401,11 +1402,21 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            double cur = 0;
-            obj.zset.score(args[2].str, cur);
-            obj.zset.add(cur + delta, args[2].str);
+            import core.stdc.math : isnan;
+
+            double cur;
+            if (!obj.zset.score(args[2].str, cur))
+                cur = 0; // absent member starts at 0 (out double leaves NaN in D)
+            immutable nv = cur + delta;
+            if (isnan(nv)) // inf + -inf
+            {
+                repError(o, "ERR resulting score is not a number (NaN)");
+                ks.delIfEmpty(args[0].str, obj); // drop a key we may have just created
+                break;
+            }
+            obj.zset.add(nv, args[2].str);
             notifyKeyspaceEvent(NClass.zset, "zincr", args[0].str);
-            repDouble(o, cur + delta);
+            repDouble(o, nv);
             break;
         }
     case "ZCARD":
@@ -1427,10 +1438,21 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "ZREVRANK":
         {
             bool rev = name.length != 5;
-            if (args.length != 2)
+            if (args.length < 2 || args.length > 3)
             {
                 arityErr(o, rev ? "zrevrank" : "zrank");
                 break;
+            }
+            bool withScore = false;
+            if (args.length == 3)
+            {
+                if (eqICKeyword(args[2].str, "WITHSCORE"))
+                    withScore = true;
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    break;
+                }
             }
             bool wrong;
             auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
@@ -1442,9 +1464,24 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             bool ok;
             auto r = obj is null ? 0 : obj.zset.rank(args[1].str, ok);
             if (!ok)
-                repNullBulk(o);
+            {
+                if (withScore)
+                    repNullArray(o); // WITHSCORE not-found is a nil array
+                else
+                    repNullBulk(o);
+                break;
+            }
+            auto rank = rev ? cast(long)(obj.zset.length - 1 - r) : cast(long) r;
+            if (withScore)
+            {
+                double sc;
+                obj.zset.score(args[1].str, sc);
+                repArrayHeader(o, 2);
+                repInt(o, rank);
+                repDouble(o, sc);
+            }
             else
-                repInt(o, rev ? cast(long)(obj.zset.length - 1 - r) : cast(long) r);
+                repInt(o, rank);
             break;
         }
     case "ZRANGE":
@@ -3186,6 +3223,11 @@ private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) 
         repError(o, "ERR value is not an integer or out of range");
         return;
     }
+    if (howMany == long.min) // -howMany would overflow (Redis rejects LLONG_MIN)
+    {
+        repError(o, "ERR value is out of range");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.set, wrong);
     if (wrong)
@@ -3259,7 +3301,7 @@ private void sintercard(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
         return;
     }
     auto keys = args[1 .. 1 + cast(size_t) numkeys];
-    auto sets = arena.allocArray!(const(Dict!Unit)*)(keys.length);
+    auto sets = arena.allocArray!(const(SmallSet)*)(keys.length);
     foreach (i, ref a; keys)
     {
         bool wrong;
@@ -3304,7 +3346,7 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
         return;
     }
     auto srcs = args[1 .. $];
-    Dict!Unit tmp;
+    SmallSet tmp;
     if (op == 'U')
     {
         foreach (ref a; srcs)
@@ -3325,8 +3367,8 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
     }
     else
     {
-        auto others = arena.allocArray!(const(Dict!Unit)*)(srcs.length - 1);
-        const(Dict!Unit)* base;
+        auto others = arena.allocArray!(const(SmallSet)*)(srcs.length - 1);
+        const(SmallSet)* base;
         foreach (i, ref a; srcs)
         {
             bool wrong;
@@ -3492,8 +3534,8 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
         arityErr(o, inter ? "sinter" : "sdiff");
         return;
     }
-    auto others = arena.allocArray!(const(Dict!Unit)*)(args.length - 1);
-    const(Dict!Unit)* base;
+    auto others = arena.allocArray!(const(SmallSet)*)(args.length - 1);
+    const(SmallSet)* base;
     foreach (i, ref a; args)
     {
         bool wrong;
@@ -3546,7 +3588,7 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
         arityErr(o, "sunion");
         return;
     }
-    Dict!Unit acc;
+    SmallSet acc;
     scope (exit)
         acc.free();
     foreach (ref a; args)
@@ -3921,11 +3963,11 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     case ObjType.list:
         return "linkedlist";
     case ObjType.hash:
-        return "hashtable";
+        return obj.hash.encoding(); // listpack | hashtable (real state)
     case ObjType.set:
-        return "hashtable";
+        return obj.set.encoding(); // intset | listpack | hashtable (real state)
     case ObjType.zset:
-        return "skiplist";
+        return obj.zset.encoding(); // listpack | skiplist (real state)
     case ObjType.stream:
         return "stream";
     }

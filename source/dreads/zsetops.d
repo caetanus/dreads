@@ -367,6 +367,11 @@ public void zrandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @
         repError(o, "ERR value is not an integer or out of range");
         return;
     }
+    if (count == long.min) // -count would overflow (Redis rejects LLONG_MIN)
+    {
+        repError(o, "ERR value is out of range");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
     if (wrong)
