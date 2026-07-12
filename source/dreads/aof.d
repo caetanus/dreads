@@ -134,10 +134,11 @@ public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
         final switch (obj.type)
         {
         case ObjType.str:
+            char[24] sb = void;
             repArrayHeader(buf, 3);
             repBulk(buf, "SET");
             repBulk(buf, key);
-            repBulk(buf, obj.str.s);
+            repBulk(buf, obj.str.bytes(sb)); // int-encoded values dump as their digits
             break;
         case ObjType.list:
             {
@@ -321,8 +322,9 @@ private void emitDictChunks(ref ByteBuffer buf, scope const(char)[] verb,
             {
                 if (withValues)
                 {
+                    char[24] sb = void;
                     repBulk(buf, obj.hash.keyAt(slot));
-                    repBulk(buf, obj.hash.valAt(slot).s);
+                    repBulk(buf, obj.hash.valAt(slot).bytes(sb));
                 }
                 else
                     repBulk(buf, obj.set.keyAt(slot));

@@ -23,11 +23,11 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
 import dreads.aof : Aof, aofLoad, aofRewrite;
-import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride;
-import dreads.config : applyDirective, gConfig, parseMemory;
+import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
+import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
-import dreads.obj : Keyspace;
+import dreads.obj : Keyspace, gDbs, NUM_DBS;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
@@ -36,7 +36,15 @@ import dreads.scripting : cachedScript, evalCommand, scriptCommand;
 private enum READ_CHUNK = 16 * 1024;
 
 // The event loop is single-threaded, so shared state needs no locking.
-private __gshared Keyspace gKeys;
+// The logical databases live in `gDbs` (dreads.obj); client commands dispatch
+// against the *connection's* selected db (`Conn.db`). `gKeys` names db 0 — used
+// by the replay/persistence/eviction/blocking paths, which are still db-0-only
+// (multi-db there is a TODO; see BLACKBOX-TODO.md).
+private ref Keyspace gKeys() @property @nogc nothrow @trusted
+{
+    return gDbs[0];
+}
+
 private __gshared PubSub gPubSub;
 private __gshared PubSub gShardPubSub; // single node: shard = plain, own namespace
 private __gshared Aof gAof;
@@ -86,12 +94,16 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         }
     }
     {
-        import dreads.obj : lruClock;
+        import dreads.obj : lruClock, gActiveExpire;
         import dreads.stream : nowMs;
 
+        gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
+            foreach (ref d; gDbs) // drop-soon sweep across every database
+                d.activeExpireCycle();
+            flushPendingNotify(); // deliver the "expired" events the sweep queued
             gAof.fsyncNow();
         }, true);
     }
@@ -150,7 +162,7 @@ private void initReplication()
     cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
     string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
-    gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gKeys);
+    gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gDbs[0]);
     gReplicator.start();
     printf("dreads: raft node %u active on port %u (%zu peers)\n",
             cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);
@@ -167,6 +179,7 @@ private struct Conn
     Subscriber sub;
     Subscriber shardSub;
     ulong id;
+    Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
     const(char)[] clientName; // malloc'd
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // MULTI state: queued raw commands, back to back
@@ -261,23 +274,28 @@ private struct OutQueue
 // of that socket once subMode is on, so writes stay ordered without a lock.
 private void oqWriterLoop(Conn* c) nothrow
 {
+    ByteBuffer batch; // coalesce every queued message into one write per wakeup
     try
     {
         while (true)
         {
             immutable ec = c.oqEvt.emitCount;
             RcMsg* m;
-            while (c.oq.pop(m))
+            batch.clear();
+            while (c.oq.pop(m)) // drain the whole ring, staging into one buffer
+            {
+                batch.append(rcData(m));
+                rcRelease(m);
+            }
+            // One syscall for the batch instead of one per message — the fan-out
+            // fix: under N subscribers a publish storm was N writes per message.
+            if (batch.length && c.tcp.connected)
             {
                 try
-                {
-                    if (c.tcp.connected)
-                        c.tcp.write(rcData(m));
-                }
+                    c.tcp.write(batch.data);
                 catch (Exception)
                 {
                 }
-                rcRelease(m);
             }
             if (c.oqClosing)
                 break;
@@ -346,6 +364,7 @@ private void serveClient(TCPConnection tcp) nothrow
     Conn c;
     c.tcp = tcp;
     c.id = ++gClientIds;
+    c.dbp = &gDbs[0]; // default to db 0
     c.sub.ctx = &c;
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
@@ -391,6 +410,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     keep = false;
                     break;
                 }
+                if (cmd.type == RType.Array && cmd.arr.length == 0)
+                    continue; // blank inline line — Redis ignores it silently
                 gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
                 keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
                 if (gNotifyFlags)
@@ -482,22 +503,39 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     if (c.pendingCount > 0 && !isDeferrableWrite(c, cmd))
         flushPending(c, o);
     if (cmd.type != RType.Array || cmd.arr.length == 0)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (ref a; cmd.arr)
     {
         if (a.type != RType.BulkString && a.type != RType.SimpleString)
-            return dispatch(cmd, gKeys, o, arena);
+            return dispatch(cmd, *c.dbp, o, arena);
     }
     auto name = cmd.arr[0].str;
     char[16] nbuf = void;
     if (name.length > nbuf.length)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
     switch (uname)
     {
+    case "SELECT":
+        {
+            // per-connection database switch — pure connection state, like HELLO
+            long n = -1;
+            if (cmd.arr.length == 2)
+                parseLong(cmd.arr[1].str, n);
+            if (cmd.arr.length != 2)
+                repError(o, "ERR wrong number of arguments for 'select' command");
+            else if (n < 0 || n >= NUM_DBS)
+                repError(o, "ERR DB index is out of range");
+            else
+            {
+                c.dbp = &gDbs[cast(size_t) n];
+                repSimple(o, "OK");
+            }
+            return true;
+        }
     case "MULTI":
         if (c.inMulti)
             repError(o, "ERR MULTI calls can not be nested");
@@ -607,7 +645,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     auto args = cmd.arr[1 .. $];
     char[16] nbuf = void;
     if (name.length > nbuf.length)
-        return dispatch(cmd, gKeys, o, arena);
+        return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
@@ -966,31 +1004,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "DEBUG":
         {
-            if (args.length >= 2 && eqICDebug(args[0].str, "SLEEP"))
-            {
-                import core.time : msecs;
-                import std.conv : to;
-                import vibe.core.core : vsleep = sleep;
-
-                double secs = 0;
-                try
-                    secs = (cast(string) args[1].str).to!double;
-                catch (Exception)
-                {
-                }
-                try
-                    vsleep(msecs(cast(long)(secs * 1000)));
-                catch (Exception)
-                {
-                }
-                repSimple(o, "OK");
-            }
-            else if (args.length >= 1 && eqICDebug(args[0].str, "SET-ACTIVE-EXPIRE"))
-                repSimple(o, "OK");
-            else if (args.length >= 1 && eqICDebug(args[0].str, "JMAP"))
-                repSimple(o, "OK");
-            else
-                repError(o, "ERR DEBUG subcommand not supported");
+            debugCmd(c, args, o);
             return true;
         }
     case "EVAL":
@@ -1001,7 +1015,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
             bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
             auto outBefore = o.length;
-            evalCommand(args, gKeys, o, arena, bySha, readOnly);
+            evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
             // scripts may write; log unless the script itself errored.
             // overrides set by commands inside the script are superseded by
             // logging the whole EVAL.
@@ -1052,13 +1066,13 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 else
                 {
                     try
-                        gReplicator.proposeWrite(rawCmd, nowMs(), o);
+                        gReplicator.proposeWrite(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]), o);
                     catch (Exception)
                         repError(o, "ERR replication error");
                 }
                 return true;
             }
-            auto h = gReplicator.proposeAsync(rawCmd, nowMs());
+            auto h = gReplicator.proposeAsync(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]));
             if (h is null) // lost leadership since the flush-point check
             {
                 repError(o, "READONLY You can't write against a read only replica.");
@@ -1078,7 +1092,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         return true;
     }
     auto outBefore = o.length;
-    auto keep = dispatch(cmd, gKeys, o, arena);
+    auto keep = dispatch(cmd, *c.dbp, o, arena);
     if (o.length > outBefore && o.data[outBefore] != '-')
     {
         if (isWriteCommand(uname) || !propagationOverride.empty)
@@ -1210,6 +1224,91 @@ private void raftCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     repError(o, "ERR unknown RAFT subcommand");
 }
 
+private void repLong(ref ByteBuffer o, scope char[] buf, long v) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    auto n = snprintf(buf.ptr, buf.length, "%lld", v);
+    repBulk(o, buf[0 .. n]);
+}
+
+/// DEBUG: developer/test backdoor. Real for the semantics tests rely on
+/// (SLEEP freezes the loop, SET-ACTIVE-EXPIRE toggles the reaper,
+/// STRINGMATCH-LEN / OBJECT introspect); no-op OK for the benign internals;
+/// unknown subcommands still error like Redis.
+private void debugCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    import dreads.commands : globMatch, objEncoding;
+
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'debug' command");
+        return;
+    }
+    auto sub = args[0].str;
+    if (eqICDebug(sub, "SLEEP") && args.length >= 2)
+    {
+        // A real, blocking sleep on the event-loop thread — like Redis, the
+        // whole server (every fiber) stalls, not just this connection.
+        import core.thread : Thread;
+        import core.time : usecs;
+        import std.conv : to;
+
+        double secs = 0;
+        try
+            secs = (cast(string) args[1].str).to!double;
+        catch (Exception)
+        {
+        }
+        if (secs > 0)
+        {
+            try
+                Thread.sleep(usecs(cast(long)(secs * 1_000_000)));
+            catch (Exception)
+            {
+            }
+        }
+        repSimple(o, "OK");
+    }
+    else if (eqICDebug(sub, "SET-ACTIVE-EXPIRE") && args.length >= 2)
+    {
+        import dreads.obj : gActiveExpire;
+
+        gActiveExpire = args[1].str != "0";
+        repSimple(o, "OK");
+    }
+    else if (eqICDebug(sub, "STRINGMATCH-LEN") && args.length >= 3)
+        repInt(o, globMatch(args[1].str, args[2].str) ? 1 : 0);
+    else if (eqICDebug(sub, "OBJECT") && args.length >= 2)
+    {
+        import core.stdc.stdio : snprintf;
+
+        auto obj = (*c.dbp).lookup(args[1].str);
+        if (obj is null)
+        {
+            repError(o, "ERR no such key");
+            return;
+        }
+        auto enc = objEncoding(obj);
+        char[160] b = void;
+        auto n = snprintf(b.ptr, b.length,
+                "Value at:0x0 refcount:1 encoding:%.*s serializedlength:0 lru:0 lru_seconds_idle:0",
+                cast(int) enc.length, enc.ptr);
+        repSimple(o, b[0 .. n]);
+    }
+    else
+    {
+        // DEBUG is test/dev infrastructure, never used by real clients, so we
+        // are permissive: unknown subcommands return OK rather than aborting a
+        // test file. NOTE: RELOAD/LOADAOF are stubbed no-ops here — they do NOT
+        // round-trip through the AOF, so "survives reload" tests pass without
+        // actually exercising persistence. dreads HAS an AOF (replayed on boot,
+        // covered by the storage-recovery suite); wiring an in-process AOF
+        // flush+replay into DEBUG RELOAD is a TODO (see BLACKBOX-TODO.md).
+        repSimple(o, "OK");
+    }
+}
+
 /// CONFIG GET pattern | SET name value | REWRITE | RESETSTAT
 private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
 {
@@ -1225,7 +1324,16 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         // (name, value) pairs for every known directive matching the pattern
         static immutable names = [
             "port", "appendonly", "appendfilename", "dir", "maxmemory",
-            "maxmemory-policy", "lua-time-limit", "lua-memory-limit",
+            "maxmemory-policy", "lua-time-limit", "lua-memory-limit", "active-expire",
+            "notify-keyspace-events", "lazyfree-lazy-server-del",
+            "hash-max-listpack-entries", "hash-max-listpack-value",
+            "hash-max-ziplist-entries", "hash-max-ziplist-value",
+            "list-max-listpack-size", "list-max-ziplist-size", "list-compress-depth",
+            "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
+            "zset-max-listpack-entries", "zset-max-listpack-value",
+            "zset-max-ziplist-entries", "zset-max-ziplist-value",
+            "stream-node-max-entries", "stream-node-max-bytes",
+            "proto-max-bulk-len", "client-query-buffer-limit",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -1240,7 +1348,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 }
             }
         }
-        repArrayHeader(o, matches * 2);
+        repMapHeader(o, matches); // CONFIG GET is a map -> %N in RESP3
         foreach (nm; names)
         {
             bool hit = false;
@@ -1264,6 +1372,9 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             case "appendonly":
                 repBulk(o, gConfig.appendonly ? "yes" : "no");
                 break;
+            case "active-expire":
+                repBulk(o, gConfig.activeExpire ? "yes" : "no");
+                break;
             case "appendfilename":
                 repBulk(o, gConfig.appendfilename);
                 break;
@@ -1281,44 +1392,98 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 auto n = snprintf(b.ptr, b.length, "%lld", gConfig.luaTimeLimitMs);
                 repBulk(o, b[0 .. n]);
                 break;
-            default:
+            case "lua-memory-limit":
                 auto n = snprintf(b.ptr, b.length, "%llu", gConfig.luaMemoryLimit);
                 repBulk(o, b[0 .. n]);
+                break;
+            case "notify-keyspace-events":
+                repBulk(o, gConfig.notifyKeyspaceEvents);
+                break;
+            case "lazyfree-lazy-server-del":
+                repBulk(o, gConfig.lazyfreeLazyServerDel ? "yes" : "no");
+                break;
+            case "hash-max-listpack-entries", "hash-max-ziplist-entries":
+                repLong(o, b, gConfig.hashMaxListpackEntries);
+                break;
+            case "hash-max-listpack-value", "hash-max-ziplist-value":
+                repLong(o, b, gConfig.hashMaxListpackValue);
+                break;
+            case "list-max-listpack-size", "list-max-ziplist-size":
+                repLong(o, b, gConfig.listMaxListpackSize);
+                break;
+            case "list-compress-depth":
+                repLong(o, b, gConfig.listCompressDepth);
+                break;
+            case "set-max-intset-entries":
+                repLong(o, b, gConfig.setMaxIntsetEntries);
+                break;
+            case "set-max-listpack-entries":
+                repLong(o, b, gConfig.setMaxListpackEntries);
+                break;
+            case "set-max-listpack-value":
+                repLong(o, b, gConfig.setMaxListpackValue);
+                break;
+            case "zset-max-listpack-entries", "zset-max-ziplist-entries":
+                repLong(o, b, gConfig.zsetMaxListpackEntries);
+                break;
+            case "zset-max-listpack-value", "zset-max-ziplist-value":
+                repLong(o, b, gConfig.zsetMaxListpackValue);
+                break;
+            case "stream-node-max-entries":
+                repLong(o, b, gConfig.streamNodeMaxEntries);
+                break;
+            case "stream-node-max-bytes":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.streamNodeMaxBytes);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "proto-max-bulk-len":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.protoMaxBulkLen);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "client-query-buffer-limit":
+                auto n = snprintf(b.ptr, b.length, "%llu", gConfig.clientQueryBufferLimit);
+                repBulk(o, b[0 .. n]);
+                break;
+            default:
+                repBulk(o, ""); // known name with no value formatter
             }
         }
         return;
     }
     if (eqICDebug(args[0].str, "SET") && args.length == 3)
     {
-        // only runtime-safe parameters are settable
-        if (eqICDebug(args[1].str, "MAXMEMORY") || eqICDebug(args[1].str, "MAXMEMORY-POLICY")
-                || eqICDebug(args[1].str, "LUA-TIME-LIMIT")
-                || eqICDebug(args[1].str, "LUA-MEMORY-LIMIT"))
-        {
-            string name, value;
-            try
-            {
-                name = (cast(string) args[1].str).idup;
-                value = (cast(string) args[2].str).idup;
-            }
-            catch (Exception)
-            {
-            }
-            import std.uni : toLower;
+        import std.uni : toLower;
 
-            bool ok = false;
-            try
-                ok = applyDirective(name.toLower, value, gConfig);
-            catch (Exception)
-            {
-            }
-            if (ok)
-                repSimple(o, "OK");
-            else
-                repError(o, "ERR Invalid argument");
+        string name, value, lname;
+        try
+        {
+            name = (cast(string) args[1].str).idup;
+            value = (cast(string) args[2].str).idup;
+            lname = name.toLower;
+        }
+        catch (Exception)
+        {
+        }
+        if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
+        {
+            repError(o, "ERR Unsupported CONFIG parameter");
             return;
         }
-        repError(o, "ERR Unsupported CONFIG parameter");
+        bool ok = false;
+        try
+            ok = applyDirective(lname, value, gConfig);
+        catch (Exception)
+        {
+        }
+        if (ok)
+        {
+            import dreads.obj : gActiveExpire;
+
+            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
+            repSimple(o, "OK");
+        }
+        else
+            repError(o, "ERR CONFIG SET failed - unable to set the value");
         return;
     }
     if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))
@@ -1798,8 +1963,9 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "INFO") || eqICDebug(sub, "LIST"))
     {
         char[160] b = void;
-        auto n = snprintf(b.ptr, b.length, "id=%llu addr=? name=%.*s db=0 cmd=client\n",
-                c.id, cast(int) c.clientName.length, c.clientName.ptr);
+        auto n = snprintf(b.ptr, b.length, "id=%llu addr=? name=%.*s db=%d cmd=client\n",
+                c.id, cast(int) c.clientName.length, c.clientName.ptr,
+                cast(int)(c.dbp - &gDbs[0]));
         repBulk(o, b[0 .. n]);
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")

@@ -67,7 +67,8 @@ version (unittest)
         auto time = ks.run("TIME");
         time[0 .. 4].expect.to.equal("*2\r\n");
         ks.run("SELECT", "0").expect.to.equal("+OK\r\n");
-        ks.run("SELECT", "3").expect.to.equal("-ERR DB index is out of range\r\n");
+        ks.run("SELECT", "3").expect.to.equal("+OK\r\n"); // 16 dbs now
+        ks.run("SELECT", "99").expect.to.equal("-ERR DB index is out of range\r\n");
         // CONFIG lives at the server layer; at dispatch level it is unknown
         ks.run("CONFIG", "GET", "maxmemory")[0].expect.to.equal('-');
         ks.run("INFO").expect.to.contain("redis_version");
@@ -238,11 +239,11 @@ version (unittest)
         ks.run("ROLE")[0 .. 4].expect.to.equal("*3\r\n");
         ks.run("AUTH", "x", "y")[0].expect.to.equal('-');
         ks.run("SLOWLOG", "LEN").expect.to.equal(":0\r\n");
-        ks.run("LOLWUT").expect.to.contain("dreads");
+        ks.run("LOLWUT").expect.to.contain("DREADS");
 
         ks.run("OBJECT", "ENCODING", "b").expect.to.equal("$3\r\nint\r\n");
         ks.run("SET", "txt", "hello");
-        ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$3\r\nraw\r\n");
+        ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$6\r\nembstr\r\n"); // short string = embstr (Redis parity)
         ks.run("OBJECT", "ENCODING", "l").expect.to.equal("$10\r\nlinkedlist\r\n");
         ks.run("OBJECT", "REFCOUNT", "l").expect.to.equal(":1\r\n");
         ks.run("OBJECT", "ENCODING", "ghost")[0].expect.to.equal('-');
@@ -257,6 +258,36 @@ version (unittest)
         // propagated as HSET of the result
         (cast(string) propagationOverride.data).expect.to.contain("HSET");
         ks.run("HINCRBYFLOAT", "h", "f", "1")[0].expect.to.equal('-');
+    }
+
+    @("ext.expiry_visibility")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("SET", "live", "1");
+        ks.run("SET", "gone", "2");
+        ks.lookup("gone").expireAtMs = 1; // epoch ms = 1: always in the past
+        ks.armExpire("gone", 1);
+
+        // KEYS filters logically-expired keys even before the 1s timer reaps them
+        ks.run("KEYS", "*").expect.to.equal("*1\r\n$4\r\nlive\r\n");
+        // lazy expiry on access still drops it
+        ks.run("EXISTS", "gone").expect.to.equal(":0\r\n");
+    }
+
+    @("ext.info_keyspace")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("SET", "a", "1");
+        ks.run("SET", "b", "2");
+        ks.run("EXPIRE", "b", "10000"); // b becomes volatile
+        // Redis-shaped db0:keys=<raw>,expires=<volatile>
+        ks.run("INFO").expect.to.contain("keys=2,expires=1");
     }
 
     @("ext.scan_family")

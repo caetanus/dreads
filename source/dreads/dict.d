@@ -1,41 +1,283 @@
 module dreads.dict;
 
-// Generic @nogc open-addressing hash table: malloc'd string keys mapped to
-// owned POD values. V must provide `void free() @nogc nothrow` to release
-// whatever it owns; the dict calls it on overwrite, del, clear and free.
-// Instances are plain data (no destructor, no copy hooks) so they can live
-// inside unions (see dreads.obj) — call free() explicitly when done.
+// The dataspace's hash table lives in the `emplace` package now (it WAS this
+// file — extracted, generalized to own any resource-bearing value, and shared
+// as a reusable library). This module keeps the dreads-specific value types and
+// aliases the container as `Dict` so the existing call sites are unchanged.
 
-import core.stdc.stdlib : calloc, cfree = free;
+import dreads.mem : mallocAppend, mallocDup, freeSlice;
 
-import dreads.mem : mallocDup, freeSlice;
+public import emplace.hashmap : HashMap;
 
-package ulong fnv1a(scope const(char)[] s) @nogc nothrow
-{
-    ulong h = 0xcbf2_9ce4_8422_2325;
-    foreach (c; s)
-    {
-        h ^= c;
-        h *= 0x100_0000_01b3;
-    }
-    return h;
-}
+/// The dataspace hash table: malloc'd string keys -> owned values.
+alias Dict(V) = HashMap!V;
 
 /// Owned string value (hash fields, plain string objects).
+/// long -> decimal into `buf` (needs >= 20 bytes). Zero-overhead: a divide loop,
+/// no runtime format-string parse. Handles long.min via unsigned magnitude.
+package const(char)[] fmtLong(long v, return scope char[] buf) @nogc nothrow @trusted
+{
+    ulong u = v < 0 ? -cast(ulong) v : cast(ulong) v;
+    size_t p = buf.length;
+    do
+    {
+        buf[--p] = cast(char)('0' + u % 10);
+        u /= 10;
+    }
+    while (u);
+    if (v < 0)
+        buf[--p] = '-';
+    return buf[p .. $];
+}
+
+/// Scalar value kind. String values split into `embstr` (short, <= 44 bytes,
+/// never mutated) and `raw` (long OR mutated) to match Redis's OBJECT ENCODING —
+/// APPEND/SETRANGE always yield raw regardless of length. `i64` is int-encoded;
+/// `f64`/`nul`/`big` are reserved for later.
+public enum ValKind : ubyte
+{
+    embstr,
+    raw,
+    i64,
+    f64,
+    nul,
+    big
+}
+
+/// A scalar value: an idiomatic D tagged union over the RESP3 scalars. The union
+/// arms are PRIVATE — callers go through the methods, so nobody reads the wrong
+/// arm. An integer value keeps ONLY the long (Redis OBJ_ENCODING_INT parity) and
+/// materializes its bytes on demand, so INCR is a native add and GET formats lazily.
 public struct StrVal
 {
-    const(char)[] s;
+    /// The Redis embstr/raw cutoff: a fresh string of at most this many bytes is
+    /// embstr-encoded, longer ones raw.
+    enum size_t EMBSTR_MAX = 44;
 
-    static StrVal of(scope const(char)[] v) @nogc nothrow
+    private ValKind kind = ValKind.embstr;
+    private union
     {
-        return StrVal(mallocDup(v));
+        const(char)[] str_; // kind == embstr | raw: owned malloc'd bytes
+        long i_; // kind == i64
+        double d_; // kind == f64 (reserved)
     }
 
-    void free() @nogc nothrow
+    private bool isStrKind() const @nogc nothrow
     {
-        freeSlice(s);
-        s = null;
+        return kind == ValKind.embstr || kind == ValKind.raw;
     }
+
+    /// From client bytes, with Redis canonical-int detection: an exact-round-trip
+    /// integer is stored int-encoded, everything else as a string.
+    static StrVal of(scope const(char)[] bytes) @nogc nothrow
+    {
+        long iv;
+        return canonicalInt(bytes, iv) ? StrVal.ofInt(iv) : StrVal.ofStr(bytes);
+    }
+
+    private static StrVal ofStr(scope const(char)[] bytes) @nogc nothrow
+    {
+        StrVal r;
+        r.kind = bytes.length <= EMBSTR_MAX ? ValKind.embstr : ValKind.raw;
+        r.str_ = mallocDup(bytes);
+        return r;
+    }
+
+    /// Construct directly int-encoded (INCR result, etc.).
+    static StrVal ofInt(long i) @nogc nothrow
+    {
+        StrVal r;
+        r.kind = ValKind.i64;
+        r.i_ = i;
+        return r;
+    }
+
+    /// Construct as a raw string WITHOUT int-detection — for values that must
+    /// round-trip byte-exact and keep a stable pointer (e.g. Lua script bodies).
+    static StrVal ofRaw(scope const(char)[] bytes) @nogc nothrow
+    {
+        StrVal r;
+        r.kind = ValKind.raw;
+        r.str_ = mallocDup(bytes);
+        return r;
+    }
+
+    /// A deep copy preserving the encoding (int copies trivially; a string
+    /// re-dups its bytes and keeps its embstr/raw kind).
+    StrVal dup() const @nogc nothrow @trusted
+    {
+        if (isStrKind)
+        {
+            StrVal r;
+            r.kind = kind;
+            r.str_ = mallocDup(str_);
+            return r;
+        }
+        StrVal r = this; // int/reserved arms own nothing — a bitwise copy is safe
+        return r;
+    }
+
+    /// The stable owned byte slice, valid ONLY for a string value (asserts).
+    /// Use where a materialized-int scratch would dangle (persistent references).
+    const(char)[] rawView() const @nogc nothrow
+    {
+        assert(isStrKind, "rawView on a non-string value");
+        return str_;
+    }
+
+    ValKind encoding() const @nogc nothrow
+    {
+        return kind;
+    }
+
+    bool isInt() const @nogc nothrow
+    {
+        return kind == ValKind.i64;
+    }
+
+    /// The integer value when int-encoded.
+    bool asInt(out long value) const @nogc nothrow
+    {
+        if (kind == ValKind.i64)
+        {
+            value = i_;
+            return true;
+        }
+        return false;
+    }
+
+    /// Byte view: a string returns its slice (zero cost); an int formats into the
+    /// caller's `scratch` (>= 20 bytes) and returns that slice.
+    const(char)[] bytes(return scope char[] scratch) const @nogc nothrow @trusted
+    {
+        final switch (kind)
+        {
+        case ValKind.embstr:
+        case ValKind.raw:
+            return str_;
+        case ValKind.i64:
+            return fmtLong(i_, scratch);
+        case ValKind.f64:
+        case ValKind.nul:
+        case ValKind.big:
+            return null; // reserved kinds not stored yet
+        }
+    }
+
+    /// Byte length without materializing.
+    size_t len() const @nogc nothrow @trusted
+    {
+        if (isStrKind)
+            return str_.length;
+        if (kind == ValKind.i64)
+        {
+            char[24] b = void;
+            return fmtLong(i_, b).length;
+        }
+        return 0;
+    }
+
+    /// Materialize into an owned RAW string in place for a mutating op
+    /// (APPEND/SETRANGE/SETBIT); returns the slice. Any mutation yields raw, so
+    /// this always leaves the value raw-encoded (like Redis).
+    const(char)[] toStr() @nogc nothrow @trusted
+    {
+        if (kind == ValKind.i64)
+        {
+            char[24] b = void;
+            str_ = mallocDup(fmtLong(i_, b)); // reads i_ before overwriting the arm
+        }
+        kind = ValKind.raw;
+        return str_;
+    }
+
+    /// Overwrite with a fresh string value (INCRBYFLOAT/GETSET result), reusing
+    /// the current allocation when it fits; embstr/raw by length.
+    void assign(scope const(char)[] nv) @nogc nothrow @trusted
+    {
+        if (isStrKind && str_.ptr !is null && nv.length <= str_.length)
+        {
+            (cast(char*) str_.ptr)[0 .. nv.length] = nv[]; // slice copy, not memcpy
+            str_ = str_.ptr[0 .. nv.length];
+        }
+        else
+        {
+            if (isStrKind)
+                freeSlice(str_);
+            str_ = mallocDup(nv);
+        }
+        kind = nv.length <= EMBSTR_MAX ? ValKind.embstr : ValKind.raw;
+    }
+
+    /// Overwrite with an int (INCR result); frees any prior bytes.
+    void assignInt(long value) @nogc nothrow @trusted
+    {
+        if (isStrKind)
+            freeSlice(str_);
+        kind = ValKind.i64;
+        i_ = value;
+    }
+
+    /// Append raw bytes (APPEND), materializing an int first. mallocAppend frees
+    /// the old buffer and returns the grown one. The result is raw (via toStr).
+    void append(scope const(char)[] add) @nogc nothrow @trusted
+    {
+        toStr();
+        str_ = mallocAppend(str_, add);
+    }
+
+    /// The raw mutable byte buffer, materializing an int first. Binary-blob
+    /// commands (bitmap, HyperLogLog) own and edit/grow this buffer in place.
+    char[] rawMut() @nogc nothrow @trusted
+    {
+        toStr();
+        return cast(char[]) str_;
+    }
+
+    /// Adopt an already-owned raw buffer, freeing the prior one. Ownership of
+    /// `owned` transfers to this value.
+    void setRaw(const(char)[] owned) @nogc nothrow @trusted
+    {
+        if (isStrKind)
+            freeSlice(str_);
+        kind = ValKind.raw;
+        str_ = owned;
+    }
+
+    void free() @nogc nothrow @trusted
+    {
+        if (isStrKind)
+            freeSlice(str_);
+        str_ = null;
+        kind = ValKind.embstr;
+    }
+}
+
+/// Redis's canonical-integer test: `v` must be exactly the decimal form of the
+/// returned long (so "007", "+5", "-0", " 5" and overflow all fail). Round-trip:
+/// parse, then require the reformat to equal the input.
+public bool canonicalInt(scope const(char)[] v, out long iv) @nogc nothrow @trusted
+{
+    if (v.length == 0 || v.length > 20)
+        return false;
+    if (v[0] != '-' && (v[0] < '0' || v[0] > '9')) // optional '-' then digits
+        return false;
+    long acc = 0;
+    immutable neg = v[0] == '-';
+    size_t start = neg ? 1 : 0;
+    if (start == v.length)
+        return false;
+    foreach (c; v[start .. $])
+    {
+        if (c < '0' || c > '9')
+            return false;
+        if (acc > (long.max - (c - '0')) / 10)
+            return false; // magnitude overflow (long.min still caught by round-trip)
+        acc = acc * 10 + (c - '0');
+    }
+    iv = neg ? -acc : acc;
+    char[24] b = void;
+    return fmtLong(iv, b) == v; // canonical iff it reformats byte-identical
 }
 
 /// Empty value for set-like dicts.
@@ -56,298 +298,33 @@ public struct DoubleVal
     }
 }
 
-private enum SlotState : ubyte
-{
-    empty,
-    used,
-    tomb
-}
-
-public struct Dict(V) if (__traits(compiles, V.init.free()))
-{
-    private static struct Slot
-    {
-        SlotState state;
-        ulong hash;
-        const(char)[] key;
-        V val;
-    }
-
-    private Slot* slots;
-    private size_t cap; // power of two; 0 until first insert
-    private size_t used; // live entries
-    private size_t fill; // live + tombstones
-
-    @property size_t length() const @nogc nothrow
-    {
-        return used;
-    }
-
-    /// Releases every entry and the table itself.
-    void free() @nogc nothrow
-    {
-        clear();
-        if (slots !is null)
-        {
-            cfree(slots);
-            slots = null;
-            cap = 0;
-        }
-    }
-
-    /// Removes every entry, keeping the allocated table.
-    void clear() @nogc nothrow
-    {
-        foreach (i; 0 .. cap)
-        {
-            if (slots[i].state == SlotState.used)
-            {
-                freeSlice(slots[i].key);
-                slots[i].val.free();
-            }
-            slots[i] = Slot.init;
-        }
-        used = fill = 0;
-    }
-
-    private size_t findSlot(scope const(char)[] k, ulong h, out bool found) const @nogc nothrow
-    {
-        size_t mask = cap - 1;
-        size_t i = h & mask;
-        size_t firstTomb = size_t.max;
-        while (true)
-        {
-            final switch (slots[i].state)
-            {
-            case SlotState.empty:
-                found = false;
-                return firstTomb != size_t.max ? firstTomb : i;
-            case SlotState.tomb:
-                if (firstTomb == size_t.max)
-                    firstTomb = i;
-                break;
-            case SlotState.used:
-                if (slots[i].hash == h && slots[i].key == k)
-                {
-                    found = true;
-                    return i;
-                }
-                break;
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    private void rehash(size_t ncap) @nogc nothrow
-    {
-        auto nslots = cast(Slot*) calloc(ncap, Slot.sizeof);
-        assert(nslots !is null, "out of memory");
-        size_t mask = ncap - 1;
-        foreach (i; 0 .. cap)
-        {
-            if (slots[i].state != SlotState.used)
-                continue;
-            size_t j = slots[i].hash & mask;
-            while (nslots[j].state == SlotState.used)
-                j = (j + 1) & mask;
-            nslots[j] = slots[i];
-        }
-        if (slots !is null)
-            cfree(slots);
-        slots = nslots;
-        cap = ncap;
-        fill = used;
-    }
-
-    private void maybeGrow() @nogc nothrow
-    {
-        if (fill * 4 < cap * 3)
-            return;
-        // double only under real growth; otherwise rebuild in place to purge tombs
-        size_t ncap = cap == 0 ? 16 : (used * 2 >= cap ? cap * 2 : cap);
-        rehash(ncap);
-    }
-
-    /// Inserts or overwrites, taking ownership of val. Returns true if new.
-    /// Invalidates pointers previously returned by get().
-    bool set(scope const(char)[] k, V val) @nogc nothrow
-    {
-        maybeGrow();
-        auto h = fnv1a(k);
-        bool found;
-        auto i = findSlot(k, h, found);
-        if (found)
-        {
-            slots[i].val.free();
-            slots[i].val = val;
-            return false;
-        }
-        if (slots[i].state == SlotState.empty)
-            fill++;
-        slots[i].state = SlotState.used;
-        slots[i].hash = h;
-        slots[i].key = mallocDup(k);
-        slots[i].val = val;
-        used++;
-        return true;
-    }
-
-    /// Pointer to the live value, or null. Valid until the next set/del.
-    inout(V)* get(scope const(char)[] k) inout @nogc nothrow
-    {
-        if (used == 0)
-            return null;
-        bool found;
-        auto i = findSlot(k, fnv1a(k), found);
-        return found ? &slots[i].val : null;
-    }
-
-    bool exists(scope const(char)[] k) const @nogc nothrow
-    {
-        return get(k) !is null;
-    }
-
-    bool del(scope const(char)[] k) @nogc nothrow
-    {
-        if (used == 0)
-            return false;
-        bool found;
-        auto i = findSlot(k, fnv1a(k), found);
-        if (!found)
-            return false;
-        freeSlice(slots[i].key);
-        slots[i].val.free();
-        slots[i] = Slot.init;
-        slots[i].state = SlotState.tomb;
-        used--;
-        return true;
-    }
-
-    /// Removes k without freeing its value; the caller takes ownership.
-    bool steal(scope const(char)[] k, out V val) @nogc nothrow
-    {
-        if (used == 0)
-            return false;
-        bool found;
-        auto i = findSlot(k, fnv1a(k), found);
-        if (!found)
-            return false;
-        freeSlice(slots[i].key);
-        val = slots[i].val;
-        slots[i] = Slot.init;
-        slots[i].state = SlotState.tomb;
-        used--;
-        return true;
-    }
-
-    // Index-based iteration for @nogc callers that cannot afford closures.
-    @property size_t capacity() const @nogc nothrow
-    {
-        return cap;
-    }
-
-    bool slotLive(size_t i) const @nogc nothrow
-    {
-        return slots[i].state == SlotState.used;
-    }
-
-    const(char)[] keyAt(size_t i) const @nogc nothrow
-    {
-        return slots[i].key;
-    }
-
-    inout(V)* valAt(size_t i) inout @nogc nothrow
-    {
-        return &slots[i].val;
-    }
-
-    int opApply(scope int delegate(const(char)[] key, ref V val) @nogc nothrow dg) @nogc nothrow
-    {
-        foreach (i; 0 .. cap)
-        {
-            if (slots[i].state != SlotState.used)
-                continue;
-            auto r = dg(slots[i].key, slots[i].val);
-            if (r)
-                return r;
-        }
-        return 0;
-    }
-}
-
-unittest // basic set/get/del/exists with owned string values
+unittest // Dict (== emplace.HashMap) with dreads' owned string values
 {
     Dict!StrVal d;
     scope (exit)
         d.free();
+    char[24] sb = void;
     assert(d.get("missing") is null);
     assert(d.set("foo", StrVal.of("bar")));
-    assert(d.get("foo").s == "bar");
+    assert(d.get("foo").bytes(sb) == "bar");
     assert(!d.set("foo", StrVal.of("baz"))); // overwrite frees the old value
-    assert(d.get("foo").s == "baz");
-    assert(d.exists("foo"));
-    assert(d.length == 1);
-    assert(d.del("foo"));
-    assert(!d.del("foo"));
-    assert(!d.exists("foo"));
-    assert(d.length == 0);
+    assert(d.get("foo").bytes(sb) == "baz");
+    assert(d.exists("foo") && d.length == 1);
+    assert(d.del("foo") && !d.del("foo") && !d.exists("foo"));
 }
 
-unittest // rehash under load, deletion churn, clear
-{
-    import std.conv : to;
-
-    Dict!StrVal d;
-    scope (exit)
-        d.free();
-    foreach (i; 0 .. 1000)
-        d.set(i.to!string, StrVal.of("v" ~ i.to!string));
-    assert(d.length == 1000);
-    assert(d.get("999").s == "v999");
-    foreach (i; 0 .. 500)
-        assert(d.del(i.to!string));
-    assert(d.length == 500);
-    assert(!d.exists("42"));
-    assert(d.exists("542"));
-    foreach (i; 0 .. 500)
-        d.set(i.to!string, StrVal.of("again"));
-    assert(d.length == 1000);
-    assert(d.get("42").s == "again");
-    size_t n;
-    foreach (key, ref val; d)
-        n++;
-    assert(n == 1000);
-    d.clear();
-    assert(d.length == 0 && !d.exists("999"));
-    d.set("x", StrVal.of("y"));
-    assert(d.get("x").s == "y");
-}
-
-unittest // set-like dict and score dict
+unittest // set-like and score dicts
 {
     Dict!Unit s;
     scope (exit)
         s.free();
-    assert(s.set("a", Unit()));
-    assert(!s.set("a", Unit()));
+    assert(s.set("a", Unit()) && !s.set("a", Unit()));
     assert(s.exists("a") && !s.exists("b"));
 
     Dict!DoubleVal z;
     scope (exit)
         z.free();
     z.set("m", DoubleVal(1.5));
-    assert(z.get("m").d == 1.5);
     z.get("m").d += 1;
     assert(z.get("m").d == 2.5);
-}
-
-unittest // empty keys and values are valid
-{
-    Dict!StrVal d;
-    scope (exit)
-        d.free();
-    d.set("", StrVal.of("empty-key"));
-    d.set("empty-val", StrVal.of(""));
-    assert(d.get("").s == "empty-key");
-    assert(d.get("empty-val").s == "");
 }

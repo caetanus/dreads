@@ -68,7 +68,16 @@ These exist but do not match Redis exactly:
   event loop no other command can arrive mid-script anyway); scripts log
   verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,
   `XADD *`) can drift on replay.
-- **Protocol**: RESP2 only — `HELLO 3` answers `NOPROTO`. No `AUTH`
+- **Protocol**: RESP2 **and RESP3** (branch `resp3-oracle`). `HELLO 2`/`HELLO 3`
+  negotiate per-connection (`Conn.resp3`); `HELLO 3` replies as a map. RESP3
+  types implemented: null (`_`), boolean (`#`), double (`,`), big number (`(`),
+  verbatim (`=`), map (`%`), set (`~`), push (`>`). Pub/sub (subscribe
+  confirmations + message/pmessage/smessage) framed as Push under RESP3.
+  Divergent replies routed through the proto-aware oracle: HGETALL/CONFIG GET
+  (map), SMEMBERS/SINTER/SDIFF/SUNION (set), ZSCORE/ZINCRBY (double),
+  INFO/LOLWUT (verbatim), all nils (`_`). RESP2 clients are byte-unchanged.
+  Still to migrate: WITHSCORES array-of-pairs restructuring (ZRANGE family),
+  XPENDING/XINFO maps, client-side tracking (not supported). No `AUTH`
   passwords (no `requirepass` yet).
 - **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
   e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. All

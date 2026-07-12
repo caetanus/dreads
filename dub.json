@@ -35,9 +35,11 @@
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
 	"dependencies": {
-		"automem": "~>0.6.11",
 		"during": "~>0.3",
-		"raft": {
+		"emplace": {
+			"path": "vendor/emplace"
+		},
+		"draft": {
 			"path": "vendor/raft"
 		},
 		"vibe-core": "~>2.8"

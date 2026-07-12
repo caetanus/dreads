@@ -46,7 +46,7 @@ import raft.vibetransport : PeerAddress, VibeTransport;
 import raft.wire;
 
 import dreads.mem : Arena, ByteBuffer;
-import dreads.obj : Keyspace;
+import dreads.obj : Keyspace, gDbs, NUM_DBS;
 import dreads.raftlog : RaftLog;
 import dreads.raftq : CrossQueue;
 import dreads.resp;
@@ -243,17 +243,20 @@ final class Replicator
     /// consecutive writes: proposeAsync them all, then awaitWrite each in order.
     /// The handle MUST be passed to awaitWrite exactly once (to reap the reply
     /// and release the slot).
-    void* proposeAsync(scope const(ubyte)[] rawCmd, ulong clock) nothrow
+    void* proposeAsync(scope const(ubyte)[] rawCmd, ulong clock, ushort db) nothrow
     {
         if (!atomicLoad(leaderFlag))
             return null;
         auto slot = acquireSlot();
-        // entry payload = 8-byte clock header + raw command bytes, built into
-        // the slot's own buffer so it stays valid across a backpressure wait.
+        // entry payload = 8-byte clock header + 2-byte db index + raw command
+        // bytes, built into the slot's own buffer so it stays valid across a
+        // backpressure wait. The db index routes the apply to gDbs[db] (multi-db).
         slot.reqBuf.clear();
-        ubyte[8] hdr = void;
+        ubyte[10] hdr = void;
         foreach (i; 0 .. 8)
             hdr[i] = cast(ubyte)(clock >> (8 * i));
+        hdr[8] = cast(ubyte) db;
+        hdr[9] = cast(ubyte)(db >> 8);
         slot.reqBuf.append(hdr[]);
         slot.reqBuf.append(rawCmd);
         propQ.put(slot.reqBuf.data, cast(void*) slot, 0, CommitKind.apply);
@@ -283,9 +286,9 @@ final class Replicator
     /// Synchronous write (used inside MULTI/EXEC and by non-pipelined callers).
     /// Returns false when this node is not the leader or the proposal is rejected
     /// because leadership was lost in flight.
-    bool proposeWrite(scope const(ubyte)[] rawCmd, ulong clock, ref ByteBuffer o)
+    bool proposeWrite(scope const(ubyte)[] rawCmd, ulong clock, ushort db, ref ByteBuffer o)
     {
-        auto h = proposeAsync(rawCmd, clock);
+        auto h = proposeAsync(rawCmd, clock, db);
         if (h is null)
             return false;
         return awaitWrite(h, o);
@@ -379,11 +382,12 @@ final class Replicator
         slot.done.emit();
     }
 
-    // Apply one committed [clock][rawCmd] entry to the keyspace, resolving it
-    // against its logged clock; fill the reply slot for a locally-proposed one.
+    // Apply one committed [clock:8][db:2][rawCmd] entry to the keyspace,
+    // resolving it against its logged clock and routing to its logged db;
+    // fill the reply slot for a locally-proposed one.
     private void applyOne(scope const(ubyte)[] p, void* tag, ref Arena arena, ref ByteBuffer reply) nothrow
     {
-        if (p == NOOP_PAYLOAD || p.length < 8)
+        if (p == NOOP_PAYLOAD || p.length < 10)
         {
             if (tag !is null) // a NOOP with a slot shouldn't happen, but never hang
                 wakeSlot(cast(Pending*) tag, false, false);
@@ -392,7 +396,10 @@ final class Replicator
         ulong clock = 0;
         foreach (i; 0 .. 8)
             clock |= cast(ulong) p[i] << (8 * i);
-        auto raw = cast(const(ubyte)[]) p[8 .. $];
+        size_t db = cast(size_t)(p[8] | (cast(uint) p[9] << 8));
+        if (db >= NUM_DBS)
+            db = 0; // corrupt index — never index out of bounds
+        auto raw = cast(const(ubyte)[]) p[10 .. $];
 
         arena.reset();
         reply.clear();
@@ -406,7 +413,7 @@ final class Replicator
         }
         import dreads.commands : dispatch;
 
-        dispatch(cmd, *keys, reply, arena, clock); // injected clock
+        dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
         if (tag !is null)
         {
             auto slot = cast(Pending*) tag;

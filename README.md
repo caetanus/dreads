@@ -1,14 +1,27 @@
 # dreads ⚡
 
-**Deadly Fast Redis in DLang.** A Redis-compatible in-memory data store built
-around three commitments: zero GC in the data plane, arena memory, and one
-purpose — speed.
+**A performance-focused, Redis-compatible alternative, in D.** An in-memory data
+store built around three commitments: zero GC in the data plane, arena memory,
+and one purpose — speed. It speaks RESP2/RESP3 and matches Redis/Valkey on the
+supported command surface (see [DRIFT.md](DRIFT.md)) — it is *not yet* a verified
+drop-in replacement; full blackbox compatibility against a live Valkey oracle is
+still in progress.
 
 ```
 ⟜ Ultra-light. Thread-isolated DBs.
 ⟜ Arena memory. Zero-GC overhead.
 ⟜ Geo indexing. Custom types. One purpose: Speed.
 ```
+
+## Origin
+
+dreads started as an experiment with a single question: **would D's fibers give
+a real edge for a Redis-like server?** Redis is single-threaded and bound on
+multiplexing many connections; D's lightweight fibers on a single-threaded
+event loop (vibe-core) promised a fiber-per-connection model without the weight
+of OS threads. The numbers below are what that experiment grew into once the
+answer looked like *yes* — the zero-GC data plane, arena memory, and the Raft
+log all came from taking that first result seriously.
 
 ## Why
 

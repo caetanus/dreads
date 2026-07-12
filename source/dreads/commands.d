@@ -9,10 +9,10 @@ import core.stdc.stdio : snprintf;
 import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
-import dreads.dict : Dict, StrVal, Unit;
+import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
-import dreads.obj : Keyspace, ObjType, RObj;
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
@@ -150,12 +150,16 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             size_t n = 0;
             foreach (k, ref v; ks)
             {
+                if (v.expired()) // Redis skips logically-expired keys (no sweep needed)
+                    continue;
                 if (globMatch(pat, k))
                     n++;
             }
             repArrayHeader(o, n);
             foreach (k, ref v; ks)
             {
+                if (v.expired())
+                    continue;
                 if (globMatch(pat, k))
                     repBulk(o, k);
             }
@@ -164,15 +168,22 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "DBSIZE":
         {
             if (args.length == 0)
-                repInt(o, cast(long) ks.length);
+                repInt(o, cast(long) ks.length); // raw count, like Redis (the 1s timer reaps)
             else
                 arityErr(o, "dbsize");
             break;
         }
-    case "FLUSHALL":
-    case "FLUSHDB": // single database: same thing
+    case "FLUSHDB":
         {
-            ks.clear();
+            ks.clear(); // current database only
+            repSimple(o, "OK");
+            break;
+        }
+    case "FLUSHALL":
+        {
+            ks.clear(); // the current db (which may be a detached test keyspace)
+            foreach (ref d; gDbs) // every database
+                d.clear();
             repSimple(o, "OK");
             break;
         }
@@ -208,7 +219,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR invalid expire time");
                 break;
             }
-            obj.expireAtMs = absMs <= 0 ? 1 : cast(ulong) absMs;
+            immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
+            ks.retimeExpire(args[0].str, obj.expireAtMs, newAt); // re-EXPIRE: drop the old deadline
+            obj.expireAtMs = newAt;
             notifyKeyspaceEvent(NClass.generic, "expire", args[0].str);
             propagatePexpireat(args[0].str, obj.expireAtMs);
             repInt(o, 1);
@@ -250,6 +263,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto obj = ks.lookup(args[0].str);
             if (obj !is null && obj.expireAtMs != 0)
             {
+                ks.retimeExpire(args[0].str, obj.expireAtMs, 0); // PERSIST drops the deadline
                 obj.expireAtMs = 0;
                 notifyKeyspaceEvent(NClass.generic, "persist", args[0].str);
                 repInt(o, 1);
@@ -336,7 +350,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if ((nx && existing !is null) || (xx && existing is null))
             {
                 if (wantGet && existing !is null)
-                    repBulk(o, existing.str.s);
+                    repStrVal(o, existing.str);
                 else
                     repNullBulk(o);
                 break;
@@ -344,19 +358,24 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wantGet)
             {
                 if (existing !is null)
-                    repBulk(o, existing.str.s);
+                    repStrVal(o, existing.str);
                 else
                     repNullBulk(o);
             }
             else
                 repSimple(o, "OK");
             ulong kept = keepttl && existing !is null ? existing.expireAtMs : 0;
+            immutable ulong oldTtl = existing !is null ? existing.expireAtMs : 0;
             ks.setStr(args[0].str, args[1].str);
             auto obj = ks.lookup(args[0].str);
+            ulong newTtl = 0;
             if (absExpire >= 0)
-                obj.expireAtMs = absExpire == 0 ? 1 : cast(ulong) absExpire;
+                newTtl = absExpire == 0 ? 1 : cast(ulong) absExpire;
             else if (keepttl)
-                obj.expireAtMs = kept;
+                newTtl = kept;
+            if (oldTtl != 0 || newTtl != 0) // plain SET on a non-volatile key never touches the index
+                ks.retimeExpire(args[0].str, oldTtl, newTtl);
+            obj.expireAtMs = newTtl;
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             if (args.length > 2)
                 propagateSet(args[0].str, args[1].str, obj.expireAtMs);
@@ -384,8 +403,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         : "ERR invalid expire time in 'psetex' command");
                 break;
             }
+            auto prior = ks.lookup(args[0].str);
+            immutable ulong oldTtl = prior !is null ? prior.expireAtMs : 0;
             ks.setStr(args[0].str, args[2].str);
             auto obj = ks.lookup(args[0].str);
+            ks.retimeExpire(args[0].str, oldTtl, cast(ulong) absMs);
             obj.expireAtMs = cast(ulong) absMs;
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             propagateSet(args[0].str, args[2].str, obj.expireAtMs);
@@ -435,15 +457,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
                 break;
             }
-            repBulk(o, obj.str.s);
+            repStrVal(o, obj.str);
             if (doPersist && obj.expireAtMs != 0)
             {
+                ks.retimeExpire(args[0].str, obj.expireAtMs, 0);
                 obj.expireAtMs = 0;
                 propagatePersist(args[0].str);
             }
             else if (absMs >= 0)
             {
-                obj.expireAtMs = absMs == 0 ? 1 : cast(ulong) absMs;
+                immutable ulong newAt = absMs == 0 ? 1 : cast(ulong) absMs;
+                ks.retimeExpire(args[0].str, obj.expireAtMs, newAt);
+                obj.expireAtMs = newAt;
                 propagatePexpireat(args[0].str, obj.expireAtMs);
             }
             break;
@@ -467,7 +492,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
                 break;
             }
-            repBulk(o, obj.str.s);
+            repStrVal(o, obj.str);
             ks.del(args[0].str);
             notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
             break;
@@ -503,7 +528,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else if (obj is null)
                 repNullBulk(o);
             else
-                repBulk(o, obj.str.s);
+                repStrVal(o, obj.str);
             break;
         }
     case "GETSET":
@@ -523,7 +548,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (obj is null)
                 repNullBulk(o);
             else
-                repBulk(o, obj.str.s);
+                repStrVal(o, obj.str);
             ks.setStr(args[0].str, args[1].str);
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             break;
@@ -542,7 +567,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            if (obj !is null && obj.str.s.length + args[1].str.length > MAX_STRING_LEN)
+            if (obj !is null && obj.str.len() + args[1].str.length > MAX_STRING_LEN)
             {
                 repError(o, "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
                 break;
@@ -554,8 +579,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             else
             {
-                obj.str.s = mallocAppend(obj.str.s, args[1].str);
-                repInt(o, cast(long) obj.str.s.length);
+                obj.str.append(args[1].str);
+                repInt(o, cast(long) obj.str.len());
             }
             notifyKeyspaceEvent(NClass.str, "append", args[0].str);
             break;
@@ -572,7 +597,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wrong)
                 repWrongType(o);
             else
-                repInt(o, obj is null ? 0 : cast(long) obj.str.s.length);
+                repInt(o, obj is null ? 0 : cast(long) obj.str.len());
             break;
         }
     case "INCR":
@@ -603,6 +628,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (!parseLong(args[1].str, delta))
             {
                 repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (nbuf[0] != 'I' && delta == long.min) // DECRBY LLONG_MIN: -delta overflows
+            {
+                repError(o, "ERR decrement would overflow");
                 break;
             }
             incrDecr(ks, args[0].str, nbuf[0] == 'I' ? delta : -delta,
@@ -636,7 +666,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             {
                 auto obj = ks.lookup(a.str);
                 if (obj !is null && obj.type == ObjType.str)
-                    repBulk(o, obj.str.s);
+                    repStrVal(o, obj.str);
                 else
                     repNullBulk(o); // missing or wrong type both read as nil
             }
@@ -854,7 +884,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (f is null)
                 repNullBulk(o);
             else
-                repBulk(o, f.s);
+                repStrVal(o, *f);
             break;
         }
     case "HMGET":
@@ -878,7 +908,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (f is null)
                     repNullBulk(o);
                 else
-                    repBulk(o, f.s);
+                    repStrVal(o, *f);
             }
             break;
         }
@@ -959,15 +989,35 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto len = obj is null ? 0 : obj.hash.length;
             bool wantKeys = nbuf[1] == 'K' || nbuf[1] == 'G';
             bool wantVals = nbuf[1] == 'V' || nbuf[1] == 'G';
-            repArrayHeader(o, len * (wantKeys && wantVals ? 2 : 1));
-            if (obj !is null)
+            if (wantKeys && wantVals)
             {
-                foreach (k, ref v; obj.hash)
+                // HGETALL is a map in RESP3 (%N), a flat array in RESP2 — the
+                // reply oracle owns that distinction. Lazy: stream the pairs
+                // straight from the hash, no materialized tree (zero alloc,
+                // ~1x direct emit).
+                import dreads.respvariant : lazyMap;
+
+                lazyMap(o, gRespProto, len, (ref oo, p) {
+                    if (obj !is null)
+                        foreach (k, ref v; obj.hash)
+                        {
+                            repBulk(oo, k);
+                            repStrVal(oo, v);
+                        }
+                });
+            }
+            else
+            {
+                repArrayHeader(o, len);
+                if (obj !is null)
                 {
-                    if (wantKeys)
-                        repBulk(o, k);
-                    if (wantVals)
-                        repBulk(o, v.s);
+                    foreach (k, ref v; obj.hash)
+                    {
+                        if (wantKeys)
+                            repBulk(o, k);
+                        if (wantVals)
+                            repStrVal(o, v);
+                    }
                 }
             }
             break;
@@ -994,10 +1044,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             long cur = 0;
             auto f = obj.hash.get(args[1].str);
-            if (f !is null && !parseLong(f.s, cur))
+            if (f !is null && !f.asInt(cur)) // int-encoded field: native
             {
-                repError(o, "ERR hash value is not an integer");
-                break;
+                char[24] sb = void;
+                if (!canonicalInt(f.bytes(sb), cur))
+                {
+                    repError(o, "ERR hash value is not an integer");
+                    break;
+                }
             }
             bool ovf;
             auto nv = adds(cur, delta, ovf);
@@ -1006,9 +1060,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR increment or decrement would overflow");
                 break;
             }
-            char[24] buf = void;
-            auto blen = snprintf(buf.ptr, buf.length, "%lld", nv);
-            obj.hash.set(args[1].str, StrVal.of(buf[0 .. blen]));
+            obj.hash.set(args[1].str, StrVal.ofInt(nv));
             notifyKeyspaceEvent(NClass.hash, "hincrby", args[0].str);
             repInt(o, nv);
             break;
@@ -1109,7 +1161,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            repArrayHeader(o, obj is null ? 0 : obj.set.length);
+            repSetHeader(o, obj is null ? 0 : obj.set.length); // ~N in RESP3
             if (obj !is null)
             {
                 foreach (m, ref u; obj.set)
@@ -1132,37 +1184,152 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // --- sorted sets ---
     case "ZADD":
         {
-            if (args.length < 3 || (args.length - 1) % 2 != 0)
+            import core.stdc.math : isnan;
+
+            if (args.length < 3)
             {
                 arityErr(o, "zadd");
                 break;
             }
+            // leading flags: [NX|XX] [GT|LT] [CH] [INCR], then score/member pairs
+            bool nx, xx, gt, lt, ch, incr;
+            size_t i = 1;
+            for (; i < args.length; i++)
+            {
+                auto f = args[i].str;
+                if (eqICKeyword(f, "NX"))
+                    nx = true;
+                else if (eqICKeyword(f, "XX"))
+                    xx = true;
+                else if (eqICKeyword(f, "GT"))
+                    gt = true;
+                else if (eqICKeyword(f, "LT"))
+                    lt = true;
+                else if (eqICKeyword(f, "CH"))
+                    ch = true;
+                else if (eqICKeyword(f, "INCR"))
+                    incr = true;
+                else
+                    break;
+            }
+            if (nx && xx)
+            {
+                repError(o, "ERR XX and NX options at the same time are not compatible");
+                break;
+            }
+            if ((gt && lt) || (nx && (gt || lt)))
+            {
+                repError(o, "ERR GT, LT, and/or NX options at the same time are not compatible");
+                break;
+            }
+            auto pairs = args[i .. $];
+            if (pairs.length == 0 || pairs.length % 2 != 0)
+            {
+                arityErr(o, "zadd");
+                break;
+            }
+            if (incr && pairs.length != 2)
+            {
+                repError(o, "ERR INCR option supports a single increment-element pair");
+                break;
+            }
             // validate every score before touching the keyspace
-            for (size_t i = 1; i < args.length; i += 2)
+            for (size_t j = 0; j < pairs.length; j += 2)
             {
                 double s;
-                if (!parseDouble(args[i].str, s))
+                if (!parseDouble(pairs[j].str, s))
                 {
                     repError(o, "ERR value is not a valid float");
                     return true;
                 }
             }
             bool wrong;
-            auto obj = ks.getOrCreate(args[0].str, ObjType.zset, wrong);
-            if (wrong)
+            RObj* obj;
+            if (xx) // XX never creates the key
             {
-                repWrongType(o);
-                break;
+                obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    break;
+                }
+                if (obj is null)
+                {
+                    if (incr)
+                        repNullBulk(o);
+                    else
+                        repInt(o, 0);
+                    break;
+                }
             }
-            long added = 0;
-            for (size_t i = 1; i < args.length; i += 2)
+            else
+            {
+                obj = ks.getOrCreate(args[0].str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    break;
+                }
+            }
+            long added = 0, changed = 0;
+            bool incrReplied = false;
+            for (size_t j = 0; j < pairs.length; j += 2)
             {
                 double s;
-                parseDouble(args[i].str, s);
-                added += obj.zset.add(s, args[i + 1].str) ? 1 : 0;
+                parseDouble(pairs[j].str, s);
+                auto member = pairs[j + 1].str;
+                double cur;
+                bool exists = obj.zset.score(member, cur);
+                if ((nx && exists) || (xx && !exists))
+                {
+                    if (incr)
+                    {
+                        repNullBulk(o);
+                        incrReplied = true;
+                    }
+                    continue;
+                }
+                double newScore = (incr && exists) ? cur + s : s;
+                if (incr && exists && isnan(newScore))
+                {
+                    repError(o, "ERR resulting score is not a number (NaN)");
+                    return true;
+                }
+                // GT/LT gate updates only (they never block a brand-new member)
+                if (exists && ((gt && newScore <= cur) || (lt && newScore >= cur)))
+                {
+                    if (incr)
+                    {
+                        repNullBulk(o);
+                        incrReplied = true;
+                    }
+                    continue;
+                }
+                if (!exists || newScore != cur)
+                {
+                    obj.zset.add(newScore, member);
+                    if (!exists)
+                        added++;
+                    changed++;
+                }
+                if (incr)
+                {
+                    repDouble(o, newScore);
+                    incrReplied = true;
+                }
             }
-            notifyKeyspaceEvent(NClass.zset, "zadd", args[0].str);
-            repInt(o, added);
+            if (added || changed)
+                notifyKeyspaceEvent(NClass.zset, "zadd", args[0].str);
+            // XX may have created no members; drop an empty key it produced
+            if (!xx)
+                ks.delIfEmpty(args[0].str, obj);
+            if (incr)
+            {
+                if (!incrReplied)
+                    repNullBulk(o);
+            }
+            else
+                repInt(o, ch ? changed : added);
             break;
         }
     case "ZREM":
@@ -1413,8 +1580,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "SELECT":
         {
-            if (args.length == 1 && args[0].str == "0")
-                repSimple(o, "OK"); // single database
+            // the real per-connection db switch happens at the server layer; this
+            // path (MULTI replay / apply) only validates the index.
+            long n;
+            if (args.length == 1 && parseLong(args[0].str, n) && n >= 0 && n < NUM_DBS)
+                repSimple(o, "OK");
             else
                 repError(o, "ERR DB index is out of range");
             break;
@@ -1422,11 +1592,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // CONFIG is handled at the server layer (it owns the live Config)
     case "INFO":
         {
+            size_t volatileKeys = 0;
+            foreach (k, ref v; ks)
+                if (v.expireAtMs != 0)
+                    volatileKeys++;
             char[160] b = void;
             auto n = snprintf(b.ptr, b.length,
-                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=0\r\n",
-                    ks.length);
-            repBulk(o, b[0 .. n]);
+                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=%zu\r\n",
+                    ks.length, volatileKeys);
+            repVerbatim(o, "txt", b[0 .. n]); // RESP3 verbatim (=txt:...), RESP2 bulk
             break;
         }
 
@@ -1451,12 +1625,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            auto len = obj is null ? 0 : cast(long) obj.str.s.length;
+            char[24] sb = void;
+            auto sv = obj is null ? "" : obj.str.bytes(sb);
+            auto len = cast(long) sv.length;
             normalizeRange(start, stop, len);
             if (len == 0 || start > stop)
                 repBulk(o, "");
             else
-                repBulk(o, obj.str.s[cast(size_t) start .. cast(size_t) stop + 1]);
+                repBulk(o, sv[cast(size_t) start .. cast(size_t) stop + 1]);
             break;
         }
     case "SETRANGE":
@@ -1480,7 +1656,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto v = args[2].str;
-            auto oldLen = obj is null ? 0 : obj.str.s.length;
+            char[24] sb = void;
+            auto old = obj is null ? "" : obj.str.bytes(sb);
+            auto oldLen = old.length;
             if (v.length == 0)
             {
                 repInt(o, cast(long) oldLen);
@@ -1496,16 +1674,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto buf = arena.allocArray!char(newLen);
             buf[] = '\0';
             if (oldLen)
-                buf[0 .. oldLen] = obj.str.s;
+                buf[0 .. oldLen] = old[]; // copy before setRaw frees the old buffer
             buf[cast(size_t) off .. cast(size_t) off + v.length] = v;
             if (obj is null)
                 ks.setStr(args[0].str, buf);
             else
             {
-                import dreads.mem : freeSlice, mallocDup;
+                import dreads.mem : mallocDup;
 
-                obj.str.s.freeSlice;
-                obj.str.s = buf.mallocDup;
+                obj.str.setRaw(mallocDup(buf)); // frees the old buffer, adopts the new
             }
             notifyKeyspaceEvent(NClass.str, "setrange", args[0].str);
             repInt(o, cast(long) newLen);
@@ -1532,7 +1709,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             double cur = 0;
-            if (obj !is null && !parseDouble(obj.str.s, cur))
+            char[24] sb = void;
+            if (obj !is null && !parseDouble(obj.str.bytes(sb), cur))
             {
                 repError(o, "ERR value is not a valid float");
                 break;
@@ -1549,12 +1727,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (obj is null)
                 ks.setStr(args[0].str, res);
             else
-            {
-                import dreads.mem : freeSlice, mallocDup;
-
-                obj.str.s.freeSlice;
-                obj.str.s = res.mallocDup;
-            }
+                obj.str.assign(res); // INCRBYFLOAT result is stored as a string (Redis parity)
             notifyKeyspaceEvent(NClass.str, "incrbyfloat", args[0].str);
             repBulk(o, res);
             // float math is logged as its result, never re-derived
@@ -1726,7 +1899,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto f = obj is null ? null : obj.hash.get(args[1].str);
-            repInt(o, f is null ? 0 : cast(long) f.s.length);
+            repInt(o, f is null ? 0 : cast(long) f.len());
             break;
         }
 
@@ -2172,26 +2345,70 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "COPY":
         {
-            if (args.length < 2 || args.length > 3)
+            if (args.length < 2)
             {
                 arityErr(o, "copy");
                 break;
             }
-            bool replace = args.length == 3 && eqICKeyword(args[2].str, "REPLACE");
-            if (args.length == 3 && !replace)
+            // COPY source destination [DB n] [REPLACE]
+            bool replace = false;
+            long destDb = -1; // -1 = same as the current db
+            for (size_t oi = 2; oi < args.length;)
             {
-                repError(o, "ERR syntax error");
+                if (eqICKeyword(args[oi].str, "REPLACE"))
+                {
+                    replace = true;
+                    oi++;
+                }
+                else if (eqICKeyword(args[oi].str, "DB") && oi + 1 < args.length)
+                {
+                    if (!parseLong(args[oi + 1].str, destDb))
+                    {
+                        repError(o, "ERR value is not an integer or out of range");
+                        return true;
+                    }
+                    if (destDb < 0 || destDb >= NUM_DBS)
+                    {
+                        repError(o, "ERR DB index is out of range");
+                        return true;
+                    }
+                    oi += 2;
+                }
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    return true;
+                }
+            }
+            // resolve the destination keyspace (which db am I on?)
+            int curIdx = -1;
+            foreach (k, ref d; gDbs)
+                if (&d is &ks)
+                {
+                    curIdx = cast(int) k;
+                    break;
+                }
+            Keyspace* destKs = &ks;
+            if (destDb >= 0 && destDb != curIdx)
+                destKs = &gDbs[cast(size_t) destDb];
+            if (destKs is &ks && args[0].str == args[1].str)
+            {
+                repError(o, "ERR source and destination objects are the same");
                 break;
             }
             auto src = ks.lookup(args[0].str);
-            if (src is null || (!replace && ks.exists(args[1].str)))
+            if (src is null || (!replace && destKs.exists(args[1].str)))
             {
                 repInt(o, 0);
                 break;
             }
             auto copy = src.deepDup(); // src pointer dies on the next line's rehash
-            ks.d.set(args[1].str, copy);
-            notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
+            if (replace)
+                destKs.del(args[1].str); // free any prior value + its TTL slot
+            destKs.d.set(args[1].str, copy);
+            destKs.armExpire(args[1].str, copy.expireAtMs); // the copy keeps the TTL
+            if (destKs is &ks)
+                notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
             repInt(o, 1);
             break;
         }
@@ -2216,19 +2433,63 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "MOVE":
         {
             if (args.length != 2)
+            {
                 arityErr(o, "move");
-            else if (args[1].str == "0")
-                repError(o, "ERR source and destination objects are the same");
-            else
+                break;
+            }
+            long dst;
+            if (!parseLong(args[1].str, dst) || dst < 0 || dst >= NUM_DBS)
+            {
                 repError(o, "ERR DB index is out of range");
+                break;
+            }
+            int curIdx = -1; // which db is `ks`? (not in gDbs when unit-tested)
+            foreach (i, ref d; gDbs)
+                if (&d is &ks)
+                {
+                    curIdx = cast(int) i;
+                    break;
+                }
+            if (curIdx < 0 || dst == curIdx) // same db, or a detached keyspace
+            {
+                repError(o, "ERR source and destination objects are the same");
+                break;
+            }
+            auto src = ks.lookup(args[0].str);
+            if (src is null || gDbs[cast(size_t) dst].exists(args[0].str))
+            {
+                repInt(o, 0); // no such key, or the destination already has it
+                break;
+            }
+            immutable ttl = src.expireAtMs;
+            ks.disarmExpire(args[0].str, ttl);
+            RObj obj;
+            ks.d.steal(args[0].str, obj);
+            gDbs[cast(size_t) dst].d.set(args[0].str, obj);
+            gDbs[cast(size_t) dst].armExpire(args[0].str, ttl);
+            repInt(o, 1);
             break;
         }
     case "SWAPDB":
         {
-            if (args.length == 2 && args[0].str == "0" && args[1].str == "0")
-                repSimple(o, "OK");
-            else
+            long a, b;
+            if (args.length != 2 || !parseLong(args[0].str, a) || !parseLong(args[1].str, b))
+            {
+                repError(o, "ERR invalid first DB index or second DB index");
+                break;
+            }
+            if (a < 0 || a >= NUM_DBS || b < 0 || b >= NUM_DBS)
+            {
                 repError(o, "ERR DB index is out of range");
+                break;
+            }
+            if (a != b)
+            {
+                import std.algorithm.mutation : swap;
+
+                swap(gDbs[cast(size_t) a], gDbs[cast(size_t) b]);
+            }
+            repSimple(o, "OK");
             break;
         }
     case "WAIT":
@@ -2243,7 +2504,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "LOLWUT":
         {
-            repBulk(o, "dreads ⚡ Deadly Fast Redis in DLang\n");
+            repVerbatim(o, "txt", "DREADS ⚡ DREADS Replicated Event-driven Arena Data Store\n");
             break;
         }
     case "ROLE":
@@ -2374,7 +2635,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             double cur = 0;
             auto f = obj.hash.get(args[1].str);
-            if (f !is null && !parseDouble(f.s, cur))
+            char[24] hsb = void;
+            if (f !is null && !parseDouble(f.bytes(hsb), cur))
             {
                 repError(o, "ERR hash value is not a float");
                 break;
@@ -2571,10 +2833,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long cursor;
             const(char)[] pat;
             long count;
+            const(char)[] typeName;
             if (!parseLong(args[0].str, cursor) || cursor < 0
-                    || !parseScanOpts(args[1 .. $], pat, count, false))
+                    || !parseScanOpts(args[1 .. $], pat, count, false, null, &typeName))
             {
                 repError(o, "ERR syntax error");
+                break;
+            }
+            ObjType wantType;
+            bool filterType = typeName.length != 0;
+            if (filterType && !typeNameKnown(typeName, wantType))
+            {
+                repError(o, "ERR unknown type name");
                 break;
             }
             auto cap = ks.d.capacity;
@@ -2589,7 +2859,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     examined++;
                     auto obj = ks.d.valAt(i);
                     bool dead = obj.expireAtMs != 0 && now >= obj.expireAtMs;
-                    if (!dead && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
+                    if (!dead && (!filterType || obj.type == wantType)
+                            && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
                         found[got++] = ks.d.keyAt(i);
                 }
                 i++;
@@ -2643,8 +2914,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         if (pat.length == 0 || globMatch(pat, k))
                         {
                             found[got++] = k;
-                            if (withValues)
-                                found[got++] = obj.hash.valAt(i).s;
+                            if (withValues) // own scratch per value (they coexist in found[])
+                                found[got++] = obj.hash.valAt(i).bytes(arena.allocArray!char(24));
                         }
                     }
                     i++;
@@ -2726,10 +2997,14 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
         return;
     }
     long cur = 0;
-    if (obj !is null && !parseLong(obj.str.s, cur))
+    if (obj !is null && !obj.str.asInt(cur)) // int-encoded: native, no parse
     {
-        repError(o, "ERR value is not an integer or out of range");
-        return;
+        char[24] sb = void;
+        if (!canonicalInt(obj.str.bytes(sb), cur)) // a string value: strict parse (rejects "007")
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return;
+        }
     }
     bool ovf;
     auto nv = adds(cur, delta, ovf);
@@ -2738,9 +3013,10 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
         repError(o, "ERR increment or decrement would overflow");
         return;
     }
-    char[24] buf = void;
-    auto n = snprintf(buf.ptr, buf.length, "%lld", nv);
-    ks.setStr(key, buf[0 .. n]);
+    if (obj !is null)
+        obj.str.assignInt(nv); // native int store — no format, no malloc
+    else
+        ks.setInt(key, nv);
     notifyKeyspaceEvent(NClass.str, event, key);
     repInt(o, nv);
 }
@@ -3235,7 +3511,7 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
     }
     if (base is null)
     {
-        repArrayHeader(o, 0);
+        repSetHeader(o, 0);
         return;
     }
     bool keepMember(const(char)[] m) @nogc nothrow
@@ -3255,7 +3531,7 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
         if (base.slotLive(i) && keepMember(base.keyAt(i)))
             n++;
     }
-    repArrayHeader(o, n);
+    repSetHeader(o, n); // SINTER/SDIFF are sets -> ~N in RESP3
     foreach (i; 0 .. base.capacity)
     {
         if (base.slotLive(i) && keepMember(base.keyAt(i)))
@@ -3287,7 +3563,7 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
         foreach (m, ref u; obj.set)
             acc.set(m, Unit());
     }
-    repArrayHeader(o, acc.length);
+    repSetHeader(o, acc.length); // SUNION is a set -> ~N in RESP3
     foreach (m, ref u; acc)
         repBulk(o, m);
 }
@@ -3362,7 +3638,7 @@ private void repEntry(ref ByteBuffer o, StreamID id, const(FieldPair)[] pairs) @
 
 /// [MATCH pat] [COUNT n] [NOVALUES] tail options of the SCAN family.
 private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long count,
-        bool allowNoValues, bool* noValues = null) @nogc nothrow
+        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null) @nogc nothrow
 {
     count = 10;
     size_t i = 0;
@@ -3384,10 +3660,28 @@ private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long c
             *noValues = true;
             i++;
         }
+        else if (typeOut !is null && eqICKeyword(opts[i].str, "TYPE") && i + 1 < opts.length)
+        {
+            *typeOut = opts[i + 1].str;
+            i += 2;
+        }
         else
             return false;
     }
     return true;
+}
+
+/// The `TYPE x` filter name matching an object's type, or false for the
+/// six type names Redis knows (so an unknown name can be rejected distinctly).
+private bool typeNameKnown(scope const(char)[] name, out ObjType t) @nogc nothrow
+{
+    if (eqICKeyword(name, "STRING")) { t = ObjType.str; return true; }
+    if (eqICKeyword(name, "LIST")) { t = ObjType.list; return true; }
+    if (eqICKeyword(name, "SET")) { t = ObjType.set; return true; }
+    if (eqICKeyword(name, "ZSET")) { t = ObjType.zset; return true; }
+    if (eqICKeyword(name, "HASH")) { t = ObjType.hash; return true; }
+    if (eqICKeyword(name, "STREAM")) { t = ObjType.stream; return true; }
+    return false;
 }
 
 /// *2 [next-cursor][items...]
@@ -3548,7 +3842,7 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         final switch (obj.type)
         {
         case ObjType.str:
-            bytes += obj.str.s.length;
+            bytes += obj.str.len();
             break;
         case ObjType.list:
             foreach (v; obj.list)
@@ -3558,7 +3852,7 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
             foreach (i; 0 .. obj.hash.capacity)
             {
                 if (obj.hash.slotLive(i))
-                    bytes += obj.hash.keyAt(i).length + obj.hash.valAt(i).s.length + 64;
+                    bytes += obj.hash.keyAt(i).length + obj.hash.valAt(i).len() + 64;
             }
             break;
         case ObjType.set:
@@ -3603,6 +3897,40 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     repUnknownSubcommand(o, "MEMORY", args.length ? args[0].str : "");
 }
 
+/// The encoding name dreads reports for an object (its real, single encoding
+/// per type — not Redis's size-tiered listpack/intset/quicklist tiers).
+public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
+{
+    final switch (obj.type)
+    {
+    case ObjType.str:
+        // real, storage-backed encoding — matches Redis's OBJECT ENCODING: int
+        // (long), embstr (fresh short string), raw (long or mutated).
+        final switch (obj.str.encoding())
+        {
+        case ValKind.embstr:
+            return "embstr";
+        case ValKind.i64:
+            return "int";
+        case ValKind.raw:
+        case ValKind.f64:
+        case ValKind.nul:
+        case ValKind.big:
+            return "raw";
+        }
+    case ObjType.list:
+        return "linkedlist";
+    case ObjType.hash:
+        return "hashtable";
+    case ObjType.set:
+        return "hashtable";
+    case ObjType.zset:
+        return "skiplist";
+    case ObjType.stream:
+        return "stream";
+    }
+}
+
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
 private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
@@ -3619,30 +3947,7 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     }
     auto sub = args[0].str;
     if (eqICKeyword(sub, "ENCODING"))
-    {
-        final switch (obj.type)
-        {
-        case ObjType.str:
-            long v;
-            repBulk(o, parseLong(obj.str.s, v) ? "int" : "raw");
-            break;
-        case ObjType.list:
-            repBulk(o, "linkedlist");
-            break;
-        case ObjType.hash:
-            repBulk(o, "hashtable");
-            break;
-        case ObjType.set:
-            repBulk(o, "hashtable");
-            break;
-        case ObjType.zset:
-            repBulk(o, "skiplist");
-            break;
-        case ObjType.stream:
-            repBulk(o, "stream");
-            break;
-        }
-    }
+        repBulk(o, objEncoding(obj));
     else if (eqICKeyword(sub, "REFCOUNT"))
         repInt(o, 1);
     else if (eqICKeyword(sub, "IDLETIME"))
@@ -3768,12 +4073,21 @@ public bool parseLong(scope const(char)[] s, out long v) @nogc nothrow
     return true;
 }
 
-public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow
+public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trusted
 {
     char[64] tmp = void;
     if (s.length == 0 || s.length >= tmp.length)
         return false;
-    memcpy(tmp.ptr, s.ptr, s.length);
+    // Redis rejects leading whitespace (strtod would silently skip it, so "  11"
+    // must NOT parse as 11); trailing garbage is caught by the endp check below.
+    switch (s[0])
+    {
+    case ' ', '\t', '\n', '\r', '\v', '\f':
+        return false;
+    default:
+        break;
+    }
+    tmp[0 .. s.length] = s[]; // slice copy, not memcpy
     tmp[s.length] = 0;
     char* endp;
     v = strtod(tmp.ptr, &endp);
@@ -3835,6 +4149,13 @@ public void repDouble(ref ByteBuffer o, double d) @nogc nothrow
 private void repWrongType(ref ByteBuffer o) @nogc nothrow
 {
     repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+}
+
+/// Reply with a string value as a bulk, materializing an int-encoded one lazily.
+private void repStrVal(ref ByteBuffer o, ref StrVal v) @nogc nothrow @trusted
+{
+    char[24] sb = void;
+    repBulk(o, v.bytes(sb));
 }
 
 private void arityErr(ref ByteBuffer o, scope const(char)[] cmdLower) @nogc nothrow

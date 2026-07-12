@@ -1,0 +1,6 @@
+[submodule "vendor/raft"]
+	path = vendor/raft
+	url = git@github.com:caetanus/draft.git
+[submodule "vendor/emplace"]
+	path = vendor/emplace
+	url = git@github.com:caetanus/emplace.git

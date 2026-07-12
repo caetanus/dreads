@@ -550,14 +550,14 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
             repError(o, "NOSCRIPT No matching script.");
             return;
         }
-        body_ = cached.s;
+        body_ = cached.rawView();
     }
     else
     {
         body_ = args[0].str;
         sha1Hex(body_, sha);
         if (gScripts.get(sha[]) is null)
-            gScripts.set(sha[], StrVal.of(body_)); // EVAL populates the cache too
+            gScripts.set(sha[], StrVal.ofRaw(body_)); // EVAL populates the cache too
     }
 
     if (!ensureState())
@@ -676,7 +676,7 @@ public const(char)[] cachedScript(scope const(char)[] sha) nothrow @nogc
     scope (exit)
         gLuaLock.unlock_nothrow();
     auto v = gScripts.get(lower[]);
-    return v is null ? null : v.s;
+    return v is null ? null : v.rawView();
 }
 
 /// SCRIPT LOAD/EXISTS/FLUSH
@@ -726,7 +726,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
             char[40] sha = void;
             sha1Hex(args[1].str, sha);
             if (gScripts.get(sha[]) is null)
-                gScripts.set(sha[], StrVal.of(args[1].str));
+                gScripts.set(sha[], StrVal.ofRaw(args[1].str));
             repBulk(o, sha[]);
             return;
         }
