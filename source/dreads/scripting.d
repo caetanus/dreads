@@ -54,6 +54,21 @@ private ulong nextScriptRandSeed() nothrow @nogc
     return atomicOp!"+="(gRandSeedCtr, 1) ^ nowMs();
 }
 
+/// Deny-oom policy for the script in flight (THREAD-LOCAL, like gPoolMode): the
+/// bridge lets writes through only when this is true. Set per run in
+/// evalCommand/fcallCommand and read by luaRedisCall on the same thread.
+private bool gScriptAllowOom;
+
+/// True when the server is over its maxmemory limit (a read-only check; script
+/// writes don't run the eviction cycle — see DRIFT.md on approximate LRU).
+private bool scriptOverMaxmemory() nothrow @nogc
+{
+    import dreads.config : gConfig;
+    import dreads.mem : usedMemory;
+
+    return gConfig.maxmemory != 0 && usedMemory() > gConfig.maxmemory;
+}
+
 /// Number of scripts in the EVAL cache (INFO Memory: number_of_cached_scripts).
 public size_t cachedScriptCount() nothrow @nogc
 {
@@ -678,6 +693,16 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
                 enum ro = "ERR Write commands are not allowed from read-only scripts.";
                 lua_createtable(L, 0, 1);
                 lua_pushlstring(L, ro.ptr, ro.length);
+                lua_setfield(L, -2, "err");
+                return lua_error(L);
+            }
+            // deny-oom write over the memory limit (legacy no-shebang scripts
+            // reach here; allow-oom/no-writes/read-only runs set gScriptAllowOom)
+            if (isWrite && !gScriptAllowOom && scriptOverMaxmemory())
+            {
+                enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
+                lua_createtable(L, 0, 1);
+                lua_pushlstring(L, oom.ptr, oom.length);
                 lua_setfield(L, -2, "err");
                 return lua_error(L);
             }
@@ -1678,11 +1703,23 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
 
     // optional `#!lua [flags=...]` shebang: validate + strip before compiling,
     // and honour no-writes (the other flags are accepted for compatibility)
-    bool shebangNoWrites;
-    if (!parseEvalShebang(body_, o, shebangNoWrites))
+    bool shebangNoWrites, shebangAllowOom, hasShebang;
+    if (!parseEvalShebang(body_, o, shebangNoWrites, shebangAllowOom, hasShebang))
         return;
     if (shebangNoWrites)
         readOnly = true;
+    // OOM policy for this run: read-only and allow-oom (or no-writes, which
+    // implies it) scripts bypass the deny-oom check; the per-command bridge
+    // check uses gScriptAllowOom. A script that declares a shebang WITHOUT
+    // allow-oom is refused outright while over maxmemory, regardless of its
+    // body (Redis's "default flags in OOM" contract); legacy no-shebang
+    // scripts still run and only their deny-oom writes fail.
+    gScriptAllowOom = shebangAllowOom || shebangNoWrites || readOnly;
+    if (hasShebang && !gScriptAllowOom && scriptOverMaxmemory())
+    {
+        repError(o, "OOM command not allowed when used memory > 'maxmemory'.");
+        return;
+    }
 
     if (!ensureState())
     {
@@ -2190,11 +2227,14 @@ private const(char)[] parseShebang(scope const(char)[] code) nothrow @nogc
 /// allow-cross-slot-keys (only no-writes changes behaviour here; the others are
 /// accepted for compatibility).
 private bool parseEvalShebang(ref const(char)[] body_, ref ByteBuffer o,
-        out bool noWrites) nothrow @nogc
+        out bool noWrites, out bool allowOom, out bool hasShebang) nothrow @nogc
 {
     noWrites = false;
+    allowOom = false;
+    hasShebang = false;
     if (body_.length < 2 || body_[0] != '#' || body_[1] != '!')
         return true;
+    hasShebang = true;
     size_t eol = 0;
     while (eol < body_.length && body_[eol] != '\n')
         eol++;
@@ -2255,8 +2295,9 @@ private bool parseEvalShebang(ref const(char)[] body_, ref ByteBuffer o,
             {
                 if (f == "no-writes")
                     noWrites = true;
-                else if (f == "allow-oom" || f == "allow-stale"
-                        || f == "allow-cross-slot-keys")
+                else if (f == "allow-oom")
+                    allowOom = true;
+                else if (f == "allow-stale" || f == "allow-cross-slot-keys")
                 {
                     // accepted, no behavioural change here
                 }
@@ -2580,6 +2621,7 @@ public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     bindBridgeContext(&ks);
     gScriptResp = 2;
     gScriptWrote = false;
+    gScriptAllowOom = readOnly; // no-writes/RO functions bypass the deny-oom gate
     // fresh RNG seed per run, script deadline, state recycling — the same run
     // discipline as EVAL
     lua_getglobal(gL, "math");
@@ -2889,4 +2931,45 @@ unittest // EVAL shebang: engine + flag validation, no-writes enforcement
     o.clear();
     evalCommand([bs("#!lua flags=no-writes\nreturn 7"), bs("0")], ks, o, arena, false);
     assert(cast(string) o.data == ":7\r\n", cast(string) o.data);
+}
+
+unittest // deny-oom enforcement in scripts
+{
+    import std.algorithm : canFind;
+    import dreads.config : gConfig;
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    ByteBuffer o;
+    Arena arena;
+
+    static RVal bs(string s)
+    {
+        RVal v;
+        v.type = RType.BulkString;
+        v.str = s;
+        return v;
+    }
+
+    auto savedMax = gConfig.maxmemory;
+    gConfig.maxmemory = 1; // used_memory is always over 1 byte
+    scope (exit)
+        gConfig.maxmemory = savedMax;
+
+    // legacy (no shebang): the deny-oom write fails, a read still runs
+    evalCommand([bs("return redis.call('set','k','v')"), bs("1"), bs("k")], ks, o, arena, false);
+    assert((cast(string) o.data).canFind("OOM command not allowed"), cast(string) o.data);
+    o.clear();
+    evalCommand([bs("redis.call('get','k'); return 5"), bs("1"), bs("k")], ks, o, arena, false);
+    assert(cast(string) o.data == ":5\r\n", cast(string) o.data);
+    o.clear();
+    // a shebang WITHOUT allow-oom is rejected outright, regardless of body
+    evalCommand([bs("#!lua flags=\nreturn 1"), bs("0")], ks, o, arena, false);
+    assert((cast(string) o.data).canFind("OOM command not allowed"), cast(string) o.data);
+    o.clear();
+    // allow-oom lets the write through
+    evalCommand([bs("#!lua flags=allow-oom\nreturn redis.call('set','k','v')"), bs("1"), bs("k")],
+            ks, o, arena, false);
+    assert(cast(string) o.data == "+OK\r\n", cast(string) o.data);
 }

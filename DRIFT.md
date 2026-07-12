@@ -127,7 +127,13 @@ These exist but do not match Redis exactly:
   notify-keyspace-events` is not wired (config-file only).
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
-  `allkeys-lfu`/`volatile-ttl` policies not implemented.
+  `allkeys-lfu`/`volatile-ttl` policies not implemented. Scripts honour the
+  deny-oom contract: over the limit, a legacy (no-shebang) script's write
+  commands fail with `OOM command not allowed`, a `#!lua`-shebang script without
+  `allow-oom` is refused outright, and `allow-oom`/`no-writes`/read-only runs
+  proceed. The script-side check is read-only (it does not run the eviction
+  cycle, which is main-thread-only), so a script write is not retried after
+  eviction the way a direct client write is.
 - **PUBSUB NUMPAT** counts total pattern subscriptions, not unique patterns.
   Shard pub/sub is a separate namespace on the same single node.
 - **MEMORY USAGE** is a rough structural estimate, not allocator-exact.

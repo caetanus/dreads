@@ -29,6 +29,13 @@ SPOP: We can call scripts rewriting client->argv from Lua
 MGET: mget shouldn't be propagated in Lua
 EXPIRE: We can call scripts rewriting client->argv from Lua
 INCRBYFLOAT: We can call scripts expanding client->argv from Lua
+# min-replicas-to-write is a legacy async-replication durability knob; dreads
+# gets write durability from Raft consensus instead and does not model
+# "not enough good replicas" / NOREPLICAS. CONFIG SET min-replicas-to-write is
+# unsupported (see DRIFT.md). The `replica-serve-stale-data` staleness tests are
+# already external:skip.
+not enough good replicas
+not enough good replicas state change during long script
 # SCRIPT KILL works (the worker's hook aborts the running script), but these
 # tests assert the single-threaded BUSY contract (other clients get -BUSY while
 # a script runs). dreads runs scripts on a dedicated thread, so the event loop
