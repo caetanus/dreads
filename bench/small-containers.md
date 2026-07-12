@@ -24,16 +24,33 @@ The headline: roughly **half the memory** for small sets. OLD pays a full open-
 addressing hash table + per-entry overhead per set; the blob is one member-byte
 buffer + a small offset array — no per-element malloc header at all.
 
-## Throughput
+## Throughput — the benchmark scenario MATTERS
 
-| op | OLD | slice-array | NEW blob |
-|---|---|---|---|
-| SMEMBERS (iterate 100-member set) | 157k rps | 174k | **173k rps** (+10%) |
-| SISMEMBER (lookup, 100-member set) | **1.65M rps** | 1.36M | 1.42M rps (−14%) |
-| SISMEMBER (lookup, 2000-member set, spilled) | 1.63M rps | — | 1.65M rps (=) |
+**O(n) inside the cache is as fast as (not slower than) O(1) that touches
+memory.** The first table below hammered ONE hot set repeatedly — an artificial
+case where both the blob AND the Dict stay entirely in cache, so the Dict wins
+purely on op-count (1 hash vs ~n compares). That is NOT the real workload.
 
-The contiguous blob recovered part of the lookup gap over the slice-array
-(1.36M → 1.42M) by removing the per-member cache miss.
+| SISMEMBER on ONE hot set (artificial) | OLD Dict | NEW blob |
+|---|---|---|
+| 100-member set | 1.65M rps | 1.42M rps |
+
+The real workload is millions of sets, each access **cold**. There the Dict's
+O(1) is a cache miss (its table + separately-malloc'd keys are cold), while the
+blob is one small hot allocation. Random SISMEMBER across 100k cold sets:
+
+| SISMEMBER across 100k cold random sets | OLD Dict | NEW blob |
+|---|---|---|
+| 20-member sets (median of 3) | 1.44M rps | **1.43M rps** (tied, within noise) |
+
+Tied on lookup **and** −51% memory. The contiguous blob is the point: cold, the
+linear scan over one hot buffer keeps pace with a hash whose table+keys fault in
+from RAM. (A pure single-allocation listpack — folding the offset index into a
+length-prefixed blob — would remove the blob's second allocation and likely tip
+this to a win; the current design keeps a separate offset array for O(1) keyAt.)
+
+SMEMBERS (iteration over a 100-member set) is +10% (contiguous walk vs Dict slot
+walk); spilled large sets are identical to the old Dict.
 
 ## Reading the result (honest tradeoff)
 
