@@ -55,8 +55,10 @@ These exist but do not match Redis exactly:
 - **Lua**: system Lua 5.4, not Redis's patched 5.1. **Sandboxed**: only
   base/string/table/math are loaded (no io/os/package/debug),
   `dofile`/`loadfile`/`load`/`print` pruned, `_G` protected against global
-  creation/reads of undefined globals, `math.random` reseeded
-  deterministically per invocation, and resource limits enforced —
+  creation/reads of undefined globals, `math.random` reseeded per invocation
+  from a distinct seed (effects replication removes the need for a deterministic
+  RNG, matching Redis 7+; an in-script `math.randomseed` still overrides it), and
+  resource limits enforced —
   `lua-time-limit` (instruction-count hook, default 5000ms) and
   `lua-memory-limit` (allocator cap, default unlimited), both settable at
   runtime via CONFIG SET. Scripts also get a **throwaway `_ENV` per run**

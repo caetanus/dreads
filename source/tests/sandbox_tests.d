@@ -92,15 +92,21 @@ version (unittest)
                 "1", "sb").expect.to.equal("$1\r\nv\r\n");
     }
 
-    @("sandbox.deterministic_random")
+    @("sandbox.random")
     unittest
     {
         Keyspace ks;
         scope (exit)
             ks.d.free();
+        // effects replication: no need for a deterministic RNG, so successive
+        // scripts draw different values (Redis 7+ behaviour)
         auto a = ks.evalRun("return tostring(math.random(1000000))");
         auto b = ks.evalRun("return tostring(math.random(1000000))");
-        a.expect.to.equal(b); // reseeded per invocation
+        a.expect.to.not.equal(b);
+        // an explicit seed is still honoured: same seed -> same draw
+        auto s1 = ks.evalRun("math.randomseed(42); return tostring(math.random(1000000))");
+        auto s2 = ks.evalRun("math.randomseed(42); return tostring(math.random(1000000))");
+        s1.expect.to.equal(s2);
     }
 
     @("sandbox.cjson")

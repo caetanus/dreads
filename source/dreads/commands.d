@@ -42,6 +42,10 @@ public alias FcallHook = void function(const(RVal)[] args, ref Keyspace ks,
         ref ByteBuffer o, ref Arena arena, bool readOnly) nothrow;
 public __gshared FunctionHook gFunctionHook;
 public __gshared FcallHook gFcallHook;
+/// number of scripts in the EVAL cache (INFO Memory); set by the scripting
+/// module so commands.d need not import it (would be a cyclic import)
+public alias ScriptCountHook = size_t function() nothrow @nogc;
+public __gshared ScriptCountHook gScriptCountHook;
 
 /// Redis's proto-max-bulk-len default: 512MB per string value.
 private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
@@ -1942,6 +1946,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
                     usedMemory(), gConfig.maxmemory,
                     cast(int) gConfig.maxmemoryPolicy.length, gConfig.maxmemoryPolicy.ptr);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length, "number_of_cached_scripts:%zu\r\n",
+                    gScriptCountHook !is null ? gScriptCountHook() : 0);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
                     "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);

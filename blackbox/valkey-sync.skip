@@ -25,6 +25,10 @@ GETEX propagate as to replica as PERSIST, UNLINK, or nothing
 Server should not propagate the read command on lazy expire
 SCAN: Lazy-expire should not be wrapped in MULTI/EXEC
 RANDOMKEY: Lazy-expire should not be wrapped in MULTI/EXEC
+SPOP: We can call scripts rewriting client->argv from Lua
+MGET: mget shouldn't be propagated in Lua
+EXPIRE: We can call scripts rewriting client->argv from Lua
+INCRBYFLOAT: We can call scripts expanding client->argv from Lua
 # SCRIPT KILL works (the worker's hook aborts the running script), but these
 # tests assert the single-threaded BUSY contract (other clients get -BUSY while
 # a script runs). dreads runs scripts on a dedicated thread, so the event loop
@@ -44,3 +48,8 @@ EVAL - cmsgpack can pack and unpack circular references?
 # out-of-scope gap (see DRIFT.md "Missing commands: dump restore migrate"); the
 # script calls redis.call("DUMP",...) which raises and aborts the file.
 RESTORE expired keys with expiration time
+# Making getmetatable('').__index (the string type's shared metatable) raise
+# needs Redis's VM-level readonly-table patch: our metatable emulation can't
+# reject a write to an already-present field, and the test also indexes
+# coroutine.* (a library we don't load). See DRIFT.md on readonly emulation.
+Try trick readonly table on basic types metatable

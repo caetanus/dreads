@@ -30,11 +30,37 @@ private __gshared Mutex gLuaLock;
 shared static this()
 {
     gLuaLock = new Mutex;
-    // dispatch reaches Redis Functions through these (no import cycle)
-    import dreads.commands : gFcallHook, gFunctionHook;
+    // dispatch reaches Redis Functions (and the script-cache count for INFO)
+    // through these hooks (no import cycle)
+    import dreads.commands : gFcallHook, gFunctionHook, gScriptCountHook;
 
     gFunctionHook = &functionCommand;
     gFcallHook = &fcallCommand;
+    gScriptCountHook = &cachedScriptCount;
+}
+
+/// Per-invocation math.random seed. dreads replicates script EFFECTS, not the
+/// RNG, so successive scripts must NOT share a fixed seed (Redis 7+ dropped the
+/// deterministic reseed for the same reason) — otherwise every math.random()
+/// returns the same value forever. An ever-increasing counter mixed with the
+/// wall clock gives each run a distinct seed; an in-script math.randomseed()
+/// still overrides it, so explicitly-seeded scripts stay reproducible.
+private shared ulong gRandSeedCtr;
+private ulong nextScriptRandSeed() nothrow @nogc
+{
+    import core.atomic : atomicOp;
+    import dreads.stream : nowMs;
+
+    return atomicOp!"+="(gRandSeedCtr, 1) ^ nowMs();
+}
+
+/// Number of scripts in the EVAL cache (INFO Memory: number_of_cached_scripts).
+public size_t cachedScriptCount() nothrow @nogc
+{
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    return gScripts.length;
 }
 
 // Bridge context for the duration of one EVAL. In INLINE mode (unit tests,
@@ -1586,6 +1612,14 @@ private void sha1Hex(scope const(char)[] body_, ref char[40] outHex) nothrow @no
 public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         ref Arena arena, bool bySha, bool readOnly = false) nothrow
 {
+    // Freeze the clock to wall time at script start: the whole EVAL runs against
+    // this instant (in-script TIME is deterministic, relative TTLs resolve to
+    // it). EVAL is handled at the server layer, which — unlike dispatch — does
+    // not freeze per command, so without this the script would inherit a stale
+    // gClock from the previous command and misjudge already-expired keys.
+    import dreads.det : freezeClock;
+
+    freezeClock(0);
     if (routeToPool(LuaReqKind.eval, args, ks, o, bySha, readOnly))
         return;
     if (args.length < 2)
@@ -1595,9 +1629,14 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         return;
     }
     long numkeys;
-    if (!parseLong(args[1].str, numkeys) || numkeys < 0)
+    if (!parseLong(args[1].str, numkeys))
     {
         repError(o, "ERR value is not an integer or out of range");
+        return;
+    }
+    if (numkeys < 0)
+    {
+        repError(o, "ERR Number of keys can't be negative");
         return;
     }
     if (cast(size_t) numkeys > args.length - 2)
@@ -1637,6 +1676,14 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
             gScripts.set(sha[], StrVal.ofRaw(body_)); // EVAL populates the cache too
     }
 
+    // optional `#!lua [flags=...]` shebang: validate + strip before compiling,
+    // and honour no-writes (the other flags are accepted for compatibility)
+    bool shebangNoWrites;
+    if (!parseEvalShebang(body_, o, shebangNoWrites))
+        return;
+    if (shebangNoWrites)
+        readOnly = true;
+
     if (!ensureState())
     {
         repError(o, "ERR failed to initialize Lua");
@@ -1666,10 +1713,11 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     bindBridgeContext(&ks); // sets ks/viaPool/db/clock for inline or pool mode
     gScriptResp = 2; // redis.setresp default per script
     gScriptWrote = false; // per-EVAL: the server signals WATCH/blocked wakes
-    // deterministic per-invocation RNG (replicas/replay must agree)
+    // fresh RNG seed per run: effects replication means the RNG need not be
+    // deterministic across runs (see nextScriptRandSeed)
     lua_getglobal(gL, "math");
     lua_getfield(gL, -1, "randomseed");
-    lua_pushinteger(gL, 0);
+    lua_pushinteger(gL, cast(long) nextScriptRandSeed());
     lua_pcall(gL, 1, 0, 0);
     lua_settop(gL, 0);
     // arm the script deadline for the timeout hook
@@ -1894,6 +1942,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
         }
     case "FLUSH":
         {
+            // optional ASYNC/SYNC mode: dreads flushes synchronously either way
             gScripts.clear();
             if (gL !is null) // drop the compiled-chunk cache too
             {
@@ -1901,6 +1950,34 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
                 lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_scripts");
             }
             repSimple(o, "OK");
+            return;
+        }
+    case "SHOW":
+        {
+            // SCRIPT SHOW <sha>: return the cached body, or NOSCRIPT when the
+            // sha is malformed (not 40 hex chars) or not in the cache
+            char[40] sha = void;
+            bool valid = args.length == 2 && args[1].str.length == 40;
+            if (valid)
+            {
+                foreach (i, c; args[1].str)
+                {
+                    char lc = c >= 'A' && c <= 'Z' ? cast(char)(c + 32) : c;
+                    if (!((lc >= '0' && lc <= '9') || (lc >= 'a' && lc <= 'f')))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    sha[i] = lc;
+                }
+            }
+            auto v = valid ? gScripts.get(sha[]) : null;
+            if (v is null)
+            {
+                repError(o, "NOSCRIPT No matching script. Please use EVAL.");
+                return;
+            }
+            repBulk(o, v.rawView());
             return;
         }
     default:
@@ -2104,6 +2181,98 @@ private const(char)[] parseShebang(scope const(char)[] code) nothrow @nogc
         }
     }
     return null;
+}
+
+/// EVAL shebang (`#!lua [flags=...]`): validates the engine and flags, strips
+/// the line off `body_`, and reports which run flags were set. Returns false and
+/// frames the error reply when the shebang is malformed. No shebang => true, no
+/// change. Recognized flags: no-writes, allow-oom, allow-stale,
+/// allow-cross-slot-keys (only no-writes changes behaviour here; the others are
+/// accepted for compatibility).
+private bool parseEvalShebang(ref const(char)[] body_, ref ByteBuffer o,
+        out bool noWrites) nothrow @nogc
+{
+    noWrites = false;
+    if (body_.length < 2 || body_[0] != '#' || body_[1] != '!')
+        return true;
+    size_t eol = 0;
+    while (eol < body_.length && body_[eol] != '\n')
+        eol++;
+    auto line = body_[2 .. eol];
+    if (line.length && line[$ - 1] == '\r')
+        line = line[0 .. $ - 1];
+
+    size_t p = 0;
+    const(char)[] nextTok() nothrow @nogc
+    {
+        while (p < line.length && (line[p] == ' ' || line[p] == '\t'))
+            p++;
+        size_t s = p;
+        while (p < line.length && line[p] != ' ' && line[p] != '\t')
+            p++;
+        return line[s .. p];
+    }
+
+    static ByteBuffer eb; // TLS: error message scratch
+    void fail(string prefix, const(char)[] what, string suffix = "") nothrow @nogc
+    {
+        eb.clear();
+        eb.append("ERR ");
+        eb.append(prefix);
+        eb.append(what);
+        eb.append(suffix);
+        repError(o, cast(const(char)[]) eb.data);
+    }
+
+    auto engine = nextTok();
+    if (engine != "lua")
+    {
+        fail("Could not find scripting engine named '", engine, "'");
+        return false;
+    }
+    for (;;)
+    {
+        auto opt = nextTok();
+        if (opt.length == 0)
+            break;
+        size_t eq = 0;
+        while (eq < opt.length && opt[eq] != '=')
+            eq++;
+        if (opt[0 .. eq] != "flags" || eq >= opt.length)
+        {
+            fail("Unknown lua shebang option: ", opt[0 .. eq]);
+            return false;
+        }
+        auto flags = opt[eq + 1 .. $];
+        size_t fs = 0;
+        while (fs <= flags.length)
+        {
+            size_t fe = fs;
+            while (fe < flags.length && flags[fe] != ',')
+                fe++;
+            auto f = flags[fs .. fe];
+            if (f.length)
+            {
+                if (f == "no-writes")
+                    noWrites = true;
+                else if (f == "allow-oom" || f == "allow-stale"
+                        || f == "allow-cross-slot-keys")
+                {
+                    // accepted, no behavioural change here
+                }
+                else
+                {
+                    fail("Unexpected flag in script shebang: ", f);
+                    return false;
+                }
+            }
+            if (fe >= flags.length)
+                break;
+            fs = fe + 1;
+        }
+    }
+    body_ = eol < body_.length ? body_[eol + 1 .. $] : body_[$ .. $];
+    return true;
 }
 
 /// Deletes every function belonging to lib; returns how many were dropped.
@@ -2329,6 +2498,10 @@ public void functionCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer 
 public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         ref Arena arena, bool readOnly) nothrow
 {
+    // freeze the clock to wall time at call start (see evalCommand)
+    import dreads.det : freezeClock;
+
+    freezeClock(0);
     if (routeToPool(LuaReqKind.fcall, args, ks, o, false, readOnly))
         return;
     if (args.length < 2)
@@ -2407,11 +2580,11 @@ public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     bindBridgeContext(&ks);
     gScriptResp = 2;
     gScriptWrote = false;
-    // deterministic per-invocation RNG, script deadline, state recycling —
-    // the same run discipline as EVAL
+    // fresh RNG seed per run, script deadline, state recycling — the same run
+    // discipline as EVAL
     lua_getglobal(gL, "math");
     lua_getfield(gL, -1, "randomseed");
-    lua_pushinteger(gL, 0);
+    lua_pushinteger(gL, cast(long) nextScriptRandSeed());
     lua_pcall(gL, 1, 0, 0);
     lua_settop(gL, 0);
     lua_getfield(gL, LUA_REGISTRYINDEX, "dreads_current_fn"); // callback
@@ -2625,4 +2798,95 @@ unittest // SCRIPT LOAD/EXISTS/FLUSH + EVALSHA
     o.clear();
     evalCommand(evArgs[0 .. 2], ks, o, arena, true);
     assert((cast(string) o.data)[0 .. 9] == "-NOSCRIPT");
+}
+
+unittest // SCRIPT SHOW, cached-script count, EVAL numkeys errors
+{
+    import std.algorithm : canFind;
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    ByteBuffer o;
+
+    static RVal bs(string s)
+    {
+        RVal v;
+        v.type = RType.BulkString;
+        v.str = s;
+        return v;
+    }
+
+    // flush, then a known body -> known sha (matches the blackbox fixture)
+    scriptCommand([bs("FLUSH")], o);
+    o.clear();
+    assert(cachedScriptCount() == 0);
+    scriptCommand([bs("LOAD"), bs("return 'dump'")], o);
+    auto sha = (cast(string) o.data)[5 .. 45].idup; // skip "$40\r\n"
+    o.clear();
+    assert(cachedScriptCount() == 1);
+
+    // SHOW returns the body for a cached sha
+    scriptCommand([bs("SHOW"), bs(sha)], o);
+    assert(cast(string) o.data == "$13\r\nreturn 'dump'\r\n", cast(string) o.data);
+    o.clear();
+    // NOSCRIPT for a wrong-length sha, an invalid-char sha, and an unknown sha
+    foreach (bad; [
+            "b534286061d4b06c06015ae8", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "0000000000000000000000000000000000000000"
+        ])
+    {
+        scriptCommand([bs("SHOW"), bs(bad)], o);
+        assert((cast(string) o.data)[0 .. 9] == "-NOSCRIPT", cast(string) o.data);
+        o.clear();
+    }
+
+    // numkeys errors: non-integer vs negative are distinct messages
+    Arena arena;
+    evalCommand([bs("return 1"), bs("notanint")], ks, o, arena, false);
+    assert(cast(string) o.data == "-ERR value is not an integer or out of range\r\n");
+    o.clear();
+    evalCommand([bs("return 1"), bs("-1")], ks, o, arena, false);
+    assert(cast(string) o.data == "-ERR Number of keys can't be negative\r\n");
+}
+
+unittest // EVAL shebang: engine + flag validation, no-writes enforcement
+{
+    import std.algorithm : canFind;
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    ByteBuffer o;
+    Arena arena;
+
+    static RVal bs(string s)
+    {
+        RVal v;
+        v.type = RType.BulkString;
+        v.str = s;
+        return v;
+    }
+
+    // a valid #!lua shebang is stripped and the body runs
+    evalCommand([bs("#!lua\nreturn 1"), bs("0")], ks, o, arena, false);
+    assert(cast(string) o.data == ":1\r\n", cast(string) o.data);
+    o.clear();
+    // wrong engine / unknown option / unknown flag each get their own message
+    evalCommand([bs("#!not-lua\nreturn 1"), bs("0")], ks, o, arena, false);
+    assert((cast(string) o.data).canFind("Could not find scripting engine"), cast(string) o.data);
+    o.clear();
+    evalCommand([bs("#!lua badger=data\nreturn 1"), bs("0")], ks, o, arena, false);
+    assert((cast(string) o.data).canFind("Unknown lua shebang option"), cast(string) o.data);
+    o.clear();
+    evalCommand([bs("#!lua flags=allow-oom,what?\nreturn 1"), bs("0")], ks, o, arena, false);
+    assert((cast(string) o.data).canFind("Unexpected flag in script shebang"), cast(string) o.data);
+    o.clear();
+    // no-writes turns the run read-only: a write raises, a read is fine
+    evalCommand([bs("#!lua flags=no-writes\nreturn redis.call('set','k','v')"), bs("1"), bs("k")],
+            ks, o, arena, false);
+    assert((cast(string) o.data).canFind("read-only script"), cast(string) o.data);
+    o.clear();
+    evalCommand([bs("#!lua flags=no-writes\nreturn 7"), bs("0")], ks, o, arena, false);
+    assert(cast(string) o.data == ":7\r\n", cast(string) o.data);
 }
