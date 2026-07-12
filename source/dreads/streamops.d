@@ -457,7 +457,7 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
     }
     if (withData == 0)
     {
-        o.append("*-1\r\n");
+        repNullArray(o);
         return;
     }
     repArrayHeader(o, withData);
@@ -597,7 +597,7 @@ public void xpending(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
         {
             repNullBulk(o);
             repNullBulk(o);
-            o.append("*-1\r\n");
+            repNullArray(o);
             return;
         }
         repStreamId(o, g.pending[0].id);

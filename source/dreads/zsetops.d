@@ -248,9 +248,13 @@ public void zrangeGeneric(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         return;
     }
     auto hits = collectRange(obj, sp, arena);
-    repArrayHeader(o, hits.length * (withScores ? 2 : 1));
+    // RESP3 WITHSCORES nests [member, score] pairs; RESP2 flattens to 2n
+    bool pairs = withScores && gRespProto >= 3;
+    repArrayHeader(o, pairs ? hits.length : hits.length * (withScores ? 2 : 1));
     foreach (ref h; hits)
     {
+        if (pairs)
+            repArrayHeader(o, 2);
         repBulk(o, h.m);
         if (withScores)
             repDouble(o, h.s);
@@ -505,7 +509,7 @@ public void zmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Are
         ks.delIfEmpty(k.str, obj);
         return;
     }
-    o.append("*-1\r\n");
+    repNullArray(o);
 }
 
 // ---------------------------------------------------------------------------
@@ -754,8 +758,12 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repInt(o, cast(long) card);
         return;
     }
-    repArrayHeader(o, acc.zset.length * (withScores ? 2 : 1));
+    // RESP3 WITHSCORES nests [member, score] pairs; RESP2 flattens to 2n
+    bool pairs = withScores && gRespProto >= 3;
+    repArrayHeader(o, pairs ? acc.zset.length : acc.zset.length * (withScores ? 2 : 1));
     acc.zset.walkRange(0, acc.zset.length, false, (m, s) {
+        if (pairs)
+            repArrayHeader(o, 2);
         repBulk(o, m);
         if (withScores)
             repDouble(o, s);

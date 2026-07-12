@@ -3082,7 +3082,7 @@ private void listPop(ref Keyspace ks, const(RVal)[] args, bool fromHead, ref Byt
     if (obj is null)
     {
         if (withCount)
-            o.append("*-1\r\n");
+            repNullArray(o);
         else
             repNullBulk(o);
         return;
@@ -3477,11 +3477,16 @@ private void zpop(ref Keyspace ks, const(RVal)[] args, bool popMax,
     }
     auto n = obj is null ? 0
         : cast(size_t)(howMany < cast(long) obj.zset.length ? howMany : obj.zset.length);
-    repArrayHeader(o, n * 2);
+    // RESP3 nests [member, score] pairs when a count was given; the plain
+    // single pop stays a flat [member, score] in both protocols
+    bool pairs = gRespProto >= 3 && args.length == 2;
+    repArrayHeader(o, pairs ? n : n * 2);
     foreach (_; 0 .. n)
     {
         const(char)[] victim;
         obj.zset.walkRange(0, 1, popMax, (m, s) {
+            if (pairs)
+                repArrayHeader(o, 2);
             repBulk(o, m);
             repDouble(o, s);
             victim = arena.dupString(m);
@@ -3866,7 +3871,7 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     if (withData == 0)
     {
-        o.append("*-1\r\n");
+        repNullArray(o);
         return;
     }
     repArrayHeader(o, withData);

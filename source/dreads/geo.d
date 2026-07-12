@@ -197,7 +197,7 @@ public void geopos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         double s;
         if (obj is null || !obj.zset.score(a.str, s))
         {
-            o.append("*-1\r\n");
+            repNullArray(o);
             continue;
         }
         double lon, lat;

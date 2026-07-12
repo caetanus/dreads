@@ -181,7 +181,7 @@ public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
         ks.delIfEmpty(k.str, obj);
         return;
     }
-    o.append("*-1\r\n");
+    repNullArray(o);
 }
 
 // ---------------------------------------------------------------------------
