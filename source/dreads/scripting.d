@@ -82,6 +82,15 @@ extern (C) private void luaTimeoutHook(lua_State* L, void* ar) nothrow @nogc
         luaL_error(L, "script exceeded the lua-time-limit");
 }
 
+// Lua 5.1 compatibility: Redis embeds 5.1 and every script in the wild
+// targets it; restore the names 5.2+ moved or dropped. Runs before _G is
+// protected (these ARE global writes).
+private static immutable lua51CompatChunk = "unpack = table.unpack\n"
+    ~ "table.getn = function(t) return #t end\n"
+    ~ "math.pow = function(x, y) return x ^ y end\n"
+    ~ "math.log10 = function(x) return math.log(x, 10) end\n"
+    ~ "math.ldexp = function(m, e) return m * 2.0 ^ e end\n";
+
 // Scripts run in a curated environment: only base/string/table/math, no
 // io/os/package/debug, escape hatches pruned, and _G protected against
 // global creation (scripts share one state; globals would leak across them).
@@ -127,6 +136,18 @@ private bool ensureState() nothrow
     lua_setfield(gL, -2, "error_reply");
     lua_pushcclosure(gL, &luaSha1Hex, 0);
     lua_setfield(gL, -2, "sha1hex");
+    lua_pushcclosure(gL, &luaRedisLog, 0);
+    lua_setfield(gL, -2, "log");
+    lua_pushcclosure(gL, &luaReplicateCommands, 0);
+    lua_setfield(gL, -2, "replicate_commands");
+    lua_pushcclosure(gL, &luaSetResp, 0);
+    lua_setfield(gL, -2, "setresp");
+    // redis.log severity constants (scripts pass them as the first argument)
+    foreach (i, lvl; ["LOG_DEBUG\0", "LOG_VERBOSE\0", "LOG_NOTICE\0", "LOG_WARNING\0"])
+    {
+        lua_pushinteger(gL, cast(long) i);
+        lua_setfield(gL, -2, lvl.ptr);
+    }
     lua_setglobal(gL, "redis");
     // helper libraries scripts expect from Redis
     {
@@ -142,7 +163,13 @@ private bool ensureState() nothrow
     lua_setglobal(gL, "KEYS");
     lua_createtable(gL, 0, 0);
     lua_setglobal(gL, "ARGV");
-    // sandbox layer 3: protect _G
+    // Lua 5.1 compat aliases, then sandbox layer 3: protect _G
+    if (luaL_loadbuffer(gL, lua51CompatChunk.ptr, lua51CompatChunk.length,
+            "@compat51") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
+    {
+        lua_settop(gL, 0);
+        return false;
+    }
     if (luaL_loadbuffer(gL, protectGlobalsChunk.ptr, protectGlobalsChunk.length,
             "@sandbox") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
     {
@@ -172,6 +199,34 @@ extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
     sha1Hex(p[0 .. len], hex);
     lua_pushlstring(L, hex.ptr, 40);
     return 1;
+}
+
+/// redis.log(level, message...): accepted and dropped — dreads has no server
+/// log file; the call must not error out of a script.
+extern (C) private int luaRedisLog(lua_State* L) nothrow @nogc
+{
+    if (lua_gettop(L) < 2)
+        return luaL_error(L, "redis.log() requires two arguments or more.");
+    return 0;
+}
+
+/// redis.replicate_commands(): dreads replicates scripts VERBATIM (the EVAL
+/// is the raft/AOF entry), not by effects — so honestly answer false; a
+/// well-behaved script then stays on the deterministic path. Effects
+/// replication is catalogued future work (BLACKBOX-TODO).
+extern (C) private int luaReplicateCommands(lua_State* L) nothrow @nogc
+{
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+/// redis.setresp(2|3): scripts see RESP2-shaped conversions either way today.
+extern (C) private int luaSetResp(lua_State* L) nothrow @nogc
+{
+    auto v = lua_tointegerx(L, 1, null);
+    if (v != 2 && v != 3)
+        return luaL_error(L, "RESP version must be 2 or 3.");
+    return 0;
 }
 
 private int bitArg(lua_State* L, int idx) nothrow @nogc

@@ -213,4 +213,64 @@ version (unittest)
         // the state remains usable afterwards
         ks.evalRun("return 7").expect.to.equal(":7\r\n");
     }
+
+    @("sandbox.lua51_compat")
+    unittest
+    {
+        // Redis embeds Lua 5.1; scripts in the wild use the names 5.2+
+        // moved or dropped — the compat chunk restores them on our 5.4
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.evalRun("return unpack({7})").expect.to.equal(":7\r\n");
+        ks.evalRun("return redis.call('RPUSH', KEYS[1], unpack(ARGV))",
+                "1", "l", "a", "b", "c").expect.to.equal(":3\r\n");
+        ks.evalRun("return math.pow(2, 10)").expect.to.equal(":1024\r\n");
+        ks.evalRun("return math.log10(1000)").expect.to.equal(":3\r\n");
+        ks.evalRun("return table.getn({1,2,3})").expect.to.equal(":3\r\n");
+    }
+
+    @("sandbox.redis_api_stubs")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // replicate_commands answers false: dreads replicates scripts
+        // verbatim, so scripts must stay on the deterministic path
+        ks.evalRun("if redis.replicate_commands() then return 1 else return 0 end")
+            .expect.to.equal(":0\r\n");
+        ks.evalRun("redis.log(redis.LOG_WARNING, 'x'); return 1").expect.to.equal(":1\r\n");
+        ks.evalRun("return redis.log()")[0].expect.to.equal('-'); // needs 2+ args
+        ks.evalRun("redis.setresp(3); return 1").expect.to.equal(":1\r\n");
+        ks.evalRun("return redis.setresp(4)")[0].expect.to.equal('-');
+    }
+
+    @("sandbox.verbatim_replication_determinism")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // a write after a random-reply command would diverge on replay
+        ks.evalRun("return redis.call('SADD', KEYS[1], 'a', 'b', 'c')", "1", "s")
+            .expect.to.equal(":3\r\n");
+        auto blocked = ks.evalRun(
+                "redis.call('SRANDMEMBER', KEYS[1]); return redis.call('SET', KEYS[2], 'x')",
+                "2", "s", "k");
+        blocked[0].expect.to.equal('-');
+        blocked.expect.to.contain("non deterministic");
+        ks.evalRun("return redis.call('EXISTS', KEYS[1])", "1", "k").expect.to.equal(":0\r\n");
+        // write BEFORE the random draw is fine; the flag resets per EVAL
+        ks.evalRun("redis.call('SET', KEYS[2], 'x'); "
+                ~ "return redis.call('SRANDMEMBER', KEYS[1]) ~= false and 1 or 0",
+                "2", "s", "k2").expect.to.equal(":1\r\n");
+        ks.evalRun("return redis.call('SET', KEYS[1], 'y')", "1", "k3")
+            .expect.to.equal("+OK\r\n");
+        // the clock is frozen for the whole EVAL: TIME is deterministic, so
+        // TTL-relative commands inside a script resolve identically on replay
+        ks.evalRun("local a = redis.call('TIME'); local b = redis.call('TIME'); "
+                ~ "return (a[1] == b[1] and a[2] == b[2]) and 1 or 0")
+            .expect.to.equal(":1\r\n");
+    }
 }
