@@ -26,10 +26,22 @@ import dreads.det : detNow = now;
 /// thread, and the test runner gets one buffer per thread.
 public ByteBuffer propagationOverride;
 
-/// True while an EVAL is running. Scripts replicate verbatim, so commands
-/// whose output order is only incidentally stable (SORT BY nosort on a set)
-/// must pick the deterministic path when they see this.
+/// True while a script is running. Script effects replicate by replay, so
+/// commands whose output order is only incidentally stable (SORT BY nosort
+/// on a set) must pick the deterministic path when they see this.
 public __gshared bool gInScript;
+
+// Redis Functions live in dreads.scripting (the Lua engine), which imports
+// this module — dispatch reaches them through hooks scripting installs at
+// startup instead of an import cycle. They are not @nogc (Lua state, and
+// FCALL effects may park the fiber under raft); dispatch calls them through
+// a cast, the same control-plane escape the server layer lives in.
+public alias FunctionHook = void function(const(RVal)[] args, ref Keyspace ks,
+        ref ByteBuffer o, ref Arena arena) nothrow;
+public alias FcallHook = void function(const(RVal)[] args, ref Keyspace ks,
+        ref ByteBuffer o, ref Arena arena, bool readOnly) nothrow;
+public __gshared FunctionHook gFunctionHook;
+public __gshared FcallHook gFcallHook;
 
 /// Redis's proto-max-bulk-len default: 512MB per string value.
 private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
@@ -69,6 +81,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     }
     foreach (i, c; name)
         nbuf[i] = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+    // case-insensitive view for comparisons INSIDE cases ('name' keeps the
+    // client's original casing — scripts routinely send lowercase)
+    auto uname = cast(const(char)[]) nbuf[0 .. name.length];
 
     switch (cast(string) nbuf[0 .. name.length])
     {
@@ -2858,6 +2873,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 0); // no replicas until Raft lands
             break;
         }
+    case "WAITAOF": // dispatch-level (scripts/replay): the server-layer form
+        {           // owns the real fsync; here nothing can be awaited
+            repArrayHeader(o, 2);
+            repInt(o, 0);
+            repInt(o, 0);
+            break;
+        }
     case "OBJECT":
         {
             objectCmd(ks, args, o);
@@ -2908,17 +2930,36 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repUnknownSubcommand(o, "COMMANDLOG", args.length ? args[0].str : "");
             break;
         }
-    case "FUNCTION": // no scripting-function library support; empty catalog
+    case "FUNCTION":
         {
+            if (gFunctionHook !is null)
+            {
+                alias NoGcFn = void function(const(RVal)[], ref Keyspace,
+                        ref ByteBuffer, ref Arena) @nogc nothrow;
+                (cast(NoGcFn) gFunctionHook)(args, ks, o, arena);
+                break;
+            }
+            // scripting engine absent (stripped builds): empty catalog
             if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
                 repHelp!"FUNCTION"(o);
             else if (args.length >= 1 && (eqICKeyword(args[0].str, "LIST")
                     || eqICKeyword(args[0].str, "STATS")))
                 repArrayHeader(o, 0);
-            else if (args.length >= 1 && eqICKeyword(args[0].str, "DUMP"))
-                repBulk(o, "");
             else
                 repUnknownSubcommand(o, "FUNCTION", args.length ? args[0].str : "");
+            break;
+        }
+    case "FCALL":
+    case "FCALL_RO":
+        {
+            if (gFcallHook is null)
+            {
+                repError(o, "ERR Function not found");
+                break;
+            }
+            alias NoGcFn = void function(const(RVal)[], ref Keyspace,
+                    ref ByteBuffer, ref Arena, bool) @nogc nothrow;
+            (cast(NoGcFn) gFcallHook)(args, ks, o, arena, name.length == 8);
             break;
         }
     case "LATENCY":
@@ -3068,6 +3109,157 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             import dreads.miscops : lmpop;
 
             lmpop(ks, args, o);
+            break;
+        }
+
+        // --- blocking family, one-shot form. Real connections block at the
+        // server layer and never reach dispatch with these names; here they
+        // arrive from scripts, MULTI replay or the raft apply, where waiting
+        // is impossible — Redis semantics is one immediate attempt. The
+        // effect propagates as the non-blocking command that actually ran.
+    case "BLPOP":
+    case "BRPOP":
+        {
+            bool fromLeft = uname[1] == 'L';
+            if (args.length < 2)
+            {
+                arityErr(o, fromLeft ? "blpop" : "brpop");
+                break;
+            }
+            double tmo;
+            if (!parseDouble(args[$ - 1].str, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            bool served = false;
+            foreach (ref k; args[0 .. $ - 1])
+            {
+                bool wrong;
+                auto obj = ks.lookupTyped(k.str, ObjType.list, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    served = true;
+                    break;
+                }
+                if (obj is null || obj.list.length == 0)
+                    continue;
+                repArrayHeader(o, 2);
+                repBulk(o, k.str);
+                repBulk(o, fromLeft ? obj.list.front : obj.list.back);
+                if (fromLeft)
+                    obj.list.popFront();
+                else
+                    obj.list.popBack();
+                ks.delIfEmpty(k.str, obj);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, fromLeft ? "LPOP" : "RPOP");
+                repBulk(propagationOverride, k.str);
+                served = true;
+                break;
+            }
+            if (!served)
+                repNullArray(o);
+            break;
+        }
+    case "BZPOPMIN":
+    case "BZPOPMAX":
+        {
+            bool popMax = uname[6] == 'A'; // BZPOPM[A]X vs BZPOPM[I]N
+            if (args.length < 2)
+            {
+                arityErr(o, popMax ? "bzpopmax" : "bzpopmin");
+                break;
+            }
+            double tmo;
+            if (!parseDouble(args[$ - 1].str, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            bool served = false;
+            foreach (ref k; args[0 .. $ - 1])
+            {
+                bool wrong;
+                auto obj = ks.lookupTyped(k.str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    served = true;
+                    break;
+                }
+                if (obj is null || obj.zset.length == 0)
+                    continue;
+                const(char)[] victim;
+                repArrayHeader(o, 3);
+                repBulk(o, k.str);
+                obj.zset.walkRange(0, 1, popMax, (m, s) {
+                    repBulk(o, m);
+                    repDouble(o, s);
+                    victim = arena.dupString(m);
+                    return 0;
+                });
+                obj.zset.remove(victim);
+                ks.delIfEmpty(k.str, obj);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, popMax ? "ZPOPMAX" : "ZPOPMIN");
+                repBulk(propagationOverride, k.str);
+                served = true;
+                break;
+            }
+            if (!served)
+                repNullArray(o);
+            break;
+        }
+    case "BRPOPLPUSH":
+    case "BLMOVE":
+    case "BLMPOP":
+    case "BZMPOP":
+        {
+            // rewrite into the non-blocking command and run it in place
+            // (BLMPOP/BZMPOP carry the timeout FIRST; the others carry it last)
+            bool leading = uname == "BLMPOP" || uname == "BZMPOP";
+            size_t minArgs = leading ? 4 : (uname == "BLMOVE" ? 5 : 3);
+            if (args.length < minArgs)
+            {
+                repError(o, "ERR wrong number of arguments");
+                break;
+            }
+            auto tmoTok = leading ? args[0].str : args[$ - 1].str;
+            double tmo;
+            if (!parseDouble(tmoTok, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            auto rest = leading ? args[1 .. $] : args[0 .. $ - 1];
+            auto verb = uname == "BRPOPLPUSH" ? "RPOPLPUSH"
+                : (uname == "BLMOVE" ? "LMOVE" : (uname == "BLMPOP" ? "LMPOP" : "ZMPOP"));
+            auto sub = arena.allocArray!RVal(1 + rest.length);
+            sub[0].type = RType.BulkString;
+            sub[0].str = verb;
+            foreach (i, ref a; rest)
+                sub[1 + i] = a;
+            RVal cmd2;
+            cmd2.type = RType.Array;
+            cmd2.arr = sub;
+            auto outBefore = o.length;
+            import dreads.det : detNow = now;
+
+            cast(void) dispatch(cmd2, ks, o, arena, detNow());
+            // effect = the rewritten command, but only when it did something
+            auto rep = cast(const(char)[]) o.data[outBefore .. $];
+            if (rep.length > 0 && rep[0] != '-' && rep != "$-1\r\n"
+                    && rep != "*-1\r\n" && rep != "_\r\n")
+            {
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, sub.length);
+                foreach (ref a; sub)
+                    repBulk(propagationOverride, a.str);
+            }
             break;
         }
     case "SORT":
@@ -4155,18 +4347,38 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
 {
     size_t i = 0;
     size_t limit = 0;
-    if (args.length >= 2 && eqICKeyword(args[0].str, "COUNT"))
+    while (i < args.length && !eqICKeyword(args[i].str, "STREAMS"))
     {
-        long n;
-        if (!parseLong(args[1].str, n) || n < 0)
+        if (eqICKeyword(args[i].str, "COUNT") && i + 1 < args.length)
         {
-            repError(o, "ERR value is not an integer or out of range");
+            long n;
+            if (!parseLong(args[i + 1].str, n) || n < 0)
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                return;
+            }
+            limit = cast(size_t) n;
+            i += 2;
+        }
+        else if (eqICKeyword(args[i].str, "BLOCK") && i + 1 < args.length)
+        {
+            // dispatch-level XREAD serves scripts and replay, where waiting
+            // is impossible: validate the timeout, then one immediate attempt
+            long ms;
+            if (!parseLong(args[i + 1].str, ms) || ms < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return;
+            }
+            i += 2;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
             return;
         }
-        limit = cast(size_t) n;
-        i = 2;
     }
-    if (i >= args.length || !eqICKeyword(args[i].str, "STREAMS"))
+    if (i >= args.length)
     {
         repError(o, "ERR syntax error");
         return;

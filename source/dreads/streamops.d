@@ -413,10 +413,17 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
             noack = true;
             i++;
         }
-        else if (eqICKeyword(args[i].str, "BLOCK"))
+        else if (eqICKeyword(args[i].str, "BLOCK") && i + 1 < args.length)
         {
-            repError(o, "ERR BLOCK is not supported yet");
-            return;
+            // scripts/replay can never wait: validate, then one immediate
+            // attempt (live connections park at the server layer instead)
+            long ms;
+            if (!parseLong(args[i + 1].str, ms) || ms < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return;
+            }
+            i += 2;
         }
         else
         {
