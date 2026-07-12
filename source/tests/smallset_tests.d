@@ -62,4 +62,88 @@ version (unittest)
         s.set("x", Unit()); // a non-int drops it to listpack
         s.encoding.expect.to.equal("listpack");
     }
+
+    // --- promotion (small -> big) must be rock solid ---
+
+    @("smallset.spill_at_exact_boundary_keeps_all_members")
+    unittest
+    {
+        SmallSet s;
+        scope (exit)
+            s.free();
+        // non-int members: listpack limit is MAX_ENTRIES
+        foreach (i; 0 .. cast(long) SmallSet.MAX_ENTRIES)
+            s.set("m" ~ i.to!string, Unit());
+        s.encoding.expect.to.equal("listpack");
+        s.set("mEXTRA", Unit()); // crosses the boundary
+        s.encoding.expect.to.equal("hashtable");
+        s.length.expect.to.equal(SmallSet.MAX_ENTRIES + 1);
+        foreach (i; 0 .. cast(long) SmallSet.MAX_ENTRIES)
+            s.contains("m" ~ i.to!string).expect.to.equal(true);
+        s.contains("mEXTRA").expect.to.equal(true);
+    }
+
+    @("smallset.intset_spills_at_512_not_128")
+    unittest
+    {
+        SmallSet s;
+        scope (exit)
+            s.free();
+        // pure ints: stays intset up to MAX_INTSET (512), not the 128 listpack cap
+        foreach (i; 0 .. 200)
+            s.set(i.to!string, Unit());
+        s.encoding.expect.to.equal("intset");
+        s.length.expect.to.equal(200);
+    }
+
+    @("smallset.spill_triggered_by_long_member")
+    unittest
+    {
+        SmallSet s;
+        scope (exit)
+            s.free();
+        s.set("short", Unit());
+        s.encoding.expect.to.equal("listpack");
+        char[100] big = 'x';
+        s.set(big[], Unit()); // member > MAX_MEMBER forces spill
+        s.encoding.expect.to.equal("hashtable");
+        s.contains("short").expect.to.equal(true);
+        s.contains(big[]).expect.to.equal(true);
+    }
+
+    @("smallset.boundary_churn_then_spill")
+    unittest
+    {
+        SmallSet s;
+        scope (exit)
+            s.free();
+        foreach (i; 0 .. cast(long) SmallSet.MAX_ENTRIES)
+            s.set("k" ~ i.to!string, Unit());
+        s.remove("k0");
+        s.remove("k1");
+        s.encoding.expect.to.equal("listpack"); // back under threshold
+        foreach (i; 0 .. 5)
+            s.set("n" ~ i.to!string, Unit());
+        s.encoding.expect.to.equal("hashtable"); // crossed again
+        s.contains("k0").expect.to.equal(false);
+        s.contains("k50").expect.to.equal(true);
+        s.contains("n3").expect.to.equal(true);
+    }
+
+    @("smallset.dup_after_spill_is_independent")
+    unittest
+    {
+        SmallSet s;
+        scope (exit)
+            s.free();
+        foreach (i; 0 .. cast(long)(SmallSet.MAX_ENTRIES + 10))
+            s.set("m" ~ i.to!string, Unit());
+        auto c = s.dup();
+        scope (exit)
+            c.free();
+        c.length.expect.to.equal(s.length);
+        s.remove("m5");
+        s.contains("m5").expect.to.equal(false);
+        c.contains("m5").expect.to.equal(true); // copy untouched
+    }
 }

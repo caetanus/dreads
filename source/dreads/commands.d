@@ -3187,6 +3187,11 @@ private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) 
         repError(o, "ERR value is not an integer or out of range");
         return;
     }
+    if (howMany == long.min) // -howMany would overflow (Redis rejects LLONG_MIN)
+    {
+        repError(o, "ERR value is out of range");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.set, wrong);
     if (wrong)

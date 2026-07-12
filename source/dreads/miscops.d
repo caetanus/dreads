@@ -543,6 +543,13 @@ public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         repError(o, "ERR value is not an integer or out of range");
         return;
     }
+    // Redis range: [-LONG_MAX, LONG_MAX] (rejects LLONG_MIN); WITHVALUES halves
+    // it since each field yields two elements (count*2 must not overflow).
+    if (count == long.min || (withValues && (count < -(long.max / 2) || count > long.max / 2)))
+    {
+        repError(o, "ERR value is out of range");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
     if (wrong)

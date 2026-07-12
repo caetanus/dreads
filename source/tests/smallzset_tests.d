@@ -82,4 +82,66 @@ version (unittest)
         z.score("m5", s).expect.to.equal(true);
         s.expect.to.equal(5.0);
     }
+
+    // --- promotion (small -> big) must be rock solid ---
+
+    @("smallzset.spill_preserves_scores_and_order")
+    unittest
+    {
+        SmallZSet z;
+        scope (exit)
+            z.free();
+        foreach (i; 0 .. cast(long) SmallZSet.MAX_ENTRIES)
+            z.add(cast(double) i, "m" ~ i.to!string);
+        z.encoding.expect.to.equal("listpack");
+        z.add(9999, "mEXTRA"); // crosses the boundary
+        z.encoding.expect.to.equal("skiplist");
+        // scores survive
+        double s;
+        z.score("m0", s);
+        s.expect.to.equal(0.0);
+        z.score("m127", s);
+        s.expect.to.equal(127.0);
+        // rank order survives (m0 first, mEXTRA last)
+        bool ok;
+        z.rank("m0", ok).expect.to.equal(cast(size_t) 0);
+        z.rank("mEXTRA", ok).expect.to.equal(z.length - 1);
+    }
+
+    @("smallzset.spill_triggered_by_long_member")
+    unittest
+    {
+        SmallZSet z;
+        scope (exit)
+            z.free();
+        z.add(1, "short");
+        z.encoding.expect.to.equal("listpack");
+        char[100] big = 'x';
+        z.add(2, big[]); // member > MAX_VALUE forces spill
+        z.encoding.expect.to.equal("skiplist");
+        double s;
+        z.score("short", s).expect.to.equal(true);
+        s.expect.to.equal(1.0);
+        z.score(big[], s).expect.to.equal(true);
+        s.expect.to.equal(2.0);
+    }
+
+    @("smallzset.dup_after_spill_is_independent")
+    unittest
+    {
+        SmallZSet z;
+        scope (exit)
+            z.free();
+        foreach (i; 0 .. cast(long)(SmallZSet.MAX_ENTRIES + 10))
+            z.add(cast(double) i, "m" ~ i.to!string);
+        auto c = z.dup();
+        scope (exit)
+            c.free();
+        c.length.expect.to.equal(z.length);
+        z.remove("m5");
+        double s;
+        z.score("m5", s).expect.to.equal(false);
+        c.score("m5", s).expect.to.equal(true); // copy untouched
+        s.expect.to.equal(5.0);
+    }
 }
