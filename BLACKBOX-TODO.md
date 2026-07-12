@@ -71,15 +71,15 @@ the retry loop — design work, not a patch.
 - HSCAN NOVALUES (scan file, to confirm).
 - COPY of a stream with consumer groups (keyspace).
 
-### Scripting: effects replication (design work)
-Scripts replicate verbatim today (EVAL is the raft/AOF entry; frozen clock +
-write-after-random guard keep it deterministic; `redis.replicate_commands()`
-answers false). Redis 7+ replicates EFFECTS instead — each redis.call write
-is what enters the log — which lifts the random-then-write restriction and
-is what `unit/scripting` increasingly assumes. Needs: a per-EVAL effect
-buffer fed by the bridge (capturing each inner command's own propagation
-override), one raft entry carrying the batch, and replay understanding it.
-Add `unit/scripting` to the sweep once the 5.1-compat layer proves out.
+### Scripting (effects replication LANDED — leftovers)
+Effects replication is in (EVAL never logged; each redis.call write logged
+in its propagation form; raft proposes per-write; replicate_commands=true).
+Leftovers: `struct` library; SCRIPT LOAD is per-node (not replicated — an
+EVALSHA on a node that never loaded the body answers NOSCRIPT, client falls
+back to EVAL); script effects are not wrapped in MULTI/EXEC (matches the
+unwrapped-EXEC drift); under raft a script's inner writes are one consensus
+round-trip EACH (pipelining them is a future optimization). Add
+`unit/scripting` to the sweep next.
 
 ### Singles
 - zset: "zunionInterDiffGenericCommand at least 1 input key" (exact arity/

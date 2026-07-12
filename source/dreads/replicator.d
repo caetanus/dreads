@@ -413,29 +413,7 @@ final class Replicator
         }
         import dreads.commands : dispatch;
 
-        // EVAL entries carry a whole script (server-layer command; plain
-        // dispatch doesn't know it). Freeze the logged clock so every
-        // redis.call inside the script resolves deterministically, then run.
-        bool ranScript = false;
-        if (cmd.type == RType.Array && cmd.arr.length > 1
-                && cmd.arr[0].type == RType.BulkString && cmd.arr[0].str.length == 4)
-        {
-            auto nm = cmd.arr[0].str;
-            char[4] up = void;
-            foreach (i, ch; nm)
-                up[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            if (up == "EVAL")
-            {
-                import dreads.det : freezeClock;
-                import dreads.scripting : evalCommand;
-
-                freezeClock(clock);
-                evalCommand(cmd.arr[1 .. $], gDbs[db], reply, arena, false, false);
-                ranScript = true;
-            }
-        }
-        if (!ranScript)
-            dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
+        dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
         if (tag !is null)
         {
             auto slot = cast(Pending*) tag;

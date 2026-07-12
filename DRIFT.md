@@ -68,13 +68,19 @@ These exist but do not match Redis exactly:
   `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4). Still missing:
   `struct`, and `SCRIPT KILL` (the time limit hard-aborts instead — with a
   single-threaded event loop no other command can arrive mid-script anyway).
-  **Replication model: scripts replicate VERBATIM** (the EVAL itself is the
-  raft/AOF entry, EVALSHA rewritten to EVAL). Determinism is enforced: the
-  clock is frozen for the whole EVAL (relative `EXPIRE`/`TIME`/`XADD *`
-  inside a script resolve identically on replay) and a write after a
-  random-reply command (SRANDMEMBER/HRANDFIELD/ZRANDMEMBER/RANDOMKEY) is
-  refused, like pre-effects Redis. `redis.replicate_commands()` honestly
-  answers **false** — effects replication is future work.
+  **Replication model: EFFECTS** (like Redis 7+, where it is also the only
+  mode): the EVAL itself never enters the raft/AOF log — each write the
+  script performs via redis.call is logged as itself, in its propagation
+  form (SETEX → `SET k v PXAT`, SPOP → SREM, XADD * → resolved id). Under
+  raft the bridge PROPOSES each inner write, so the leader's state only
+  changes through the log; standalone, a server-installed sink appends each
+  effect to the AOF. Random-reply commands need no write guard — replicas
+  replay what happened. A script that fails halfway keeps its earlier
+  writes in the log, exactly like it keeps them in the dataset (dreads does
+  not wrap script effects in MULTI/EXEC, same as its unwrapped EXEC).
+  `redis.replicate_commands()` answers **true**. The clock is frozen for
+  the whole EVAL (in-script `TIME` is deterministic; relative TTLs resolve
+  like their logged effects).
 - **Protocol**: RESP2 **and RESP3** (branch `resp3-oracle`). `HELLO 2`/`HELLO 3`
   negotiate per-connection (`Conn.resp3`); `HELLO 3` replies as a map. RESP3
   types implemented: null (`_`), boolean (`#`), double (`,`), big number (`(`),

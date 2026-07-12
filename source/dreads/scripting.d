@@ -38,11 +38,26 @@ private struct BridgeCtx
     Keyspace* ks;
     Arena* arena;
     bool readOnly; // EVAL_RO / EVALSHA_RO
-    bool sawRandom; // a non-deterministic command ran; writes must be refused
     ByteBuffer replyBuf; // staging for bridge replies, reused across calls
+    ByteBuffer effectBuf; // re-encoded inner command (effect capture / propose)
 }
 
 private __gshared BridgeCtx gCtx;
+
+// --- effects replication (the EVAL itself never enters the log) ---
+// Every write a script performs via redis.call is what gets logged: its
+// propagation-override form when the command set one (SETEX -> absolute
+// time, SPOP -> SREM, XADD * -> resolved id), else the command verbatim.
+// Standalone, the server installs a sink that appends to the AOF; under
+// raft the bridge PROPOSES each write and the apply loop runs it, so the
+// leader's state only ever changes through the log. Random-reply commands
+// need no write guard under this model: replicas replay what happened.
+
+/// Set by the server at boot: receives one RESP-encoded effect to log.
+public __gshared void function(scope const(ubyte)[]) @nogc nothrow gScriptEffectSink;
+
+/// True when the last EVAL performed at least one effective write.
+public __gshared bool gScriptWrote;
 
 // --- sandbox: memory accounting and script deadline ---
 private __gshared ulong gLuaBytes; // bytes currently allocated by the state
@@ -210,13 +225,12 @@ extern (C) private int luaRedisLog(lua_State* L) nothrow @nogc
     return 0;
 }
 
-/// redis.replicate_commands(): dreads replicates scripts VERBATIM (the EVAL
-/// is the raft/AOF entry), not by effects — so honestly answer false; a
-/// well-behaved script then stays on the deterministic path. Effects
-/// replication is catalogued future work (BLACKBOX-TODO).
+/// redis.replicate_commands(): effects replication IS dreads' only mode
+/// (each redis.call write is the log entry), so this is truthfully a yes —
+/// like Redis 7+, where it also became the only mode.
 extern (C) private int luaReplicateCommands(lua_State* L) nothrow @nogc
 {
-    lua_pushboolean(L, 0);
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -393,6 +407,7 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     cmd.type = RType.Array;
     cmd.arr = arr;
 
+    bool isWrite = false;
     {
         import dreads.commands : isWriteCommand;
 
@@ -402,38 +417,76 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
         {
             foreach (ci, ch; cname)
                 up[ci] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            auto uname = up[0 .. cname.length];
-            if (gCtx.readOnly && isWriteCommand(uname))
+            isWrite = isWriteCommand(up[0 .. cname.length]);
+            if (gCtx.readOnly && isWrite)
             {
                 lua_pushlstring(L,
                         "Write commands are not allowed from read-only scripts.".ptr, 55);
                 return lua_error(L);
             }
-            // Scripts replicate verbatim (the EVAL itself is the AOF/raft
-            // entry), so a replay must retrace every step: once a random-
-            // reply command ran, further writes would diverge — refuse them,
-            // like pre-effects Redis. The clock is frozen per EVAL, so TIME
-            // stays deterministic and needs no flag.
-            if (gCtx.sawRandom && isWriteCommand(uname))
-            {
-                enum msg = "Write commands not allowed after non deterministic commands";
-                lua_pushlstring(L, msg.ptr, msg.length);
-                return lua_error(L);
-            }
-            switch (uname)
-            {
-            case "RANDOMKEY", "SRANDMEMBER", "HRANDFIELD", "ZRANDMEMBER":
-                gCtx.sawRandom = true;
-                break;
-            default:
-                break;
-            }
         }
     }
 
     gCtx.replyBuf.clear();
-    // keep the EVAL entry's frozen clock: inner dispatch must NOT re-freeze
-    // to the wall clock, or TTL commands inside a replayed script drift
+    if (isWrite)
+    {
+        import dreads.replicator : gReplicator;
+
+        if (gReplicator !is null)
+        {
+            // effects replication under raft: the leader's state only ever
+            // changes through the log, so PROPOSE the inner command and let
+            // the apply loop run it; its reply feeds the script. The
+            // consensus round-trip parks the fiber (vibe, GC control plane):
+            // the @nogc cast is the same escape the server layer lives in.
+            encodeEffect(arr);
+            alias ProposeFn = int function(scope const(ubyte)[], ref ByteBuffer) @nogc nothrow;
+            auto st = (cast(ProposeFn)&raftProposeEffect)(gCtx.effectBuf.data, gCtx.replyBuf);
+            if (st == 1)
+            {
+                enum ro = "READONLY You can't write against a read only replica.";
+                lua_pushlstring(L, ro.ptr, ro.length);
+                return lua_error(L);
+            }
+            if (st == 2)
+            {
+                enum re = "ERR replication error";
+                lua_pushlstring(L, re.ptr, re.length);
+                return lua_error(L);
+            }
+            gScriptWrote = true;
+        }
+        else
+        {
+            // keep the EVAL's frozen clock: inner dispatch must not re-freeze
+            // to the wall clock (TTL commands inside the script must resolve
+            // like their logged effect will)
+            import dreads.commands : propagationOverride;
+            import dreads.det : detNow = now;
+
+            dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena, detNow());
+            // effect capture: log the command's propagation form (or itself)
+            // unless it errored; a partially-failed script keeps its earlier
+            // writes in both the dataset and the log
+            auto rd = gCtx.replyBuf.data;
+            if (rd.length > 0 && rd[0] != '-')
+            {
+                if (gScriptEffectSink !is null)
+                {
+                    if (!propagationOverride.empty)
+                        gScriptEffectSink(propagationOverride.data);
+                    else
+                    {
+                        encodeEffect(arr);
+                        gScriptEffectSink(gCtx.effectBuf.data);
+                    }
+                }
+                gScriptWrote = true;
+            }
+            propagationOverride.clear();
+        }
+    }
+    else
     {
         import dreads.det : detNow = now;
 
@@ -458,6 +511,39 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     }
     pushRespToLua(L, reply);
     return 1;
+}
+
+/// Re-encodes the bridge command into gCtx.effectBuf as RESP (the effect to
+/// log verbatim, or the raft entry to propose).
+private void encodeEffect(scope const(RVal)[] arr) nothrow @nogc
+{
+    gCtx.effectBuf.clear();
+    repArrayHeader(gCtx.effectBuf, arr.length);
+    foreach (ref a; arr)
+        repBulk(gCtx.effectBuf, a.str);
+}
+
+/// Proposes one script effect through raft; the committed apply's reply lands
+/// in `o`. 0 = ok, 1 = not the leader, 2 = replication error. NOT @nogc (the
+/// fiber parks awaiting consensus); the bridge calls it through a cast.
+private int raftProposeEffect(scope const(ubyte)[] entry, ref ByteBuffer o) nothrow
+{
+    import dreads.obj : gDbs, NUM_DBS;
+    import dreads.replicator : gReplicator;
+    import dreads.stream : nowMs;
+
+    auto dbIdx = cast(size_t)(gCtx.ks - &gDbs[0]);
+    if (dbIdx >= NUM_DBS)
+        dbIdx = 0;
+    try
+    {
+        if (!gReplicator.isLeader)
+            return 1;
+        gReplicator.proposeWrite(entry, nowMs(), cast(ushort) dbIdx, o);
+    }
+    catch (Exception)
+        return 2;
+    return 0;
 }
 
 /// Redis reply -> Lua value conversion rules.
@@ -668,7 +754,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     gCtx.ks = &ks;
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
-    gCtx.sawRandom = false;
+    gScriptWrote = false; // per-EVAL: the server signals WATCH/blocked wakes
     // deterministic per-invocation RNG (replicas/replay must agree)
     lua_getglobal(gL, "math");
     lua_getfield(gL, -1, "randomseed");

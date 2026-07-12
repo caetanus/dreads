@@ -101,6 +101,15 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
         seedRand(nowMs()); // shuffle the random-pick commands per boot
+        {
+            // effects replication: script writes reach the AOF one by one
+            import dreads.scripting : gScriptEffectSink;
+
+            gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
+                if (gAof.enabled)
+                    gAof.append(fx);
+            };
+        }
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
             foreach (ref d; gDbs) // drop-soon sweep across every database
@@ -1018,70 +1027,21 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
             bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
-            // under raft a write-capable script IS a write: it must reach the
-            // log through consensus, or followers never see redis.call effects.
-            // Propose the EVAL form (EVALSHA is rewritten so followers don't
-            // depend on their script cache); the apply loop runs it.
-            if (gReplicator !is null && !readOnly)
-            {
-                import dreads.stream : nowMs;
+            // effects replication: the EVAL itself NEVER enters the log.
+            // Each write the script performs is captured by the redis.call
+            // bridge — its propagation form goes to the AOF (sink installed
+            // at boot) or through raft consensus, one entry per write. A
+            // script that fails halfway keeps its earlier writes in the log,
+            // exactly like it keeps them in the dataset.
+            import dreads.scripting : gScriptWrote;
 
-                if (!gReplicator.isLeader)
-                {
-                    repError(o, "READONLY You can't write against a read only replica.");
-                    return true;
-                }
-                const(ubyte)[] entry = rawCmd;
-                static ByteBuffer evalBuf; // TLS: EVALSHA -> EVAL rewrite
-                if (bySha)
-                {
-                    if (args.length == 0)
-                    {
-                        repError(o, "ERR wrong number of arguments for 'evalsha' command");
-                        return true;
-                    }
-                    auto body_ = cachedScript(args[0].str);
-                    if (body_ is null)
-                    {
-                        repError(o,
-                                "NOSCRIPT No matching script. Please use EVAL.");
-                        return true;
-                    }
-                    evalBuf.clear();
-                    repArrayHeader(evalBuf, 1 + args.length);
-                    repBulk(evalBuf, "EVAL");
-                    repBulk(evalBuf, body_);
-                    foreach (ref a; args[1 .. $])
-                        repBulk(evalBuf, a.str);
-                    entry = evalBuf.data;
-                }
-                try
-                    gReplicator.proposeWrite(entry, nowMs(), cast(ushort)(c.dbp - &gDbs[0]), o);
-                catch (Exception)
-                    repError(o, "ERR replication error");
-                return true;
-            }
-            auto outBefore = o.length;
+            gScriptWrote = false;
             evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
-            // scripts may write; log unless the script itself errored.
-            // overrides set by commands inside the script are superseded by
-            // logging the whole EVAL.
             propagationOverride.clear();
-            if (o.length > outBefore && o.data[outBefore] != '-')
+            if (gScriptWrote)
             {
                 gWriteEpoch++;
                 gKeyActivity.emit();
-            }
-            if (gAof.enabled && o.length > outBefore && o.data[outBefore] != '-')
-            {
-                if (!bySha)
-                    gAof.append(rawCmd);
-                else if (args.length > 0)
-                {
-                    auto body_ = cachedScript(args[0].str);
-                    if (body_ !is null)
-                        gAof.appendEval(body_, args[1 .. $]);
-                }
             }
             return true;
         }

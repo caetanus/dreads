@@ -236,39 +236,66 @@ version (unittest)
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // replicate_commands answers false: dreads replicates scripts
-        // verbatim, so scripts must stay on the deterministic path
+        // effects replication is the only mode, so this is truthfully a yes
         ks.evalRun("if redis.replicate_commands() then return 1 else return 0 end")
-            .expect.to.equal(":0\r\n");
+            .expect.to.equal(":1\r\n");
         ks.evalRun("redis.log(redis.LOG_WARNING, 'x'); return 1").expect.to.equal(":1\r\n");
         ks.evalRun("return redis.log()")[0].expect.to.equal('-'); // needs 2+ args
         ks.evalRun("redis.setresp(3); return 1").expect.to.equal(":1\r\n");
         ks.evalRun("return redis.setresp(4)")[0].expect.to.equal('-');
     }
 
-    @("sandbox.verbatim_replication_determinism")
+    @("sandbox.effects_replication")
     unittest
     {
+        // the EVAL never enters the log — each redis.call write does, in its
+        // propagation form. Capture the sink and check.
+        import dreads.scripting : gScriptEffectSink;
+
+        static ByteBuffer captured;
+        captured.clear();
+        auto savedSink = gScriptEffectSink;
+        scope (exit)
+            gScriptEffectSink = savedSink;
+        gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
+            captured.append(fx);
+        };
+
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // a write after a random-reply command would diverge on replay
-        ks.evalRun("return redis.call('SADD', KEYS[1], 'a', 'b', 'c')", "1", "s")
-            .expect.to.equal(":3\r\n");
-        auto blocked = ks.evalRun(
-                "redis.call('SRANDMEMBER', KEYS[1]); return redis.call('SET', KEYS[2], 'x')",
-                "2", "s", "k");
-        blocked[0].expect.to.equal('-');
-        blocked.expect.to.contain("non deterministic");
-        ks.evalRun("return redis.call('EXISTS', KEYS[1])", "1", "k").expect.to.equal(":0\r\n");
-        // write BEFORE the random draw is fine; the flag resets per EVAL
-        ks.evalRun("redis.call('SET', KEYS[2], 'x'); "
-                ~ "return redis.call('SRANDMEMBER', KEYS[1]) ~= false and 1 or 0",
-                "2", "s", "k2").expect.to.equal(":1\r\n");
-        ks.evalRun("return redis.call('SET', KEYS[1], 'y')", "1", "k3")
+        ks.evalRun("redis.call('SETEX', KEYS[1], 100, 'v'); "
+                ~ "redis.call('RPUSH', KEYS[2], 'a'); "
+                ~ "redis.call('GET', KEYS[1]); return 1", "2", "k", "l")
+            .expect.to.equal(":1\r\n");
+        auto fx = (cast(string) captured.data).idup;
+        fx.expect.to.not.contain("EVAL"); // the script itself is never logged
+        fx.expect.to.contain("RPUSH"); // plain writes log verbatim
+        fx.expect.to.not.contain("GET\r\n"); // reads leave no effect
+        fx.expect.to.not.contain("SETEX"); // logged as its absolute-time form
+        fx.expect.to.contain("PXAT"); // ...i.e. SET k v PXAT <deadline>
+
+        // random-then-write is legal under effects replication: the replica
+        // replays what happened, not what was rolled
+        captured.clear();
+        ks.evalRun("redis.call('SADD', KEYS[1], 'a', 'b', 'c'); "
+                ~ "local m = redis.call('SRANDMEMBER', KEYS[1]); "
+                ~ "return redis.call('SET', KEYS[2], m)", "2", "s", "pick")
             .expect.to.equal("+OK\r\n");
-        // the clock is frozen for the whole EVAL: TIME is deterministic, so
-        // TTL-relative commands inside a script resolve identically on replay
+        (cast(string) captured.data).expect.to.contain("SET");
+
+        // a script that fails halfway keeps its earlier writes in the log,
+        // exactly like it keeps them in the dataset
+        captured.clear();
+        auto err = ks.evalRun("redis.call('SET', KEYS[1], 'kept'); "
+                ~ "redis.call('INCR', KEYS[1]); return 1", "1", "half");
+        err[0].expect.to.equal('-');
+        ks.evalRun("return redis.call('GET', KEYS[1])", "1", "half")
+            .expect.to.equal("$4\r\nkept\r\n");
+        (cast(string) captured.data).expect.to.contain("kept");
+
+        // the clock is frozen for the whole EVAL: TIME is deterministic and
+        // in-script relative TTLs match the absolute effects that got logged
         ks.evalRun("local a = redis.call('TIME'); local b = redis.call('TIME'); "
                 ~ "return (a[1] == b[1] and a[2] == b[2]) and 1 or 0")
             .expect.to.equal(":1\r\n");
