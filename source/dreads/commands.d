@@ -1402,11 +1402,21 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            double cur = 0;
-            obj.zset.score(args[2].str, cur);
-            obj.zset.add(cur + delta, args[2].str);
+            import core.stdc.math : isnan;
+
+            double cur;
+            if (!obj.zset.score(args[2].str, cur))
+                cur = 0; // absent member starts at 0 (out double leaves NaN in D)
+            immutable nv = cur + delta;
+            if (isnan(nv)) // inf + -inf
+            {
+                repError(o, "ERR resulting score is not a number (NaN)");
+                ks.delIfEmpty(args[0].str, obj); // drop a key we may have just created
+                break;
+            }
+            obj.zset.add(nv, args[2].str);
             notifyKeyspaceEvent(NClass.zset, "zincr", args[0].str);
-            repDouble(o, cur + delta);
+            repDouble(o, nv);
             break;
         }
     case "ZCARD":
@@ -1428,10 +1438,21 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "ZREVRANK":
         {
             bool rev = name.length != 5;
-            if (args.length != 2)
+            if (args.length < 2 || args.length > 3)
             {
                 arityErr(o, rev ? "zrevrank" : "zrank");
                 break;
+            }
+            bool withScore = false;
+            if (args.length == 3)
+            {
+                if (eqICKeyword(args[2].str, "WITHSCORE"))
+                    withScore = true;
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    break;
+                }
             }
             bool wrong;
             auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
@@ -1443,9 +1464,24 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             bool ok;
             auto r = obj is null ? 0 : obj.zset.rank(args[1].str, ok);
             if (!ok)
-                repNullBulk(o);
+            {
+                if (withScore)
+                    repNullArray(o); // WITHSCORE not-found is a nil array
+                else
+                    repNullBulk(o);
+                break;
+            }
+            auto rank = rev ? cast(long)(obj.zset.length - 1 - r) : cast(long) r;
+            if (withScore)
+            {
+                double sc;
+                obj.zset.score(args[1].str, sc);
+                repArrayHeader(o, 2);
+                repInt(o, rank);
+                repDouble(o, sc);
+            }
             else
-                repInt(o, rev ? cast(long)(obj.zset.length - 1 - r) : cast(long) r);
+                repInt(o, rank);
             break;
         }
     case "ZRANGE":
