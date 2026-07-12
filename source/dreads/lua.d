@@ -86,6 +86,7 @@ int luaopen_math(lua_State* L);
 // raw global access (bypasses the _G protection metatable)
 void lua_rawset(lua_State* L, int idx);
 int lua_rawget(lua_State* L, int idx);
+void lua_copy(lua_State* L, int fromidx, int toidx);
 enum LUA_RIDX_GLOBALS = 2;
 
 // table traversal and integer introspection (cjson)

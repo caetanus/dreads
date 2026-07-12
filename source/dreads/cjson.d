@@ -12,7 +12,10 @@ import core.stdc.stdlib : strtod;
 import dreads.lua;
 import dreads.mem : ByteBuffer;
 
-private enum MAX_DEPTH = 100;
+// lua-cjson runtime configuration (the Redis suite flips these)
+private __gshared long gEncodeMaxDepth = 1000;
+private __gshared long gDecodeMaxDepth = 1000;
+private __gshared bool gEncodeInvalidNumbers = false;
 
 public void registerCjson(lua_State* L) nothrow @nogc
 {
@@ -23,7 +26,56 @@ public void registerCjson(lua_State* L) nothrow @nogc
     lua_setfield(L, -2, "decode");
     lua_pushlightuserdata(L, null); // cjson.null sentinel
     lua_setfield(L, -2, "null");
+    // lua-cjson runtime configuration: depth limits and invalid-number
+    // tolerance really apply; the rest are accepted no-ops
+    lua_pushcclosure(L, &jsonEncodeMaxDepth, 0);
+    lua_setfield(L, -2, "encode_max_depth");
+    lua_pushcclosure(L, &jsonDecodeMaxDepth, 0);
+    lua_setfield(L, -2, "decode_max_depth");
+    lua_pushcclosure(L, &jsonEncodeInvalidNumbers, 0);
+    lua_setfield(L, -2, "encode_invalid_numbers");
+    foreach (nm; ["encode_keep_buffer\0", "decode_invalid_numbers\0",
+            "encode_sparse_array\0", "encode_number_precision\0"])
+    {
+        lua_pushcclosure(L, &jsonConfigStub, 0);
+        lua_setfield(L, -2, nm.ptr);
+    }
     lua_setglobal(L, "cjson");
+}
+
+/// Config calls with no effect on this implementation; echo the args.
+extern (C) private int jsonConfigStub(lua_State* L) nothrow @nogc
+{
+    return lua_gettop(L);
+}
+
+extern (C) private int jsonEncodeMaxDepth(lua_State* L) nothrow @nogc
+{
+    int isnum;
+    auto v = lua_tointegerx(L, 1, &isnum);
+    if (isnum == 0 || v < 1)
+        return luaL_error(L, "expected positive integer");
+    gEncodeMaxDepth = v;
+    lua_pushinteger(L, v);
+    return 1;
+}
+
+extern (C) private int jsonDecodeMaxDepth(lua_State* L) nothrow @nogc
+{
+    int isnum;
+    auto v = lua_tointegerx(L, 1, &isnum);
+    if (isnum == 0 || v < 1)
+        return luaL_error(L, "expected positive integer");
+    gDecodeMaxDepth = v;
+    lua_pushinteger(L, v);
+    return 1;
+}
+
+extern (C) private int jsonEncodeInvalidNumbers(lua_State* L) nothrow @nogc
+{
+    gEncodeInvalidNumbers = lua_toboolean(L, 1) != 0;
+    lua_pushboolean(L, gEncodeInvalidNumbers ? 1 : 0);
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +127,7 @@ private void escapeInto(ref ByteBuffer o, scope const(char)[] s) nothrow @nogc
 /// Encodes the value at absolute index idx. Errors longjmp via luaL_error.
 private void encodeValue(lua_State* L, int idx, ref ByteBuffer o, int depth) nothrow @nogc
 {
-    if (depth > MAX_DEPTH)
+    if (depth > gEncodeMaxDepth)
         luaL_error(L, "Cannot serialise: excessive nesting");
     switch (lua_type(L, idx))
     {
@@ -107,8 +159,15 @@ private void encodeValue(lua_State* L, int idx, ref ByteBuffer o, int depth) not
                 int isnum;
                 auto d = lua_tonumberx(L, idx, &isnum);
                 if (d != d || d == double.infinity || d == -double.infinity)
-                    luaL_error(L, "Cannot serialise number: must not be NaN or Infinity");
-                n = snprintf(b.ptr, b.length, "%.14g", d);
+                {
+                    if (!gEncodeInvalidNumbers)
+                        luaL_error(L,
+                                "Cannot serialise number: must not be NaN or Infinity");
+                    n = snprintf(b.ptr, b.length, d != d ? "nan"
+                            : (d > 0 ? "inf" : "-inf"));
+                }
+                else
+                    n = snprintf(b.ptr, b.length, "%.14g", d);
             }
             o.append(b[0 .. n]);
             break;
@@ -238,7 +297,7 @@ private struct Parser
     /// Parses one value and leaves it on the Lua stack.
     void value(int depth) nothrow @nogc
     {
-        if (depth > MAX_DEPTH)
+        if (depth > gDecodeMaxDepth)
             luaL_error(L, "Found too many nested data structures");
         skipWs();
         if (i >= s.length)
@@ -366,7 +425,10 @@ private struct Parser
         auto d = strtod(b.ptr, &endp);
         if (endp !is b.ptr + len)
             fail();
-        if (isInt && d >= -9.007199254740992e15 && d <= 9.007199254740992e15)
+        // integer BY VALUE, not just by syntax: Redis's Lua 5.1 prints whole
+        // doubles as "0"/"-5000" (%.14g); on 5.4 only an integer does that
+        if ((isInt || d == cast(double) cast(long) d)
+                && d >= -9.007199254740992e15 && d <= 9.007199254740992e15)
             lua_pushinteger(L, cast(long) d);
         else
             lua_pushnumber(L, d);

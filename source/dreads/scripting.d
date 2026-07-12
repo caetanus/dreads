@@ -30,6 +30,11 @@ private __gshared Mutex gLuaLock;
 shared static this()
 {
     gLuaLock = new Mutex;
+    // dispatch reaches Redis Functions through these (no import cycle)
+    import dreads.commands : gFcallHook, gFunctionHook;
+
+    gFunctionHook = &functionCommand;
+    gFcallHook = &fcallCommand;
 }
 
 // Bridge context for the duration of one EVAL: which keyspace/arena to use.
@@ -112,13 +117,31 @@ private static immutable lua51CompatChunk = "unpack = table.unpack\n"
 private static immutable protectGlobalsChunk = q{
     local mt = {}
     mt.__newindex = function(t, n, v)
-        error("Script attempted to create global variable '" .. tostring(n) .. "'", 2)
+        error("Attempt to modify a readonly table", 2)
     end
     mt.__index = function(t, n)
         error("Script attempted to access nonexistent global variable '" .. tostring(n) .. "'", 2)
     end
     setmetatable(_G, mt)
 };
+
+/// Make the table on top of the stack read-only: writes raise "Attempt to
+/// modify a readonly table" and the metatable is protected. Leaves the table
+/// on the stack. Used for the library tables scripts must not tamper with.
+private void installReadonlyProxy(lua_State* L, const(char)* name) nothrow @nogc
+{
+    lua_createtable(L, 0, 0); // proxy
+    lua_createtable(L, 0, 3); // metatable
+    lua_pushvalue(L, -3); // real table
+    lua_setfield(L, -2, "__index");
+    lua_pushcclosure(L, &luaReadonlyNewIndex, 0);
+    lua_setfield(L, -2, "__newindex");
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "__metatable"); // hide it from get/setmetatable
+    lua_setmetatable(L, -2); // proxy gets the metatable
+    lua_setglobal(L, name); // global = proxy
+    lua_settop(L, lua_gettop(L) - 1); // pop the real table
+}
 
 private bool ensureState() nothrow
 {
@@ -157,12 +180,24 @@ private bool ensureState() nothrow
     lua_setfield(gL, -2, "replicate_commands");
     lua_pushcclosure(gL, &luaSetResp, 0);
     lua_setfield(gL, -2, "setresp");
+    lua_pushcclosure(gL, &luaSetRepl, 0);
+    lua_setfield(gL, -2, "set_repl");
+    foreach (i, r; ["REPL_NONE\0", "REPL_AOF\0", "REPL_SLAVE\0",
+            "REPL_REPLICA\0", "REPL_ALL\0"])
+    {
+        lua_pushinteger(gL, cast(long) i);
+        lua_setfield(gL, -2, r.ptr);
+    }
+    lua_pushcclosure(gL, &luaRegisterFunction, 0);
+    lua_setfield(gL, -2, "register_function");
     // redis.log severity constants (scripts pass them as the first argument)
     foreach (i, lvl; ["LOG_DEBUG\0", "LOG_VERBOSE\0", "LOG_NOTICE\0", "LOG_WARNING\0"])
     {
         lua_pushinteger(gL, cast(long) i);
         lua_setfield(gL, -2, lvl.ptr);
     }
+    lua_pushvalue(gL, -1); // Valkey aliases the whole API: server == redis
+    lua_setglobal(gL, "server");
     lua_setglobal(gL, "redis");
     // helper libraries scripts expect from Redis
     {
@@ -173,6 +208,26 @@ private bool ensureState() nothrow
         registerCmsgpack(gL);
     }
     registerBitLib(gL);
+    // restricted os: the real table has only clock, but a metatable __index
+    // hands back an error-raising stub for any other field, so os.execute()
+    // fails with Valkey's exact "attempt to call field 'execute'" while
+    // pairs(os) still enumerates just clock
+    lua_createtable(gL, 0, 1);
+    lua_pushcclosure(gL, &luaOsClock, 0);
+    lua_setfield(gL, -2, "clock");
+    lua_createtable(gL, 0, 1);
+    lua_pushcclosure(gL, &luaOsForbiddenIndex, 0);
+    lua_setfield(gL, -2, "__index");
+    lua_setmetatable(gL, -2);
+    lua_setglobal(gL, "os");
+    // library tables are read-only: scripts may not shadow redis.call, etc.
+    foreach (lib; ["redis\0", "cjson\0", "cmsgpack\0", "bit\0"])
+    {
+        lua_getglobal(gL, lib.ptr);
+        installReadonlyProxy(gL, lib.ptr);
+    }
+    lua_getglobal(gL, "redis"); // server aliases the read-only redis proxy
+    lua_setglobal(gL, "server");
     // pre-create KEYS/ARGV so reading them never trips the protection
     lua_createtable(gL, 0, 0);
     lua_setglobal(gL, "KEYS");
@@ -197,12 +252,33 @@ private bool ensureState() nothrow
     // so scripts compile once per state lifetime, like Redis
     lua_createtable(gL, 0, 16);
     lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_scripts");
+    // Redis Functions: fname -> callback (rebuilt lazily after a recycle
+    // from gLibCode, the D-side source of truth)
+    lua_createtable(gL, 0, 8);
+    lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_functions");
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // helper libraries: redis.sha1hex and the LuaJIT-style bit library
 // ---------------------------------------------------------------------------
+
+/// _ENV.__newindex: scripts run against a throwaway environment but may not
+/// create globals (Valkey forbids it); every assignment to an undeclared
+/// global lands here.
+extern (C) private int luaReadonlyNewIndex(lua_State* L) nothrow @nogc
+{
+    return luaL_error(L, "Attempt to modify a readonly table");
+}
+
+/// Raise a plain-string error carrying its own code — no "chunk:line:"
+/// location (unlike luaL_error), so pcall(err) is exactly msg and a client
+/// switching on "-ERR ..." keeps working (issue #3663).
+private int raiseErr(lua_State* L, string msg) nothrow @nogc
+{
+    lua_pushlstring(L, msg.ptr, msg.length);
+    return lua_error(L);
+}
 
 extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
 {
@@ -216,12 +292,56 @@ extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
     return 1;
 }
 
+/// os.<missing>: returns a closure that raises "attempt to call field '<f>'"
+/// (upvalue 1 = the field name), matching Valkey's sandboxed os.
+extern (C) private int luaOsForbiddenCall(lua_State* L) nothrow @nogc
+{
+    size_t len;
+    auto name = lua_tolstring(L, lua_upvalueindex(1), &len);
+    static ByteBuffer mb; // TLS
+    mb.clear();
+    mb.append("attempt to call field '");
+    if (name !is null)
+        mb.append(cast(const(ubyte)[]) name[0 .. len]);
+    mb.append("'");
+    lua_pushlstring(L, cast(const(char)*) mb.data.ptr, mb.data.length);
+    return lua_error(L);
+}
+
+extern (C) private int luaOsForbiddenIndex(lua_State* L) nothrow @nogc
+{
+    // args: (table, key); return a raiser closure carrying the key name
+    lua_pushvalue(L, 2);
+    lua_pushcclosure(L, &luaOsForbiddenCall, 1);
+    return 1;
+}
+
+/// os.clock(): elapsed CPU-ish seconds; scripts use it to measure spans.
+extern (C) private int luaOsClock(lua_State* L) nothrow @nogc
+{
+    lua_pushnumber(L, cast(double) monoMsecs() / 1000.0);
+    return 1;
+}
+
 /// redis.log(level, message...): accepted and dropped — dreads has no server
 /// log file; the call must not error out of a script.
 extern (C) private int luaRedisLog(lua_State* L) nothrow @nogc
 {
     if (lua_gettop(L) < 2)
-        return luaL_error(L, "redis.log() requires two arguments or more.");
+        return raiseErr(L, "ERR server.log() requires two arguments or more.");
+    int isnum;
+    auto lvl = lua_tointegerx(L, 1, &isnum);
+    if (isnum == 0 || lvl < 0 || lvl > 3)
+        return raiseErr(L, "ERR Invalid log level.");
+    return 0;
+}
+
+/// redis.set_repl(flags): effects replication is the only mode, so the
+/// replication target can't be narrowed; accept a valid arg, ignore it.
+extern (C) private int luaSetRepl(lua_State* L) nothrow @nogc
+{
+    if (lua_gettop(L) < 1)
+        return raiseErr(L, "ERR server.set_repl() requires one argument.");
     return 0;
 }
 
@@ -239,7 +359,7 @@ extern (C) private int luaSetResp(lua_State* L) nothrow @nogc
 {
     auto v = lua_tointegerx(L, 1, null);
     if (v != 2 && v != 3)
-        return luaL_error(L, "RESP version must be 2 or 3.");
+        return raiseErr(L, "ERR RESP version must be 2 or 3.");
     return 0;
 }
 
@@ -311,8 +431,23 @@ extern (C) private int bitTobit(lua_State* L) nothrow @nogc
 
 extern (C) private int bitTohex(lua_State* L) nothrow @nogc
 {
+    // LuaBitOp: optional width (default 8); negative width => uppercase, and
+    // |width| digits capped at 8
+    long width = 8;
+    if (lua_gettop(L) >= 2)
+    {
+        int isnum;
+        auto w = lua_tonumberx(L, 2, &isnum);
+        if (isnum)
+            width = cast(long) w;
+    }
+    bool upper = width < 0;
+    long digits = width < 0 ? -width : width;
+    if (digits > 8)
+        digits = 8;
     char[16] b = void;
-    auto n = snprintf(b.ptr, b.length, "%08x", cast(uint) bitArg(L, 1));
+    auto fmt = upper ? "%0*X".ptr : "%0*x".ptr;
+    auto n = snprintf(b.ptr, b.length, fmt, cast(int) digits, cast(uint) bitArg(L, 1));
     lua_pushlstring(L, b.ptr, n);
     return 1;
 }
@@ -383,11 +518,16 @@ private int wrapReply(lua_State* L, const(char)* field) nothrow @nogc
 
 private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
 {
+    if (gLoadingLib)
+    {
+        enum msg = "attempt to call a redis command from a function loading context";
+        lua_pushlstring(L, msg.ptr, msg.length);
+        return lua_error(L);
+    }
     auto argc = lua_gettop(L);
     if (argc == 0 || gCtx.ks is null)
     {
-        lua_pushlstring(L, "Please specify at least one argument for this redis lib call".ptr, 61);
-        return lua_error(L);
+return raiseErr(L, "ERR Please specify at least one argument for this redis lib call");
     }
     auto arr = gCtx.arena.allocArray!RVal(argc);
     foreach (i; 0 .. argc)
@@ -417,11 +557,33 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
         {
             foreach (ci, ch; cname)
                 up[ci] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            isWrite = isWriteCommand(up[0 .. cname.length]);
+            auto uc = up[0 .. cname.length];
+            isWrite = isWriteCommand(uc);
+            // commands that manage the server/connection make no sense from a
+            // script and Redis flags them CMD_NOSCRIPT
+            switch (uc)
+            {
+            case "CLUSTER", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE",
+                    "PUNSUBSCRIBE", "MULTI", "EXEC", "DISCARD", "WATCH",
+                    "SCRIPT", "FUNCTION", "FCALL", "FCALL_RO", "EVAL",
+                    "EVALSHA", "EVAL_RO", "EVALSHA_RO", "MONITOR", "SYNC",
+                    "PSYNC", "RESET", "AUTH", "HELLO":
+                enum ns = "ERR This Redis command is not allowed from script";
+                lua_createtable(L, 0, 1);
+                lua_pushlstring(L, ns.ptr, ns.length);
+                lua_setfield(L, -2, "err");
+                return lua_error(L);
+            default:
+                break;
+            }
             if (gCtx.readOnly && isWrite)
             {
-                lua_pushlstring(L,
-                        "Write commands are not allowed from read-only scripts.".ptr, 55);
+                // raise as an {err=...} object so it surfaces verbatim, the
+                // way Redis reports bridge-level refusals
+                enum ro = "ERR Write commands are not allowed from read-only scripts.";
+                lua_createtable(L, 0, 1);
+                lua_pushlstring(L, ro.ptr, ro.length);
+                lua_setfield(L, -2, "err");
                 return lua_error(L);
             }
         }
@@ -502,8 +664,27 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     }
     if (reply.type == RType.Error)
     {
+        // two error classes get the BRIDGE's wording, like Redis (scripts
+        // and the suite match on these exact phrases)
+        auto emsg = reply.str;
+        if (emsg.length >= 19 && emsg[0 .. 19] == "ERR unknown command")
+            emsg = "Unknown command called from script";
+        else
+        {
+            enum arity = "wrong number of arguments";
+            foreach (i; 0 .. emsg.length >= arity.length ? emsg.length - arity.length + 1 : 0)
+            {
+                if (emsg[i .. i + arity.length] == arity)
+                {
+                    emsg = "Wrong number of args calling command from script";
+                    break;
+                }
+            }
+        }
+        static ByteBuffer eb; // TLS: ERR-prefixed error text
+        emsg = ensureErrCode(eb, emsg);
         lua_createtable(L, 0, 1);
-        lua_pushlstring(L, reply.str.ptr, reply.str.length);
+        lua_pushlstring(L, emsg.ptr, emsg.length);
         lua_setfield(L, -2, "err");
         if (raise)
             return lua_error(L); // longjmp; no D destructors live on this frame
@@ -511,6 +692,23 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     }
     pushRespToLua(L, reply);
     return 1;
+}
+
+/// Issue #3663: every error a script surfaces must carry an error code, so
+/// clients switching on `-ERR ...` keep working. A message already starting
+/// with an uppercase CODE + space is left alone (WRONGTYPE, READONLY, ...);
+/// anything else is prefixed "ERR ". Result is staged in `buf`.
+private const(char)[] ensureErrCode(ref ByteBuffer buf, const(char)[] msg) nothrow @nogc
+{
+    size_t i = 0;
+    while (i < msg.length && msg[i] >= 'A' && msg[i] <= 'Z')
+        i++;
+    if (i > 0 && i < msg.length && msg[i] == ' ')
+        return msg; // already coded
+    buf.clear();
+    buf.append("ERR ");
+    buf.append(cast(const(ubyte)[]) msg);
+    return cast(const(char)[]) buf.data;
 }
 
 /// Re-encodes the bridge command into gCtx.effectBuf as RESP (the effect to
@@ -582,8 +780,15 @@ private void pushRespToLua(lua_State* L, const ref RVal v) nothrow @nogc
 }
 
 /// Lua return value -> RESP reply conversion rules.
-private void luaToResp(lua_State* L, int idx, ref ByteBuffer o) nothrow @nogc
+private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) nothrow @nogc
 {
+    // deep/recursive tables would overflow the C stack; Redis caps the
+    // conversion and emits this sentinel (the reply so far is already framed)
+    if (depth > 1000)
+    {
+        repError(o, "reached lua stack limit");
+        return;
+    }
     switch (lua_type(L, idx))
     {
     case LUA_TNIL:
@@ -610,8 +815,12 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o) nothrow @nogc
         }
     case LUA_TTABLE:
         {
-            // {err=...} / {ok=...} win over the array part
-            if (lua_getfield(L, idx, "err") == LUA_TSTRING)
+            // {err=...} / {ok=...} win over the array part. RAW gets: this
+            // runs outside any pcall, and a table with a throwing __index
+            // metamethod (the protected _G, a user metatable) would longjmp
+            // straight through the D frames — a hard crash, not an error.
+            lua_pushlstring(L, "err".ptr, 3);
+            if (lua_rawget(L, idx) == LUA_TSTRING)
             {
                 size_t len;
                 auto p = lua_tolstring(L, -1, &len);
@@ -620,11 +829,60 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o) nothrow @nogc
                 break;
             }
             lua_settop(L, lua_gettop(L) - 1);
-            if (lua_getfield(L, idx, "ok") == LUA_TSTRING)
+            lua_pushlstring(L, "ok".ptr, 2);
+            if (lua_rawget(L, idx) == LUA_TSTRING)
             {
                 size_t len;
                 auto p = lua_tolstring(L, -1, &len);
                 repSimple(o, p[0 .. len]);
+                lua_settop(L, lua_gettop(L) - 1);
+                break;
+            }
+            lua_settop(L, lua_gettop(L) - 1);
+            // {double=n} -> RESP3 double / RESP2 bulk string
+            lua_pushlstring(L, "double".ptr, 6);
+            if (lua_rawget(L, idx) == LUA_TNUMBER)
+            {
+                import dreads.commands : repDouble;
+
+                int isnum;
+                repDouble(o, lua_tonumberx(L, -1, &isnum));
+                lua_settop(L, lua_gettop(L) - 1);
+                break;
+            }
+            lua_settop(L, lua_gettop(L) - 1);
+            // {big_number=str} -> RESP3 big number / RESP2 bulk string
+            lua_pushlstring(L, "big_number".ptr, 10);
+            if (lua_rawget(L, idx) == LUA_TSTRING)
+            {
+                size_t bl;
+                auto bp = lua_tolstring(L, -1, &bl);
+                repBigNumber(o, bp[0 .. bl]);
+                lua_settop(L, lua_gettop(L) - 1);
+                break;
+            }
+            lua_settop(L, lua_gettop(L) - 1);
+            // {map={k=v,...}} -> RESP3 map / RESP2 flat array
+            lua_pushlstring(L, "map".ptr, 3);
+            if (lua_rawget(L, idx) == LUA_TTABLE)
+            {
+                int mapIdx = lua_gettop(L);
+                size_t pairs = 0;
+                lua_pushnil(L);
+                while (lua_next(L, mapIdx) != 0)
+                {
+                    pairs++;
+                    lua_settop(L, lua_gettop(L) - 1); // drop value, keep key
+                }
+                repMapHeader(o, pairs);
+                lua_pushnil(L);
+                while (lua_next(L, mapIdx) != 0)
+                {
+                    // key at -2, value at -1; emit both, keep key for next
+                    luaToResp(L, lua_gettop(L) - 1, o, depth + 1);
+                    luaToResp(L, lua_gettop(L), o, depth + 1);
+                    lua_settop(L, lua_gettop(L) - 1);
+                }
                 lua_settop(L, lua_gettop(L) - 1);
                 break;
             }
@@ -646,7 +904,7 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o) nothrow @nogc
             foreach (i; 0 .. count)
             {
                 lua_rawgeti(L, idx, i + 1);
-                luaToResp(L, lua_gettop(L), o);
+                luaToResp(L, lua_gettop(L), o, depth + 1);
                 lua_settop(L, lua_gettop(L) - 1);
             }
             break;
@@ -806,6 +1064,8 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     lua_createtable(gL, 0, 1); // env metatable
     lua_rawgeti(gL, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
     lua_setfield(gL, -2, "__index");
+    lua_pushcclosure(gL, &luaReadonlyNewIndex, 0);
+    lua_setfield(gL, -2, "__newindex"); // scripts may not create globals
     lua_setmetatable(gL, -2);
     lua_setupvalue(gL, -2, 1);
     {
@@ -823,19 +1083,48 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     luaToResp(gL, lua_gettop(gL), o);
 }
 
-/// -<prefix><lua error message>, CRLF-sanitized
+/// -<prefix><lua error message>, CRLF-sanitized. A {err=...} error object
+/// (a failing redis.call raised inside the script) surfaces VERBATIM, like
+/// Redis: the caller sees the original command error, not a wrapper.
 private void luaErrToResp(ref ByteBuffer o, scope const(char)[] prefix) nothrow
 {
     size_t len;
+    if (lua_type(gL, -1) == LUA_TTABLE)
+    {
+        lua_pushlstring(gL, "err".ptr, 3);
+        if (lua_rawget(gL, -2) == LUA_TSTRING)
+        {
+            auto ep = lua_tolstring(gL, -1, &len);
+            o.appendByte('-');
+            foreach (c; ep[0 .. len])
+                o.appendByte(c == '\r' || c == '\n' ? ' ' : c);
+            o.append("\r\n");
+            lua_settop(gL, lua_gettop(gL) - 1);
+            return;
+        }
+        lua_settop(gL, lua_gettop(gL) - 1);
+    }
     auto p = lua_tolstring(gL, -1, &len);
     o.appendByte('-');
-    o.append(prefix);
+    // an error already carrying a CODE (our raiseErr strings: "ERR ...",
+    // "WRONGTYPE ...") surfaces verbatim; a raw Lua error gets the wrapper
+    if (p !is null && !startsWithCode(p[0 .. len]))
+        o.append(prefix);
     if (p !is null)
     {
         foreach (c; p[0 .. len])
             o.appendByte(c == '\r' || c == '\n' ? ' ' : c);
     }
     o.append("\r\n");
+}
+
+/// True when the message opens with an uppercase CODE followed by a space.
+private bool startsWithCode(scope const(char)[] m) nothrow @nogc
+{
+    size_t i = 0;
+    while (i < m.length && m[i] >= 'A' && m[i] <= 'Z')
+        i++;
+    return i > 0 && i < m.length && m[i] == ' ';
 }
 
 /// Cached script body for a 40-char sha (any case), or null. The slice stays
@@ -935,6 +1224,556 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
     default:
         repUnknownSubcommand(o, "SCRIPT", sub);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redis Functions: FUNCTION LOAD/DELETE/FLUSH/LIST/STATS + FCALL/FCALL_RO.
+// Named callbacks registered by a library script, sharing the EVAL sandbox,
+// bridge and effects replication. D side owns the durable state (function ->
+// library + flags, library -> source); the Lua-side callback table is a
+// cache rebuilt lazily from the source after a state recycle. FUNCTION
+// LOAD/DELETE/FLUSH set propagationOverride = themselves, so they reach the
+// AOF and (via the server's raft gate) the followers; FCALL replicates by
+// its effects like EVAL.
+// ---------------------------------------------------------------------------
+
+private __gshared Dict!StrVal gFns; // fname -> "<lib>\0" ~ ('W'|'R')
+private __gshared Dict!StrVal gLibCode; // libname -> full library source
+private __gshared bool gLoadingLib; // register_function allowed; redis.call not
+private __gshared const(char)[] gLoadingLibName; // valid during one LOAD
+private __gshared ByteBuffer gLoadNames; // "\0"-joined fnames this LOAD added
+
+/// redis.register_function('name', callback) or
+/// redis.register_function{function_name=, callback=, flags={...}}
+extern (C) private int luaRegisterFunction(lua_State* L) nothrow @nogc
+{
+    if (!gLoadingLib)
+    {
+        enum msg = "redis.register_function can only be called inside a library load";
+        lua_pushlstring(L, msg.ptr, msg.length);
+        return lua_error(L);
+    }
+    const(char)[] fname;
+    bool noWrites = false;
+    size_t len;
+    if (lua_type(L, 1) == LUA_TTABLE)
+    {
+        lua_getfield(L, 1, "function_name");
+        auto p = lua_tolstring(L, -1, &len);
+        if (p is null)
+        {
+            enum m1 = "missing function_name";
+            lua_pushlstring(L, m1.ptr, m1.length);
+            return lua_error(L);
+        }
+        fname = p[0 .. len];
+        // fname stays valid: the string lives in the argument table
+        lua_settop(L, 1);
+        lua_getfield(L, 1, "flags");
+        if (lua_type(L, -1) == LUA_TTABLE)
+        {
+            foreach (i; 1 .. 17) // flags are few; bounded scan
+            {
+                lua_rawgeti(L, -1, i);
+                auto fp = lua_tolstring(L, -1, &len);
+                if (fp is null)
+                {
+                    lua_settop(L, lua_gettop(L) - 1);
+                    break;
+                }
+                if (fp[0 .. len] == "no-writes")
+                    noWrites = true;
+                lua_settop(L, lua_gettop(L) - 1);
+            }
+        }
+        lua_settop(L, 1);
+        lua_getfield(L, 1, "callback");
+    }
+    else
+    {
+        auto p = lua_tolstring(L, 1, &len);
+        if (p is null)
+        {
+            enum m2 = "wrong arguments to register_function";
+            lua_pushlstring(L, m2.ptr, m2.length);
+            return lua_error(L);
+        }
+        fname = p[0 .. len];
+        lua_pushvalue(L, 2);
+    }
+    if (lua_type(L, -1) != LUA_TFUNCTION)
+    {
+        enum m3 = "callback must be a function";
+        lua_pushlstring(L, m3.ptr, m3.length);
+        return lua_error(L);
+    }
+    // collision with another library is an error; re-registering within the
+    // same library (a lazy reload) just overwrites
+    auto meta = gFns.get(fname);
+    if (meta !is null)
+    {
+        auto raw = meta.rawView();
+        auto lib = raw[0 .. $ - 2];
+        if (lib != gLoadingLibName)
+        {
+            enum m4 = "Function already exists in another library";
+            lua_pushlstring(L, m4.ptr, m4.length);
+            return lua_error(L);
+        }
+    }
+    // registry cache: dreads_functions[fname] = callback
+    lua_getfield(L, LUA_REGISTRYINDEX, "dreads_functions");
+    lua_pushlstring(L, fname.ptr, fname.length);
+    lua_pushvalue(L, -3);
+    lua_rawset(L, -3);
+    lua_settop(L, 0);
+    // durable D-side metadata
+    static ByteBuffer mv; // TLS scratch: "<lib>\0" ~ flag
+    mv.clear();
+    mv.append(gLoadingLibName);
+    mv.appendByte(0);
+    mv.appendByte(noWrites ? 'R' : 'W');
+    gFns.set(fname, StrVal.ofRaw(cast(const(char)[]) mv.data));
+    gLoadNames.append(fname);
+    gLoadNames.appendByte(0);
+    return 0;
+}
+
+/// Runs a library body in loading mode; false = Lua error (reply written).
+private bool runLibraryBody(scope const(char)[] lib, scope const(char)[] body_,
+        ref ByteBuffer o, bool emitError) nothrow
+{
+    gLoadingLib = true;
+    gLoadingLibName = lib;
+    gLoadNames.clear();
+    scope (exit)
+    {
+        gLoadingLib = false;
+        gLoadingLibName = null;
+    }
+    // the "#!lua name=..." shebang is metadata, not Lua: compile past it
+    if (body_.length >= 2 && body_[0] == '#' && body_[1] == '!')
+    {
+        size_t nl = 0;
+        while (nl < body_.length && body_[nl] != '\n')
+            nl++;
+        body_ = nl < body_.length ? body_[nl + 1 .. $] : null;
+    }
+    if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_function") != LUA_OK)
+    {
+        if (emitError)
+            luaErrToResp(o, "ERR Error compiling function: ");
+        lua_settop(gL, 0);
+        return false;
+    }
+    // same throwaway _ENV as EVAL, chained to the protected base
+    lua_createtable(gL, 0, 8);
+    lua_createtable(gL, 0, 1);
+    lua_rawgeti(gL, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+    lua_setfield(gL, -2, "__index");
+    lua_pushcclosure(gL, &luaReadonlyNewIndex, 0);
+    lua_setfield(gL, -2, "__newindex"); // scripts may not create globals
+    lua_setmetatable(gL, -2);
+    lua_setupvalue(gL, -2, 1);
+    if (lua_pcall(gL, 0, 0, 0) != LUA_OK)
+    {
+        // roll back whatever this load registered
+        size_t start = 0;
+        auto names = cast(const(char)[]) gLoadNames.data;
+        foreach (i, ch; names)
+        {
+            if (ch == 0)
+            {
+                gFns.del(names[start .. i]);
+                start = i + 1;
+            }
+        }
+        if (emitError)
+            luaErrToResp(o, "ERR Error registering functions: ");
+        lua_settop(gL, 0);
+        return false;
+    }
+    lua_settop(gL, 0);
+    return true;
+}
+
+/// Parses "#!lua name=<lib>" and returns the library name (null = bad).
+private const(char)[] parseShebang(scope const(char)[] code) nothrow @nogc
+{
+    if (code.length < 2 || code[0] != '#' || code[1] != '!')
+        return null;
+    size_t eol = 0;
+    while (eol < code.length && code[eol] != '\n')
+        eol++;
+    auto line = code[0 .. eol];
+    if (line.length < 5 || line[2 .. 5] != "lua")
+        return null;
+    enum tag = "name=";
+    foreach (i; 0 .. line.length)
+    {
+        if (i + tag.length <= line.length && line[i .. i + tag.length] == tag)
+        {
+            auto rest = line[i + tag.length .. $];
+            size_t end = 0;
+            while (end < rest.length && rest[end] != ' ' && rest[end] != '\t'
+                    && rest[end] != '\r')
+                end++;
+            return end == 0 ? null : rest[0 .. end];
+        }
+    }
+    return null;
+}
+
+/// Deletes every function belonging to lib; returns how many were dropped.
+private size_t dropLibFunctions(scope const(char)[] lib) nothrow
+{
+    // collect first (no deleting while iterating), then remove dict + cache
+    static ByteBuffer victims; // TLS
+    victims.clear();
+    foreach (i; 0 .. gFns.capacity)
+    {
+        if (!gFns.slotLive(i))
+            continue;
+        auto raw = gFns.valAt(i).rawView();
+        if (raw[0 .. $ - 2] == lib)
+        {
+            victims.append(gFns.keyAt(i));
+            victims.appendByte(0);
+        }
+    }
+    size_t n = 0, start = 0;
+    auto names = cast(const(char)[]) victims.data;
+    foreach (i, ch; names)
+    {
+        if (ch != 0)
+            continue;
+        auto fname = names[start .. i];
+        gFns.del(fname);
+        if (gL !is null)
+        {
+            lua_getfield(gL, LUA_REGISTRYINDEX, "dreads_functions");
+            lua_pushlstring(gL, fname.ptr, fname.length);
+            lua_pushnil(gL);
+            lua_rawset(gL, -3);
+            lua_settop(gL, 0);
+        }
+        n++;
+        start = i + 1;
+    }
+    return n;
+}
+
+/// Leaves the raw FUNCTION subcommand in propagationOverride: registry
+/// mutations must reach the AOF and the raft log like any write.
+private void propagateFunctionCmd(const(RVal)[] args) nothrow @nogc
+{
+    import dreads.commands : propagationOverride;
+
+    propagationOverride.clear();
+    repArrayHeader(propagationOverride, 1 + args.length);
+    repBulk(propagationOverride, "FUNCTION");
+    foreach (ref a; args)
+        repBulk(propagationOverride, a.str);
+}
+
+/// FUNCTION LOAD [REPLACE] code | DELETE lib | FLUSH | LIST | STATS | HELP
+public void functionCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
+        ref Arena arena) nothrow
+{
+    import dreads.commands : eqICKeyword;
+
+    if (args.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'function' command");
+        return;
+    }
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    auto sub = args[0].str;
+    if (eqICKeyword(sub, "HELP"))
+    {
+        repHelp!"FUNCTION"(o);
+        return;
+    }
+    if (eqICKeyword(sub, "LOAD"))
+    {
+        bool replace = args.length >= 2 && eqICKeyword(args[1].str, "REPLACE");
+        auto codeIdx = replace ? 2 : 1;
+        if (args.length != codeIdx + 1)
+        {
+            repError(o, "ERR wrong number of arguments for 'function|load' command");
+            return;
+        }
+        auto code = args[cast(size_t) codeIdx].str;
+        auto lib = parseShebang(code);
+        if (lib is null)
+        {
+            repError(o, "ERR Missing library metadata");
+            return;
+        }
+        if (gLibCode.get(lib) !is null)
+        {
+            if (!replace)
+            {
+                o.append("-ERR Library '");
+                o.append(lib);
+                o.append("' already exists\r\n");
+                return;
+            }
+            dropLibFunctions(lib);
+        }
+        if (!ensureState())
+        {
+            repError(o, "ERR failed to initialize Lua");
+            return;
+        }
+        if (!runLibraryBody(lib, code, o, true))
+            return;
+        if (gLoadNames.empty)
+        {
+            gLibCode.del(lib);
+            repError(o, "ERR No functions registered");
+            return;
+        }
+        gLibCode.set(lib, StrVal.ofRaw(code));
+        propagateFunctionCmd(args);
+        repBulk(o, lib);
+        return;
+    }
+    if (eqICKeyword(sub, "DELETE"))
+    {
+        if (args.length != 2)
+        {
+            repError(o, "ERR wrong number of arguments for 'function|delete' command");
+            return;
+        }
+        if (gLibCode.get(args[1].str) is null)
+        {
+            repError(o, "ERR Library not found");
+            return;
+        }
+        dropLibFunctions(args[1].str);
+        gLibCode.del(args[1].str);
+        propagateFunctionCmd(args);
+        repSimple(o, "OK");
+        return;
+    }
+    if (eqICKeyword(sub, "FLUSH"))
+    {
+        gFns.clear();
+        gLibCode.clear();
+        if (gL !is null)
+        {
+            lua_createtable(gL, 0, 8);
+            lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_functions");
+        }
+        propagateFunctionCmd(args);
+        repSimple(o, "OK");
+        return;
+    }
+    if (eqICKeyword(sub, "LIST"))
+    {
+        // array of {library_name, engine, functions:[{name, description, flags}]}
+        size_t nlibs = 0;
+        foreach (i; 0 .. gLibCode.capacity)
+            if (gLibCode.slotLive(i))
+                nlibs++;
+        repArrayHeader(o, nlibs);
+        foreach (i; 0 .. gLibCode.capacity)
+        {
+            if (!gLibCode.slotLive(i))
+                continue;
+            auto lib = gLibCode.keyAt(i);
+            repMapHeader(o, 3);
+            repBulk(o, "library_name");
+            repBulk(o, lib);
+            repBulk(o, "engine");
+            repBulk(o, "LUA");
+            repBulk(o, "functions");
+            size_t nf = 0;
+            foreach (j; 0 .. gFns.capacity)
+                if (gFns.slotLive(j) && gFns.valAt(j).rawView()[0 .. $ - 2] == lib)
+                    nf++;
+            repArrayHeader(o, nf);
+            foreach (j; 0 .. gFns.capacity)
+            {
+                if (!gFns.slotLive(j))
+                    continue;
+                auto raw = gFns.valAt(j).rawView();
+                if (raw[0 .. $ - 2] != lib)
+                    continue;
+                repMapHeader(o, 3);
+                repBulk(o, "name");
+                repBulk(o, gFns.keyAt(j));
+                repBulk(o, "description");
+                repNullBulk(o);
+                repBulk(o, "flags");
+                repSetHeader(o, raw[$ - 1] == 'R' ? 1 : 0);
+                if (raw[$ - 1] == 'R')
+                    repBulk(o, "no-writes");
+            }
+        }
+        return;
+    }
+    if (eqICKeyword(sub, "STATS"))
+    {
+        size_t nlibs = 0, nfns = 0;
+        foreach (i; 0 .. gLibCode.capacity)
+            if (gLibCode.slotLive(i))
+                nlibs++;
+        foreach (i; 0 .. gFns.capacity)
+            if (gFns.slotLive(i))
+                nfns++;
+        repMapHeader(o, 2);
+        repBulk(o, "running_script");
+        repNullBulk(o);
+        repBulk(o, "engines");
+        repMapHeader(o, 1);
+        repBulk(o, "LUA");
+        repMapHeader(o, 2);
+        repBulk(o, "libraries_count");
+        repInt(o, cast(long) nlibs);
+        repBulk(o, "functions_count");
+        repInt(o, cast(long) nfns);
+        return;
+    }
+    repUnknownSubcommand(o, "FUNCTION", sub);
+}
+
+/// FCALL/FCALL_RO name numkeys key [key ...] arg [arg ...]
+public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
+        ref Arena arena, bool readOnly) nothrow
+{
+    if (args.length < 2)
+    {
+        repError(o, readOnly ? "ERR wrong number of arguments for 'fcall_ro' command"
+                : "ERR wrong number of arguments for 'fcall' command");
+        return;
+    }
+    long numkeys;
+    if (!parseLong(args[1].str, numkeys))
+    {
+        repError(o, "ERR value is not an integer or out of range");
+        return;
+    }
+    if (numkeys < 0)
+    {
+        repError(o, "ERR Number of keys can't be negative");
+        return;
+    }
+    if (cast(size_t) numkeys > args.length - 2)
+    {
+        repError(o, "ERR Number of keys can't be greater than number of args");
+        return;
+    }
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    auto meta = gFns.get(args[0].str);
+    if (meta is null)
+    {
+        repError(o, "ERR Function not found");
+        return;
+    }
+    auto raw = meta.rawView();
+    if (readOnly && raw[$ - 1] != 'R')
+    {
+        repError(o, "ERR Can not execute a script with write flag using *_ro command.");
+        return;
+    }
+    if (!ensureState())
+    {
+        repError(o, "ERR failed to initialize Lua");
+        return;
+    }
+    // fetch the callback; a recycled state rebuilds it from the library source
+    bool fetchCallback() nothrow @nogc
+    {
+        // stash the callback under a fixed registry key so it survives the
+        // stack cleanup without lua_remove (not bound)
+        lua_getfield(gL, LUA_REGISTRYINDEX, "dreads_functions");
+        lua_pushlstring(gL, args[0].str.ptr, args[0].str.length);
+        lua_rawget(gL, -2);
+        if (lua_type(gL, -1) != LUA_TFUNCTION)
+        {
+            lua_settop(gL, 0);
+            return false;
+        }
+        lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_current_fn");
+        lua_settop(gL, 0);
+        return true;
+    }
+
+    if (!fetchCallback())
+    {
+        auto lib = raw[0 .. $ - 2];
+        auto src = gLibCode.get(lib);
+        if (src is null || !runLibraryBody(lib, src.rawView(), o, false) || !fetchCallback())
+        {
+            repError(o, "ERR Function not found");
+            return;
+        }
+    }
+
+    gCtx.ks = &ks;
+    gCtx.arena = &arena;
+    gCtx.readOnly = readOnly;
+    gScriptWrote = false;
+    // deterministic per-invocation RNG, script deadline, state recycling —
+    // the same run discipline as EVAL
+    lua_getglobal(gL, "math");
+    lua_getfield(gL, -1, "randomseed");
+    lua_pushinteger(gL, 0);
+    lua_pcall(gL, 1, 0, 0);
+    lua_settop(gL, 0);
+    lua_getfield(gL, LUA_REGISTRYINDEX, "dreads_current_fn"); // callback
+    import dreads.config : gConfig;
+
+    gLuaDeadlineMsecs = gConfig.luaTimeLimitMs > 0 ? monoMsecs() + gConfig.luaTimeLimitMs : 0;
+    scope (exit)
+    {
+        gCtx.ks = null;
+        gCtx.arena = null;
+        gCtx.readOnly = false;
+        gLuaDeadlineMsecs = 0;
+        lua_settop(gL, 0);
+        enum RECYCLE_BYTES = 32UL * 1024 * 1024;
+        if (gLuaBytes > RECYCLE_BYTES)
+        {
+            lua_close(gL);
+            gL = null;
+            gLuaBytes = 0;
+        }
+    }
+    // functions receive KEYS/ARGV as ARGUMENTS (two tables), not globals
+    auto keys = args[2 .. 2 + cast(size_t) numkeys];
+    auto argv = args[2 + cast(size_t) numkeys .. $];
+    lua_createtable(gL, cast(int) keys.length, 0);
+    foreach (i, ref k; keys)
+    {
+        lua_pushlstring(gL, k.str.ptr, k.str.length);
+        lua_rawseti(gL, -2, cast(long) i + 1);
+    }
+    lua_createtable(gL, cast(int) argv.length, 0);
+    foreach (i, ref a; argv)
+    {
+        lua_pushlstring(gL, a.str.ptr, a.str.length);
+        lua_rawseti(gL, -2, cast(long) i + 1);
+    }
+    {
+        import dreads.commands : gInScript;
+
+        gInScript = true;
+        scope (exit)
+            gInScript = false;
+        if (lua_pcall(gL, 2, 1, 0) != LUA_OK)
+        {
+            luaErrToResp(o, "ERR Error running function: ");
+            return;
+        }
+    }
+    luaToResp(gL, lua_gettop(gL), o);
 }
 
 // ---------------------------------------------------------------------------
