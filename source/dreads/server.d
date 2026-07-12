@@ -1066,13 +1066,13 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 else
                 {
                     try
-                        gReplicator.proposeWrite(rawCmd, nowMs(), o);
+                        gReplicator.proposeWrite(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]), o);
                     catch (Exception)
                         repError(o, "ERR replication error");
                 }
                 return true;
             }
-            auto h = gReplicator.proposeAsync(rawCmd, nowMs());
+            auto h = gReplicator.proposeAsync(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]));
             if (h is null) // lost leadership since the flush-point check
             {
                 repError(o, "READONLY You can't write against a read only replica.");
