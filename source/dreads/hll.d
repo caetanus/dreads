@@ -126,17 +126,18 @@ private char[] hllFor(ref Keyspace ks, scope const(char)[] key, bool create,
             return null;
         RObj no;
         no.type = ObjType.str;
-        no.str.s = newHll();
+        no.str.setRaw(newHll());
         ks.d.set(key, no);
-        return cast(char[]) ks.lookup(key).str.s;
+        return ks.lookup(key).str.rawMut();
     }
-    if (!isHll(obj.str.s))
+    char[24] sb = void;
+    if (!isHll(obj.str.bytes(sb))) // an int-encoded value materializes then fails the magic
     {
         err = true;
         repError(o, "WRONGTYPE Key is not a valid HyperLogLog string value.");
         return null;
     }
-    return cast(char[]) obj.str.s;
+    return obj.str.rawMut(); // a valid HLL is already raw bytes (no conversion)
 }
 
 /// PFADD key [element ...]
@@ -231,7 +232,7 @@ public void pfmerge(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc
         bool err2;
         auto src = hllFor(ks, a.str, false, o, err2);
         // re-resolve dest each round: source lookups may have rehashed
-        auto dst2 = cast(char[]) ks.lookup(args[0].str).str.s;
+        auto dst2 = ks.lookup(args[0].str).str.rawMut();
         if (src is null)
             continue;
         foreach (i; 0 .. REGISTERS)

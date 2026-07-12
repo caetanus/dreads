@@ -243,7 +243,7 @@ version (unittest)
 
         ks.run("OBJECT", "ENCODING", "b").expect.to.equal("$3\r\nint\r\n");
         ks.run("SET", "txt", "hello");
-        ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$3\r\nraw\r\n");
+        ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$6\r\nembstr\r\n"); // short string = embstr (Redis parity)
         ks.run("OBJECT", "ENCODING", "l").expect.to.equal("$10\r\nlinkedlist\r\n");
         ks.run("OBJECT", "REFCOUNT", "l").expect.to.equal(":1\r\n");
         ks.run("OBJECT", "ENCODING", "ghost")[0].expect.to.equal('-');

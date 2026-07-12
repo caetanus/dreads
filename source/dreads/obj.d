@@ -87,6 +87,14 @@ public struct RObj
         return o;
     }
 
+    static RObj ofInt(long v) @nogc nothrow
+    {
+        RObj o;
+        o.type = ObjType.str;
+        o.str = StrVal.ofInt(v);
+        return o;
+    }
+
     /// Empty object of any type; the zeroed union is a valid empty container.
     static RObj empty(ObjType t) @nogc nothrow
     {
@@ -131,7 +139,7 @@ public struct RObj
         final switch (type)
         {
         case ObjType.str:
-            c.str = StrVal.of(str.s);
+            c.str = str.dup();
             break;
         case ObjType.list:
             foreach (v; list)
@@ -141,7 +149,7 @@ public struct RObj
             foreach (i; 0 .. hash.capacity)
             {
                 if (hash.slotLive(i))
-                    c.hash.set(hash.keyAt(i), StrVal.of(hash.valAt(i).s));
+                    c.hash.set(hash.keyAt(i), hash.valAt(i).dup());
             }
             break;
         case ObjType.set:
@@ -362,6 +370,12 @@ public struct Keyspace
         d.set(k, RObj.ofStr(v));
     }
 
+    /// SET of an int-encoded value (INCR on a missing key).
+    void setInt(scope const(char)[] k, long v) @nogc nothrow
+    {
+        d.set(k, RObj.ofInt(v));
+    }
+
     bool del(scope const(char)[] k) @nogc nothrow
     {
         // an already-expired key must read as missing, not as deleted-now
@@ -426,7 +440,8 @@ unittest // typed keyspace flow and WRONGTYPE detection
 
     ks.setStr("s", "hello");
     auto o = ks.lookup("s");
-    assert(o !is null && o.type == ObjType.str && o.str.s == "hello");
+    char[24] sb = void;
+    assert(o !is null && o.type == ObjType.str && o.str.bytes(sb) == "hello");
     assert(o.typeName == "string");
 
     bool wrong;

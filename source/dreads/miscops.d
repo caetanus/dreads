@@ -413,8 +413,9 @@ public void lcs(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena
         repError(o, "ERR The specified keys must contain string values");
         return;
     }
-    auto a = o1 is null ? "" : o1.str.s;
-    auto b = o2 is null ? "" : o2.str.s;
+    char[24] sa = void, sbb = void; // scratch for int-encoded operands (both coexist)
+    auto a = o1 is null ? "" : o1.str.bytes(sa);
+    auto b = o2 is null ? "" : o2.str.bytes(sbb);
     // guard the O(n*m) table
     if (a.length * b.length > 32UL * 1024 * 1024)
     {
@@ -584,7 +585,10 @@ public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
                 continue;
             repBulk(o, obj.hash.keyAt(i2));
             if (withValues)
-                repBulk(o, obj.hash.valAt(i2).s);
+            {
+                char[24] sb = void;
+                repBulk(o, obj.hash.valAt(i2).bytes(sb));
+            }
             emitted++;
         }
     }

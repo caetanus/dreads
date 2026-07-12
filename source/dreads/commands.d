@@ -9,7 +9,7 @@ import core.stdc.stdio : snprintf;
 import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
-import dreads.dict : Dict, StrVal, Unit;
+import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
@@ -350,7 +350,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if ((nx && existing !is null) || (xx && existing is null))
             {
                 if (wantGet && existing !is null)
-                    repBulk(o, existing.str.s);
+                    repStrVal(o, existing.str);
                 else
                     repNullBulk(o);
                 break;
@@ -358,7 +358,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wantGet)
             {
                 if (existing !is null)
-                    repBulk(o, existing.str.s);
+                    repStrVal(o, existing.str);
                 else
                     repNullBulk(o);
             }
@@ -457,7 +457,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
                 break;
             }
-            repBulk(o, obj.str.s);
+            repStrVal(o, obj.str);
             if (doPersist && obj.expireAtMs != 0)
             {
                 ks.retimeExpire(args[0].str, obj.expireAtMs, 0);
@@ -492,7 +492,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
                 break;
             }
-            repBulk(o, obj.str.s);
+            repStrVal(o, obj.str);
             ks.del(args[0].str);
             notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
             break;
@@ -528,7 +528,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else if (obj is null)
                 repNullBulk(o);
             else
-                repBulk(o, obj.str.s);
+                repStrVal(o, obj.str);
             break;
         }
     case "GETSET":
@@ -548,7 +548,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (obj is null)
                 repNullBulk(o);
             else
-                repBulk(o, obj.str.s);
+                repStrVal(o, obj.str);
             ks.setStr(args[0].str, args[1].str);
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             break;
@@ -567,7 +567,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            if (obj !is null && obj.str.s.length + args[1].str.length > MAX_STRING_LEN)
+            if (obj !is null && obj.str.len() + args[1].str.length > MAX_STRING_LEN)
             {
                 repError(o, "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
                 break;
@@ -579,8 +579,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             else
             {
-                obj.str.s = mallocAppend(obj.str.s, args[1].str);
-                repInt(o, cast(long) obj.str.s.length);
+                obj.str.append(args[1].str);
+                repInt(o, cast(long) obj.str.len());
             }
             notifyKeyspaceEvent(NClass.str, "append", args[0].str);
             break;
@@ -597,7 +597,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wrong)
                 repWrongType(o);
             else
-                repInt(o, obj is null ? 0 : cast(long) obj.str.s.length);
+                repInt(o, obj is null ? 0 : cast(long) obj.str.len());
             break;
         }
     case "INCR":
@@ -666,7 +666,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             {
                 auto obj = ks.lookup(a.str);
                 if (obj !is null && obj.type == ObjType.str)
-                    repBulk(o, obj.str.s);
+                    repStrVal(o, obj.str);
                 else
                     repNullBulk(o); // missing or wrong type both read as nil
             }
@@ -884,7 +884,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (f is null)
                 repNullBulk(o);
             else
-                repBulk(o, f.s);
+                repStrVal(o, *f);
             break;
         }
     case "HMGET":
@@ -908,7 +908,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (f is null)
                     repNullBulk(o);
                 else
-                    repBulk(o, f.s);
+                    repStrVal(o, *f);
             }
             break;
         }
@@ -1002,7 +1002,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         foreach (k, ref v; obj.hash)
                         {
                             repBulk(oo, k);
-                            repBulk(oo, v.s);
+                            repStrVal(oo, v);
                         }
                 });
             }
@@ -1016,7 +1016,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         if (wantKeys)
                             repBulk(o, k);
                         if (wantVals)
-                            repBulk(o, v.s);
+                            repStrVal(o, v);
                     }
                 }
             }
@@ -1044,10 +1044,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             long cur = 0;
             auto f = obj.hash.get(args[1].str);
-            if (f !is null && !parseLong(f.s, cur))
+            if (f !is null && !f.asInt(cur)) // int-encoded field: native
             {
-                repError(o, "ERR hash value is not an integer");
-                break;
+                char[24] sb = void;
+                if (!canonicalInt(f.bytes(sb), cur))
+                {
+                    repError(o, "ERR hash value is not an integer");
+                    break;
+                }
             }
             bool ovf;
             auto nv = adds(cur, delta, ovf);
@@ -1056,9 +1060,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR increment or decrement would overflow");
                 break;
             }
-            char[24] buf = void;
-            auto blen = snprintf(buf.ptr, buf.length, "%lld", nv);
-            obj.hash.set(args[1].str, StrVal.of(buf[0 .. blen]));
+            obj.hash.set(args[1].str, StrVal.ofInt(nv));
             notifyKeyspaceEvent(NClass.hash, "hincrby", args[0].str);
             repInt(o, nv);
             break;
@@ -1623,12 +1625,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            auto len = obj is null ? 0 : cast(long) obj.str.s.length;
+            char[24] sb = void;
+            auto sv = obj is null ? "" : obj.str.bytes(sb);
+            auto len = cast(long) sv.length;
             normalizeRange(start, stop, len);
             if (len == 0 || start > stop)
                 repBulk(o, "");
             else
-                repBulk(o, obj.str.s[cast(size_t) start .. cast(size_t) stop + 1]);
+                repBulk(o, sv[cast(size_t) start .. cast(size_t) stop + 1]);
             break;
         }
     case "SETRANGE":
@@ -1652,7 +1656,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto v = args[2].str;
-            auto oldLen = obj is null ? 0 : obj.str.s.length;
+            char[24] sb = void;
+            auto old = obj is null ? "" : obj.str.bytes(sb);
+            auto oldLen = old.length;
             if (v.length == 0)
             {
                 repInt(o, cast(long) oldLen);
@@ -1668,16 +1674,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto buf = arena.allocArray!char(newLen);
             buf[] = '\0';
             if (oldLen)
-                buf[0 .. oldLen] = obj.str.s;
+                buf[0 .. oldLen] = old[]; // copy before setRaw frees the old buffer
             buf[cast(size_t) off .. cast(size_t) off + v.length] = v;
             if (obj is null)
                 ks.setStr(args[0].str, buf);
             else
             {
-                import dreads.mem : freeSlice, mallocDup;
+                import dreads.mem : mallocDup;
 
-                obj.str.s.freeSlice;
-                obj.str.s = buf.mallocDup;
+                obj.str.setRaw(mallocDup(buf)); // frees the old buffer, adopts the new
             }
             notifyKeyspaceEvent(NClass.str, "setrange", args[0].str);
             repInt(o, cast(long) newLen);
@@ -1704,7 +1709,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             double cur = 0;
-            if (obj !is null && !parseDouble(obj.str.s, cur))
+            char[24] sb = void;
+            if (obj !is null && !parseDouble(obj.str.bytes(sb), cur))
             {
                 repError(o, "ERR value is not a valid float");
                 break;
@@ -1721,12 +1727,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (obj is null)
                 ks.setStr(args[0].str, res);
             else
-            {
-                import dreads.mem : freeSlice, mallocDup;
-
-                obj.str.s.freeSlice;
-                obj.str.s = res.mallocDup;
-            }
+                obj.str.assign(res); // INCRBYFLOAT result is stored as a string (Redis parity)
             notifyKeyspaceEvent(NClass.str, "incrbyfloat", args[0].str);
             repBulk(o, res);
             // float math is logged as its result, never re-derived
@@ -1898,7 +1899,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto f = obj is null ? null : obj.hash.get(args[1].str);
-            repInt(o, f is null ? 0 : cast(long) f.s.length);
+            repInt(o, f is null ? 0 : cast(long) f.len());
             break;
         }
 
@@ -2634,7 +2635,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             double cur = 0;
             auto f = obj.hash.get(args[1].str);
-            if (f !is null && !parseDouble(f.s, cur))
+            char[24] hsb = void;
+            if (f !is null && !parseDouble(f.bytes(hsb), cur))
             {
                 repError(o, "ERR hash value is not a float");
                 break;
@@ -2912,8 +2914,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         if (pat.length == 0 || globMatch(pat, k))
                         {
                             found[got++] = k;
-                            if (withValues)
-                                found[got++] = obj.hash.valAt(i).s;
+                            if (withValues) // own scratch per value (they coexist in found[])
+                                found[got++] = obj.hash.valAt(i).bytes(arena.allocArray!char(24));
                         }
                     }
                     i++;
@@ -2995,10 +2997,14 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
         return;
     }
     long cur = 0;
-    if (obj !is null && !parseLong(obj.str.s, cur))
+    if (obj !is null && !obj.str.asInt(cur)) // int-encoded: native, no parse
     {
-        repError(o, "ERR value is not an integer or out of range");
-        return;
+        char[24] sb = void;
+        if (!canonicalInt(obj.str.bytes(sb), cur)) // a string value: strict parse (rejects "007")
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return;
+        }
     }
     bool ovf;
     auto nv = adds(cur, delta, ovf);
@@ -3007,12 +3013,10 @@ private void incrDecr(ref Keyspace ks, scope const(char)[] key, long delta,
         repError(o, "ERR increment or decrement would overflow");
         return;
     }
-    char[24] buf = void;
-    auto n = snprintf(buf.ptr, buf.length, "%lld", nv);
     if (obj !is null)
-        obj.str.assign(buf[0 .. n]); // reuse the buffer: no malloc when the digit count is unchanged
+        obj.str.assignInt(nv); // native int store — no format, no malloc
     else
-        ks.setStr(key, buf[0 .. n]);
+        ks.setInt(key, nv);
     notifyKeyspaceEvent(NClass.str, event, key);
     repInt(o, nv);
 }
@@ -3838,7 +3842,7 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         final switch (obj.type)
         {
         case ObjType.str:
-            bytes += obj.str.s.length;
+            bytes += obj.str.len();
             break;
         case ObjType.list:
             foreach (v; obj.list)
@@ -3848,7 +3852,7 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
             foreach (i; 0 .. obj.hash.capacity)
             {
                 if (obj.hash.slotLive(i))
-                    bytes += obj.hash.keyAt(i).length + obj.hash.valAt(i).s.length + 64;
+                    bytes += obj.hash.keyAt(i).length + obj.hash.valAt(i).len() + 64;
             }
             break;
         case ObjType.set:
@@ -3900,8 +3904,20 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     final switch (obj.type)
     {
     case ObjType.str:
-        long v;
-        return parseLong(obj.str.s, v) ? "int" : "raw";
+        // real, storage-backed encoding — matches Redis's OBJECT ENCODING: int
+        // (long), embstr (fresh short string), raw (long or mutated).
+        final switch (obj.str.encoding())
+        {
+        case ValKind.embstr:
+            return "embstr";
+        case ValKind.i64:
+            return "int";
+        case ValKind.raw:
+        case ValKind.f64:
+        case ValKind.nul:
+        case ValKind.big:
+            return "raw";
+        }
     case ObjType.list:
         return "linkedlist";
     case ObjType.hash:
@@ -4124,6 +4140,13 @@ public void repDouble(ref ByteBuffer o, double d) @nogc nothrow
 private void repWrongType(ref ByteBuffer o) @nogc nothrow
 {
     repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+}
+
+/// Reply with a string value as a bulk, materializing an int-encoded one lazily.
+private void repStrVal(ref ByteBuffer o, ref StrVal v) @nogc nothrow @trusted
+{
+    char[24] sb = void;
+    repBulk(o, v.bytes(sb));
 }
 
 private void arityErr(ref ByteBuffer o, scope const(char)[] cmdLower) @nogc nothrow

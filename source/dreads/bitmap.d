@@ -40,19 +40,17 @@ private char[] ensureBytes(ref Keyspace ks, scope const(char)[] key, size_t nbyt
     {
         RObj no;
         no.type = ObjType.str;
-        auto p = mallocDup(zeroes(nbytes));
-        no.str.s = p;
+        no.str.setRaw(mallocDup(zeroes(nbytes)));
         ks.d.set(key, no);
-        obj = ks.lookup(key);
-        return cast(char[]) obj.str.s;
+        return ks.lookup(key).str.rawMut();
     }
-    if (obj.str.s.length >= nbytes)
-        return cast(char[]) obj.str.s; // we own the malloc'd buffer
+    auto cur = obj.str.rawMut(); // materialize an int-encoded value to raw bytes
+    if (cur.length >= nbytes)
+        return cur; // we own the malloc'd buffer
     auto grown = mallocDup(zeroes(nbytes));
-    memcpy(cast(void*) grown.ptr, obj.str.s.ptr, obj.str.s.length);
-    obj.str.s.freeSlice;
-    obj.str.s = grown;
-    return cast(char[]) obj.str.s;
+    grown[0 .. cur.length] = cur[]; // slice copy, not memcpy
+    obj.str.setRaw(grown); // frees the old buffer
+    return grown;
 }
 
 // scratch zero-span provider for mallocDup-based growth
@@ -124,7 +122,8 @@ public void getbit(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repWrongTypeB(o);
         return;
     }
-    repInt(o, obj is null ? 0 : bitAt(obj.str.s, cast(ulong) off));
+    char[24] sb = void;
+    repInt(o, obj is null ? 0 : bitAt(obj.str.bytes(sb), cast(ulong) off));
 }
 
 /// Resolves [start end [BYTE|BIT]] into an inclusive bit range.
@@ -191,7 +190,8 @@ public void bitcount(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
         repInt(o, 0);
         return;
     }
-    auto s = obj.str.s;
+    char[24] sb = void;
+    auto s = obj.str.bytes(sb);
     ulong fromBit, toBit;
     bool empty;
     if (!bitRange(args[1 .. $], s.length * 8, fromBit, toBit, empty))
@@ -239,7 +239,8 @@ public void bitpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repWrongTypeB(o);
         return;
     }
-    auto s = obj is null ? null : obj.str.s;
+    char[24] sb = void;
+    auto s = obj is null ? null : obj.str.bytes(sb);
     // missing/empty key: 0 is "found" at 0 only when no range given; 1 is -1
     bool rangeGiven = args.length > 2;
     if (s.length == 0)
@@ -329,7 +330,8 @@ public void bitop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Are
             repWrongTypeB(o);
             return;
         }
-        views[i] = obj is null ? null : obj.str.s;
+        // each operand needs its own scratch (they coexist); str values ignore it
+        views[i] = obj is null ? null : obj.str.bytes(arena.allocArray!char(24));
         if (views[i].length > maxLen)
             maxLen = views[i].length;
     }
@@ -520,6 +522,7 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
 
     bool wrong;
     char[] bytes;
+    char[24] sb = void; // scratch for an int-encoded read value; must outlive the pass
     if (mutates)
     {
         bytes = ensureBytes(ks, args[0].str, cast(size_t)((maxBit + 7) / 8), wrong);
@@ -537,7 +540,7 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
             repWrongTypeB(o);
             return;
         }
-        bytes = obj is null ? null : cast(char[]) obj.str.s;
+        bytes = obj is null ? null : cast(char[]) obj.str.bytes(sb);
     }
 
     // second pass: execute
