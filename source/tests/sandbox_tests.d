@@ -35,14 +35,22 @@ version (unittest)
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // io/os/package/debug are not loaded; reading them trips _G protection
-        foreach (lib; ["os", "io", "debug", "package", "require", "dofile",
+        // io/package/debug are not loaded; reading them trips _G protection
+        foreach (lib; ["io", "debug", "package", "require", "dofile",
                 "loadfile", "load", "print"])
         {
             auto reply = ks.run2(lib);
             reply[0].expect.to.equal('-');
             reply.expect.to.contain("global");
         }
+        // os is a two-function whitelist: clock/time yes, execute & co. no
+        ks.evalRun("return type(os.clock())").expect.to.equal("$6\r\nnumber\r\n");
+        // os is clock-only when enumerated, but any other field is a stub
+        // that errors on call (Valkey's exact "attempt to call field 'X'")
+        ks.evalRun("local n=0 for k in pairs(os) do n=n+1 end return n").expect.to.equal(":1\r\n");
+        ks.evalRun("os.execute()").expect.to.contain("attempt to call field 'execute'");
+        ks.evalRun("os.getenv()").expect.to.contain("attempt to call field 'getenv'");
+        ks.evalRun("os.time()").expect.to.contain("attempt to call field 'time'");
         // the allowed libraries work
         ks.evalRun("return string.upper('ok')").expect.to.equal("$2\r\nOK\r\n");
         ks.evalRun("return table.concat({'a','b'}, '-')").expect.to.equal("$3\r\na-b\r\n");
@@ -62,16 +70,19 @@ version (unittest)
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // globals live in a throwaway per-run _ENV: usable within the script...
-        ks.evalRun("leaked = 42 return leaked").expect.to.equal(":42\r\n");
-        // ...but gone on the next run (reads chain to the protected base)
+        // creating a global is forbidden (Valkey parity): the throwaway _ENV
+        // is read-only for undeclared names
+        auto wr = ks.evalRun("leaked = 42 return 1");
+        wr[0].expect.to.equal('-');
+        wr.expect.to.contain("readonly table");
+        // reading an undeclared global errors through the protected base
         auto next = ks.evalRun("return tostring(leaked)");
         next[0].expect.to.equal('-');
         next.expect.to.contain("nonexistent global");
-        // writing the shared base directly is still blocked
+        // writing the shared base directly is blocked too
         auto direct = ks.evalRun("_G.leaked = 42 return 1");
         direct[0].expect.to.equal('-');
-        direct.expect.to.contain("create global");
+        direct.expect.to.contain("readonly table");
         // locals are fine, and KEYS/ARGV still arrive
         ks.evalRun("local x = 42 return x").expect.to.equal(":42\r\n");
         ks.evalRun("return {KEYS[1], ARGV[1]}", "1", "k", "a")
@@ -81,15 +92,21 @@ version (unittest)
                 "1", "sb").expect.to.equal("$1\r\nv\r\n");
     }
 
-    @("sandbox.deterministic_random")
+    @("sandbox.random")
     unittest
     {
         Keyspace ks;
         scope (exit)
             ks.d.free();
+        // effects replication: no need for a deterministic RNG, so successive
+        // scripts draw different values (Redis 7+ behaviour)
         auto a = ks.evalRun("return tostring(math.random(1000000))");
         auto b = ks.evalRun("return tostring(math.random(1000000))");
-        a.expect.to.equal(b); // reseeded per invocation
+        a.expect.to.not.equal(b);
+        // an explicit seed is still honoured: same seed -> same draw
+        auto s1 = ks.evalRun("math.randomseed(42); return tostring(math.random(1000000))");
+        auto s2 = ks.evalRun("math.randomseed(42); return tostring(math.random(1000000))");
+        s1.expect.to.equal(s2);
     }
 
     @("sandbox.cjson")
@@ -212,5 +229,117 @@ version (unittest)
 
         // the state remains usable afterwards
         ks.evalRun("return 7").expect.to.equal(":7\r\n");
+    }
+
+    @("sandbox.lua51_compat")
+    unittest
+    {
+        // Redis embeds Lua 5.1; scripts in the wild use the names 5.2+
+        // moved or dropped — the compat chunk restores them on our 5.4
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.evalRun("return unpack({7})").expect.to.equal(":7\r\n");
+        ks.evalRun("return redis.call('RPUSH', KEYS[1], unpack(ARGV))",
+                "1", "l", "a", "b", "c").expect.to.equal(":3\r\n");
+        ks.evalRun("return math.pow(2, 10)").expect.to.equal(":1024\r\n");
+        ks.evalRun("return math.log10(1000)").expect.to.equal(":3\r\n");
+        ks.evalRun("return table.getn({1,2,3})").expect.to.equal(":3\r\n");
+    }
+
+    @("sandbox.redis_api_stubs")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // effects replication is the only mode, so this is truthfully a yes
+        ks.evalRun("if redis.replicate_commands() then return 1 else return 0 end")
+            .expect.to.equal(":1\r\n");
+        ks.evalRun("redis.log(redis.LOG_WARNING, 'x'); return 1").expect.to.equal(":1\r\n");
+        ks.evalRun("return redis.log()")[0].expect.to.equal('-'); // needs 2+ args
+        ks.evalRun("redis.setresp(3); return 1").expect.to.equal(":1\r\n");
+        ks.evalRun("return redis.setresp(4)")[0].expect.to.equal('-');
+    }
+
+    @("sandbox.blocking_commands_one_shot")
+    unittest
+    {
+        // inside a script the blocking family degrades to one immediate
+        // attempt (scripts, like replay, can never wait) — and script
+        // command names arrive lowercase, which once picked the wrong verb
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.evalRun("local r = redis.pcall('blpop', KEYS[1], 0); "
+                ~ "return r == false and 1 or 0", "1", "nolist")
+            .expect.to.equal(":1\r\n");
+        ks.evalRun("redis.call('RPUSH', KEYS[1], 'a', 'b'); "
+                ~ "local r = redis.call('blpop', KEYS[1], 0); return r[2]", "1", "bl")
+            .expect.to.equal("$1\r\na\r\n");
+        ks.evalRun("redis.call('RPUSH', KEYS[1], 'x'); "
+                ~ "return redis.call('brpoplpush', KEYS[1], KEYS[2], 0)", "2", "bs", "bd")
+            .expect.to.equal("$1\r\nx\r\n");
+        ks.evalRun("redis.call('ZADD', KEYS[1], 1, 'lo', 2, 'hi'); "
+                ~ "local r = redis.call('bzpopmax', KEYS[1], 0); return r[2]", "1", "bz")
+            .expect.to.equal("$2\r\nhi\r\n");
+        ks.evalRun("local r = redis.call('bzmpop', 0, 1, KEYS[1], 'MIN'); "
+                ~ "return r[1]", "1", "bz").expect.to.equal("$2\r\nbz\r\n");
+    }
+
+    @("sandbox.effects_replication")
+    unittest
+    {
+        // the EVAL never enters the log — each redis.call write does, in its
+        // propagation form. Capture the sink and check.
+        import dreads.scripting : gScriptEffectSink;
+
+        static ByteBuffer captured;
+        captured.clear();
+        auto savedSink = gScriptEffectSink;
+        scope (exit)
+            gScriptEffectSink = savedSink;
+        gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
+            captured.append(fx);
+        };
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.evalRun("redis.call('SETEX', KEYS[1], 100, 'v'); "
+                ~ "redis.call('RPUSH', KEYS[2], 'a'); "
+                ~ "redis.call('GET', KEYS[1]); return 1", "2", "k", "l")
+            .expect.to.equal(":1\r\n");
+        auto fx = (cast(string) captured.data).idup;
+        fx.expect.to.not.contain("EVAL"); // the script itself is never logged
+        fx.expect.to.contain("RPUSH"); // plain writes log verbatim
+        fx.expect.to.not.contain("GET\r\n"); // reads leave no effect
+        fx.expect.to.not.contain("SETEX"); // logged as its absolute-time form
+        fx.expect.to.contain("PXAT"); // ...i.e. SET k v PXAT <deadline>
+
+        // random-then-write is legal under effects replication: the replica
+        // replays what happened, not what was rolled
+        captured.clear();
+        ks.evalRun("redis.call('SADD', KEYS[1], 'a', 'b', 'c'); "
+                ~ "local m = redis.call('SRANDMEMBER', KEYS[1]); "
+                ~ "return redis.call('SET', KEYS[2], m)", "2", "s", "pick")
+            .expect.to.equal("+OK\r\n");
+        (cast(string) captured.data).expect.to.contain("SET");
+
+        // a script that fails halfway keeps its earlier writes in the log,
+        // exactly like it keeps them in the dataset
+        captured.clear();
+        auto err = ks.evalRun("redis.call('SET', KEYS[1], 'kept'); "
+                ~ "redis.call('INCR', KEYS[1]); return 1", "1", "half");
+        err[0].expect.to.equal('-');
+        ks.evalRun("return redis.call('GET', KEYS[1])", "1", "half")
+            .expect.to.equal("$4\r\nkept\r\n");
+        (cast(string) captured.data).expect.to.contain("kept");
+
+        // the clock is frozen for the whole EVAL: TIME is deterministic and
+        // in-script relative TTLs match the absolute effects that got logged
+        ks.evalRun("local a = redis.call('TIME'); local b = redis.call('TIME'); "
+                ~ "return (a[1] == b[1] and a[2] == b[2]) and 1 or 0")
+            .expect.to.equal(":1\r\n");
     }
 }

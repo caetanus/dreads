@@ -33,7 +33,8 @@ public void lpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Aren
             if (!parseLong(args[i + 1].str, rank) || rank == 0)
             {
                 repError(o,
-                        "ERR RANK can't be zero. Use 1 to start searching from the first matching element, or the negative number to start searching from the end.");
+                        "ERR RANK can't be zero: use 1 to start from the first match, "
+                        ~ "2 from the second ... or use negative to start from the end of the list");
                 return;
             }
             i += 2;
@@ -123,11 +124,20 @@ public void lpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Aren
 /// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
 public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
+    if (args.length < 3)
+    {
+        repError(o, "ERR wrong number of arguments for 'lmpop' command");
+        return;
+    }
     long numkeys;
-    if (args.length < 3 || !parseLong(args[0].str, numkeys) || numkeys < 1
-            || args.length < 1 + cast(size_t) numkeys + 1)
+    if (!parseLong(args[0].str, numkeys) || numkeys < 1)
     {
         repError(o, "ERR numkeys should be greater than 0");
+        return;
+    }
+    if (args.length < 1 + cast(size_t) numkeys + 1) // no room for LEFT|RIGHT
+    {
+        repError(o, "ERR syntax error");
         return;
     }
     auto keys = args[1 .. 1 + cast(size_t) numkeys];
@@ -181,7 +191,7 @@ public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
         ks.delIfEmpty(k.str, obj);
         return;
     }
-    o.append("*-1\r\n");
+    repNullArray(o);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +200,8 @@ public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
 
 private struct SortItem
 {
-    const(char)[] v;
+    const(char)[] v; // the element (what SORT returns / stores)
+    const(char)[] sv; // what it sorts by: the element, or its BY-pattern weight
     double num;
 }
 
@@ -207,18 +218,74 @@ extern (C) private int sortAlphaAsc(scope const void* a, scope const void* b) no
 
     auto x = cast(const(SortItem)*) a;
     auto y = cast(const(SortItem)*) b;
-    auto minl = x.v.length < y.v.length ? x.v.length : y.v.length;
+    auto minl = x.sv.length < y.sv.length ? x.sv.length : y.sv.length;
     if (minl)
     {
-        auto c = memcmp(x.v.ptr, y.v.ptr, minl);
+        auto c = memcmp(x.sv.ptr, y.sv.ptr, minl);
         if (c)
             return c < 0 ? -1 : 1;
     }
-    return x.v.length < y.v.length ? -1 : (x.v.length > y.v.length ? 1 : 0);
+    return x.sv.length < y.sv.length ? -1 : (x.sv.length > y.sv.length ? 1 : 0);
 }
 
-/// SORT key [LIMIT off count] [ASC|DESC] [ALPHA] [STORE dst]
-/// (BY/GET patterns are not supported — documented in DRIFT.md)
+/// SORT BY/GET pattern lookup: the first '*' becomes the element; an optional
+/// "->field" tail reads a hash field. False = no value (missing key/field).
+private bool lookupPattern(ref Keyspace ks, const(char)[] pat, const(char)[] e,
+        ref Arena arena, out const(char)[] val) @nogc nothrow
+{
+    import core.stdc.string : memchr;
+
+    if (pat == "#") // GET #: the element itself
+    {
+        val = e;
+        return true;
+    }
+    const(char)[] keyPat = pat, fieldPat;
+    if (pat.length >= 2)
+    {
+        foreach (idx; 0 .. pat.length - 1)
+        {
+            if (pat[idx] == '-' && pat[idx + 1] == '>')
+            {
+                keyPat = pat[0 .. idx];
+                fieldPat = pat[idx + 2 .. $];
+                break;
+            }
+        }
+    }
+    if (keyPat.length == 0)
+        return false;
+    auto star = cast(const(char)*) memchr(keyPat.ptr, '*', keyPat.length);
+    if (star is null)
+        return false; // Redis: a '*'-less pattern never matches anything
+    auto pos = cast(size_t)(star - keyPat.ptr);
+    auto key = arena.allocArray!char(keyPat.length - 1 + e.length);
+    key[0 .. pos] = keyPat[0 .. pos];
+    key[pos .. pos + e.length] = e[];
+    key[pos + e.length .. $] = keyPat[pos + 1 .. $];
+    bool wrong;
+    char[24] sb = void;
+    if (fieldPat.length)
+    {
+        auto ho = ks.lookupTyped(key, ObjType.hash, wrong);
+        if (ho is null)
+            return false; // missing or wrong type both read as no value
+        auto f = ho.hash.get(fieldPat);
+        if (f is null)
+            return false;
+        val = arena.dupString(f.bytes(sb));
+        return true;
+    }
+    auto so = ks.lookupTyped(key, ObjType.str, wrong);
+    if (so is null)
+        return false;
+    val = arena.dupString(so.str.bytes(sb));
+    return true;
+}
+
+/// SORT key [BY pat] [LIMIT off count] [GET pat ...] [ASC|DESC] [ALPHA]
+/// [STORE dst] — full Redis surface, including hash-field patterns (k*->f)
+/// and the "BY without '*' skips sorting" rule.
 public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         ref Arena arena, bool readOnly) @nogc nothrow
 {
@@ -230,6 +297,9 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     bool alpha, desc;
     long limOff = 0, limCnt = -1;
     const(char)[] storeKey;
+    const(char)[] byPat;
+    const(char)[][] getPats;
+    size_t ngets = 0, getCap = 0;
     size_t i = 1;
     while (i < args.length)
     {
@@ -261,10 +331,22 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
             storeKey = args[i + 1].str;
             i += 2;
         }
-        else if (eqICKeyword(w, "BY") || eqICKeyword(w, "GET"))
+        else if (eqICKeyword(w, "BY") && i + 1 < args.length)
         {
-            repError(o, "ERR BY/GET patterns are not supported");
-            return;
+            byPat = args[i + 1].str;
+            i += 2;
+        }
+        else if (eqICKeyword(w, "GET") && i + 1 < args.length)
+        {
+            if (ngets == getCap) // grow-by-double in the arena (n is tiny)
+            {
+                auto bigger = arena.allocArray!(const(char)[])(getCap ? getCap * 2 : 4);
+                bigger[0 .. ngets] = getPats[0 .. ngets];
+                getPats = bigger;
+                getCap = getPats.length;
+            }
+            getPats[ngets++] = args[i + 1].str;
+            i += 2;
         }
         else
         {
@@ -279,6 +361,23 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repWrongTypeM(o);
         return;
     }
+    import core.stdc.string : memchr;
+
+    import dreads.commands : gInScript;
+
+    // BY with a '*'-less pattern means "don't sort" (Redis uses it to fetch
+    // GET projections in container order)
+    bool dontsort = byPat.length != 0
+        && memchr(byPat.ptr, '*', byPat.length) is null;
+    // ...except when the result must be reproducible: a STOREd list re-enters
+    // via AOF/raft replay and scripts replay verbatim, so Redis forces
+    // alphabetical order there (set slot order isn't replay-stable)
+    if (dontsort && (storeKey.length != 0 || gInScript))
+    {
+        dontsort = false;
+        byPat = null;
+        alpha = true;
+    }
     size_t total = obj is null ? 0 : obj.containerLen;
     auto items = arena.allocArray!SortItem(total);
     size_t n = 0;
@@ -288,7 +387,8 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         int take(const(char)[] v) @nogc nothrow
         {
             items[n].v = v;
-            if (!alpha && !parseDouble(v, items[n].num))
+            items[n].sv = v;
+            if (!dontsort && byPat.length == 0 && !alpha && !parseDouble(v, items[n].num))
                 numFail = true;
             n++;
             return 0;
@@ -307,19 +407,35 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         else
             obj.zset.walkRange(0, total, false, (m, s) => take(m));
     }
+    if (byPat.length && !dontsort) // sort by the pattern's weight keys
+    {
+        foreach (ref it; items[0 .. n])
+        {
+            const(char)[] w;
+            if (!lookupPattern(ks, byPat, it.v, arena, w))
+                w = null; // missing weight sorts first (alpha "" / score 0)
+            it.sv = w;
+            it.num = 0;
+            if (!alpha && w.length && !parseDouble(w, it.num))
+                numFail = true;
+        }
+    }
     if (numFail)
     {
         repError(o, "ERR One or more scores can't be converted into double");
         return;
     }
-    qsort(items.ptr, n, SortItem.sizeof, alpha ? &sortAlphaAsc : &sortNumAsc);
-    if (desc)
+    if (!dontsort)
     {
-        foreach (k; 0 .. n / 2)
+        qsort(items.ptr, n, SortItem.sizeof, alpha ? &sortAlphaAsc : &sortNumAsc);
+        if (desc)
         {
-            auto t = items[k];
-            items[k] = items[n - 1 - k];
-            items[n - 1 - k] = t;
+            foreach (k; 0 .. n / 2)
+            {
+                auto t = items[k];
+                items[k] = items[n - 1 - k];
+                items[n - 1 - k] = t;
+            }
         }
     }
     auto hits = items[0 .. n];
@@ -338,18 +454,48 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
             it.v = arena.dupString(it.v);
         RObj lst;
         lst.type = ObjType.list;
+        size_t stored = 0;
         foreach (ref it; hits)
-            lst.list.pushBack(it.v);
-        if (hits.length == 0)
+        {
+            if (ngets == 0)
+            {
+                lst.list.pushBack(it.v);
+                stored++;
+                continue;
+            }
+            foreach (pat; getPats[0 .. ngets]) // nil projections store as ""
+            {
+                const(char)[] val;
+                lst.list.pushBack(lookupPattern(ks, pat, it.v, arena, val) ? val : "");
+                stored++;
+            }
+        }
+        if (stored == 0)
             ks.del(storeKey);
         else
             ks.d.set(storeKey, lst);
-        repInt(o, cast(long) hits.length);
+        repInt(o, cast(long) stored);
         return;
     }
-    repArrayHeader(o, hits.length);
+    if (ngets == 0)
+    {
+        repArrayHeader(o, hits.length);
+        foreach (ref it; hits)
+            repBulk(o, it.v);
+        return;
+    }
+    repArrayHeader(o, hits.length * ngets);
     foreach (ref it; hits)
-        repBulk(o, it.v);
+    {
+        foreach (pat; getPats[0 .. ngets])
+        {
+            const(char)[] val;
+            if (lookupPattern(ks, pat, it.v, arena, val))
+                repBulk(o, val);
+            else
+                repNullBulk(o);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,8 +668,10 @@ public void lcs(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena
     repInt(o, total);
 }
 
-/// HRANDFIELD key [count [WITHVALUES]] — deterministic (first live slots).
-public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+/// HRANDFIELD key [count [WITHVALUES]] — uniform draws (reservoir for the
+/// distinct form). RESP3 WITHVALUES replies [field, value] pairs.
+public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
+        ref Arena arena) @nogc nothrow
 {
     if (args.length < 1 || args.length > 3)
     {
@@ -565,38 +713,71 @@ public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
             repNullBulk(o);
         return;
     }
+    import dreads.rand : randBelow;
+    import dreads.resp : gRespProto;
+
+    // uniform live slot: uniform start, wrapping scan to the next live one
+    size_t randSlot() @nogc nothrow
+    {
+        auto i = randBelow(obj.hash.capacity);
+        while (!obj.hash.slotLive(i))
+            i = i + 1 == obj.hash.capacity ? 0 : i + 1;
+        return i;
+    }
+
     if (!withCount)
     {
-        foreach (i2; 0 .. obj.hash.capacity)
-        {
-            if (obj.hash.slotLive(i2))
-            {
-                repBulk(o, obj.hash.keyAt(i2));
-                break;
-            }
-        }
+        repBulk(o, obj.hash.keyAt(randSlot()));
         return;
     }
     bool repeat = count < 0;
     auto want = cast(size_t)(repeat ? -count : count);
     auto n = repeat ? want : (want < obj.hash.length ? want : obj.hash.length);
-    repArrayHeader(o, n * (withValues ? 2 : 1));
-    size_t emitted = 0;
-    while (emitted < n)
+    // RESP3 WITHVALUES nests [field, value] pairs; RESP2 flattens to 2n
+    bool pairs = withValues && gRespProto >= 3;
+    repArrayHeader(o, pairs ? n : n * (withValues ? 2 : 1));
+    void emit(size_t slot) @nogc nothrow
     {
-        foreach (i2; 0 .. obj.hash.capacity)
+        if (pairs)
+            repArrayHeader(o, 2);
+        repBulk(o, obj.hash.keyAt(slot));
+        if (withValues)
         {
-            if (emitted == n)
-                break;
-            if (!obj.hash.slotLive(i2))
-                continue;
-            repBulk(o, obj.hash.keyAt(i2));
-            if (withValues)
-            {
-                char[24] sb = void;
-                repBulk(o, obj.hash.valAt(i2).bytes(sb));
-            }
-            emitted++;
+            char[24] sb = void;
+            repBulk(o, obj.hash.valAt(slot).bytes(sb));
         }
     }
+
+    if (repeat) // independent draws, repeats allowed
+    {
+        foreach (_; 0 .. n)
+            emit(randSlot());
+        return;
+    }
+    if (n == obj.hash.length) // whole hash: emit every live slot
+    {
+        foreach (i2; 0 .. obj.hash.capacity)
+            if (obj.hash.slotLive(i2))
+                emit(i2);
+        return;
+    }
+    // distinct sample: reservoir over the live slots
+    auto res = arena.allocArray!size_t(n);
+    size_t seen = 0;
+    foreach (i2; 0 .. obj.hash.capacity)
+    {
+        if (!obj.hash.slotLive(i2))
+            continue;
+        if (seen < n)
+            res[seen] = i2;
+        else
+        {
+            auto j = randBelow(seen + 1);
+            if (j < n)
+                res[j] = i2;
+        }
+        seen++;
+    }
+    foreach (slot; res)
+        emit(slot);
 }

@@ -30,13 +30,13 @@ These exist but do not match Redis exactly:
 - **EXPIRE family**: no `NX/XX/GT/LT` flags. **ZADD**: no
   `NX/XX/GT/LT/CH/INCR` flags (GEOADD does implement NX/XX/CH).
 - **SET**: full option set implemented (`EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET`).
-- **SPOP/SRANDMEMBER/ZRANDMEMBER/HRANDFIELD/RANDOMKEY**: deterministic
-  (first live slots/ranks), not random. SPOP propagates as `SREM`, so
+- **SRANDMEMBER/ZRANDMEMBER/HRANDFIELD**: real uniform draws (xorshift64*,
+  reservoir sampling for the distinct-count form). **SPOP/RANDOMKEY** remain
+  deterministic (first live slot). SPOP propagates as `SREM`, so
   persistence/replication are unaffected.
 - **SCAN family**: cursor is a slot index; a concurrent rehash can miss or
   duplicate elements (Redis's reverse-binary cursor guarantees stability).
   ZSCAN is rank-based (ordered).
-- **SORT**: no `BY`/`GET` patterns (explicit error).
 - **WATCH**: global write epoch — *any* write since WATCH aborts EXEC
   (stricter than Redis's per-key tracking). MULTI queues without validating
   commands, so unknown commands fail inside EXEC instead of at queue time;
@@ -55,19 +55,50 @@ These exist but do not match Redis exactly:
 - **Lua**: system Lua 5.4, not Redis's patched 5.1. **Sandboxed**: only
   base/string/table/math are loaded (no io/os/package/debug),
   `dofile`/`loadfile`/`load`/`print` pruned, `_G` protected against global
-  creation/reads of undefined globals, `math.random` reseeded
-  deterministically per invocation, and resource limits enforced —
+  creation/reads of undefined globals, `math.random` reseeded per invocation
+  from a distinct seed (effects replication removes the need for a deterministic
+  RNG, matching Redis 7+; an in-script `math.randomseed` still overrides it), and
+  resource limits enforced —
   `lua-time-limit` (instruction-count hook, default 5000ms) and
   `lua-memory-limit` (allocator cap, default unlimited), both settable at
   runtime via CONFIG SET. Scripts also get a **throwaway `_ENV` per run**
   (globals they create die with the execution — fresh-interpreter isolation
   at shared-state cost) and the state is recycled past 32MB of heap.
   Helper libraries: `cjson` and `cmsgpack` (in-project D implementations),
-  `redis.sha1hex` and `bit` are provided; still missing: `struct`, and
-  `SCRIPT KILL` (the time limit hard-aborts instead — with a single-threaded
-  event loop no other command can arrive mid-script anyway); scripts log
-  verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,
-  `XADD *`) can drift on replay.
+  Redis marks `_G` and the library tables read-only at the Lua VM level (a
+  patch we don't have on stock 5.4), so protection is emulated: library tables
+  are read-only proxies, and `setmetatable`/`getmetatable` are guarded so a
+  script can't wipe `_G`'s protective metatable (`setmetatable(_G, {})`) or
+  reach through it. `cmsgpack` packs a self-referential table to a fixed depth
+  (16) exactly like Redis, but the byte order of the packed map depends on Lua's
+  hash iteration and 5.4 differs from 5.1 (semantics/unpack identical; only the
+  hex dump differs). Deep-table reply conversion reserves Lua stack via
+  `lua_checkstack` and caps at "reached lua stack limit" rather than overflowing.
+  `redis.sha1hex`, `bit`, `redis.log` (accepted, dropped), `redis.setresp`,
+  `redis.set_repl` and a **Lua 5.1 compat layer** (`unpack`, `table.getn`,
+  `math.pow`, `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4).
+  Redis **Functions** (FUNCTION LOAD/DELETE/FLUSH/LIST/STATS, FCALL/FCALL_RO)
+  are implemented. Still missing: `struct`. **Threading model diverges on
+  purpose**: scripts run on a dedicated Lua thread (one, off the event loop),
+  every `redis.call` round-trips to the main thread (the single keyspace
+  writer). So a long/looping script does NOT stall the loop — other clients
+  keep getting real replies (PONG), where single-threaded Redis returns
+  `-BUSY`. **SCRIPT KILL works** (a shared flag the worker's instruction hook
+  polls, like the time limit), but the BUSY-state tests are N/A since there
+  is no BUSY state.
+  **Replication model: EFFECTS** (like Redis 7+, where it is also the only
+  mode): the EVAL itself never enters the raft/AOF log — each write the
+  script performs via redis.call is logged as itself, in its propagation
+  form (SETEX → `SET k v PXAT`, SPOP → SREM, XADD * → resolved id). Under
+  raft the bridge PROPOSES each inner write, so the leader's state only
+  changes through the log; standalone, a server-installed sink appends each
+  effect to the AOF. Random-reply commands need no write guard — replicas
+  replay what happened. A script that fails halfway keeps its earlier
+  writes in the log, exactly like it keeps them in the dataset (dreads does
+  not wrap script effects in MULTI/EXEC, same as its unwrapped EXEC).
+  `redis.replicate_commands()` answers **true**. The clock is frozen for
+  the whole EVAL (in-script `TIME` is deterministic; relative TTLs resolve
+  like their logged effects).
 - **Protocol**: RESP2 **and RESP3** (branch `resp3-oracle`). `HELLO 2`/`HELLO 3`
   negotiate per-connection (`Conn.resp3`); `HELLO 3` replies as a map. RESP3
   types implemented: null (`_`), boolean (`#`), double (`,`), big number (`(`),
@@ -96,7 +127,13 @@ These exist but do not match Redis exactly:
   notify-keyspace-events` is not wired (config-file only).
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
-  `allkeys-lfu`/`volatile-ttl` policies not implemented.
+  `allkeys-lfu`/`volatile-ttl` policies not implemented. Scripts honour the
+  deny-oom contract: over the limit, a legacy (no-shebang) script's write
+  commands fail with `OOM command not allowed`, a `#!lua`-shebang script without
+  `allow-oom` is refused outright, and `allow-oom`/`no-writes`/read-only runs
+  proceed. The script-side check is read-only (it does not run the eviction
+  cycle, which is main-thread-only), so a script write is not retried after
+  eviction the way a direct client write is.
 - **PUBSUB NUMPAT** counts total pattern subscriptions, not unique patterns.
   Shard pub/sub is a separate namespace on the same single node.
 - **MEMORY USAGE** is a rough structural estimate, not allocator-exact.

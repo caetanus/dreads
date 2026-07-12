@@ -26,6 +26,27 @@ import dreads.det : detNow = now;
 /// thread, and the test runner gets one buffer per thread.
 public ByteBuffer propagationOverride;
 
+/// True while a script is running. Script effects replicate by replay, so
+/// commands whose output order is only incidentally stable (SORT BY nosort
+/// on a set) must pick the deterministic path when they see this.
+public __gshared bool gInScript;
+
+// Redis Functions live in dreads.scripting (the Lua engine), which imports
+// this module — dispatch reaches them through hooks scripting installs at
+// startup instead of an import cycle. They are not @nogc (Lua state, and
+// FCALL effects may park the fiber under raft); dispatch calls them through
+// a cast, the same control-plane escape the server layer lives in.
+public alias FunctionHook = void function(const(RVal)[] args, ref Keyspace ks,
+        ref ByteBuffer o, ref Arena arena) nothrow;
+public alias FcallHook = void function(const(RVal)[] args, ref Keyspace ks,
+        ref ByteBuffer o, ref Arena arena, bool readOnly) nothrow;
+public __gshared FunctionHook gFunctionHook;
+public __gshared FcallHook gFcallHook;
+/// number of scripts in the EVAL cache (INFO Memory); set by the scripting
+/// module so commands.d need not import it (would be a cyclic import)
+public alias ScriptCountHook = size_t function() nothrow @nogc;
+public __gshared ScriptCountHook gScriptCountHook;
+
 /// Redis's proto-max-bulk-len default: 512MB per string value.
 private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
 
@@ -64,6 +85,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     }
     foreach (i, c; name)
         nbuf[i] = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+    // case-insensitive view for comparisons INSIDE cases ('name' keeps the
+    // client's original casing — scripts routinely send lowercase)
+    auto uname = cast(const(char)[]) nbuf[0 .. name.length];
 
     switch (cast(string) nbuf[0 .. name.length])
     {
@@ -88,7 +112,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "COMMAND":
         {
-            repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"COMMAND"(o);
+            else
+                repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
             break;
         }
     case "QUIT":
@@ -196,16 +223,49 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             // EXPIRE(6)/EXPIREAT(8) take seconds; EXPIRE(6)/PEXPIRE(7) are relative
             bool isSec = name.length == 6 || name.length == 8;
             bool isRel = name.length <= 7;
-            if (args.length != 2)
+            auto lname = isRel ? (isSec ? "expire" : "pexpire") : (isSec
+                    ? "expireat" : "pexpireat");
+            if (args.length < 2)
             {
-                arityErr(o, isRel ? (isSec ? "expire" : "pexpire") : (isSec
-                        ? "expireat" : "pexpireat"));
+                arityErr(o, lname);
                 break;
             }
             long v;
             if (!parseLong(args[1].str, v))
             {
                 repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            bool fNX, fXX, fGT, fLT, badOpt;
+            foreach (ref a; args[2 .. $])
+            {
+                if (eqICKeyword(a.str, "NX"))
+                    fNX = true;
+                else if (eqICKeyword(a.str, "XX"))
+                    fXX = true;
+                else if (eqICKeyword(a.str, "GT"))
+                    fGT = true;
+                else if (eqICKeyword(a.str, "LT"))
+                    fLT = true;
+                else
+                {
+                    o.append("-ERR Unsupported option ");
+                    o.append(a.str.length > 128 ? a.str[0 .. 128] : a.str);
+                    o.append("\r\n");
+                    badOpt = true;
+                    break;
+                }
+            }
+            if (badOpt)
+                break;
+            if (fNX && (fXX || fGT || fLT))
+            {
+                repError(o, "ERR NX and XX, GT or LT options at the same time are not compatible");
+                break;
+            }
+            if (fGT && fLT)
+            {
+                repError(o, "ERR GT and LT options at the same time are not compatible");
                 break;
             }
             auto obj = ks.lookup(args[0].str);
@@ -217,11 +277,37 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long absMs;
             if (!resolveExpireMs(v, isSec, isRel, absMs))
             {
-                repError(o, "ERR invalid expire time");
+                o.append("-ERR invalid expire time in '");
+                o.append(lname);
+                o.append("' command\r\n");
                 break;
             }
             immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
-            ks.retimeExpire(args[0].str, obj.expireAtMs, newAt); // re-EXPIRE: drop the old deadline
+            // a key without a TTL counts as +infinity for GT/LT
+            immutable ulong curAt = obj.expireAtMs;
+            if ((fNX && curAt != 0) || (fXX && curAt == 0)
+                    || (fGT && (curAt == 0 || newAt <= curAt))
+                    || (fLT && curAt != 0 && newAt >= curAt))
+            {
+                repInt(o, 0);
+                break;
+            }
+            if (absMs <= cast(long) detNow())
+            {
+                // already past: Valkey deletes right away and counts the expiry
+                import dreads.obj : gExpiredKeys;
+
+                ks.del(args[0].str);
+                gExpiredKeys++;
+                notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, "DEL");
+                repBulk(propagationOverride, args[0].str);
+                repInt(o, 1);
+                break;
+            }
+            ks.retimeExpire(args[0].str, curAt, newAt); // re-EXPIRE: drop the old deadline
             obj.expireAtMs = newAt;
             notifyKeyspaceEvent(NClass.generic, "expire", args[0].str);
             propagatePexpireat(args[0].str, obj.expireAtMs);
@@ -440,11 +526,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 bool isRel = opt.length == 2;
                 bool isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
                 if (!(eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX")
-                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT"))
-                        || !parseLong(args[2].str, v) || (isRel && v <= 0)
-                        || !resolveExpireMs(v, isSec, isRel, absMs))
+                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT")))
                 {
                     repError(o, "ERR syntax error");
+                    break;
+                }
+                if (!parseLong(args[2].str, v))
+                {
+                    repError(o, "ERR value is not an integer or out of range");
+                    break;
+                }
+                if ((isRel && v <= 0) || !resolveExpireMs(v, isSec, isRel, absMs))
+                {
+                    repError(o, "ERR invalid expire time in 'getex' command");
                     break;
                 }
             }
@@ -653,6 +747,153 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 notifyKeyspaceEvent(NClass.str, "set", args[i].str);
             }
             repSimple(o, "OK");
+            break;
+        }
+    case "MSETEX":
+        {
+            // MSETEX numkeys k v [k v ...] [NX|XX]
+            //        [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
+            if (args.length < 3)
+            {
+                arityErr(o, "msetex");
+                break;
+            }
+            long numkeys;
+            if (!parseLong(args[0].str, numkeys) || numkeys < 1 || numkeys > int.max)
+            {
+                repError(o, "ERR invalid numkeys value or out of range");
+                break;
+            }
+            auto pairsEnd = 1 + cast(size_t) numkeys * 2;
+            if (pairsEnd > args.length)
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            long absExpire = -1; // resolved absolute ms; -1 = none given
+            bool nx, xx, keepttl, badSyntax, badExpire, badInt, expireGiven;
+            size_t i = pairsEnd;
+            while (i < args.length)
+            {
+                auto opt = args[i].str;
+                if (eqICKeyword(opt, "NX"))
+                {
+                    nx = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "XX"))
+                {
+                    xx = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "KEEPTTL"))
+                {
+                    keepttl = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX")
+                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT"))
+                {
+                    if (expireGiven || i + 1 >= args.length)
+                    {
+                        badSyntax = true;
+                        break;
+                    }
+                    long v;
+                    if (!parseLong(args[i + 1].str, v))
+                    {
+                        badInt = true;
+                        break;
+                    }
+                    expireGiven = true;
+                    bool isRel = opt.length == 2;
+                    bool isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
+                    if ((isRel && v <= 0) || !resolveExpireMs(v, isSec, isRel, absExpire))
+                    {
+                        badExpire = true;
+                        break;
+                    }
+                    i += 2;
+                }
+                else
+                {
+                    badSyntax = true;
+                    break;
+                }
+            }
+            if (badInt)
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (badExpire)
+            {
+                repError(o, "ERR invalid expire time in 'msetex' command");
+                break;
+            }
+            if (badSyntax || (nx && xx) || (keepttl && expireGiven))
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            if (nx || xx) // all-or-nothing key-level conditions
+            {
+                bool blocked = false;
+                for (size_t j = 1; j < pairsEnd; j += 2)
+                {
+                    auto existing = ks.lookup(args[j].str);
+                    if ((nx && existing !is null) || (xx && existing is null))
+                    {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked)
+                {
+                    repInt(o, 0);
+                    break;
+                }
+            }
+            for (size_t j = 1; j < pairsEnd; j += 2)
+            {
+                auto existing = ks.lookup(args[j].str);
+                immutable ulong oldTtl = existing !is null ? existing.expireAtMs : 0;
+                ulong kept = keepttl ? oldTtl : 0;
+                ks.setStr(args[j].str, args[j + 1].str);
+                auto obj = ks.lookup(args[j].str);
+                ulong newTtl = 0;
+                if (absExpire >= 0)
+                    newTtl = absExpire == 0 ? 1 : cast(ulong) absExpire;
+                else if (keepttl)
+                    newTtl = kept;
+                if (oldTtl != 0 || newTtl != 0)
+                    ks.retimeExpire(args[j].str, oldTtl, newTtl);
+                obj.expireAtMs = newTtl;
+                notifyKeyspaceEvent(NClass.str, "set", args[j].str);
+                if (expireGiven)
+                    notifyKeyspaceEvent(NClass.generic, "expire", args[j].str);
+            }
+            if (expireGiven)
+            {
+                // propagate the ABSOLUTE deadline (PXAT): a relative EX
+                // replayed later would compute a different expiry (Valkey
+                // rewrites MSETEX the same way)
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride,
+                        1 + pairsEnd + (nx || xx ? 1 : 0) + 2);
+                repBulk(propagationOverride, "MSETEX");
+                foreach (j; 0 .. pairsEnd)
+                    repBulk(propagationOverride, args[j].str);
+                if (nx)
+                    repBulk(propagationOverride, "NX");
+                else if (xx)
+                    repBulk(propagationOverride, "XX");
+                repBulk(propagationOverride, "PXAT");
+                char[24] eb = void;
+                auto en = snprintf(eb.ptr, eb.length, "%lld", absExpire);
+                repBulk(propagationOverride, eb[0 .. en]);
+            }
+            repInt(o, 1);
             break;
         }
     case "MGET":
@@ -941,6 +1182,62 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
+    case "HGETDEL":
+        {
+            // HGETDEL key FIELDS numfields field [field ...] — reply the
+            // values (nulls for misses) and delete those fields
+            if (args.length < 4)
+            {
+                arityErr(o, "hgetdel");
+                break;
+            }
+            if (!eqICKeyword(args[1].str, "FIELDS"))
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            long nf;
+            if (!parseLong(args[2].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (nf <= 0 || cast(size_t) nf != args.length - 3)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            long deleted = 0;
+            repArrayHeader(o, cast(size_t) nf);
+            foreach (ref a; args[3 .. $])
+            {
+                auto f = obj is null ? null : obj.hash.get(a.str);
+                if (f is null)
+                {
+                    repNullBulk(o);
+                    continue;
+                }
+                repStrVal(o, *f);
+                if (obj.hash.del(a.str))
+                    deleted++;
+            }
+            if (deleted > 0)
+            {
+                notifyKeyspaceEvent(NClass.hash, "hdel", args[0].str);
+                if (obj.hash.length == 0)
+                    notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+                ks.delIfEmpty(args[0].str, obj);
+            }
+            break;
+        }
     case "HLEN":
         {
             if (args.length != 1)
@@ -1224,9 +1521,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto pairs = args[i .. $];
-            if (pairs.length == 0 || pairs.length % 2 != 0)
+            if (pairs.length == 0)
             {
                 arityErr(o, "zadd");
+                break;
+            }
+            if (pairs.length % 2 != 0) // dangling score without a member
+            {
+                repError(o, "ERR syntax error");
                 break;
             }
             if (incr && pairs.length != 2)
@@ -1629,15 +1931,59 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // CONFIG is handled at the server layer (it owns the live Config)
     case "INFO":
         {
-            size_t volatileKeys = 0;
-            foreach (k, ref v; ks)
-                if (v.expireAtMs != 0)
-                    volatileKeys++;
-            char[160] b = void;
-            auto n = snprintf(b.ptr, b.length,
-                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=%zu\r\n",
-                    ks.length, volatileKeys);
-            repVerbatim(o, "txt", b[0 .. n]); // RESP3 verbatim (=txt:...), RESP2 bulk
+            import dreads.config : gConfig;
+            import dreads.mem : usedMemory;
+            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys;
+
+            static ByteBuffer ib; // TLS scratch: INFO payload
+            ib.clear();
+            char[192] b = void;
+            ib.append("# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n");
+            auto n = snprintf(b.ptr, b.length, "# Clients\r\nblocked_clients:%lld\r\n",
+                    gBlockedClients);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length,
+                    "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
+                    usedMemory(), gConfig.maxmemory,
+                    cast(int) gConfig.maxmemoryPolicy.length, gConfig.maxmemoryPolicy.ptr);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length, "number_of_cached_scripts:%zu\r\n",
+                    gScriptCountHook !is null ? gScriptCountHook() : 0);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length,
+                    "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
+            ib.append(b[0 .. n]);
+            ib.append("# Keyspace\r\n");
+            // count what a client would see: logically-expired keys are gone
+            static void dbLine(ref ByteBuffer ib, ref char[192] b, size_t idx,
+                    ref Keyspace db) @nogc nothrow
+            {
+                size_t live = 0, volatileKeys = 0;
+                foreach (k, ref v; db)
+                {
+                    if (v.expired())
+                        continue;
+                    live++;
+                    if (v.expireAtMs != 0)
+                        volatileKeys++;
+                }
+                if (live == 0)
+                    return;
+                auto n = snprintf(b.ptr, b.length, "db%zu:keys=%zu,expires=%zu,avg_ttl=0\r\n",
+                        idx, live, volatileKeys);
+                ib.append(b[0 .. n]);
+            }
+
+            bool ksIsGlobal = false;
+            foreach (i, ref db; gDbs)
+            {
+                if (&db is &ks)
+                    ksIsGlobal = true;
+                dbLine(ib, b, i, db);
+            }
+            if (!ksIsGlobal) // standalone keyspace (unit tests): report as db0
+                dbLine(ib, b, 0, ks);
+            repVerbatim(o, "txt", cast(const(char)[]) ib.data); // RESP3 verbatim, RESP2 bulk
             break;
         }
 
@@ -1948,7 +2294,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "SRANDMEMBER":
         {
-            srandmember(ks, args, o);
+            srandmember(ks, args, o, arena);
             break;
         }
     case "SMOVE":
@@ -1975,8 +2321,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             notifyKeyspaceEvent(NClass.set, "srem", args[0].str);
             bool w3;
             auto dst = ks.getOrCreate(args[1].str, ObjType.set, w3); // may rehash: src is stale now
-            dst.set.set(args[2].str, Unit());
-            notifyKeyspaceEvent(NClass.set, "sadd", args[1].str);
+            if (dst.set.set(args[2].str, Unit())) // notify only a real addition
+                notifyKeyspaceEvent(NClass.set, "sadd", args[1].str);
             auto src2 = ks.lookup(args[0].str);
             if (src2 !is null)
                 ks.delIfEmpty(args[0].str, src2);
@@ -2534,6 +2880,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 0); // no replicas until Raft lands
             break;
         }
+    case "WAITAOF": // dispatch-level (scripts/replay): the server-layer form
+        {           // owns the real fsync; here nothing can be awaited
+            repArrayHeader(o, 2);
+            repInt(o, 0);
+            repInt(o, 0);
+            break;
+        }
     case "OBJECT":
         {
             objectCmd(ks, args, o);
@@ -2558,14 +2911,156 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
             break;
         }
+    case "DEBUG":
+        {
+            // Dispatch-level DEBUG: reached from scripts (redis.call('debug',…))
+            // and replay. The rich, connection-aware DEBUG lives at the server
+            // layer; here we serve PROTOCOL (the test helper that emits each
+            // RESP type at the current gRespProto) and accept the benign stubs.
+            if (args.length >= 2 && eqICKeyword(args[0].str, "PROTOCOL"))
+            {
+                auto t = args[1].str;
+                if (t == "string")
+                    repSimple(o, "Simple status string");
+                else if (t == "integer")
+                    repInt(o, 12_345);
+                else if (t == "double")
+                    repDouble(o, 3.141);
+                else if (t == "bignum")
+                    repBigNumber(o, "1234567999999999999999999999999999999");
+                else if (t == "null")
+                    repNullBulk(o); // `_` in RESP3, `$-1` in RESP2
+                else if (t == "true")
+                    repBool(o, true);
+                else if (t == "false")
+                    repBool(o, false);
+                else if (t == "verbatim")
+                    repVerbatim(o, "txt", "This is a verbatim\nstring");
+                else if (t == "map")
+                {
+                    repMapHeader(o, 3);
+                    foreach (i; 0 .. 3)
+                    {
+                        repInt(o, i);
+                        repBool(o, i == 1);
+                    }
+                }
+                else if (t == "set")
+                {
+                    repSetHeader(o, 3);
+                    foreach (i; 0 .. 3)
+                        repInt(o, i);
+                }
+                else if (t == "attrib")
+                {
+                    // RESP3 attribute precedes the real reply; RESP2 emits only
+                    // the reply
+                    if (gRespProto >= 3)
+                    {
+                        o.append("|1\r\n");
+                        repBulk(o, "key-popularity");
+                        repArrayHeader(o, 2);
+                        repBulk(o, "key:123");
+                        repInt(o, 90);
+                    }
+                    repBulk(o, "Some real reply following the attribute");
+                }
+                else if (t == "err")
+                    repError(o, "An error message");
+                else
+                    repError(o, "ERR Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|verbatim|true|false");
+                break;
+            }
+            // DEBUG SLEEP reaches here when invoked from a script
+            // (redis.call('DEBUG','SLEEP',n)); real blocking sleep so wall-clock
+            // advances (the script's clock stays frozen, but keys set with short
+            // TTLs expire once the script returns and the real clock is restored)
+            if (args.length >= 2 && eqICKeyword(args[0].str, "SLEEP"))
+            {
+                import core.thread : Thread;
+                import core.time : usecs;
+
+                // NUL-terminate into a small stack buffer for strtod (@nogc)
+                char[64] slbuf = void;
+                auto sarg = args[1].str;
+                double secs = 0;
+                if (sarg.length < slbuf.length)
+                {
+                    memcpy(slbuf.ptr, sarg.ptr, sarg.length);
+                    slbuf[sarg.length] = '\0';
+                    secs = strtod(slbuf.ptr, null);
+                }
+                if (secs > 0)
+                {
+                    try
+                        Thread.sleep(usecs(cast(long)(secs * 1_000_000)));
+                    catch (Exception)
+                    {
+                    }
+                }
+                repSimple(o, "OK");
+                break;
+            }
+            // benign no-op stubs scripts/tests toggle
+            repSimple(o, "OK");
+            break;
+        }
     case "SLOWLOG":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
                 repSimple(o, "OK");
             else if (args.length >= 1 && eqICKeyword(args[0].str, "LEN"))
                 repInt(o, 0);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"SLOWLOG"(o);
             else
-                repArrayHeader(o, 0); // GET / HELP
+                repArrayHeader(o, 0); // GET
+            break;
+        }
+    case "COMMANDLOG": // Valkey 8's generalized SLOWLOG; nothing is logged yet
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
+                repSimple(o, "OK");
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "LEN"))
+                repInt(o, 0);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"COMMANDLOG"(o);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "GET"))
+                repArrayHeader(o, 0);
+            else
+                repUnknownSubcommand(o, "COMMANDLOG", args.length ? args[0].str : "");
+            break;
+        }
+    case "FUNCTION":
+        {
+            if (gFunctionHook !is null)
+            {
+                alias NoGcFn = void function(const(RVal)[], ref Keyspace,
+                        ref ByteBuffer, ref Arena) @nogc nothrow;
+                (cast(NoGcFn) gFunctionHook)(args, ks, o, arena);
+                break;
+            }
+            // scripting engine absent (stripped builds): empty catalog
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"FUNCTION"(o);
+            else if (args.length >= 1 && (eqICKeyword(args[0].str, "LIST")
+                    || eqICKeyword(args[0].str, "STATS")))
+                repArrayHeader(o, 0);
+            else
+                repUnknownSubcommand(o, "FUNCTION", args.length ? args[0].str : "");
+            break;
+        }
+    case "FCALL":
+    case "FCALL_RO":
+        {
+            if (gFcallHook is null)
+            {
+                repError(o, "ERR Function not found");
+                break;
+            }
+            alias NoGcFn = void function(const(RVal)[], ref Keyspace,
+                    ref ByteBuffer, ref Arena, bool) @nogc nothrow;
+            (cast(NoGcFn) gFcallHook)(args, ks, o, arena, name.length == 8);
             break;
         }
     case "LATENCY":
@@ -2578,7 +3073,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "MODULE":
         {
-            repArrayHeader(o, 0);
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"MODULE"(o);
+            else
+                repArrayHeader(o, 0); // LIST: no modules
             break;
         }
     case "ACL":
@@ -2591,6 +3089,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repBulk(o, "user default on nopass ~* &* +@all");
             }
             else if (args.length >= 1 && eqICKeyword(args[0].str, "CAT"))
+                repArrayHeader(o, 0);
+            else if (args.length >= 1 && (eqICKeyword(args[0].str, "SETUSER")
+                    || eqICKeyword(args[0].str, "DELUSER") || eqICKeyword(args[0].str, "SAVE")
+                    || eqICKeyword(args[0].str, "LOAD")))
+                repSimple(o, "OK"); // no ACL enforcement; accept the config
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "GETUSER"))
                 repArrayHeader(o, 0);
             else
                 repUnknownSubcommand(o, "ACL", args.length ? args[0].str : "");
@@ -2714,6 +3218,157 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             lmpop(ks, args, o);
             break;
         }
+
+        // --- blocking family, one-shot form. Real connections block at the
+        // server layer and never reach dispatch with these names; here they
+        // arrive from scripts, MULTI replay or the raft apply, where waiting
+        // is impossible — Redis semantics is one immediate attempt. The
+        // effect propagates as the non-blocking command that actually ran.
+    case "BLPOP":
+    case "BRPOP":
+        {
+            bool fromLeft = uname[1] == 'L';
+            if (args.length < 2)
+            {
+                arityErr(o, fromLeft ? "blpop" : "brpop");
+                break;
+            }
+            double tmo;
+            if (!parseDouble(args[$ - 1].str, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            bool served = false;
+            foreach (ref k; args[0 .. $ - 1])
+            {
+                bool wrong;
+                auto obj = ks.lookupTyped(k.str, ObjType.list, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    served = true;
+                    break;
+                }
+                if (obj is null || obj.list.length == 0)
+                    continue;
+                repArrayHeader(o, 2);
+                repBulk(o, k.str);
+                repBulk(o, fromLeft ? obj.list.front : obj.list.back);
+                if (fromLeft)
+                    obj.list.popFront();
+                else
+                    obj.list.popBack();
+                ks.delIfEmpty(k.str, obj);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, fromLeft ? "LPOP" : "RPOP");
+                repBulk(propagationOverride, k.str);
+                served = true;
+                break;
+            }
+            if (!served)
+                repNullArray(o);
+            break;
+        }
+    case "BZPOPMIN":
+    case "BZPOPMAX":
+        {
+            bool popMax = uname[6] == 'A'; // BZPOPM[A]X vs BZPOPM[I]N
+            if (args.length < 2)
+            {
+                arityErr(o, popMax ? "bzpopmax" : "bzpopmin");
+                break;
+            }
+            double tmo;
+            if (!parseDouble(args[$ - 1].str, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            bool served = false;
+            foreach (ref k; args[0 .. $ - 1])
+            {
+                bool wrong;
+                auto obj = ks.lookupTyped(k.str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    served = true;
+                    break;
+                }
+                if (obj is null || obj.zset.length == 0)
+                    continue;
+                const(char)[] victim;
+                repArrayHeader(o, 3);
+                repBulk(o, k.str);
+                obj.zset.walkRange(0, 1, popMax, (m, s) {
+                    repBulk(o, m);
+                    repDouble(o, s);
+                    victim = arena.dupString(m);
+                    return 0;
+                });
+                obj.zset.remove(victim);
+                ks.delIfEmpty(k.str, obj);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, popMax ? "ZPOPMAX" : "ZPOPMIN");
+                repBulk(propagationOverride, k.str);
+                served = true;
+                break;
+            }
+            if (!served)
+                repNullArray(o);
+            break;
+        }
+    case "BRPOPLPUSH":
+    case "BLMOVE":
+    case "BLMPOP":
+    case "BZMPOP":
+        {
+            // rewrite into the non-blocking command and run it in place
+            // (BLMPOP/BZMPOP carry the timeout FIRST; the others carry it last)
+            bool leading = uname == "BLMPOP" || uname == "BZMPOP";
+            size_t minArgs = leading ? 4 : (uname == "BLMOVE" ? 5 : 3);
+            if (args.length < minArgs)
+            {
+                repError(o, "ERR wrong number of arguments");
+                break;
+            }
+            auto tmoTok = leading ? args[0].str : args[$ - 1].str;
+            double tmo;
+            if (!parseDouble(tmoTok, tmo) || tmo < 0)
+            {
+                repError(o, "ERR timeout is not a float or out of range");
+                break;
+            }
+            auto rest = leading ? args[1 .. $] : args[0 .. $ - 1];
+            auto verb = uname == "BRPOPLPUSH" ? "RPOPLPUSH"
+                : (uname == "BLMOVE" ? "LMOVE" : (uname == "BLMPOP" ? "LMPOP" : "ZMPOP"));
+            auto sub = arena.allocArray!RVal(1 + rest.length);
+            sub[0].type = RType.BulkString;
+            sub[0].str = verb;
+            foreach (i, ref a; rest)
+                sub[1 + i] = a;
+            RVal cmd2;
+            cmd2.type = RType.Array;
+            cmd2.arr = sub;
+            auto outBefore = o.length;
+            import dreads.det : detNow = now;
+
+            cast(void) dispatch(cmd2, ks, o, arena, detNow());
+            // effect = the rewritten command, but only when it did something
+            auto rep = cast(const(char)[]) o.data[outBefore .. $];
+            if (rep.length > 0 && rep[0] != '-' && rep != "$-1\r\n"
+                    && rep != "*-1\r\n" && rep != "_\r\n")
+            {
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, sub.length);
+                foreach (ref a; sub)
+                    repBulk(propagationOverride, a.str);
+            }
+            break;
+        }
     case "SORT":
     case "SORT_RO":
         {
@@ -2733,7 +3388,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.miscops : hrandfield;
 
-            hrandfield(ks, args, o);
+            hrandfield(ks, args, o, arena);
             break;
         }
     case "PFADD":
@@ -3082,7 +3737,7 @@ private void listPop(ref Keyspace ks, const(RVal)[] args, bool fromHead, ref Byt
     if (obj is null)
     {
         if (withCount)
-            o.append("*-1\r\n");
+            repNullArray(o);
         else
             repNullBulk(o);
         return;
@@ -3209,7 +3864,8 @@ private void spop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Are
     ks.delIfEmpty(args[0].str, obj);
 }
 
-private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
+        ref Arena arena) @nogc nothrow
 {
     if (args.length < 1 || args.length > 2)
     {
@@ -3243,46 +3899,77 @@ private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) 
             repNullBulk(o);
         return;
     }
+    import dreads.rand : randBelow;
+
+    // uniform live slot: uniform start, wrapping scan to the next live one
+    size_t randSlot() @nogc nothrow
+    {
+        auto i = randBelow(obj.set.capacity);
+        while (!obj.set.slotLive(i))
+            i = i + 1 == obj.set.capacity ? 0 : i + 1;
+        return i;
+    }
+
     if (!withCount)
     {
-        foreach (i; 0 .. obj.set.capacity)
-        {
-            if (obj.set.slotLive(i))
-            {
-                repBulk(o, obj.set.keyAt(i));
-                break;
-            }
-        }
+        repBulk(o, obj.set.keyAt(randSlot()));
         return;
     }
-    // positive count: up to card distinct members; negative: cycle with repeats
+    // positive count: up to card distinct members; negative: draws with repeats
     bool repeat = howMany < 0;
     auto want = cast(size_t)(repeat ? -howMany : howMany);
     auto n = repeat ? want : (want < obj.set.length ? want : obj.set.length);
     repArrayHeader(o, n);
-    size_t emitted = 0;
-    while (emitted < n)
+    if (repeat)
+    {
+        foreach (_; 0 .. n)
+            repBulk(o, obj.set.keyAt(randSlot()));
+        return;
+    }
+    if (n == obj.set.length) // whole set
     {
         foreach (i; 0 .. obj.set.capacity)
-        {
-            if (emitted == n)
-                break;
             if (obj.set.slotLive(i))
-            {
                 repBulk(o, obj.set.keyAt(i));
-                emitted++;
-            }
-        }
+        return;
     }
+    // distinct sample: reservoir over the live slots
+    auto res = arena.allocArray!size_t(n);
+    size_t seen = 0;
+    foreach (i; 0 .. obj.set.capacity)
+    {
+        if (!obj.set.slotLive(i))
+            continue;
+        if (seen < n)
+            res[seen] = i;
+        else
+        {
+            auto j = randBelow(seen + 1);
+            if (j < n)
+                res[j] = i;
+        }
+        seen++;
+    }
+    foreach (slot; res)
+        repBulk(o, obj.set.keyAt(slot));
 }
 
 private void sintercard(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
+    if (args.length < 2)
+    {
+        arityErr(o, "sintercard");
+        return;
+    }
     long numkeys;
-    if (args.length < 2 || !parseLong(args[0].str, numkeys) || numkeys < 1
-            || args.length < 1 + cast(size_t) numkeys)
+    if (!parseLong(args[0].str, numkeys) || numkeys < 1)
     {
         repError(o, "ERR numkeys should be greater than 0");
+        return;
+    }
+    if (args.length < 1 + cast(size_t) numkeys)
+    {
+        repError(o, "ERR Number of keys can't be greater than number of args");
         return;
     }
     long limit = 0;
@@ -3445,11 +4132,16 @@ private void zpop(ref Keyspace ks, const(RVal)[] args, bool popMax,
     }
     auto n = obj is null ? 0
         : cast(size_t)(howMany < cast(long) obj.zset.length ? howMany : obj.zset.length);
-    repArrayHeader(o, n * 2);
+    // RESP3 nests [member, score] pairs when a count was given; the plain
+    // single pop stays a flat [member, score] in both protocols
+    bool pairs = gRespProto >= 3 && args.length == 2;
+    repArrayHeader(o, pairs ? n : n * 2);
     foreach (_; 0 .. n)
     {
         const(char)[] victim;
         obj.zset.walkRange(0, 1, popMax, (m, s) {
+            if (pairs)
+                repArrayHeader(o, 2);
             repBulk(o, m);
             repDouble(o, s);
             victim = arena.dupString(m);
@@ -3472,6 +4164,25 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
         arityErr(o, byRank ? "zremrangebyrank" : "zremrangebyscore");
         return;
     }
+    // validate the range before touching the key (Valkey errors on bad
+    // bounds even for a missing key)
+    long start, stop;
+    double min, max;
+    bool minExcl, maxExcl;
+    if (byRank)
+    {
+        if (!parseLong(args[1].str, start) || !parseLong(args[2].str, stop))
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return;
+        }
+    }
+    else if (!parseScoreBound(args[1].str, min, minExcl)
+            || !parseScoreBound(args[2].str, max, maxExcl))
+    {
+        repError(o, "ERR min or max is not a float");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
     if (wrong)
@@ -3488,12 +4199,6 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
     size_t n = 0;
     if (byRank)
     {
-        long start, stop;
-        if (!parseLong(args[1].str, start) || !parseLong(args[2].str, stop))
-        {
-            repError(o, "ERR value is not an integer or out of range");
-            return;
-        }
         auto len = cast(long) obj.zset.length;
         normalizeRange(start, stop, len);
         if (start <= stop)
@@ -3504,14 +4209,6 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
     }
     else
     {
-        double min, max;
-        bool minExcl, maxExcl;
-        if (!parseScoreBound(args[1].str, min, minExcl) || !parseScoreBound(args[2].str,
-                max, maxExcl))
-        {
-            repError(o, "ERR min or max is not a float");
-            return;
-        }
         obj.zset.walkScoreRange(min, minExcl, max, maxExcl, (m, s) {
             victims[n++] = arena.dupString(m);
             return 0;
@@ -3757,18 +4454,38 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
 {
     size_t i = 0;
     size_t limit = 0;
-    if (args.length >= 2 && eqICKeyword(args[0].str, "COUNT"))
+    while (i < args.length && !eqICKeyword(args[i].str, "STREAMS"))
     {
-        long n;
-        if (!parseLong(args[1].str, n) || n < 0)
+        if (eqICKeyword(args[i].str, "COUNT") && i + 1 < args.length)
         {
-            repError(o, "ERR value is not an integer or out of range");
+            long n;
+            if (!parseLong(args[i + 1].str, n) || n < 0)
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                return;
+            }
+            limit = cast(size_t) n;
+            i += 2;
+        }
+        else if (eqICKeyword(args[i].str, "BLOCK") && i + 1 < args.length)
+        {
+            // dispatch-level XREAD serves scripts and replay, where waiting
+            // is impossible: validate the timeout, then one immediate attempt
+            long ms;
+            if (!parseLong(args[i + 1].str, ms) || ms < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return;
+            }
+            i += 2;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
             return;
         }
-        limit = cast(size_t) n;
-        i = 2;
     }
-    if (i >= args.length || !eqICKeyword(args[i].str, "STREAMS"))
+    if (i >= args.length)
     {
         repError(o, "ERR syntax error");
         return;
@@ -3834,7 +4551,7 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     if (withData == 0)
     {
-        o.append("*-1\r\n");
+        repNullArray(o);
         return;
     }
     repArrayHeader(o, withData);
@@ -3936,6 +4653,11 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         repInt(o, cast(long) ks.length);
         return;
     }
+    if (args.length && eqICKeyword(args[0].str, "HELP"))
+    {
+        repHelp!"MEMORY"(o);
+        return;
+    }
     repUnknownSubcommand(o, "MEMORY", args.length ? args[0].str : "");
 }
 
@@ -3961,7 +4683,34 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
             return "raw";
         }
     case ObjType.list:
-        return "linkedlist";
+        {
+            // Storage is one DList either way; the reported tier follows
+            // Valkey's conversion rule (t_list.c listTypeTryConvertListpack):
+            // listpack until quicklistNodeExceedsLimit(fill, lpBytes, count).
+            import dreads.config : gConfig;
+
+            size_t lpBytes = 7; // listpack header + terminator
+            foreach (v; obj.list)
+            {
+                auto entry = v.length + (v.length < 64 ? 1 : v.length < 4096 ? 2 : 5);
+                entry += entry < 128 ? 1 : entry < 16_384 ? 2 : 5; // backlen
+                lpBytes += entry;
+            }
+            auto fill = gConfig.listMaxListpackSize;
+            bool small;
+            if (fill >= 0)
+            {
+                enum sizeSafetyLimit = 8192;
+                small = obj.list.length <= cast(ulong) fill && lpBytes <= sizeSafetyLimit;
+            }
+            else
+            {
+                static immutable size_t[5] optLevel = [4096, 8192, 16_384, 32_768, 65_536];
+                auto idx = cast(size_t)(-fill - 1);
+                small = lpBytes <= optLevel[idx > 4 ? 4 : idx];
+            }
+            return small ? "listpack" : "quicklist";
+        }
     case ObjType.hash:
         return obj.hash.encoding(); // listpack | hashtable (real state)
     case ObjType.set:
@@ -3976,6 +4725,11 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
 private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
+    if (args.length == 1 && eqICKeyword(args[0].str, "HELP"))
+    {
+        repHelp!"OBJECT"(o);
+        return;
+    }
     if (args.length != 2)
     {
         repError(o, "ERR wrong number of arguments for 'object' command");
@@ -4230,12 +4984,12 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     switch (uname)
     {
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
-    case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX":
+    case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
     case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
-    case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT":
+    case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT", "HGETDEL":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":

@@ -193,6 +193,18 @@ version (unittest)
         ks.run("SINTERCARD", "2", "i1", "i2").expect.to.equal(":2\r\n");
         ks.run("SINTERCARD", "2", "i1", "i2", "LIMIT", "1").expect.to.equal(":1\r\n");
         ks.run("SINTERCARD", "2", "i1", "ghost").expect.to.equal(":0\r\n");
+        // error parity (Valkey set.tcl "SINTERCARD with illegal arguments")
+        ks.run("SINTERCARD")
+            .expect.to.equal("-ERR wrong number of arguments for 'sintercard' command\r\n");
+        ks.run("SINTERCARD", "0", "i1").expect.to.equal("-ERR numkeys should be greater than 0\r\n");
+        ks.run("SINTERCARD", "3", "i1", "i2")
+            .expect.to.equal("-ERR Number of keys can't be greater than number of args\r\n");
+        // *MPOP: too few keys for numkeys is a syntax error, not a numkeys error
+        ks.run("ZMPOP", "2", "zz", "MIN").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("LMPOP", "2", "ll", "LEFT").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("LMPOP", "1", "ll")
+            .expect.to.equal("-ERR wrong number of arguments for 'lmpop' command\r\n");
+        ks.run("ZMPOP").expect.to.equal("-ERR wrong number of arguments for 'zmpop' command\r\n");
 
         ks.run("SINTERSTORE", "outI", "i1", "i2").expect.to.equal(":2\r\n");
         ks.run("SMEMBERS", "outI")[0 .. 4].expect.to.equal("*2\r\n");
@@ -244,9 +256,29 @@ version (unittest)
         ks.run("OBJECT", "ENCODING", "b").expect.to.equal("$3\r\nint\r\n");
         ks.run("SET", "txt", "hello");
         ks.run("OBJECT", "ENCODING", "txt").expect.to.equal("$6\r\nembstr\r\n"); // short string = embstr (Redis parity)
-        ks.run("OBJECT", "ENCODING", "l").expect.to.equal("$10\r\nlinkedlist\r\n");
+        // small list reports listpack, Valkey tiering (storage is one DList)
+        ks.run("OBJECT", "ENCODING", "l").expect.to.equal("$8\r\nlistpack\r\n");
         ks.run("OBJECT", "REFCOUNT", "l").expect.to.equal(":1\r\n");
         ks.run("OBJECT", "ENCODING", "ghost")[0].expect.to.equal('-');
+        {
+            // list tier follows list-max-listpack-size: count cap when >= 0,
+            // size cap (4KB << n) when negative
+            import dreads.config : gConfig;
+
+            auto savedFill = gConfig.listMaxListpackSize;
+            scope (exit)
+                gConfig.listMaxListpackSize = savedFill;
+            ks.run("RPUSH", "l3", "a", "b", "c");
+            gConfig.listMaxListpackSize = 2;
+            ks.run("OBJECT", "ENCODING", "l3").expect.to.equal("$9\r\nquicklist\r\n");
+            gConfig.listMaxListpackSize = 128;
+            ks.run("OBJECT", "ENCODING", "l3").expect.to.equal("$8\r\nlistpack\r\n");
+            gConfig.listMaxListpackSize = -1; // 4KB size cap
+            ks.run("OBJECT", "ENCODING", "l3").expect.to.equal("$8\r\nlistpack\r\n");
+            char[4200] big = 'x';
+            ks.run("RPUSH", "l3", cast(string) big[]);
+            ks.run("OBJECT", "ENCODING", "l3").expect.to.equal("$9\r\nquicklist\r\n");
+        }
 
         ks.run("SUBSTR", "txt", "0", "1").expect.to.equal("$2\r\nhe\r\n");
         ks.run("HMSET", "h", "f", "v").expect.to.equal("+OK\r\n");
@@ -275,6 +307,41 @@ version (unittest)
         ks.run("KEYS", "*").expect.to.equal("*1\r\n$4\r\nlive\r\n");
         // lazy expiry on access still drops it
         ks.run("EXISTS", "gone").expect.to.equal(":0\r\n");
+    }
+
+    @("ext.msetex")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("MSETEX", "2", "a", "1", "b", "2").expect.to.equal(":1\r\n");
+        ks.run("GET", "a").expect.to.equal("$1\r\n1\r\n");
+        ks.run("MSETEX", "1", "c", "3", "EX", "100").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c")[0].expect.to.equal(':');
+        ks.run("PTTL", "c").expect.to.not.equal(":-1\r\n");
+        // NX blocks when any key exists; XX blocks when any is missing
+        ks.run("MSETEX", "2", "a", "9", "new", "9", "NX").expect.to.equal(":0\r\n");
+        ks.run("EXISTS", "new").expect.to.equal(":0\r\n");
+        ks.run("MSETEX", "2", "a", "9", "ghost", "9", "XX").expect.to.equal(":0\r\n");
+        ks.run("MSETEX", "1", "a", "9", "XX").expect.to.equal(":1\r\n");
+        ks.run("GET", "a").expect.to.equal("$1\r\n9\r\n");
+        // plain MSETEX clears a TTL; KEEPTTL keeps it
+        ks.run("MSETEX", "1", "c", "4").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c").expect.to.equal(":-1\r\n");
+        ks.run("EXPIRE", "c", "100");
+        ks.run("MSETEX", "1", "c", "5", "KEEPTTL").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c").expect.to.not.equal(":-1\r\n");
+        // errors
+        ks.run("MSETEX", "0", "a", "1")
+            .expect.to.equal("-ERR invalid numkeys value or out of range\r\n");
+        ks.run("MSETEX", "3", "a", "1", "b", "2").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "NX", "XX").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "EX", "100", "KEEPTTL")
+            .expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "EX", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "a", "1", "BOGUS").expect.to.equal("-ERR syntax error\r\n");
     }
 
     @("ext.info_keyspace")

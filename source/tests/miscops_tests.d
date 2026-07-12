@@ -80,10 +80,46 @@ version (unittest)
         ks.run("SORT", "l", "STORE", "dst").expect.to.equal(":4\r\n");
         ks.run("TYPE", "dst").expect.to.equal("+list\r\n");
         ks.run("SORT_RO", "l", "STORE", "dst")[0].expect.to.equal('-'); // no STORE on _RO
-        ks.run("SORT", "l", "BY", "w_*")[0].expect.to.equal('-'); // documented unsupported
         ks.run("SORT", "ghost").expect.to.equal("*0\r\n");
         ks.run("SET", "str", "v");
         ks.run("SORT", "str")[0].expect.to.equal('-');
+    }
+
+    @("misc.sort_by_get")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("RPUSH", "l", "a", "b", "c");
+        ks.run("MSET", "w_a", "3", "w_b", "1", "w_c", "2");
+        ks.run("SORT", "l", "BY", "w_*", "ALPHA")
+            .expect.to.equal("*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n");
+        ks.run("SORT", "l", "BY", "w_*") // numeric weights
+            .expect.to.equal("*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n");
+        // GET projects through a pattern; '#' is the element itself
+        ks.run("MSET", "d_a", "A", "d_b", "B", "d_c", "C");
+        ks.run("SORT", "l", "BY", "w_*", "GET", "d_*", "GET", "#")
+            .expect.to.equal("*6\r\n$1\r\nB\r\n$1\r\nb\r\n$1\r\nC\r\n$1\r\nc\r\n$1\r\nA\r\n$1\r\na\r\n");
+        // missing GET key -> nil
+        ks.run("SORT", "l", "BY", "w_*", "GET", "nope_*")
+            .expect.to.equal("*3\r\n$-1\r\n$-1\r\n$-1\r\n");
+        // BY without '*' skips sorting (container order)
+        ks.run("SORT", "l", "BY", "nosort")
+            .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        // hash-field weights and projections
+        ks.run("HSET", "h_a", "w", "2", "v", "va");
+        ks.run("HSET", "h_b", "w", "1", "v", "vb");
+        ks.run("RPUSH", "l2", "a", "b");
+        ks.run("SORT", "l2", "BY", "h_*->w", "GET", "h_*->v")
+            .expect.to.equal("*2\r\n$2\r\nvb\r\n$2\r\nva\r\n");
+        // STORE flattens GET projections; nil stores as empty string
+        ks.run("SORT", "l2", "BY", "h_*->w", "GET", "ghost_*", "STORE", "dst2")
+            .expect.to.equal(":2\r\n");
+        ks.run("LRANGE", "dst2", "0", "-1").expect.to.equal("*2\r\n$0\r\n\r\n$0\r\n\r\n");
+        // non-numeric weights without ALPHA -> error
+        ks.run("MSET", "w_a", "x");
+        ks.run("SORT", "l", "BY", "w_*")[0].expect.to.equal('-');
     }
 
     @("misc.lcs")

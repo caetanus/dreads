@@ -79,6 +79,11 @@ version (unittest)
         ks.run("XGROUP", "CREATE", "nostream", "g", "0")[0].expect.to.equal('-');
         ks.run("XGROUP", "CREATE", "mk", "g", "$", "MKSTREAM").expect.to.equal("+OK\r\n");
         ks.run("TYPE", "mk").expect.to.equal("+stream\r\n");
+        ks.run("XGROUP", "SETID", "s", "g", "1-1").expect.to.equal("+OK\r\n");
+        ks.run("XGROUP", "SETID", "s", "g", "$", "ENTRIESREAD", "3").expect.to.equal("+OK\r\n");
+        ks.run("XGROUP", "SETID", "s", "nogroup", "$")[0].expect.to.equal('-');
+        ks.run("XGROUP", "SETID", "s", "g", "bogus")[0].expect.to.equal('-');
+        ks.run("XGROUP", "SETID", "s", "g", "0").expect.to.equal("+OK\r\n"); // back to start
 
         // consumer alice reads two new entries
         auto r1 = ks.run("XREADGROUP", "GROUP", "g", "alice", "COUNT", "2", "STREAMS", "s", ">");

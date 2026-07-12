@@ -1,0 +1,62 @@
+# Tests that require SYNC/PSYNC via attach_to_replication_stream.
+# dreads replicates through Raft; SYNC is a deliberate noop, so these are
+# N/A by design (see BLACKBOX-TODO.md). Pass to runtest with:
+#   ./runtest --host H --port P --single <file> --skipfile <this file>
+# Lines are exact test names (or /regexp). Regenerate with:
+#   grep -B40 attach_to_replication_stream tests/unit/**/*.tcl | grep 'test {'
+GETDEL propagate as DEL command to replica
+GETEX without argument does not propagate to replica
+MSETEX with past EXAT/PXAT - key stored but logically expired
+MSETEX lazy expire with all expiration options
+MSETEX active expire with all expiration options
+MSETEX propagate as MSETEX with PXAT to replica
+SET EXAT / PXAT Expiration time is expired
+DELIFEQ propagate as DEL command to replica
+SWAPDB wants to wake blocked client, but the key already expired
+MULTI + LPUSH + EXPIRE + DEBUG SLEEP on blocked client, key already expired
+BLMPOP propagate as pop with count command to replica
+LMPOP propagate as pop with count command to replica
+Command being unblocked cause another command to get unblocked execution order test
+SPOP new implementation: code path #1 propagate as DEL or UNLINK
+ZMPOP propagate as pop with count command to replica
+BZMPOP propagate as pop with count command to replica
+All TTL in commands are propagated as absolute timestamp in replication stream
+GETEX propagate as to replica as PERSIST, UNLINK, or nothing
+Server should not propagate the read command on lazy expire
+SCAN: Lazy-expire should not be wrapped in MULTI/EXEC
+RANDOMKEY: Lazy-expire should not be wrapped in MULTI/EXEC
+SPOP: We can call scripts rewriting client->argv from Lua
+MGET: mget shouldn't be propagated in Lua
+EXPIRE: We can call scripts rewriting client->argv from Lua
+INCRBYFLOAT: We can call scripts expanding client->argv from Lua
+# min-replicas-to-write is a legacy async-replication durability knob; dreads
+# gets write durability from Raft consensus instead and does not model
+# "not enough good replicas" / NOREPLICAS. CONFIG SET min-replicas-to-write is
+# unsupported (see DRIFT.md). The `replica-serve-stale-data` staleness tests are
+# already external:skip.
+not enough good replicas
+not enough good replicas state change during long script
+# SCRIPT KILL works (the worker's hook aborts the running script), but these
+# tests assert the single-threaded BUSY contract (other clients get -BUSY while
+# a script runs). dreads runs scripts on a dedicated thread, so the event loop
+# stays responsive (PONG, not BUSY) — a deliberate divergence. See DRIFT.md.
+Timedout read-only scripts can be killed by SCRIPT KILL
+Timedout read-only scripts can be killed by SCRIPT KILL even when use pcall
+Timedout script does not cause a false dead client
+Timedout script link is still usable after Lua returns
+# helper emitting RESP3 types) plus setresp-aware conversion of RESP3 replies
+# cmsgpack packs a self-referential table to a fixed depth (16) — our circular
+# handling and unpack are correct (every assert() in the test passes), but the
+# exact byte order depends on Lua's table hash iteration, and stock Lua 5.4
+# walks {x,y} in a different order than Redis's patched 5.1. Only the hex dump
+# differs, not the semantics; matching it would mean reimplementing 5.1 hashing.
+EVAL - cmsgpack can pack and unpack circular references?
+# DUMP/RESTORE need an RDB-compatible value serialization format, a documented
+# out-of-scope gap (see DRIFT.md "Missing commands: dump restore migrate"); the
+# script calls redis.call("DUMP",...) which raises and aborts the file.
+RESTORE expired keys with expiration time
+# Making getmetatable('').__index (the string type's shared metatable) raise
+# needs Redis's VM-level readonly-table patch: our metatable emulation can't
+# reject a write to an already-present field, and the test also indexes
+# coroutine.* (a library we don't load). See DRIFT.md on readonly emulation.
+Try trick readonly table on basic types metatable

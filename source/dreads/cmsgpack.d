@@ -19,6 +19,10 @@ public void registerCmsgpack(lua_State* L) nothrow @nogc
     lua_setfield(L, -2, "pack");
     lua_pushcclosure(L, &msgpackUnpack, 0);
     lua_setfield(L, -2, "unpack");
+    lua_pushcclosure(L, &msgpackUnpackOne, 0);
+    lua_setfield(L, -2, "unpack_one");
+    lua_pushcclosure(L, &msgpackUnpackLimit, 0);
+    lua_setfield(L, -2, "unpack_limit");
     lua_setglobal(L, "cmsgpack");
 }
 
@@ -110,8 +114,6 @@ private void packStr(ref ByteBuffer o, scope const(char)[] s) nothrow @nogc
 
 private void packValue(lua_State* L, int idx, ref ByteBuffer o, int depth) nothrow @nogc
 {
-    if (depth > MAX_DEPTH)
-        luaL_error(L, "Cannot pack: excessive nesting");
     switch (lua_type(L, idx))
     {
     case LUA_TNIL:
@@ -148,6 +150,14 @@ private void packValue(lua_State* L, int idx, ref ByteBuffer o, int depth) nothr
             break;
         }
     case LUA_TTABLE:
+        // lua-cmsgpack packs TABLES to a depth of 16 and emits NIL at the
+        // limit (it's how circular references terminate) — scalars never
+        // truncate and nothing errors
+        if (depth >= 16)
+        {
+            o.appendByte(0xC0);
+            break;
+        }
         {
             // array iff every key is an integer in 1..rawlen (like cjson)
             auto n = cast(long) lua_rawlen(L, idx);
@@ -434,4 +444,57 @@ extern (C) private int msgpackUnpack(lua_State* L) nothrow @nogc
         count++;
     }
     return count;
+}
+
+/// Shared body of unpack_one / unpack_limit: decode up to `limit` objects
+/// starting at the byte offset in arg `offArg`; replies (newOffset, objs...)
+/// with newOffset = -1 once the input is exhausted (lua-cmsgpack semantics).
+private int unpackLimited(lua_State* L, long limit, int offArg) nothrow @nogc
+{
+    size_t len;
+    auto p = lua_tolstring(L, 1, &len);
+    if (p is null || len == 0)
+        return luaL_error(L, "cmsgpack.unpack expects a non-empty string");
+    int isnum;
+    auto off = lua_tointegerx(L, offArg, &isnum);
+    if (isnum == 0)
+        off = 0;
+    if (off < 0 || cast(size_t) off >= len)
+        return luaL_error(L, "cmsgpack: bad offset");
+    Decoder d;
+    d.L = L;
+    d.s = cast(const(ubyte)[]) p[0 .. len];
+    d.i = cast(size_t) off;
+    lua_pushinteger(L, 0); // placeholder: patched with the real offset below
+    int count = 0;
+    while (count < limit && d.i < d.s.length)
+    {
+        d.value(0);
+        count++;
+    }
+    // rewrite the placeholder: -1 when fully consumed, else the next offset
+    lua_pushinteger(L, d.i >= d.s.length ? -1 : cast(long) d.i);
+    lua_replace_compat(L, -(count + 2));
+    return count + 1;
+}
+
+/// lua_replace without the macro: pops the top and stores it at idx.
+private void lua_replace_compat(lua_State* L, int idx) nothrow @nogc
+{
+    lua_copy(L, -1, idx);
+    lua_settop(L, lua_gettop(L) - 1);
+}
+
+extern (C) private int msgpackUnpackOne(lua_State* L) nothrow @nogc
+{
+    return unpackLimited(L, 1, 2);
+}
+
+extern (C) private int msgpackUnpackLimit(lua_State* L) nothrow @nogc
+{
+    int isnum;
+    auto limit = lua_tointegerx(L, 2, &isnum);
+    if (isnum == 0 || limit < 1)
+        return luaL_error(L, "cmsgpack: bad limit");
+    return unpackLimited(L, limit, 3);
 }

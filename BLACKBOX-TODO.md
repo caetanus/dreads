@@ -9,62 +9,95 @@ external mode (`./runtest --host … --port … --single <file>`), on **db 9**
 > failures are **masked** until the blocker above them is cleared. Re-run each
 > file after fixing a blocker to reveal the next layer.
 
-## First blocker per file (db 9)
+**Layer 1 (2026-07, cleared):** CONFIG encoding thresholds, DEBUG stubs,
+COPY … DB n, OBJECT arity, SCAN TYPE — all landed on master.
 
-| File | ok before block | First blocker |
-|---|---|---|
-| unit/type/incr | 14 | `ERR DEBUG subcommand not supported` |
-| unit/type/string | 21 | `ERR Unsupported CONFIG parameter` |
-| unit/type/list | 0 | `ERR Unsupported CONFIG parameter` |
-| unit/type/hash | 1 | `ERR Unsupported CONFIG parameter` |
-| unit/type/set | 0 | `ERR Unsupported CONFIG parameter` |
-| unit/type/zset | 0 | `ERR Unsupported CONFIG parameter` |
-| unit/expire | 30 | `ERR Unsupported CONFIG parameter` |
-| unit/keyspace | 28 | `ERR wrong number of arguments for 'copy'` (COPY … DB n) |
-| unit/scan | 3 | `ERR syntax error` (SCAN … TYPE) |
-| unit/bitops | 11 | `ERR syntax error` |
-| unit/other | 0 | `ERR wrong number of arguments for 'object'` |
-| unit/sort | 0 | `ERR Unsupported CONFIG parameter` |
+**Layer 2 (2026-07-12, cleared on `blackbox`):** list OBJECT ENCODING tiers,
+blocking on db≠0 (+ firstPass WRONGTYPE + `inExec` bail), HELP replies,
+real RANDFIELD/RANDMEMBER randomness (dreads.rand, reservoir/selection
+sampling), RESP3 pair nesting + `_` nulls, live-config small-container
+thresholds, SINTERCARD/*MPOP error parity, BITCOUNT/BITPOS range semantics,
+SORT BY/GET, MSETEX, CONFIG INFO, XGROUP SETID, INFO
+(blocked_clients/used_memory/expired_keys/multi-db keyspace), SMOVE notify,
+notify-keyspace-events applied on CONFIG SET, `blackbox/valkey-sync.skip`
+(SYNC is N/A by design), `blackbox/dreads-suite.conf` (active-expire for
+suite runs). Every fix has its own UT (`tests/blackbox_regressions_tests.d`
+and siblings — NEVER copy the tcl suite; memory `blackbox-internal-coverage`).
+Unit runner is now single-threaded (`-s` injected in bin/ut.d): tests mutate
+`__gshared` state (gRespProto, gConfig, notify hooks).
 
-## Blockers, grouped
+**Layer 3 (2026-07-12, cleared):** HGETDEL; EXPIRE-family NX/XX/GT/LT +
+overflow messages + past-deadline synchronous delete; GETEX error split;
+ZUNIONSTORE ±inf→0 and 0×inf weights; lex-range reversed-bounds emptiness;
+typed range-bound errors (float/lex/int); ZADD dangling-pair = syntax error;
+MSETEX expire not-an-integer; notify flags applied on CONFIG SET;
+ZRANDMEMBER WITHSCORES count-overflow guard (was a server CRASH via 9e18-draw
+loop); `blackbox/sweep.sh` restarts dreads per file (kills cross-file config
+leakage).
 
-### 1. CONFIG SET encoding thresholds — biggest unblocker
-Type tests flip encoding thresholds to force listpack↔hashtable/skiplist
-transitions, then `assert_encoding`. dreads rejects the params with
-`ERR Unsupported CONFIG parameter`, aborting the file immediately. Accept
-(store, even as a no-op where dreads has a single encoding) at least:
+## Progress per file (session start → sweep8, db 9, skipfile, fresh server per file)
 
-- `list-max-listpack-size` / `list-max-ziplist-size`, `list-compress-depth`
-- `hash-max-listpack-entries` / `-value` (+ `-ziplist-` aliases)
-- `set-max-listpack-entries`, `set-max-intset-entries`
-- `zset-max-listpack-entries` / `-value` (+ `-ziplist-` aliases)
-- `stream-node-max-entries`
-- `proto-max-bulk-len`, `client-query-buffer-limit`
-- `lazyfree-lazy-server-del`, `notify-keyspace-events`
+| File | ok before | ok now | err | runs to end? |
+|---|---|---|---|---|
+| unit/type/incr | 32 | 32 | 0 | **PASSES** |
+| unit/type/string | 21† | 82 | 2 | yes |
+| unit/type/list | 32†‡ | 100 | 9 | yes |
+| unit/type/hash | 31† | 79 | 4 | aborts at DUMP (not implemented) |
+| unit/type/set | 90 | 115 | 2 | yes |
+| unit/type/zset | 110† | 305 | 9 | crashed at ZRANDMEMBER overflow (guard landed after sweep8) |
+| unit/expire | 30 | 62 | 4 | yes |
+| unit/keyspace | 42 | 45 | 1 | aborts: stream-cgroups COPY (syntax) |
+| unit/scan | 10 | 10 | 3 | aborts (HSCAN NOVALUES?) |
+| unit/bitops | 11† | 46 | 1 | aborts: SETBIT fuzz empty reply |
+| unit/other | 0† | 8 | 3 | aborts: CONFIG INFO `flags` field |
+| unit/sort | 0† | 45 | 10 | yes |
+| **total** | **409** | **929** | **48** | |
 
-Unblocks: string, list, hash, set, zset, expire, sort (and more).
+† aborted at first exception; ‡ plus a 600 s hang.
 
-### 2. DEBUG subcommands
-`ERR DEBUG subcommand not supported`. Tests lean on:
-`DEBUG JMAP`, `DEBUG OBJECT`, `DEBUG RELOAD`, `DEBUG SET-ACTIVE-EXPIRE`,
-`DEBUG STRINGMATCH-LEN`, `DEBUG QUICKLIST-PACKED-THRESHOLD`,
-`DEBUG SLEEP`, `DEBUG JMAP`. Stub the safe no-ops (`JMAP`, `SLEEP`,
-`SET-ACTIVE-EXPIRE`, `QUICKLIST-PACKED-THRESHOLD`) → `+OK`; implement
-`DEBUG OBJECT` (encoding/refcount) and `DEBUG RELOAD` (AOF round-trip) where
-feasible. Unblocks: incr + most type files past encoding asserts.
+## Layer 4 — open failures (sweep7/8)
 
-### 3. COPY … DB n [REPLACE] — multi-DB gap
-`copy src dst DB 10` and `copy src dst DB 10 REPLACE`. dreads' COPY only
-takes 2 args. Extend to cross-db (write into `gDbs[n]`), honoring `REPLACE`
-and the same-key/same-db guard, mirroring MOVE.
+### Blocking service order (list 9, zset ~5)
+Multiple blocked clients must be served FIFO and chained wakes must cascade
+(Linked LMOVEs, Circular BRPOPLPUSH, BLMPOP/BZMPOP "multiple blocked
+clients", BZPOPMIN re-block after expired). dreads' poll-retry model wakes
+all waiters and races them. BRPOPLPUSH with a wrong-typed *destination* must
+surface the error on wake (currently swallowed by the firstPass rule shared
+with B*MPOP). Needs a real blocked-client queue (FIFO per key) instead of
+the retry loop — design work, not a patch.
 
-### 4. OBJECT arity/subcommands
-`ERR wrong number of arguments for 'object'` in unit/other. Audit
-`OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ|HELP` arity + outputs.
+### Not implemented (each aborts its file)
+- DUMP/RESTORE (hash file; RDB payload + CRC — sizeable).
+- HSCAN NOVALUES (scan file, to confirm).
+- COPY of a stream with consumer groups (keyspace).
 
-### 5. SCAN TYPE option + error parity
-`scan 0 type string` must filter by type and, for an unknown type, error
-`*unknown type name*`. dreads returns a generic `ERR syntax error`.
+### Scripting (effects replication LANDED — leftovers)
+Effects replication is in (EVAL never logged; each redis.call write logged
+in its propagation form; raft proposes per-write; replicate_commands=true).
+Leftovers: `struct` library; SCRIPT LOAD is per-node (not replicated — an
+EVALSHA on a node that never loaded the body answers NOSCRIPT, client falls
+back to EVAL); script effects are not wrapped in MULTI/EXEC (matches the
+unwrapped-EXEC drift); under raft a script's inner writes are one consensus
+round-trip EACH (pipelining them is a future optimization). Add
+`unit/scripting` to the sweep next.
+
+### Singles
+- zset: "zunionInterDiffGenericCommand at least 1 input key" (exact arity/
+  message split), ZRANGE/ZRANGESTORE "invalid syntax" edges, BZMPOP
+  non-key-argument arity (#10762).
+- hash: HRANDFIELD count-hashtable coverage edge; HINCRBYFLOAT float
+  representation (uses long double in Redis; issue #2846 test).
+- set: SRANDMEMBER histogram distribution in spilled (Dict) mode — the
+  wrapping-scan draw is biased by probe clusters; use rejection sampling.
+- set/WATCH: "SMOVE only notify dstset" is really the WATCH global-epoch
+  drift (DRIFT.md): unchanged dst still aborts EXEC.
+- expire: 4 leftovers (re-check names after next sweep).
+- bitops: SETBIT fuzz test got an empty reply mid-run (find which command).
+- other: CONFIG INFO entries need a `flags` field (+ multi-pattern matching).
+- sort: BY-nosort ordering nuances (sorted-set source keeps zset order,
+  `BY <constant> + STORE` still sorts for determinism), GET pattern ending in
+  `->`, "sub-sorts lexicographically when scores equal", SORT_RO key
+  extraction, STORE-created list must report the right encoding.
 
 ## Multi-DB peripheral gaps (not yet exercised, known incomplete)
 

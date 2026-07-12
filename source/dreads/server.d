@@ -95,10 +95,24 @@ public int runServer(ushort port, const(char)[] aofPath = null)
     }
     {
         import dreads.obj : lruClock, gActiveExpire;
+        import dreads.rand : seedRand;
         import dreads.stream : nowMs;
 
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
+        seedRand(nowMs()); // shuffle the random-pick commands per boot
+        {
+            // effects replication: script writes reach the AOF one by one
+            import dreads.scripting : gScriptEffectSink, startLuaScriptPool;
+
+            gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
+                if (gAof.enabled)
+                    gAof.append(fx);
+            };
+            // scripts run on a dedicated thread (off the event loop), so a
+            // busy script can't stall the loop and SCRIPT KILL can reach it
+            startLuaScriptPool();
+        }
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
             foreach (ref d; gDbs) // drop-soon sweep across every database
@@ -592,7 +606,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             }
             if (c.watching && c.watchEpoch != gWriteEpoch)
             {
-                o.append("*-1\r\n");
+                repNullArray(o); // aborted EXEC: RESP3 null
                 return true;
             }
             repArrayHeader(o, c.multiCount);
@@ -798,10 +812,12 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     case "BLMPOP":
     case "BZMPOP":
         {
-            // B*MPOP timeout numkeys ... -> *MPOP numkeys ...
-            if (args.length < 3)
+            // B*MPOP timeout numkeys key [key ...] WHERE -> *MPOP numkeys ...
+            if (args.length < 4)
             {
-                repError(o, "ERR wrong number of arguments");
+                repError(o, uname == "BLMPOP"
+                        ? "ERR wrong number of arguments for 'blmpop' command"
+                        : "ERR wrong number of arguments for 'bzmpop' command");
                 return true;
             }
             ulong timeoutMs;
@@ -1014,27 +1030,21 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
             bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
-            auto outBefore = o.length;
+            // effects replication: the EVAL itself NEVER enters the log.
+            // Each write the script performs is captured by the redis.call
+            // bridge — its propagation form goes to the AOF (sink installed
+            // at boot) or through raft consensus, one entry per write. A
+            // script that fails halfway keeps its earlier writes in the log,
+            // exactly like it keeps them in the dataset.
+            import dreads.scripting : gScriptWrote;
+
+            gScriptWrote = false;
             evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
-            // scripts may write; log unless the script itself errored.
-            // overrides set by commands inside the script are superseded by
-            // logging the whole EVAL.
             propagationOverride.clear();
-            if (o.length > outBefore && o.data[outBefore] != '-')
+            if (gScriptWrote)
             {
                 gWriteEpoch++;
                 gKeyActivity.emit();
-            }
-            if (gAof.enabled && o.length > outBefore && o.data[outBefore] != '-')
-            {
-                if (!bySha)
-                    gAof.append(rawCmd);
-                else if (args.length > 0)
-                {
-                    auto body_ = cachedScript(args[0].str);
-                    if (body_ !is null)
-                        gAof.appendEval(body_, args[1 .. $]);
-                }
             }
             return true;
         }
@@ -1051,7 +1061,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // (gReplicator is null) falls straight through with zero added cost.
     if (gReplicator !is null)
     {
-        if (isWriteCommand(uname))
+        // GETEX is not a logged write (a plain GETEX changes nothing and the
+        // AOF stays clean via the PEXPIREAT/PERSIST override), but under raft
+        // its TTL mutation must still reach followers: propose it and let the
+        // injected clock keep the replay deterministic.
+        if (isWriteCommand(uname) || uname == "GETEX")
         {
             import dreads.stream : nowMs;
 
@@ -1477,9 +1491,11 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         }
         if (ok)
         {
+            import dreads.notify : parseNotifyFlags;
             import dreads.obj : gActiveExpire;
 
-            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
+            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
+            cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
             repSimple(o, "OK");
         }
         else
@@ -1491,37 +1507,111 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         repSimple(o, "OK");
         return;
     }
+    if (eqICDebug(args[0].str, "HELP"))
+    {
+        repHelp!"CONFIG"(o);
+        return;
+    }
+    if (eqICDebug(args[0].str, "INFO"))
+    {
+        configInfo(args[1 .. $], o);
+        return;
+    }
     repUnknownSubcommand(o, "CONFIG", args.length ? args[0].str : "");
+}
+
+// CONFIG INFO metadata: enough shape (name/type/values/range) for tooling and
+// the Valkey suite's type probes; not an exhaustive mirror of Valkey's table.
+private struct CfgMeta
+{
+    string name;
+    string type; // bool | numeric | string | enum | special
+    immutable(string)[] values; // enum choices
+    bool hasRange;
+    long lo, hi;
+}
+
+private static immutable CfgMeta[] gCfgMeta = [
+    {"appendonly", "bool"},
+    {"active-expire", "bool"},
+    {"activerehashing", "bool"},
+    {"lazyfree-lazy-server-del", "bool"},
+    {"port", "numeric", null, true, 0, 65_535},
+    {"maxmemory", "numeric", null, true, 0, long.max},
+    {"proto-max-bulk-len", "numeric", null, true, 0, long.max},
+    {"client-query-buffer-limit", "numeric", null, true, 0, long.max},
+    {"hash-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"hash-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"list-max-listpack-size", "numeric", null, true, long.min, long.max},
+    {"list-compress-depth", "numeric", null, true, 0, long.max},
+    {"set-max-intset-entries", "numeric", null, true, 0, long.max},
+    {"set-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"set-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"zset-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"zset-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"stream-node-max-entries", "numeric", null, true, 0, long.max},
+    {"dir", "string"},
+    {"appendfilename", "string"},
+    {"dbfilename", "string"},
+    {"maxmemory-policy", "enum", [
+        "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random",
+        "volatile-random", "volatile-ttl"
+    ]},
+    {"repl-diskless-load", "enum", ["disabled", "on-empty-db", "swapdb"]},
+    {"save", "special"},
+    {"notify-keyspace-events", "special"},
+];
+
+/// CONFIG INFO [name-or-glob ...] — array of per-directive metadata maps.
+private void configInfo(const(RVal)[] pats, ref ByteBuffer o) nothrow
+{
+    static bool hit(const(RVal)[] pats, string nm) nothrow
+    {
+        if (pats.length == 0)
+            return true;
+        foreach (ref p; pats)
+            if (globMatch(p.str, nm))
+                return true;
+        return false;
+    }
+
+    size_t matches = 0;
+    foreach (ref m; gCfgMeta)
+        if (hit(pats, m.name))
+            matches++;
+    repArrayHeader(o, matches);
+    foreach (ref m; gCfgMeta)
+    {
+        if (!hit(pats, m.name))
+            continue;
+        auto pairs = 2 + (m.values.length ? 1 : 0) + (m.hasRange ? 1 : 0);
+        repMapHeader(o, pairs);
+        repBulk(o, "name");
+        repBulk(o, m.name);
+        repBulk(o, "type");
+        repBulk(o, m.type);
+        if (m.values.length)
+        {
+            repBulk(o, "values");
+            repArrayHeader(o, m.values.length);
+            foreach (v; m.values)
+                repBulk(o, v);
+        }
+        if (m.hasRange)
+        {
+            repBulk(o, "range");
+            repArrayHeader(o, 2);
+            repInt(o, m.lo);
+            repInt(o, m.hi);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // maxmemory / LRU eviction (jemalloc-backed accounting; Linux only)
 // ---------------------------------------------------------------------------
 
-version (linux)
-{
-    private extern (C) int mallctl(const(char)* name, void* oldp, size_t* oldlenp,
-            void* newp, size_t newlen) nothrow @nogc;
-
-    private ulong usedMemory() nothrow @nogc
-    {
-        ulong epoch = 1;
-        size_t esz = epoch.sizeof;
-        mallctl("epoch", &epoch, &esz, &epoch, epoch.sizeof);
-        size_t allocated;
-        size_t asz = allocated.sizeof;
-        if (mallctl("stats.allocated", &allocated, &asz, null, 0) != 0)
-            return 0;
-        return allocated;
-    }
-}
-else
-{
-    private ulong usedMemory() nothrow @nogc
-    {
-        return 0; // accounting unavailable: maxmemory is inert
-    }
-}
+import dreads.mem : usedMemory; // jemalloc accounting (shared with INFO)
 
 private __gshared size_t gEvictCursor;
 
@@ -1614,8 +1704,13 @@ private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) 
 {
     import core.time : MonoTime, msecs;
 
+    import dreads.obj : gBlockedClients;
+
     if (timeoutMs != 0 && remainingMs <= 0)
         return false;
+    gBlockedClients++; // INFO clients: parked in a blocking wait
+    scope (exit)
+        gBlockedClients--;
     auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs; // forever = 1h slices
     auto before = MonoTime.currTime;
     ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
@@ -1644,16 +1739,22 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
     auto keys = args[0 .. $ - 1];
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
     for (;;)
     {
         foreach (ref k; keys)
         {
             bool wrong;
-            auto obj = gKeys.lookupTyped(k.str, ObjType.list, wrong);
+            auto obj = c.dbp.lookupTyped(k.str, ObjType.list, wrong);
             if (wrong)
             {
-                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
-                return;
+                // once blocked, a wrong-typed key never wakes the client
+                if (firstPass)
+                {
+                    repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                    return;
+                }
+                continue;
             }
             if (obj is null || obj.list.length == 0)
                 continue;
@@ -1664,13 +1765,14 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
                 obj.list.popFront();
             else
                 obj.list.popBack();
-            gKeys.delIfEmpty(k.str, obj);
+            c.dbp.delIfEmpty(k.str, obj);
             logEffect(fromLeft ? "LPOP" : "RPOP", k.str);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            repNullArray(o);
             return;
         }
     }
@@ -1697,16 +1799,22 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
     auto keys = args[0 .. $ - 1];
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
     for (;;)
     {
         foreach (ref k; keys)
         {
             bool wrong;
-            auto obj = gKeys.lookupTyped(k.str, ObjType.zset, wrong);
+            auto obj = c.dbp.lookupTyped(k.str, ObjType.zset, wrong);
             if (wrong)
             {
-                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
-                return;
+                // once blocked, a wrong-typed key never wakes the client
+                if (firstPass)
+                {
+                    repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                    return;
+                }
+                continue;
             }
             if (obj is null || obj.zset.length == 0)
                 continue;
@@ -1720,13 +1828,14 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
                 return 0;
             });
             obj.zset.remove(victim);
-            gKeys.delIfEmpty(k.str, obj);
+            c.dbp.delIfEmpty(k.str, obj);
             logEffect(popMax ? "ZPOPMAX" : "ZPOPMIN", k.str);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            repNullArray(o);
             return;
         }
     }
@@ -1751,6 +1860,10 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
 
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
+    // the rewritten command replies through the connection's protocol, so the
+    // "nothing to serve" sentinel is `_` under RESP3
+    auto nil = gRespProto >= 3 ? "_\r\n" : nilReply;
     for (;;)
     {
         attempt.clear();
@@ -1761,15 +1874,21 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
-        dispatch(cmd2, gKeys, attempt, arena);
+        dispatch(cmd2, *c.dbp, attempt, arena);
         propagationOverride.clear();
         auto rep = cast(const(char)[]) attempt.data;
         if (rep.length > 0 && rep[0] == '-')
         {
-            o.append(attempt.data); // real error: surface it
-            return;
+            // surface errors only before blocking; once blocked, a key that
+            // turned wrong-typed must not wake (or fail) the client
+            if (firstPass)
+            {
+                o.append(attempt.data);
+                return;
+            }
+            rep = nil; // treat as "not ready", keep waiting
         }
-        if (rep != nilReply)
+        if (rep != nil)
         {
             o.append(attempt.data);
             if (gAof.enabled)
@@ -1778,9 +1897,10 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             gKeyActivity.emit();
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append(nilReply);
+            o.append(nil);
             return;
         }
     }
@@ -1827,7 +1947,7 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             // resolve to the stream's current last id
             auto keyIdx = i - half;
             bool wrong;
-            auto obj = gKeys.lookupTyped(args[keyIdx].str, ObjType.stream, wrong);
+            auto obj = c.dbp.lookupTyped(args[keyIdx].str, ObjType.stream, wrong);
             char[48] b = void;
             auto ms = obj is null ? 0 : obj.stream.lastId.ms;
             auto seq = obj is null ? 0 : obj.stream.lastId.seq;
@@ -1851,16 +1971,17 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
-        dispatch(cmd2, gKeys, attempt, arena);
+        dispatch(cmd2, *c.dbp, attempt, arena);
         auto rep = cast(const(char)[]) attempt.data;
-        if (rep != "*-1\r\n")
+        auto nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
+        if (rep != nil)
         {
             o.append(attempt.data);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            o.append(nil);
             return;
         }
     }
@@ -1971,6 +2092,8 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
+    else if (eqICDebug(sub, "HELP"))
+        repHelp!"CLIENT"(o);
     else
         repUnknownSubcommand(o, "CLIENT", sub);
 }
@@ -2061,6 +2184,11 @@ private void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
                 repBulk(o, a.str);
                 repInt(o, cast(long) gShardPubSub.channelSubCount(a.str));
             }
+            break;
+        }
+    case "HELP":
+        {
+            repHelp!"PUBSUB"(o);
             break;
         }
     default:

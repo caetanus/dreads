@@ -277,7 +277,10 @@ public void repBulk(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
 // (default), 3 = RESP3. Reply builders whose *shape* differs between versions
 // consult this; pub/sub delivery to OTHER connections cannot use it (it frames
 // per-subscriber — see repPushHeader / connSink).
-public __gshared int gRespProto = 2;
+// THREAD-LOCAL: the main loop, the raft apply thread and the Lua script thread
+// each frame replies at their own connection's level without racing. (Was
+// __gshared; that broke once scripts ran on a dedicated thread.)
+public int gRespProto = 2;
 
 public void repNullBulk(ref ByteBuffer o) @nogc nothrow
 {
@@ -372,6 +375,17 @@ public void repUnknownSubcommand(ref ByteBuffer o, scope const(char)[] parent,
     o.append("'. Try ");
     o.append(parent);
     o.append(" HELP.\r\n");
+}
+
+/// Minimal "<CMD> HELP" reply: an array of status lines in Valkey's shape.
+/// The first line is the one suites pattern-match ("*<CMD> <subcommand> *").
+public void repHelp(string cmd)(ref ByteBuffer o) @nogc nothrow
+{
+    enum header = cmd ~ " <subcommand> [<arg> [value] [opt] ...]. Subcommands are:";
+    repArrayHeader(o, 3);
+    repSimple(o, header);
+    repSimple(o, "HELP");
+    repSimple(o, "    Print this help.");
 }
 
 public void repArrayHeader(ref ByteBuffer o, size_t n) @nogc nothrow

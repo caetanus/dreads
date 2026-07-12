@@ -249,3 +249,33 @@ unittest
     auto s3 = a.dupString("baz");
     assert(s3 == "baz");
 }
+
+// ---------------------------------------------------------------------------
+// process memory accounting (jemalloc stats; Linux only — 0 elsewhere)
+// ---------------------------------------------------------------------------
+
+version (linux)
+{
+    private extern (C) int mallctl(const(char)* name, void* oldp, size_t* oldlenp,
+            void* newp, size_t newlen) nothrow @nogc;
+
+    /// Bytes currently allocated by the process allocator (jemalloc).
+    public ulong usedMemory() nothrow @nogc
+    {
+        ulong epoch = 1;
+        size_t esz = epoch.sizeof;
+        mallctl("epoch", &epoch, &esz, &epoch, epoch.sizeof);
+        size_t allocated;
+        size_t asz = allocated.sizeof;
+        if (mallctl("stats.allocated", &allocated, &asz, null, 0) != 0)
+            return 0;
+        return allocated;
+    }
+}
+else
+{
+    public ulong usedMemory() nothrow @nogc
+    {
+        return 0; // accounting unavailable: maxmemory is inert
+    }
+}

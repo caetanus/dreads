@@ -18,7 +18,8 @@
 			"mainSourceFile": "bin/ut.d",
 			"name": "unittest",
 			"preBuildCommands": [
-				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"
+				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB",
+				"sed -i -e 's/mixin runTestsMain!(/int main(string[] args) { import unit_threaded.runner.runner : runTests; return runTests!(/' -e 's/\");$$/\")(args ~ \"-s\"); }/' bin/ut.d"
 			],
 			"targetName": "dreads_tests",
 			"targetType": "executable"

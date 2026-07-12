@@ -34,6 +34,12 @@ public __gshared uint lruClock;
 /// index-maintenance path, so SET-with-TTL pays nothing when active expiry is off.
 public __gshared bool gActiveExpire;
 
+/// INFO stats: lifetime count of keys dropped by lazy or active expiration.
+public __gshared ulong gExpiredKeys;
+
+/// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
+public __gshared long gBlockedClients;
+
 /// The logical databases (Redis SELECT 0..15). The *current* db is per-client
 /// (`Conn.db`); the connection dispatches against `gDbs[conn.db]`, SELECT just
 /// moves that per-connection index, and the replay/apply path takes the db from
@@ -305,6 +311,7 @@ public struct Keyspace
                     notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
                     d.del(key);
                     dropped++;
+                    gExpiredKeys++;
                 }
                 // key is a non-owning slice into Dict memory — nothing to free
             }
@@ -330,6 +337,7 @@ public struct Keyspace
             disarmExpire(k, o.expireAtMs);
             d.del(k);
             notifyKeyspaceEvent(NClass.expired, "expired", k);
+            gExpiredKeys++;
             return null;
         }
         o.lruSecs = lruClock;
