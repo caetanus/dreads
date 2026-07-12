@@ -210,6 +210,16 @@ version (unittest)
         ks.run("ZLEXCOUNT", "z", "-", "+").expect.to.equal(":3\r\n");
         // dangling score without member is a syntax error, not arity
         ks.run("ZADD", "z", "1", "x", "2").expect.to.equal("-ERR syntax error\r\n");
+        // a score spelled out to DBL_MAX's full ~325-digit decimal still parses
+        // (strtod handles any length; our copy buffer must not cap it)
+        enum dblmax = "179769313486231570814527423731704356798070567525844996"
+            ~ "598917476803157260780028538760589558632766878171540458953514"
+            ~ "382464234321326889464182768467546703537516986049910576551282"
+            ~ "076245490090389328944075868508455133942304583236903222948165"
+            ~ "808559332123348274797826204144723168738177180919299881250404"
+            ~ "026184124858368.00000000000000000";
+        ks.run("ZADD", "zbig", dblmax, "m").expect.to.equal(":1\r\n");
+        ks.run("ZSCORE", "zbig", "m").expect.to.equal("$23\r\n1.7976931348623157e+308\r\n");
         // +inf + -inf aggregates to 0 (never NaN)
         ks.run("ZADD", "zi1", "inf", "k");
         ks.run("ZADD", "zi2", "-inf", "k");
@@ -218,6 +228,44 @@ version (unittest)
         // MSETEX: non-integer expire value is a not-an-integer error
         ks.run("MSETEX", "1", "k", "v", "EX", "abc")
             .expect.to.equal("-ERR value is not an integer or out of range\r\n");
+        // a non-positive time is invalid for every option, absolute included
+        ks.run("MSETEX", "1", "k", "v", "EX", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "k", "v", "EXAT", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "k", "v", "PXAT", "-1")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+    }
+
+    @("blackbox.compare_and_set")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // SET ... IFEQ: write only when the current value matches
+        ks.run("SET", "foo", "initial");
+        ks.run("SET", "foo", "newv", "IFEQ", "initial").expect.to.equal("+OK\r\n");
+        ks.run("GET", "foo").expect.to.equal("$4\r\nnewv\r\n");
+        ks.run("SET", "foo", "nope", "IFEQ", "wrong").expect.to.equal("$-1\r\n"); // no match
+        ks.run("GET", "foo").expect.to.equal("$4\r\nnewv\r\n");
+        // IFEQ + GET returns the old value on a match
+        ks.run("SET", "foo", "x2", "IFEQ", "newv", "GET").expect.to.equal("$4\r\nnewv\r\n");
+        // IFEQ is incompatible with NX/XX; a non-string current value is WRONGTYPE
+        ks.run("SET", "foo", "v", "IFEQ", "x2", "XX").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("SADD", "s", "m");
+        ks.run("SET", "s", "v", "IFEQ", "m")
+            .expect.to.equal("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+
+        // DELIFEQ: delete only when the current value matches
+        ks.run("DELIFEQ", "ghost", "v").expect.to.equal(":0\r\n");
+        ks.run("SET", "k", "v");
+        ks.run("DELIFEQ", "k", "nope").expect.to.equal(":0\r\n");
+        ks.run("EXISTS", "k").expect.to.equal(":1\r\n");
+        ks.run("DELIFEQ", "k", "v").expect.to.equal(":1\r\n");
+        ks.run("EXISTS", "k").expect.to.equal(":0\r\n");
+        ks.run("DELIFEQ", "s", "m")
+            .expect.to.equal("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
     }
 
     @("blackbox.expire_flags_and_overflow")

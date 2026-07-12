@@ -144,29 +144,37 @@ private enum RangeErr
 /// Parses [BYSCORE|BYLEX] [REV] [LIMIT o c] [WITHSCORES] plus the bounds.
 /// boundsRev: bounds arrive as (max, min) — the legacy ZREV* forms.
 private bool parseRangeArgs(const(RVal)[] bounds, const(RVal)[] opts, bool boundsRev,
-        ref RangeSpec sp, ref bool withScores, ref bool limitUsed, out RangeErr err) @nogc nothrow
+        ref RangeSpec sp, ref bool withScores, ref bool limitUsed, out RangeErr err,
+        int form = 0) @nogc nothrow
 {
+    // `form` selects which options the command accepts (an invalid combination
+    // is a syntax error, independent of the bounds — hence checked before they
+    // are parsed): 0 ZRANGE / 6 ZRANGESTORE take BY*/REV; the legacy *BYSCORE/
+    // *BYLEX/REVRANGE forms (1..5) fix mode+direction, so those keywords aren't
+    // theirs. WITHSCORES is meaningless in lex/store forms; LIMIT needs a BY.
     err = RangeErr.syntax;
+    immutable bool takesBy = form == 0 || form == 6;
+    immutable bool takesWithScores = form == 0 || form == 1 || form == 2 || form == 3;
     size_t i = 0;
     while (i < opts.length)
     {
         auto w = opts[i].str;
-        if (eqICKeyword(w, "BYSCORE"))
+        if (takesBy && eqICKeyword(w, "BYSCORE"))
         {
             sp.mode = RangeMode.score;
             i++;
         }
-        else if (eqICKeyword(w, "BYLEX"))
+        else if (takesBy && eqICKeyword(w, "BYLEX"))
         {
             sp.mode = RangeMode.lex;
             i++;
         }
-        else if (eqICKeyword(w, "REV"))
+        else if (takesBy && eqICKeyword(w, "REV"))
         {
             sp.rev = true;
             i++;
         }
-        else if (eqICKeyword(w, "WITHSCORES"))
+        else if (takesWithScores && eqICKeyword(w, "WITHSCORES"))
         {
             withScores = true;
             i++;
@@ -182,6 +190,12 @@ private bool parseRangeArgs(const(RVal)[] bounds, const(RVal)[] opts, bool bound
         else
             return false;
     }
+    // WITHSCORES is invalid with BYLEX — a syntax error regardless of the
+    // bounds (err is still RangeErr.syntax here, so the caller frames it before
+    // trying to parse "0"/"-1" as a lex bound). LIMIT-without-BY carries a more
+    // specific message and is left to the callers to report.
+    if (withScores && sp.mode == RangeMode.lex)
+        return false;
     // resolve bounds: when the command form is reversed, (first, second) is (max, min)
     auto first = bounds[0].str;
     auto second = bounds[1].str;
@@ -240,7 +254,8 @@ public void zrangeGeneric(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         break;
     }
     RangeErr rerr;
-    if (!parseRangeArgs(args[1 .. 3], args[3 .. $], boundsRev, sp, withScores, limitUsed, rerr))
+    if (!parseRangeArgs(args[1 .. 3], args[3 .. $], boundsRev, sp, withScores,
+            limitUsed, rerr, form))
     {
         final switch (rerr)
         {
@@ -303,10 +318,16 @@ public void zrangestore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
     RangeSpec sp;
     bool withScores, limitUsed;
     RangeErr rerr;
-    if (!parseRangeArgs(args[2 .. 4], args[4 .. $], false, sp, withScores, limitUsed, rerr)
+    if (!parseRangeArgs(args[2 .. 4], args[4 .. $], false, sp, withScores, limitUsed, rerr, 6)
             || withScores)
     {
         repError(o, "ERR syntax error");
+        return;
+    }
+    if (limitUsed && sp.mode == RangeMode.index)
+    {
+        repError(o,
+                "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
         return;
     }
     bool wrong;
@@ -652,7 +673,20 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     if (args.length < at + 2 || !parseLong(args[at].str, numkeys) || numkeys < 1
             || args.length < at + 1 + cast(size_t) numkeys)
     {
-        repError(o, "ERR at least 1 input key is needed");
+        // Redis names the offending command in this error (canonical lowercase)
+        string cmd;
+        if (op == 'U')
+            cmd = mode == 1 ? "zunionstore" : "zunion";
+        else if (op == 'I')
+            cmd = mode == 2 ? "zintercard" : (mode == 1 ? "zinterstore" : "zinter");
+        else
+            cmd = mode == 1 ? "zdiffstore" : "zdiff";
+        static ByteBuffer eb; // TLS scratch
+        eb.clear();
+        eb.append("ERR at least 1 input key is needed for '");
+        eb.append(cmd);
+        eb.append("' command");
+        repError(o, cast(const(char)[]) eb.data);
         return;
     }
     auto keys = args[at + 1 .. at + 1 + cast(size_t) numkeys];

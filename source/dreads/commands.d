@@ -369,7 +369,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             long absExpire = -1; // resolved absolute ms; -1 = leave untouched
-            bool nx, xx, wantGet, keepttl, badSyntax, badExpire;
+            bool nx, xx, wantGet, keepttl, badSyntax, badExpire, hasIfeq;
+            const(char)[] ifeqVal;
             size_t i = 2;
             while (i < args.length)
             {
@@ -383,6 +384,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 {
                     xx = true;
                     i++;
+                }
+                else if (eqICKeyword(opt, "IFEQ"))
+                {
+                    // Valkey compare-and-set: write only if the current value
+                    // equals this string (incompatible with NX/XX)
+                    if (i + 1 >= args.length)
+                    {
+                        badSyntax = true;
+                        break;
+                    }
+                    hasIfeq = true;
+                    ifeqVal = args[i + 1].str;
+                    i += 2;
                 }
                 else if (eqICKeyword(opt, "GET"))
                 {
@@ -423,18 +437,27 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR invalid expire time in 'set' command");
                 break;
             }
-            if (badSyntax || (nx && xx) || (keepttl && absExpire >= 0))
+            if (badSyntax || (nx && xx) || (keepttl && absExpire >= 0)
+                    || (hasIfeq && (nx || xx)))
             {
                 repError(o, "ERR syntax error");
                 break;
             }
             auto existing = ks.lookup(args[0].str);
-            if (wantGet && existing !is null && existing.type != ObjType.str)
+            // GET and IFEQ both require the current value (if any) to be a string
+            if ((wantGet || hasIfeq) && existing !is null && existing.type != ObjType.str)
             {
                 repWrongType(o);
                 break;
             }
-            if ((nx && existing !is null) || (xx && existing is null))
+            // IFEQ fails to match when the key is absent or holds a different value
+            bool ifeqFail = false;
+            if (hasIfeq)
+            {
+                char[24] sb = void;
+                ifeqFail = existing is null || existing.str.bytes(sb) != ifeqVal;
+            }
+            if ((nx && existing !is null) || (xx && existing is null) || ifeqFail)
             {
                 if (wantGet && existing !is null)
                     repStrVal(o, existing.str);
@@ -590,6 +613,37 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repStrVal(o, obj.str);
             ks.del(args[0].str);
             notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+            break;
+        }
+    case "DELIFEQ":
+        {
+            // Valkey compare-and-delete: drop the key only when its current
+            // string value equals the comparison; propagate as a plain DEL.
+            if (args.length != 2)
+            {
+                arityErr(o, "delifeq");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.str, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            char[24] sb = void;
+            if (obj is null || obj.str.bytes(sb) != args[1].str)
+            {
+                repInt(o, 0);
+                break;
+            }
+            ks.del(args[0].str);
+            notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+            propagationOverride.clear();
+            repArrayHeader(propagationOverride, 2);
+            repBulk(propagationOverride, "DEL");
+            repBulk(propagationOverride, args[0].str);
+            repInt(o, 1);
             break;
         }
     case "SETNX":
@@ -808,7 +862,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     expireGiven = true;
                     bool isRel = opt.length == 2;
                     bool isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
-                    if ((isRel && v <= 0) || !resolveExpireMs(v, isSec, isRel, absExpire))
+                    // MSETEX rejects a non-positive time for every option, incl.
+                    // absolute EXAT/PXAT (unlike SET, which allows a past EXAT)
+                    if (v <= 0 || !resolveExpireMs(v, isSec, isRel, absExpire))
                     {
                         badExpire = true;
                         break;
@@ -1953,16 +2009,32 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             n = snprintf(b.ptr, b.length,
                     "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
             ib.append(b[0 .. n]);
+            // Persistence: dreads has no RDB, but the common fields tests read
+            // via `s <field>` must exist and be numeric. rdb_changes_since_last_
+            // save tracks effective writes (monotonic; not Redis's exact
+            // per-mutation dirty count — see BLACKBOX-TODO.md).
+            {
+                import dreads.server : gWriteEpoch;
+
+                ib.append("# Persistence\r\nloading:0\r\n");
+                n = snprintf(b.ptr, b.length, "rdb_changes_since_last_save:%llu\r\n",
+                        cast(ulong) gWriteEpoch);
+                ib.append(b[0 .. n]);
+                ib.append("rdb_bgsave_in_progress:0\r\nrdb_last_save_time:0\r\n"
+                        ~ "rdb_last_bgsave_status:ok\r\naof_enabled:0\r\n"
+                        ~ "aof_rewrite_in_progress:0\r\naof_last_bgrewrite_status:ok\r\n"
+                        ~ "aof_last_write_status:ok\r\n");
+            }
             ib.append("# Keyspace\r\n");
-            // count what a client would see: logically-expired keys are gone
+            // raw dict count, like Redis/DBSIZE: a logically-expired key that
+            // hasn't been reaped yet still counts (the test with active-expire
+            // off relies on this). `expires` counts keys carrying a TTL.
             static void dbLine(ref ByteBuffer ib, ref char[192] b, size_t idx,
                     ref Keyspace db) @nogc nothrow
             {
                 size_t live = 0, volatileKeys = 0;
                 foreach (k, ref v; db)
                 {
-                    if (v.expired())
-                        continue;
                     live++;
                     if (v.expireAtMs != 0)
                         volatileKeys++;
@@ -3550,10 +3622,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 {
                     examined++;
                     auto obj = ks.d.valAt(i);
-                    bool dead = obj.expireAtMs != 0 && now >= obj.expireAtMs;
-                    if (!dead && (!filterType || obj.type == wantType)
-                            && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
-                        found[got++] = ks.d.keyAt(i);
+                    // a TYPE filter gates the passive expiry: only type-matching
+                    // expired keys are reaped, a non-matching one is skipped and
+                    // survives (Redis semantics)
+                    bool typeOk = !filterType || obj.type == wantType;
+                    if (typeOk)
+                    {
+                        if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                            ks.lookup(ks.d.keyAt(i)); // drop it via the lazy-expire path
+                        else if (pat.length == 0 || globMatch(pat, ks.d.keyAt(i)))
+                            found[got++] = ks.d.keyAt(i);
+                    }
                 }
                 i++;
             }
@@ -3627,8 +3706,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long cursor;
             const(char)[] pat;
             long count;
+            bool noScores;
             if (!parseLong(args[1].str, cursor) || cursor < 0
-                    || !parseScanOpts(args[2 .. $], pat, count, false))
+                    || !parseScanOpts(args[2 .. $], pat, count, false, &noScores, null, true))
             {
                 repError(o, "ERR syntax error");
                 break;
@@ -3655,13 +3735,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto cn = snprintf(cb.ptr, cb.length, "%llu", cast(ulong) next);
             repArrayHeader(o, 2);
             repBulk(o, cb[0 .. cn]);
-            repArrayHeader(o, matched * 2);
+            repArrayHeader(o, matched * (noScores ? 1 : 2));
             if (n)
                 obj.zset.walkRange(start, n, false, (m, s) {
                     if (pat.length == 0 || globMatch(pat, m))
                     {
                         repBulk(o, m);
-                        repDouble(o, s);
+                        if (!noScores)
+                            repDouble(o, s);
                     }
                     return 0;
                 });
@@ -4377,7 +4458,8 @@ private void repEntry(ref ByteBuffer o, StreamID id, const(FieldPair)[] pairs) @
 
 /// [MATCH pat] [COUNT n] [NOVALUES] tail options of the SCAN family.
 private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long count,
-        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null) @nogc nothrow
+        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null,
+        bool allowNoScores = false) @nogc nothrow
 {
     count = 10;
     size_t i = 0;
@@ -4397,6 +4479,11 @@ private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long c
         else if (allowNoValues && noValues !is null && eqICKeyword(opts[i].str, "NOVALUES"))
         {
             *noValues = true;
+            i++;
+        }
+        else if (allowNoScores && noValues !is null && eqICKeyword(opts[i].str, "NOSCORES"))
+        {
+            *noValues = true; // ZSCAN: omit the score column, mirror NOVALUES
             i++;
         }
         else if (typeOut !is null && eqICKeyword(opts[i].str, "TYPE") && i + 1 < opts.length)
@@ -4871,8 +4958,7 @@ public bool parseLong(scope const(char)[] s, out long v) @nogc nothrow
 
 public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trusted
 {
-    char[64] tmp = void;
-    if (s.length == 0 || s.length >= tmp.length)
+    if (s.length == 0)
         return false;
     // Redis rejects leading whitespace (strtod would silently skip it, so "  11"
     // must NOT parse as 11); trailing garbage is caught by the endp check below.
@@ -4883,11 +4969,29 @@ public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trus
     default:
         break;
     }
-    tmp[0 .. s.length] = s[]; // slice copy, not memcpy
-    tmp[s.length] = 0;
+    // strtod needs a NUL-terminated copy. The short case (every normal score)
+    // stays on the stack; the rare long decimal — e.g. DBL_MAX spelled out to
+    // ~325 digits — falls back to a growable TLS buffer, so no fixed length cap
+    // rejects a value strtod would accept.
+    char[64] tmp = void;
+    char* cstr;
+    if (s.length < tmp.length)
+    {
+        tmp[0 .. s.length] = s[];
+        tmp[s.length] = 0;
+        cstr = tmp.ptr;
+    }
+    else
+    {
+        static ByteBuffer big; // TLS scratch, reused across calls
+        big.clear();
+        big.append(s);
+        big.appendByte(0);
+        cstr = cast(char*) big.data.ptr;
+    }
     char* endp;
-    v = strtod(tmp.ptr, &endp);
-    if (endp !is tmp.ptr + s.length)
+    v = strtod(cstr, &endp);
+    if (endp !is cstr + s.length)
         return false;
     return v == v; // reject NaN like Redis
 }
@@ -4984,7 +5088,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     switch (uname)
     {
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
-    case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
+    case "SETEX", "PSETEX", "GETDEL", "DELIFEQ", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
     case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
