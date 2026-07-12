@@ -63,11 +63,18 @@ These exist but do not match Redis exactly:
   (globals they create die with the execution — fresh-interpreter isolation
   at shared-state cost) and the state is recycled past 32MB of heap.
   Helper libraries: `cjson` and `cmsgpack` (in-project D implementations),
-  `redis.sha1hex`, `bit`, `redis.log` (accepted, dropped), `redis.setresp`
-  and a **Lua 5.1 compat layer** (`unpack`, `table.getn`, `math.pow`,
-  `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4). Still missing:
-  `struct`, and `SCRIPT KILL` (the time limit hard-aborts instead — with a
-  single-threaded event loop no other command can arrive mid-script anyway).
+  `redis.sha1hex`, `bit`, `redis.log` (accepted, dropped), `redis.setresp`,
+  `redis.set_repl` and a **Lua 5.1 compat layer** (`unpack`, `table.getn`,
+  `math.pow`, `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4).
+  Redis **Functions** (FUNCTION LOAD/DELETE/FLUSH/LIST/STATS, FCALL/FCALL_RO)
+  are implemented. Still missing: `struct`. **Threading model diverges on
+  purpose**: scripts run on a dedicated Lua thread (one, off the event loop),
+  every `redis.call` round-trips to the main thread (the single keyspace
+  writer). So a long/looping script does NOT stall the loop — other clients
+  keep getting real replies (PONG), where single-threaded Redis returns
+  `-BUSY`. **SCRIPT KILL works** (a shared flag the worker's instruction hook
+  polls, like the time limit), but the BUSY-state tests are N/A since there
+  is no BUSY state.
   **Replication model: EFFECTS** (like Redis 7+, where it is also the only
   mode): the EVAL itself never enters the raft/AOF log — each write the
   script performs via redis.call is logged as itself, in its propagation

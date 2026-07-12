@@ -103,12 +103,15 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         seedRand(nowMs()); // shuffle the random-pick commands per boot
         {
             // effects replication: script writes reach the AOF one by one
-            import dreads.scripting : gScriptEffectSink;
+            import dreads.scripting : gScriptEffectSink, startLuaScriptPool;
 
             gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
                 if (gAof.enabled)
                     gAof.append(fx);
             };
+            // scripts run on a dedicated thread (off the event loop), so a
+            // busy script can't stall the loop and SCRIPT KILL can reach it
+            startLuaScriptPool();
         }
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);

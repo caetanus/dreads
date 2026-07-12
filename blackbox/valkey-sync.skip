@@ -25,6 +25,10 @@ GETEX propagate as to replica as PERSIST, UNLINK, or nothing
 Server should not propagate the read command on lazy expire
 SCAN: Lazy-expire should not be wrapped in MULTI/EXEC
 RANDOMKEY: Lazy-expire should not be wrapped in MULTI/EXEC
+# SCRIPT KILL works (the worker's hook aborts the running script), but these
+# tests assert the single-threaded BUSY contract (other clients get -BUSY while
+# a script runs). dreads runs scripts on a dedicated thread, so the event loop
+# stays responsive (PONG, not BUSY) — a deliberate divergence. See DRIFT.md.
 Timedout read-only scripts can be killed by SCRIPT KILL
 Timedout read-only scripts can be killed by SCRIPT KILL even when use pcall
 Timedout script does not cause a false dead client

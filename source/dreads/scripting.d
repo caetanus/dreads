@@ -37,16 +37,26 @@ shared static this()
     gFcallHook = &fcallCommand;
 }
 
-// Bridge context for the duration of one EVAL: which keyspace/arena to use.
+// Bridge context for the duration of one EVAL. In INLINE mode (unit tests,
+// standalone-without-pool) the bridge dispatches directly against `ks`. In
+// POOL mode the script runs on the dedicated Lua thread and the bridge
+// round-trips each redis.call to the main thread (single keyspace writer),
+// carrying `db`/`clock` instead of a keyspace pointer.
 private struct BridgeCtx
 {
-    Keyspace* ks;
+    Keyspace* ks; // inline mode only
     Arena* arena;
     bool readOnly; // EVAL_RO / EVALSHA_RO
+    bool viaPool; // true on the Lua worker: round-trip commands to main
+    ushort db; // pool mode: which gDbs slot the round-trip targets
+    ulong clock; // frozen per-script clock threaded through every round-trip
     ByteBuffer replyBuf; // staging for bridge replies, reused across calls
     ByteBuffer effectBuf; // re-encoded inner command (effect capture / propose)
 }
 
+// Bridge context lives wherever the VM runs: __gshared for inline (main), and
+// the same variable on the single Lua thread in pool mode (only one thread
+// touches the VM either way, so no sharing hazard).
 private __gshared BridgeCtx gCtx;
 
 // --- effects replication (the EVAL itself never enters the log) ---
@@ -96,8 +106,21 @@ private long monoMsecs() nothrow @nogc
     return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
 }
 
+// SCRIPT KILL: the main loop bumps this when a `SCRIPT KILL` arrives; the
+// per-worker hook (which already polls the time limit) sees it and aborts the
+// running script. Thread-shared, checked cheaply between instruction batches.
+package shared bool gScriptKillRequested;
+
+// True while the Lua thread is executing a script (SCRIPT KILL -> NOTBUSY when
+// clear). Set/cleared by the worker around each run.
+package shared bool gScriptRunning;
+
 extern (C) private void luaTimeoutHook(lua_State* L, void* ar) nothrow @nogc
 {
+    import core.atomic : atomicLoad;
+
+    if (atomicLoad(gScriptKillRequested))
+        luaL_error(L, "Script killed by user with SCRIPT KILL...");
     if (gLuaDeadlineMsecs != 0 && monoMsecs() > gLuaDeadlineMsecs)
         luaL_error(L, "script exceeded the lua-time-limit");
 }
@@ -525,10 +548,9 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
         return lua_error(L);
     }
     auto argc = lua_gettop(L);
-    if (argc == 0 || gCtx.ks is null)
-    {
-return raiseErr(L, "ERR Please specify at least one argument for this redis lib call");
-    }
+    // inline mode needs a bound keyspace; pool mode round-trips (ks is null)
+    if (argc == 0 || (!gCtx.viaPool && gCtx.ks is null))
+        return raiseErr(L, "ERR Please specify at least one argument for this redis lib call");
     auto arr = gCtx.arena.allocArray!RVal(argc);
     foreach (i; 0 .. argc)
     {
@@ -590,70 +612,28 @@ return raiseErr(L, "ERR Please specify at least one argument for this redis lib 
     }
 
     gCtx.replyBuf.clear();
-    if (isWrite)
+    int st;
+    if (gCtx.viaPool)
     {
-        import dreads.replicator : gReplicator;
-
-        if (gReplicator !is null)
-        {
-            // effects replication under raft: the leader's state only ever
-            // changes through the log, so PROPOSE the inner command and let
-            // the apply loop run it; its reply feeds the script. The
-            // consensus round-trip parks the fiber (vibe, GC control plane):
-            // the @nogc cast is the same escape the server layer lives in.
-            encodeEffect(arr);
-            alias ProposeFn = int function(scope const(ubyte)[], ref ByteBuffer) @nogc nothrow;
-            auto st = (cast(ProposeFn)&raftProposeEffect)(gCtx.effectBuf.data, gCtx.replyBuf);
-            if (st == 1)
-            {
-                enum ro = "READONLY You can't write against a read only replica.";
-                lua_pushlstring(L, ro.ptr, ro.length);
-                return lua_error(L);
-            }
-            if (st == 2)
-            {
-                enum re = "ERR replication error";
-                lua_pushlstring(L, re.ptr, re.length);
-                return lua_error(L);
-            }
-            gScriptWrote = true;
-        }
-        else
-        {
-            // keep the EVAL's frozen clock: inner dispatch must not re-freeze
-            // to the wall clock (TTL commands inside the script must resolve
-            // like their logged effect will)
-            import dreads.commands : propagationOverride;
-            import dreads.det : detNow = now;
-
-            dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena, detNow());
-            // effect capture: log the command's propagation form (or itself)
-            // unless it errored; a partially-failed script keeps its earlier
-            // writes in both the dataset and the log
-            auto rd = gCtx.replyBuf.data;
-            if (rd.length > 0 && rd[0] != '-')
-            {
-                if (gScriptEffectSink !is null)
-                {
-                    if (!propagationOverride.empty)
-                        gScriptEffectSink(propagationOverride.data);
-                    else
-                    {
-                        encodeEffect(arr);
-                        gScriptEffectSink(gCtx.effectBuf.data);
-                    }
-                }
-                gScriptWrote = true;
-            }
-            propagationOverride.clear();
-        }
+        // POOL mode: hand the command to the main thread (single keyspace
+        // writer), which executes it, captures the effect and replies. The
+        // round-trip parks this Lua-thread fiber on a cross-thread event;
+        // the @nogc cast is the same control-plane escape the server uses.
+        alias RtFn = int function(scope const(RVal)[], bool, ref ByteBuffer) @nogc nothrow;
+        st = (cast(RtFn)&poolRoundTrip)(arr, isWrite, gCtx.replyBuf);
     }
     else
     {
-        import dreads.det : detNow = now;
-
-        dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena, detNow());
+        // INLINE mode: run it right here against the bound keyspace.
+        alias ExFn = int function(ref Keyspace, const ref RVal, scope const(RVal)[],
+                bool, ulong, ref Arena, ref ByteBuffer, ref ByteBuffer) @nogc nothrow;
+        st = (cast(ExFn)&executeScriptCommand)(*gCtx.ks, cmd, arr, isWrite,
+                gCtx.clock, *gCtx.arena, gCtx.replyBuf, gCtx.effectBuf);
     }
+    if (st == 1)
+        return raiseErr(L, "READONLY You can't write against a read only replica.");
+    if (st == 2)
+        return raiseErr(L, "ERR replication error");
 
     RVal reply;
     size_t pos = 0;
@@ -711,37 +691,410 @@ private const(char)[] ensureErrCode(ref ByteBuffer buf, const(char)[] msg) nothr
     return cast(const(char)[]) buf.data;
 }
 
-/// Re-encodes the bridge command into gCtx.effectBuf as RESP (the effect to
-/// log verbatim, or the raft entry to propose).
-private void encodeEffect(scope const(RVal)[] arr) nothrow @nogc
+/// Re-encodes a command as a RESP array into `dst` (an effect to log verbatim,
+/// or a raft entry to propose).
+private void encodeCmd(ref ByteBuffer dst, scope const(RVal)[] arr) nothrow @nogc
 {
-    gCtx.effectBuf.clear();
-    repArrayHeader(gCtx.effectBuf, arr.length);
+    dst.clear();
+    repArrayHeader(dst, arr.length);
     foreach (ref a; arr)
-        repBulk(gCtx.effectBuf, a.str);
+        repBulk(dst, a.str);
 }
 
-/// Proposes one script effect through raft; the committed apply's reply lands
-/// in `o`. 0 = ok, 1 = not the leader, 2 = replication error. NOT @nogc (the
-/// fiber parks awaiting consensus); the bridge calls it through a cast.
-private int raftProposeEffect(scope const(ubyte)[] entry, ref ByteBuffer o) nothrow
+private void encodeEffect(scope const(RVal)[] arr) nothrow @nogc
 {
+    encodeCmd(gCtx.effectBuf, arr);
+}
+
+/// Executes one script bridge command against `ks` at the frozen `clock`:
+/// standalone dispatches and captures the effect (AOF sink); under raft
+/// PROPOSES the effect through consensus so the leader's state only changes
+/// via the log. Reply RESP lands in `reply`. Returns 0 ok, 1 = not the
+/// leader, 2 = replication error. Runs on the MAIN thread (the single
+/// keyspace writer) — inline for tests/standalone, or the cmd-drain in pool
+/// mode. NOT @nogc: the raft path parks the fiber awaiting consensus.
+package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
+        scope const(RVal)[] arr, bool isWrite, ulong clock, ref Arena arena,
+        ref ByteBuffer reply, ref ByteBuffer effScratch) nothrow
+{
+    import dreads.det : freezeClock;
+
+    reply.clear();
+    if (!isWrite)
+    {
+        dispatch(cmd, ks, reply, arena, clock);
+        return 0;
+    }
+    import dreads.commands : propagationOverride;
     import dreads.obj : gDbs, NUM_DBS;
     import dreads.replicator : gReplicator;
     import dreads.stream : nowMs;
 
-    auto dbIdx = cast(size_t)(gCtx.ks - &gDbs[0]);
-    if (dbIdx >= NUM_DBS)
-        dbIdx = 0;
+    if (gReplicator !is null)
+    {
+        encodeCmd(effScratch, arr);
+        auto dbIdx = cast(size_t)(&ks - &gDbs[0]);
+        if (dbIdx >= NUM_DBS)
+            dbIdx = 0;
+        try
+        {
+            if (!gReplicator.isLeader)
+                return 1;
+            gReplicator.proposeWrite(effScratch.data, nowMs(), cast(ushort) dbIdx, reply);
+        }
+        catch (Exception)
+            return 2;
+        gScriptWrote = true;
+        return 0;
+    }
+    // standalone: dispatch with the frozen clock, then log the effect
+    dispatch(cmd, ks, reply, arena, clock);
+    auto rd = reply.data;
+    if (rd.length > 0 && rd[0] != '-')
+    {
+        if (gScriptEffectSink !is null)
+        {
+            if (!propagationOverride.empty)
+                gScriptEffectSink(propagationOverride.data);
+            else
+            {
+                encodeCmd(effScratch, arr);
+                gScriptEffectSink(effScratch.data);
+            }
+        }
+        gScriptWrote = true;
+    }
+    propagationOverride.clear();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Lua worker thread — scripts run OFF the event loop on one dedicated thread
+// (SPSC queues both ways), so a busy script can't stall the main loop and a
+// SCRIPT KILL delivered on the main loop reaches the worker's hook. The
+// keyspace stays single-writer: every redis.call round-trips to the main
+// thread, which executes it and replies. Falls back to INLINE execution when
+// the pool isn't started (unit tests, standalone-without-pool).
+// ---------------------------------------------------------------------------
+
+import vibe.core.core : runTask;
+import vibe.core.sync : createSharedManualEvent, ManualEvent;
+import vibe.core.taskpool : TaskPool;
+
+import dreads.raftq : CrossQueue;
+
+public enum LuaReqKind : ubyte
+{
+    eval,
+    fcall,
+    function_,
+    script
+}
+
+private struct ReqSlot
+{
+    LuaReqKind kind;
+    bool bySha, readOnly;
+    ushort db;
+    ulong clock;
+    ByteBuffer args; // RESP-encoded arg array (stable across the hand-off)
+    ByteBuffer reply; // filled by the Lua thread
+    shared(ManualEvent) done;
+    bool ready;
+    ReqSlot* nextFree;
+}
+
+private struct CmdSlot
+{
+    ByteBuffer bytes; // RESP command from the bridge
+    ushort db;
+    ulong clock;
+    bool isWrite;
+    ByteBuffer reply;
+    int status; // 0 ok / 1 readonly-replica / 2 repl error
+    shared(ManualEvent) done;
+    bool ready;
+}
+
+private shared TaskPool gLuaPool;
+package __gshared bool gLuaPoolUp; // pool started? (server sets it)
+private __gshared CrossQueue gReqQ; // main -> lua: execution requests
+private __gshared CrossQueue gCmdQ; // lua -> main: redis.call round-trips
+private __gshared CmdSlot gCmdSlot; // reused: the Lua thread runs one call at a time
+private __gshared ReqSlot* gReqFree; // main-side freelist
+
+// pool-mode signal: THREAD-LOCAL — true only on the Lua worker thread while a
+// script runs. Must NOT be __gshared: the main thread has to see false so its
+// SCRIPT KILL / routing guards work while the worker is busy.
+private bool gPoolMode;
+private ushort gPoolDb;
+private ulong gPoolClock;
+
+/// Binds gCtx for the run: inline uses the passed keyspace and the wall clock;
+/// pool mode carries the request's db/clock and round-trips instead.
+private void bindBridgeContext(Keyspace* ks) nothrow @nogc
+{
+    import dreads.det : detNow = now;
+
+    if (gPoolMode)
+    {
+        gCtx.ks = null;
+        gCtx.viaPool = true;
+        gCtx.db = gPoolDb;
+        gCtx.clock = gPoolClock;
+    }
+    else
+    {
+        gCtx.ks = ks;
+        gCtx.viaPool = false;
+        gCtx.db = 0;
+        gCtx.clock = detNow();
+    }
+}
+
+/// Bridge (Lua thread): post one command to the main thread and await its
+/// reply. Returns the execute status; the RESP reply lands in `reply`.
+private int poolRoundTrip(scope const(RVal)[] arr, bool isWrite, ref ByteBuffer reply) nothrow
+{
+    encodeCmd(gCmdSlot.bytes, arr);
+    gCmdSlot.db = gCtx.db;
+    gCmdSlot.clock = gCtx.clock;
+    gCmdSlot.isWrite = isWrite;
+    gCmdSlot.ready = false;
+    gCmdSlot.status = 0;
     try
     {
-        if (!gReplicator.isLeader)
-            return 1;
-        gReplicator.proposeWrite(entry, nowMs(), cast(ushort) dbIdx, o);
+        auto ec = gCmdSlot.done.emitCount;
+        gCmdQ.put(gCmdSlot.bytes.data, cast(void*)&gCmdSlot, 0);
+        while (!gCmdSlot.ready)
+        {
+            ec = gCmdSlot.done.emitCount;
+            if (gCmdSlot.ready)
+                break;
+            gCmdSlot.done.waitUninterruptible(ec);
+        }
     }
     catch (Exception)
-        return 2;
-    return 0;
+    {
+        reply.clear();
+        repError(reply, "ERR script command dispatch failed");
+        return 0;
+    }
+    reply.clear();
+    reply.append(gCmdSlot.reply.data);
+    return gCmdSlot.status; // gScriptWrote is set on the main thread by the drain
+}
+
+/// Start the Lua worker thread and the main-side command drain. Called once at
+/// server boot. After this, EVAL/FCALL/FUNCTION/SCRIPT route through the pool.
+public void startLuaScriptPool() nothrow
+{
+    try
+    {
+        gReqQ = new CrossQueue(1024);
+        gCmdQ = new CrossQueue(1024);
+        gCmdSlot.done = createSharedManualEvent();
+        gLuaPool = new shared TaskPool(1, "lua");
+        gLuaPool.runTaskH(&luaThreadEntry);
+        runTask(() nothrow { cmdDrainLoop(); });
+        gLuaPoolUp = true;
+    }
+    catch (Exception)
+    {
+    }
+}
+
+/// Main-side: hand a script request to the Lua thread and await its reply.
+public void luaExecOnPool(LuaReqKind kind, scope const(RVal)[] args, bool bySha,
+        bool readOnly, ushort db, ulong clock, ref ByteBuffer o) nothrow
+{
+    auto slot = acquireReqSlot();
+    slot.kind = kind;
+    slot.bySha = bySha;
+    slot.readOnly = readOnly;
+    slot.db = db;
+    slot.clock = clock;
+    encodeCmd(slot.args, args);
+    slot.ready = false;
+    try
+    {
+        auto ec = slot.done.emitCount;
+        gReqQ.put(slot.args.data, cast(void*) slot, 0);
+        while (!slot.ready)
+        {
+            ec = slot.done.emitCount;
+            if (slot.ready)
+                break;
+            slot.done.waitUninterruptible(ec);
+        }
+    }
+    catch (Exception)
+    {
+        releaseReqSlot(slot);
+        repError(o, "ERR script execution failed");
+        return;
+    }
+    o.append(slot.reply.data);
+    releaseReqSlot(slot);
+}
+
+private ReqSlot* acquireReqSlot() nothrow
+{
+    if (gReqFree !is null)
+    {
+        auto s = gReqFree;
+        gReqFree = s.nextFree;
+        s.nextFree = null;
+        return s;
+    }
+    auto s = new ReqSlot; // one-time GC as the pool of in-flight EVALs grows
+    try
+        s.done = createSharedManualEvent();
+    catch (Exception)
+    {
+    }
+    return s;
+}
+
+private void releaseReqSlot(ReqSlot* s) nothrow
+{
+    s.nextFree = gReqFree;
+    gReqFree = s;
+}
+
+/// Routes a script entry through the pool when it's up and we're on the main
+/// thread; true = handled (caller returns). On the Lua thread (gPoolMode) it
+/// returns false so the real body runs.
+private bool routeToPool(LuaReqKind kind, scope const(RVal)[] args, ref Keyspace ks,
+        ref ByteBuffer o, bool bySha, bool readOnly) nothrow
+{
+    if (!gLuaPoolUp || gPoolMode)
+        return false;
+    import dreads.det : detNow = now;
+    import dreads.obj : gDbs, NUM_DBS;
+
+    auto dbi = cast(size_t)(&ks - &gDbs[0]);
+    if (dbi >= NUM_DBS)
+        dbi = 0;
+    luaExecOnPool(kind, args, bySha, readOnly, cast(ushort) dbi, detNow(), o);
+    return true;
+}
+
+/// The Lua worker thread: drain requests, run each script, reply. One request
+/// at a time — the VM and its lua_State are affine to this thread.
+private static void luaThreadEntry() nothrow
+{
+    static ByteBuffer payload;
+    static Arena arena;
+    while (true)
+    {
+        try
+        {
+            gReqQ.waitData();
+            void* tag;
+            ulong meta;
+            uint kind;
+            while (gReqQ.take(payload, tag, meta, kind))
+            {
+                auto slot = cast(ReqSlot*) tag;
+                arena.reset();
+                import core.atomic : atomicStore;
+
+                atomicStore(gScriptRunning, true);
+                scope (exit)
+                {
+                    atomicStore(gScriptRunning, false);
+                    atomicStore(gScriptKillRequested, false); // consume any pending kill
+                }
+                // reconstruct the arg array from the RESP payload
+                RVal cmd;
+                size_t pos = 0;
+                slot.reply.clear();
+                if (parseValue(slot.args.data, pos, arena, cmd) != ParseStatus.ok
+                        || cmd.type != RType.Array)
+                {
+                    repError(slot.reply, "ERR internal script marshalling error");
+                }
+                else
+                {
+                    gPoolMode = true;
+                    gPoolDb = slot.db;
+                    gPoolClock = slot.clock;
+                    scope (exit)
+                        gPoolMode = false;
+                    auto a = cmd.arr;
+                    // gDbs[0] is a placeholder; pool mode never dereferences ks
+                    import dreads.obj : gDbs;
+
+                    final switch (slot.kind)
+                    {
+                    case LuaReqKind.eval:
+                        evalCommand(a, gDbs[0], slot.reply, arena, slot.bySha, slot.readOnly);
+                        break;
+                    case LuaReqKind.fcall:
+                        fcallCommand(a, gDbs[0], slot.reply, arena, slot.readOnly);
+                        break;
+                    case LuaReqKind.function_:
+                        functionCommand(a, gDbs[0], slot.reply, arena);
+                        break;
+                    case LuaReqKind.script:
+                        scriptCommand(a, slot.reply);
+                        break;
+                    }
+                }
+                slot.ready = true;
+                slot.done.emit();
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+}
+
+/// Main-side command drain: execute each round-tripped redis.call against the
+/// keyspace (single writer here), capture the effect, reply to the Lua thread.
+private void cmdDrainLoop() nothrow
+{
+    static ByteBuffer payload;
+    static Arena arena;
+    static ByteBuffer eff;
+    import dreads.commands : isWriteCommand;
+    import dreads.obj : gDbs, NUM_DBS;
+
+    while (true)
+    {
+        try
+        {
+            gCmdQ.waitData();
+            void* tag;
+            ulong meta;
+            uint kind;
+            while (gCmdQ.take(payload, tag, meta, kind))
+            {
+                auto slot = cast(CmdSlot*) tag;
+                arena.reset();
+                RVal cmd;
+                size_t pos = 0;
+                slot.reply.clear();
+                slot.status = 0;
+                if (parseValue(slot.bytes.data, pos, arena, cmd) == ParseStatus.ok
+                        && cmd.type == RType.Array && cmd.arr.length > 0)
+                {
+                    auto dbi = slot.db < NUM_DBS ? slot.db : 0;
+                    slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr,
+                            slot.isWrite, slot.clock, arena, slot.reply, eff);
+                }
+                else
+                    repError(slot.reply, "ERR internal script command error");
+                slot.ready = true;
+                slot.done.emit();
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
 }
 
 /// Redis reply -> Lua value conversion rules.
@@ -936,6 +1289,8 @@ private void sha1Hex(scope const(char)[] body_, ref char[40] outHex) nothrow @no
 public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         ref Arena arena, bool bySha, bool readOnly = false) nothrow
 {
+    if (routeToPool(LuaReqKind.eval, args, ks, o, bySha, readOnly))
+        return;
     if (args.length < 2)
     {
         repError(o, bySha ? "ERR wrong number of arguments for 'evalsha' command"
@@ -1009,9 +1364,9 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     }
     lua_setglobal(gL, "ARGV");
 
-    gCtx.ks = &ks;
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    bindBridgeContext(&ks); // sets ks/viaPool/db/clock for inline or pool mode
     gScriptWrote = false; // per-EVAL: the server signals WATCH/blocked wakes
     // deterministic per-invocation RNG (replicas/replay must agree)
     lua_getglobal(gL, "math");
@@ -1149,6 +1504,35 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
     if (args.length == 0)
     {
         repError(o, "ERR wrong number of arguments for 'script' command");
+        return;
+    }
+    // SCRIPT KILL runs on the MAIN thread (never the pool — the Lua thread is
+    // busy with the very script we're killing): flag it for the worker's hook.
+    if (!gPoolMode && args[0].str.length == 4)
+    {
+        char[4] k = void;
+        foreach (i, c; args[0].str)
+            k[i] = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+        if (k == "KILL")
+        {
+            import core.atomic : atomicLoad, atomicStore;
+
+            if (!atomicLoad(gScriptRunning))
+            {
+                repError(o, "NOTBUSY No scripts in execution right now.");
+                return;
+            }
+            atomicStore(gScriptKillRequested, true);
+            repSimple(o, "OK");
+            return;
+        }
+    }
+    // everything else runs on the Lua thread when the pool is up
+    if (gLuaPoolUp && !gPoolMode)
+    {
+        import dreads.det : detNow = now;
+
+        luaExecOnPool(LuaReqKind.script, args, false, false, 0, detNow(), o);
         return;
     }
     gLuaLock.lock_nothrow();
@@ -1480,6 +1864,8 @@ private void propagateFunctionCmd(const(RVal)[] args) nothrow @nogc
 public void functionCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         ref Arena arena) nothrow
 {
+    if (routeToPool(LuaReqKind.function_, args, ks, o, false, false))
+        return;
     import dreads.commands : eqICKeyword;
 
     if (args.length == 0)
@@ -1645,6 +2031,8 @@ public void functionCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer 
 public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         ref Arena arena, bool readOnly) nothrow
 {
+    if (routeToPool(LuaReqKind.fcall, args, ks, o, false, readOnly))
+        return;
     if (args.length < 2)
     {
         repError(o, readOnly ? "ERR wrong number of arguments for 'fcall_ro' command"
@@ -1716,9 +2104,9 @@ public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         }
     }
 
-    gCtx.ks = &ks;
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    bindBridgeContext(&ks);
     gScriptWrote = false;
     // deterministic per-invocation RNG, script deadline, state recycling —
     // the same run discipline as EVAL
