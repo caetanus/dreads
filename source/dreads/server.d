@@ -1479,9 +1479,11 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         }
         if (ok)
         {
+            import dreads.notify : parseNotifyFlags;
             import dreads.obj : gActiveExpire;
 
-            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggle
+            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
+            cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
             repSimple(o, "OK");
         }
         else
@@ -1493,37 +1495,111 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         repSimple(o, "OK");
         return;
     }
+    if (eqICDebug(args[0].str, "HELP"))
+    {
+        repHelp!"CONFIG"(o);
+        return;
+    }
+    if (eqICDebug(args[0].str, "INFO"))
+    {
+        configInfo(args[1 .. $], o);
+        return;
+    }
     repUnknownSubcommand(o, "CONFIG", args.length ? args[0].str : "");
+}
+
+// CONFIG INFO metadata: enough shape (name/type/values/range) for tooling and
+// the Valkey suite's type probes; not an exhaustive mirror of Valkey's table.
+private struct CfgMeta
+{
+    string name;
+    string type; // bool | numeric | string | enum | special
+    immutable(string)[] values; // enum choices
+    bool hasRange;
+    long lo, hi;
+}
+
+private static immutable CfgMeta[] gCfgMeta = [
+    {"appendonly", "bool"},
+    {"active-expire", "bool"},
+    {"activerehashing", "bool"},
+    {"lazyfree-lazy-server-del", "bool"},
+    {"port", "numeric", null, true, 0, 65_535},
+    {"maxmemory", "numeric", null, true, 0, long.max},
+    {"proto-max-bulk-len", "numeric", null, true, 0, long.max},
+    {"client-query-buffer-limit", "numeric", null, true, 0, long.max},
+    {"hash-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"hash-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"list-max-listpack-size", "numeric", null, true, long.min, long.max},
+    {"list-compress-depth", "numeric", null, true, 0, long.max},
+    {"set-max-intset-entries", "numeric", null, true, 0, long.max},
+    {"set-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"set-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"zset-max-listpack-entries", "numeric", null, true, 0, long.max},
+    {"zset-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"stream-node-max-entries", "numeric", null, true, 0, long.max},
+    {"dir", "string"},
+    {"appendfilename", "string"},
+    {"dbfilename", "string"},
+    {"maxmemory-policy", "enum", [
+        "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random",
+        "volatile-random", "volatile-ttl"
+    ]},
+    {"repl-diskless-load", "enum", ["disabled", "on-empty-db", "swapdb"]},
+    {"save", "special"},
+    {"notify-keyspace-events", "special"},
+];
+
+/// CONFIG INFO [name-or-glob ...] — array of per-directive metadata maps.
+private void configInfo(const(RVal)[] pats, ref ByteBuffer o) nothrow
+{
+    static bool hit(const(RVal)[] pats, string nm) nothrow
+    {
+        if (pats.length == 0)
+            return true;
+        foreach (ref p; pats)
+            if (globMatch(p.str, nm))
+                return true;
+        return false;
+    }
+
+    size_t matches = 0;
+    foreach (ref m; gCfgMeta)
+        if (hit(pats, m.name))
+            matches++;
+    repArrayHeader(o, matches);
+    foreach (ref m; gCfgMeta)
+    {
+        if (!hit(pats, m.name))
+            continue;
+        auto pairs = 2 + (m.values.length ? 1 : 0) + (m.hasRange ? 1 : 0);
+        repMapHeader(o, pairs);
+        repBulk(o, "name");
+        repBulk(o, m.name);
+        repBulk(o, "type");
+        repBulk(o, m.type);
+        if (m.values.length)
+        {
+            repBulk(o, "values");
+            repArrayHeader(o, m.values.length);
+            foreach (v; m.values)
+                repBulk(o, v);
+        }
+        if (m.hasRange)
+        {
+            repBulk(o, "range");
+            repArrayHeader(o, 2);
+            repInt(o, m.lo);
+            repInt(o, m.hi);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // maxmemory / LRU eviction (jemalloc-backed accounting; Linux only)
 // ---------------------------------------------------------------------------
 
-version (linux)
-{
-    private extern (C) int mallctl(const(char)* name, void* oldp, size_t* oldlenp,
-            void* newp, size_t newlen) nothrow @nogc;
-
-    private ulong usedMemory() nothrow @nogc
-    {
-        ulong epoch = 1;
-        size_t esz = epoch.sizeof;
-        mallctl("epoch", &epoch, &esz, &epoch, epoch.sizeof);
-        size_t allocated;
-        size_t asz = allocated.sizeof;
-        if (mallctl("stats.allocated", &allocated, &asz, null, 0) != 0)
-            return 0;
-        return allocated;
-    }
-}
-else
-{
-    private ulong usedMemory() nothrow @nogc
-    {
-        return 0; // accounting unavailable: maxmemory is inert
-    }
-}
+import dreads.mem : usedMemory; // jemalloc accounting (shared with INFO)
 
 private __gshared size_t gEvictCursor;
 
@@ -1616,8 +1692,13 @@ private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) 
 {
     import core.time : MonoTime, msecs;
 
+    import dreads.obj : gBlockedClients;
+
     if (timeoutMs != 0 && remainingMs <= 0)
         return false;
+    gBlockedClients++; // INFO clients: parked in a blocking wait
+    scope (exit)
+        gBlockedClients--;
     auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs; // forever = 1h slices
     auto before = MonoTime.currTime;
     ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
@@ -1999,6 +2080,8 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
+    else if (eqICDebug(sub, "HELP"))
+        repHelp!"CLIENT"(o);
     else
         repUnknownSubcommand(o, "CLIENT", sub);
 }
@@ -2089,6 +2172,11 @@ private void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
                 repBulk(o, a.str);
                 repInt(o, cast(long) gShardPubSub.channelSubCount(a.str));
             }
+            break;
+        }
+    case "HELP":
+        {
+            repHelp!"PUBSUB"(o);
             break;
         }
     default:

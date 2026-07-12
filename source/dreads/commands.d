@@ -88,7 +88,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "COMMAND":
         {
-            repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"COMMAND"(o);
+            else
+                repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
             break;
         }
     case "QUIT":
@@ -1629,15 +1632,56 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // CONFIG is handled at the server layer (it owns the live Config)
     case "INFO":
         {
-            size_t volatileKeys = 0;
-            foreach (k, ref v; ks)
-                if (v.expireAtMs != 0)
-                    volatileKeys++;
-            char[160] b = void;
-            auto n = snprintf(b.ptr, b.length,
-                    "# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n# Keyspace\r\ndb0:keys=%zu,expires=%zu\r\n",
-                    ks.length, volatileKeys);
-            repVerbatim(o, "txt", b[0 .. n]); // RESP3 verbatim (=txt:...), RESP2 bulk
+            import dreads.config : gConfig;
+            import dreads.mem : usedMemory;
+            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys;
+
+            static ByteBuffer ib; // TLS scratch: INFO payload
+            ib.clear();
+            char[192] b = void;
+            ib.append("# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n");
+            auto n = snprintf(b.ptr, b.length, "# Clients\r\nblocked_clients:%lld\r\n",
+                    gBlockedClients);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length,
+                    "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
+                    usedMemory(), gConfig.maxmemory,
+                    cast(int) gConfig.maxmemoryPolicy.length, gConfig.maxmemoryPolicy.ptr);
+            ib.append(b[0 .. n]);
+            n = snprintf(b.ptr, b.length,
+                    "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
+            ib.append(b[0 .. n]);
+            ib.append("# Keyspace\r\n");
+            // count what a client would see: logically-expired keys are gone
+            static void dbLine(ref ByteBuffer ib, ref char[192] b, size_t idx,
+                    ref Keyspace db) @nogc nothrow
+            {
+                size_t live = 0, volatileKeys = 0;
+                foreach (k, ref v; db)
+                {
+                    if (v.expired())
+                        continue;
+                    live++;
+                    if (v.expireAtMs != 0)
+                        volatileKeys++;
+                }
+                if (live == 0)
+                    return;
+                auto n = snprintf(b.ptr, b.length, "db%zu:keys=%zu,expires=%zu,avg_ttl=0\r\n",
+                        idx, live, volatileKeys);
+                ib.append(b[0 .. n]);
+            }
+
+            bool ksIsGlobal = false;
+            foreach (i, ref db; gDbs)
+            {
+                if (&db is &ks)
+                    ksIsGlobal = true;
+                dbLine(ib, b, i, db);
+            }
+            if (!ksIsGlobal) // standalone keyspace (unit tests): report as db0
+                dbLine(ib, b, 0, ks);
+            repVerbatim(o, "txt", cast(const(char)[]) ib.data); // RESP3 verbatim, RESP2 bulk
             break;
         }
 
@@ -2564,8 +2608,37 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repSimple(o, "OK");
             else if (args.length >= 1 && eqICKeyword(args[0].str, "LEN"))
                 repInt(o, 0);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"SLOWLOG"(o);
             else
-                repArrayHeader(o, 0); // GET / HELP
+                repArrayHeader(o, 0); // GET
+            break;
+        }
+    case "COMMANDLOG": // Valkey 8's generalized SLOWLOG; nothing is logged yet
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
+                repSimple(o, "OK");
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "LEN"))
+                repInt(o, 0);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"COMMANDLOG"(o);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "GET"))
+                repArrayHeader(o, 0);
+            else
+                repUnknownSubcommand(o, "COMMANDLOG", args.length ? args[0].str : "");
+            break;
+        }
+    case "FUNCTION": // no scripting-function library support; empty catalog
+        {
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"FUNCTION"(o);
+            else if (args.length >= 1 && (eqICKeyword(args[0].str, "LIST")
+                    || eqICKeyword(args[0].str, "STATS")))
+                repArrayHeader(o, 0);
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "DUMP"))
+                repBulk(o, "");
+            else
+                repUnknownSubcommand(o, "FUNCTION", args.length ? args[0].str : "");
             break;
         }
     case "LATENCY":
@@ -2578,7 +2651,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "MODULE":
         {
-            repArrayHeader(o, 0);
+            if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+                repHelp!"MODULE"(o);
+            else
+                repArrayHeader(o, 0); // LIST: no modules
             break;
         }
     case "ACL":
@@ -3973,6 +4049,11 @@ private void memoryCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         repInt(o, cast(long) ks.length);
         return;
     }
+    if (args.length && eqICKeyword(args[0].str, "HELP"))
+    {
+        repHelp!"MEMORY"(o);
+        return;
+    }
     repUnknownSubcommand(o, "MEMORY", args.length ? args[0].str : "");
 }
 
@@ -4013,6 +4094,11 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
 private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
+    if (args.length == 1 && eqICKeyword(args[0].str, "HELP"))
+    {
+        repHelp!"OBJECT"(o);
+        return;
+    }
     if (args.length != 2)
     {
         repError(o, "ERR wrong number of arguments for 'object' command");

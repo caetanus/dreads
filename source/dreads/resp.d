@@ -374,6 +374,17 @@ public void repUnknownSubcommand(ref ByteBuffer o, scope const(char)[] parent,
     o.append(" HELP.\r\n");
 }
 
+/// Minimal "<CMD> HELP" reply: an array of status lines in Valkey's shape.
+/// The first line is the one suites pattern-match ("*<CMD> <subcommand> *").
+public void repHelp(string cmd)(ref ByteBuffer o) @nogc nothrow
+{
+    enum header = cmd ~ " <subcommand> [<arg> [value] [opt] ...]. Subcommands are:";
+    repArrayHeader(o, 3);
+    repSimple(o, header);
+    repSimple(o, "HELP");
+    repSimple(o, "    Print this help.");
+}
+
 public void repArrayHeader(ref ByteBuffer o, size_t n) @nogc nothrow
 {
     o.appendByte('*');
