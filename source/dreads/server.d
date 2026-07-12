@@ -1529,6 +1529,8 @@ private struct CfgMeta
     immutable(string)[] values; // enum choices
     bool hasRange;
     long lo, hi;
+    immutable(string)[] flags; // e.g. immutable | sensitive | alias
+    string aliasName; // the paired name for aliased directives ("" = none)
 }
 
 private static immutable CfgMeta[] gCfgMeta = [
@@ -1537,6 +1539,7 @@ private static immutable CfgMeta[] gCfgMeta = [
     {"activerehashing", "bool"},
     {"lazyfree-lazy-server-del", "bool"},
     {"port", "numeric", null, true, 0, 65_535},
+    {"maxclients", "numeric", null, true, 1, long.max},
     {"maxmemory", "numeric", null, true, 0, long.max},
     {"proto-max-bulk-len", "numeric", null, true, 0, long.max},
     {"client-query-buffer-limit", "numeric", null, true, 0, long.max},
@@ -1560,6 +1563,11 @@ private static immutable CfgMeta[] gCfgMeta = [
     {"repl-diskless-load", "enum", ["disabled", "on-empty-db", "swapdb"]},
     {"save", "special"},
     {"notify-keyspace-events", "special"},
+    // directives carried only for their metadata (flags / aliasing)
+    {"databases", "numeric", null, true, 1, 65_535, ["immutable"]},
+    {"requirepass", "string", null, false, 0, 0, ["sensitive"]},
+    {"replicaof", "string", null, false, 0, 0, null, "slaveof"},
+    {"slaveof", "string", null, false, 0, 0, ["alias"], "replicaof"},
 ];
 
 /// CONFIG INFO [name-or-glob ...] — array of per-directive metadata maps.
@@ -1584,7 +1592,9 @@ private void configInfo(const(RVal)[] pats, ref ByteBuffer o) nothrow
     {
         if (!hit(pats, m.name))
             continue;
-        auto pairs = 2 + (m.values.length ? 1 : 0) + (m.hasRange ? 1 : 0);
+        // name + type + flags are always present; values/range/alias vary
+        auto pairs = 3 + (m.values.length ? 1 : 0) + (m.hasRange ? 1 : 0)
+            + (m.aliasName.length ? 1 : 0);
         repMapHeader(o, pairs);
         repBulk(o, "name");
         repBulk(o, m.name);
@@ -1603,6 +1613,15 @@ private void configInfo(const(RVal)[] pats, ref ByteBuffer o) nothrow
             repArrayHeader(o, 2);
             repInt(o, m.lo);
             repInt(o, m.hi);
+        }
+        repBulk(o, "flags");
+        repArrayHeader(o, m.flags.length);
+        foreach (f; m.flags)
+            repBulk(o, f);
+        if (m.aliasName.length)
+        {
+            repBulk(o, "alias");
+            repBulk(o, m.aliasName);
         }
     }
 }
