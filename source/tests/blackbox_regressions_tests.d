@@ -293,6 +293,79 @@ version (unittest)
             .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
     }
 
+    @("blackbox.functions")
+    unittest
+    {
+        // minimal Redis Functions: LOAD registers named callbacks, FCALL runs
+        // them with KEYS/ARGV as arguments, flags gate FCALL_RO
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.run("FUNCTION", "FLUSH");
+            ks.d.free();
+        }
+        enum lib = "#!lua name=mylib\n"
+            ~ "redis.register_function('f1', function(KEYS, ARGV) "
+            ~ "return redis.call('SET', KEYS[1], ARGV[1]) end)\n"
+            ~ "redis.register_function{function_name='f2', callback="
+            ~ "function(KEYS, ARGV) return redis.call('GET', KEYS[1]) end, "
+            ~ "flags={'no-writes'}}";
+        ks.run("FUNCTION", "LOAD", lib).expect.to.equal("$5\r\nmylib\r\n");
+        // duplicate load fails without REPLACE, succeeds with it
+        ks.run("FUNCTION", "LOAD", lib).expect.to.contain("already exists");
+        ks.run("FUNCTION", "LOAD", "REPLACE", lib).expect.to.equal("$5\r\nmylib\r\n");
+        ks.run("FCALL", "f1", "1", "k", "v").expect.to.equal("+OK\r\n");
+        ks.run("FCALL", "f2", "1", "k").expect.to.equal("$1\r\nv\r\n");
+        // FCALL_RO: only no-writes functions
+        ks.run("FCALL_RO", "f2", "1", "k").expect.to.equal("$1\r\nv\r\n");
+        ks.run("FCALL_RO", "f1", "1", "k", "x")
+            .expect.to.contain("with write flag using *_ro");
+        // and a no-writes function is refused a write at the bridge
+        enum badLib = "#!lua name=badlib\n"
+            ~ "redis.register_function{function_name='bad', callback="
+            ~ "function(KEYS, ARGV) return redis.call('SET', KEYS[1], 'x') end, "
+            ~ "flags={'no-writes'}}";
+        ks.run("FUNCTION", "LOAD", badLib);
+        ks.run("FCALL_RO", "bad", "1", "kk")[0].expect.to.equal('-');
+        // errors
+        ks.run("FCALL", "nope", "0").expect.to.equal("-ERR Function not found\r\n");
+        ks.run("FUNCTION", "LOAD", "no shebang here")
+            .expect.to.equal("-ERR Missing library metadata\r\n");
+        ks.run("FUNCTION", "LOAD", "#!lua name=empty\nlocal x = 1")
+            .expect.to.equal("-ERR No functions registered\r\n");
+        // redis.call is fenced off during library load
+        ks.run("FUNCTION", "LOAD", "#!lua name=fence\nredis.call('SET', 'a', 'b')")
+            .expect.to.contain("function loading context");
+        // the server API alias registers too
+        enum srvLib = "#!lua name=srvlib\n"
+            ~ "server.register_function('sf', function(KEYS, ARGV) return 7 end)";
+        ks.run("FUNCTION", "LOAD", srvLib).expect.to.equal("$6\r\nsrvlib\r\n");
+        ks.run("FCALL", "sf", "0").expect.to.equal(":7\r\n");
+        // DELETE drops the lib's functions
+        ks.run("FUNCTION", "DELETE", "srvlib").expect.to.equal("+OK\r\n");
+        // LOAD/DELETE/FLUSH propagate themselves (registry must replicate)
+        (cast(string) propagationOverride.data).expect.to.contain("FUNCTION");
+        ks.run("FCALL", "sf", "0").expect.to.equal("-ERR Function not found\r\n");
+        ks.run("FUNCTION", "DELETE", "srvlib").expect.to.equal("-ERR Library not found\r\n");
+        // effects: FCALL writes replicate as the inner command, never FCALL
+        {
+            import dreads.scripting : gScriptEffectSink;
+
+            static ByteBuffer captured;
+            captured.clear();
+            auto saved = gScriptEffectSink;
+            scope (exit)
+                gScriptEffectSink = saved;
+            gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
+                captured.append(fx);
+            };
+            ks.run("FCALL", "f1", "1", "fxk", "fxv").expect.to.equal("+OK\r\n");
+            auto fx = (cast(string) captured.data).idup;
+            fx.expect.to.contain("SET");
+            fx.expect.to.not.contain("FCALL");
+        }
+    }
+
     @("blackbox.lpos_rank_zero_message")
     unittest
     {

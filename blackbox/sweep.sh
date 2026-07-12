@@ -12,7 +12,9 @@ FILES=${@:-"unit/type/incr unit/type/string unit/type/list unit/type/hash unit/t
 mkdir -p "$OUT"
 cd /tmp/valkey
 for f in $FILES; do
-  pkill -9 -x dreads 2>/dev/null
+  # kill by PORT, never by process name: -x would take down dreads
+  # instances that belong to other sessions/sweeps
+  fuser -k $PORT/tcp 2>/dev/null
   while ss -tlnH | grep -q ":$PORT "; do sleep 0.2; done
   (cd /tmp && $DREADS $CONF $PORT >"$OUT/server-$(echo $f | tr '/' '_').log" 2>&1 &)
   for i in $(seq 50); do redis-cli -p $PORT ping >/dev/null 2>&1 && break; sleep 0.1; done
@@ -20,4 +22,4 @@ for f in $FILES; do
   timeout 900 ./runtest --host 127.0.0.1 --port $PORT --single $f --skipfile $SKIP > "$OUT/$name.log" 2>&1
   echo "$f exit=$?"
 done
-pkill -9 -x dreads 2>/dev/null
+fuser -k $PORT/tcp 2>/dev/null

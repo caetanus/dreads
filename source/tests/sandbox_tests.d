@@ -35,14 +35,22 @@ version (unittest)
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // io/os/package/debug are not loaded; reading them trips _G protection
-        foreach (lib; ["os", "io", "debug", "package", "require", "dofile",
+        // io/package/debug are not loaded; reading them trips _G protection
+        foreach (lib; ["io", "debug", "package", "require", "dofile",
                 "loadfile", "load", "print"])
         {
             auto reply = ks.run2(lib);
             reply[0].expect.to.equal('-');
             reply.expect.to.contain("global");
         }
+        // os is a two-function whitelist: clock/time yes, execute & co. no
+        ks.evalRun("return type(os.clock())").expect.to.equal("$6\r\nnumber\r\n");
+        // os is clock-only when enumerated, but any other field is a stub
+        // that errors on call (Valkey's exact "attempt to call field 'X'")
+        ks.evalRun("local n=0 for k in pairs(os) do n=n+1 end return n").expect.to.equal(":1\r\n");
+        ks.evalRun("os.execute()").expect.to.contain("attempt to call field 'execute'");
+        ks.evalRun("os.getenv()").expect.to.contain("attempt to call field 'getenv'");
+        ks.evalRun("os.time()").expect.to.contain("attempt to call field 'time'");
         // the allowed libraries work
         ks.evalRun("return string.upper('ok')").expect.to.equal("$2\r\nOK\r\n");
         ks.evalRun("return table.concat({'a','b'}, '-')").expect.to.equal("$3\r\na-b\r\n");
@@ -62,16 +70,19 @@ version (unittest)
         Keyspace ks;
         scope (exit)
             ks.d.free();
-        // globals live in a throwaway per-run _ENV: usable within the script...
-        ks.evalRun("leaked = 42 return leaked").expect.to.equal(":42\r\n");
-        // ...but gone on the next run (reads chain to the protected base)
+        // creating a global is forbidden (Valkey parity): the throwaway _ENV
+        // is read-only for undeclared names
+        auto wr = ks.evalRun("leaked = 42 return 1");
+        wr[0].expect.to.equal('-');
+        wr.expect.to.contain("readonly table");
+        // reading an undeclared global errors through the protected base
         auto next = ks.evalRun("return tostring(leaked)");
         next[0].expect.to.equal('-');
         next.expect.to.contain("nonexistent global");
-        // writing the shared base directly is still blocked
+        // writing the shared base directly is blocked too
         auto direct = ks.evalRun("_G.leaked = 42 return 1");
         direct[0].expect.to.equal('-');
-        direct.expect.to.contain("create global");
+        direct.expect.to.contain("readonly table");
         // locals are fine, and KEYS/ARGV still arrive
         ks.evalRun("local x = 42 return x").expect.to.equal(":42\r\n");
         ks.evalRun("return {KEYS[1], ARGV[1]}", "1", "k", "a")
@@ -243,6 +254,31 @@ version (unittest)
         ks.evalRun("return redis.log()")[0].expect.to.equal('-'); // needs 2+ args
         ks.evalRun("redis.setresp(3); return 1").expect.to.equal(":1\r\n");
         ks.evalRun("return redis.setresp(4)")[0].expect.to.equal('-');
+    }
+
+    @("sandbox.blocking_commands_one_shot")
+    unittest
+    {
+        // inside a script the blocking family degrades to one immediate
+        // attempt (scripts, like replay, can never wait) — and script
+        // command names arrive lowercase, which once picked the wrong verb
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.evalRun("local r = redis.pcall('blpop', KEYS[1], 0); "
+                ~ "return r == false and 1 or 0", "1", "nolist")
+            .expect.to.equal(":1\r\n");
+        ks.evalRun("redis.call('RPUSH', KEYS[1], 'a', 'b'); "
+                ~ "local r = redis.call('blpop', KEYS[1], 0); return r[2]", "1", "bl")
+            .expect.to.equal("$1\r\na\r\n");
+        ks.evalRun("redis.call('RPUSH', KEYS[1], 'x'); "
+                ~ "return redis.call('brpoplpush', KEYS[1], KEYS[2], 0)", "2", "bs", "bd")
+            .expect.to.equal("$1\r\nx\r\n");
+        ks.evalRun("redis.call('ZADD', KEYS[1], 1, 'lo', 2, 'hi'); "
+                ~ "local r = redis.call('bzpopmax', KEYS[1], 0); return r[2]", "1", "bz")
+            .expect.to.equal("$2\r\nhi\r\n");
+        ks.evalRun("local r = redis.call('bzmpop', 0, 1, KEYS[1], 'MIN'); "
+                ~ "return r[1]", "1", "bz").expect.to.equal("$2\r\nbz\r\n");
     }
 
     @("sandbox.effects_replication")
