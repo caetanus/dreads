@@ -11,6 +11,7 @@ import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.zset : ZSet;
 import dreads.smallset : SmallSet;
 import dreads.smallhash : SmallHash;
+import dreads.smallzset : SmallZSet;
 import emplace.map : Map;
 import emplace.vector : Vector;
 
@@ -52,7 +53,7 @@ public struct RObj
         DList list;
         SmallHash hash;
         SmallSet set;
-        ZSet zset;
+        SmallZSet zset;
         Stream stream;
     }
 
