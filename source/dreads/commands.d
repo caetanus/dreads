@@ -4073,12 +4073,21 @@ public bool parseLong(scope const(char)[] s, out long v) @nogc nothrow
     return true;
 }
 
-public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow
+public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trusted
 {
     char[64] tmp = void;
     if (s.length == 0 || s.length >= tmp.length)
         return false;
-    memcpy(tmp.ptr, s.ptr, s.length);
+    // Redis rejects leading whitespace (strtod would silently skip it, so "  11"
+    // must NOT parse as 11); trailing garbage is caught by the endp check below.
+    switch (s[0])
+    {
+    case ' ', '\t', '\n', '\r', '\v', '\f':
+        return false;
+    default:
+        break;
+    }
+    tmp[0 .. s.length] = s[]; // slice copy, not memcpy
     tmp[s.length] = 0;
     char* endp;
     v = strtod(tmp.ptr, &endp);
