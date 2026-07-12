@@ -127,14 +127,16 @@ public void getbit(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
 }
 
 /// Resolves [start end [BYTE|BIT]] into an inclusive bit range.
+/// `badInt` distinguishes a non-integer start/end (Valkey: "not an integer or
+/// out of range") from a syntax error (extra/unknown trailing words).
 private bool bitRange(const(RVal)[] opts, size_t bitLen, out ulong fromBit,
-        out ulong toBit, out bool empty) @nogc nothrow
+        out ulong toBit, out bool empty, out bool badInt) @nogc nothrow
 {
     long start = 0, stop = -1;
     bool bitMode;
     if (opts.length >= 2)
     {
-        if (!parseLong(opts[0].str, start) || !parseLong(opts[1].str, stop))
+        if (opts.length > 3)
             return false;
         if (opts.length == 3)
         {
@@ -143,11 +145,21 @@ private bool bitRange(const(RVal)[] opts, size_t bitLen, out ulong fromBit,
             else if (!eqICKeyword(opts[2].str, "BYTE"))
                 return false;
         }
-        else if (opts.length > 3)
+        if (!parseLong(opts[0].str, start) || !parseLong(opts[1].str, stop))
+        {
+            badInt = true;
             return false;
+        }
     }
     else if (opts.length == 1)
-        return false;
+    {
+        // start without end: end defaults to -1 (byte mode)
+        if (!parseLong(opts[0].str, start))
+        {
+            badInt = true;
+            return false;
+        }
+    }
     auto units = bitMode ? cast(long) bitLen : cast(long)((bitLen + 7) / 8);
     normalizeRange(start, stop, units);
     if (start > stop || units == 0)
@@ -178,6 +190,15 @@ public void bitcount(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
         repError(o, "ERR wrong number of arguments for 'bitcount' command");
         return;
     }
+    ulong fromBit, toBit;
+    bool empty, badInt;
+    // validate the range args before touching the key (Valkey errors on bad
+    // args even for a missing or wrong-typed key)
+    if (!bitRange(args[1 .. $], 0, fromBit, toBit, empty, badInt))
+    {
+        repError(o, badInt ? "ERR value is not an integer or out of range" : "ERR syntax error");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.str, wrong);
     if (wrong)
@@ -192,13 +213,7 @@ public void bitcount(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
     }
     char[24] sb = void;
     auto s = obj.str.bytes(sb);
-    ulong fromBit, toBit;
-    bool empty;
-    if (!bitRange(args[1 .. $], s.length * 8, fromBit, toBit, empty))
-    {
-        repError(o, "ERR syntax error");
-        return;
-    }
+    cast(void) bitRange(args[1 .. $], s.length * 8, fromBit, toBit, empty, badInt);
     if (empty || s.length == 0)
     {
         repInt(o, 0);
@@ -226,12 +241,53 @@ public void bitpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repError(o, "ERR wrong number of arguments for 'bitpos' command");
         return;
     }
-    if (args[1].str != "0" && args[1].str != "1")
+    long bitArg;
+    if (!parseLong(args[1].str, bitArg))
+    {
+        repError(o, "ERR value is not an integer or out of range");
+        return;
+    }
+    if (bitArg != 0 && bitArg != 1)
     {
         repError(o, "ERR The bit argument must be 1 or 0.");
         return;
     }
-    bool wantOne = args[1].str[0] == '1';
+    bool wantOne = bitArg == 1;
+    // pad "start without end" to end=-1, then validate the range args before
+    // touching the key (Valkey errors on bad args even for a missing key)
+    bool rangeGiven = args.length > 2;
+    bool endGiven = args.length > 3;
+    RVal[3] padded;
+    size_t nOpts = 0;
+    if (rangeGiven)
+    {
+        if (args.length > 5)
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+        padded[0] = args[2];
+        if (endGiven)
+            padded[1] = args[3];
+        else
+        {
+            padded[1].type = RType.BulkString;
+            padded[1].str = "-1";
+        }
+        nOpts = 2;
+        if (args.length == 5)
+        {
+            padded[2] = args[4];
+            nOpts = 3;
+        }
+    }
+    ulong fromBit = 0, toBit = 0;
+    bool empty, badInt;
+    if (!bitRange(padded[0 .. nOpts], 0, fromBit, toBit, empty, badInt))
+    {
+        repError(o, badInt ? "ERR value is not an integer or out of range" : "ERR syntax error");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.str, wrong);
     if (wrong)
@@ -241,35 +297,16 @@ public void bitpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     char[24] sb = void;
     auto s = obj is null ? null : obj.str.bytes(sb);
-    // missing/empty key: 0 is "found" at 0 only when no range given; 1 is -1
-    bool rangeGiven = args.length > 2;
+    // missing/empty key is all virtual zeros: 0 is found at 0, 1 is absent
     if (s.length == 0)
     {
-        repInt(o, wantOne ? -1 : (rangeGiven ? -1 : 0));
+        repInt(o, wantOne ? -1 : 0);
         return;
     }
-    ulong fromBit = 0, toBit = s.length * 8 - 1;
-    bool empty;
+    toBit = s.length * 8 - 1;
     if (rangeGiven)
     {
-        // end defaults to -1 when only start is present
-        RVal[3] padded;
-        padded[0] = args[2];
-        if (args.length >= 4)
-            padded[1] = args[3];
-        else
-        {
-            padded[1].type = RType.BulkString;
-            padded[1].str = "-1";
-        }
-        auto n = args.length >= 4 ? args.length - 2 : 2;
-        if (args.length == 5)
-            padded[2] = args[4];
-        if (!bitRange(padded[0 .. n], s.length * 8, fromBit, toBit, empty))
-        {
-            repError(o, "ERR syntax error");
-            return;
-        }
+        cast(void) bitRange(padded[0 .. nOpts], s.length * 8, fromBit, toBit, empty, badInt);
         if (empty)
         {
             repInt(o, -1);
@@ -284,8 +321,8 @@ public void bitpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             return;
         }
     }
-    // searching for 0 with no explicit range: virtual zeros after the end
-    if (!wantOne && !rangeGiven)
+    // searching for 0 without an explicit end: virtual zeros past the end
+    if (!wantOne && !endGiven)
         repInt(o, cast(long)(s.length * 8));
     else
         repInt(o, -1);

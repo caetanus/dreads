@@ -72,16 +72,36 @@ version (unittest)
         ks.run("BITCOUNT", "s", "5", "30", "BIT").expect.to.equal(":17\r\n");
         ks.run("BITCOUNT", "ghost").expect.to.equal(":0\r\n");
         ks.run("BITCOUNT", "s", "50", "60").expect.to.equal(":0\r\n"); // out of window
-        ks.run("BITCOUNT", "s", "0").expect.to.equal("-ERR syntax error\r\n");
+        // start without end: end defaults to -1
+        ks.run("BITCOUNT", "s", "0").expect.to.equal(":26\r\n");
+        ks.run("BITCOUNT", "s", "1").expect.to.equal(":22\r\n"); // "oobar"
+        ks.run("BITCOUNT", "s", "-1").expect.to.equal(":4\r\n"); // "r"
+        ks.run("BITCOUNT", "s", "1000").expect.to.equal(":0\r\n");
+        ks.run("BITCOUNT", "s", "x")
+            .expect.to.equal("-ERR value is not an integer or out of range\r\n");
+        ks.run("BITCOUNT", "s", "0", "1", "junk").expect.to.equal("-ERR syntax error\r\n");
+        // args are validated before the key is looked at (Valkey parity)
+        ks.run("BITCOUNT", "ghost", "a", "b")
+            .expect.to.equal("-ERR value is not an integer or out of range\r\n");
 
         ks.run("SET", "z", "\xff\xf0\x00");
         ks.run("BITPOS", "z", "0").expect.to.equal(":12\r\n");
         ks.run("BITPOS", "z", "1").expect.to.equal(":0\r\n");
         ks.run("SET", "ones", "\xff\xff");
         ks.run("BITPOS", "ones", "0").expect.to.equal(":16\r\n"); // virtual zero past end
-        ks.run("BITPOS", "ones", "0", "0", "-1").expect.to.equal(":-1\r\n"); // explicit range
+        ks.run("BITPOS", "ones", "0", "0", "-1").expect.to.equal(":-1\r\n"); // explicit end
+        ks.run("BITPOS", "ones", "0", "0").expect.to.equal(":16\r\n"); // start only: virtual zero
         ks.run("BITPOS", "ghost", "1").expect.to.equal(":-1\r\n");
+        // missing key is all zeros no matter the range
+        ks.run("BITPOS", "ghost", "0", "0", "-1", "BIT").expect.to.equal(":0\r\n");
         ks.run("BITPOS", "z", "2")[0].expect.to.equal('-');
+        ks.run("BITPOS", "z", "x")
+            .expect.to.equal("-ERR value is not an integer or out of range\r\n");
+        // args are validated before the key is looked at
+        ks.run("BITPOS", "ghost", "0", "a", "b")
+            .expect.to.equal("-ERR value is not an integer or out of range\r\n");
+        ks.run("BITPOS", "ghost", "0", "0", "-1", "JUNK").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("BITPOS", "ghost", "0", "0", "-1", "BIT", "X").expect.to.equal("-ERR syntax error\r\n");
     }
 
     @("bitmap.bitop")
