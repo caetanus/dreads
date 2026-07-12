@@ -12,21 +12,34 @@ module dreads.smallset;
 // (a union field may not have one). That rules out emplace.Vector (it has a
 // ~this), so the small array is a raw malloc'd buffer managed here.
 
-import dreads.dict : Dict, Unit;
+import dreads.dict : canonicalInt, Dict, Unit;
 import dreads.mem : mallocDup, freeSlice;
 
 struct SmallSet
 {
-    // Redis set-max-listpack thresholds: stay small while the count is within
-    // MAX_ENTRIES and every member is at most MAX_MEMBER bytes. That bounds the
-    // contiguous array to a few KB (fits L1), so the linear scan stays hot.
-    enum size_t MAX_ENTRIES = 128;
-    enum size_t MAX_MEMBER = 64;
+    // Redis thresholds. An all-integer set stays a compact array (intset) up to
+    // MAX_INTSET; a set with any non-int member is bounded by the listpack
+    // limits (MAX_ENTRIES / MAX_MEMBER). Either way the array fits L1, so the
+    // linear scan stays hot. Past the limit it spills one-way to a Dict.
+    enum size_t MAX_ENTRIES = 128; // set-max-listpack-entries
+    enum size_t MAX_MEMBER = 64; // set-max-listpack-value
+    enum size_t MAX_INTSET = 512; // set-max-intset-entries
 
     private bool big; // false = small array, true = Dict
+    private bool hasNonInt; // a non-int member was added (drops intset -> listpack).
+    // NOTE: inverted (not `allInt`) on purpose — RObj holds this in a zero-init
+    // union, so a field's `= true` default would NOT apply; zero must mean intset.
     private const(char)[]* items; // malloc'd array of owned member slices (small)
     private size_t len, cap;
     private Dict!Unit large; // large mode
+
+    /// The Redis-equivalent encoding, backed by the real small/large state.
+    const(char)[] encoding() const @nogc nothrow
+    {
+        if (big)
+            return "hashtable";
+        return hasNonInt ? "listpack" : "intset";
+    }
 
     // ----- queries -----
 
@@ -75,13 +88,20 @@ struct SmallSet
         foreach (i; 0 .. len)
             if (items[i] == m)
                 return false;
-        // spill before growing past the cache-fitting threshold
-        if (len >= MAX_ENTRIES || m.length > MAX_MEMBER)
+        // an int-only set stays intset (up to 512); any non-int member (or a
+        // too-long one) drops it to listpack limits. Spill past the limit.
+        long iv;
+        immutable mIsInt = canonicalInt(m, iv);
+        immutable staysInt = !hasNonInt && mIsInt;
+        immutable limit = staysInt ? MAX_INTSET : MAX_ENTRIES;
+        if (len >= limit || (!mIsInt && m.length > MAX_MEMBER))
         {
             spill();
             return large.set(m, Unit());
         }
         pushSmall(mallocDup(m)); // own the member bytes
+        if (!mIsInt)
+            hasNonInt = true;
         return true;
     }
 
@@ -152,6 +172,7 @@ struct SmallSet
                 freeSlice(items[i]);
         len = 0;
         big = false;
+        hasNonInt = false;
     }
 
     void free() @nogc nothrow @trusted

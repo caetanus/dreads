@@ -3924,7 +3924,7 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     case ObjType.hash:
         return "hashtable";
     case ObjType.set:
-        return "hashtable";
+        return obj.set.encoding(); // intset | listpack | hashtable (real state)
     case ObjType.zset:
         return "skiplist";
     case ObjType.stream:
