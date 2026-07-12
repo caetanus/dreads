@@ -1948,7 +1948,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "SRANDMEMBER":
         {
-            srandmember(ks, args, o);
+            srandmember(ks, args, o, arena);
             break;
         }
     case "SMOVE":
@@ -2733,7 +2733,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.miscops : hrandfield;
 
-            hrandfield(ks, args, o);
+            hrandfield(ks, args, o, arena);
             break;
         }
     case "PFADD":
@@ -3209,7 +3209,8 @@ private void spop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Are
     ks.delIfEmpty(args[0].str, obj);
 }
 
-private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
+        ref Arena arena) @nogc nothrow
 {
     if (args.length < 1 || args.length > 2)
     {
@@ -3243,46 +3244,77 @@ private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) 
             repNullBulk(o);
         return;
     }
+    import dreads.rand : randBelow;
+
+    // uniform live slot: uniform start, wrapping scan to the next live one
+    size_t randSlot() @nogc nothrow
+    {
+        auto i = randBelow(obj.set.capacity);
+        while (!obj.set.slotLive(i))
+            i = i + 1 == obj.set.capacity ? 0 : i + 1;
+        return i;
+    }
+
     if (!withCount)
     {
-        foreach (i; 0 .. obj.set.capacity)
-        {
-            if (obj.set.slotLive(i))
-            {
-                repBulk(o, obj.set.keyAt(i));
-                break;
-            }
-        }
+        repBulk(o, obj.set.keyAt(randSlot()));
         return;
     }
-    // positive count: up to card distinct members; negative: cycle with repeats
+    // positive count: up to card distinct members; negative: draws with repeats
     bool repeat = howMany < 0;
     auto want = cast(size_t)(repeat ? -howMany : howMany);
     auto n = repeat ? want : (want < obj.set.length ? want : obj.set.length);
     repArrayHeader(o, n);
-    size_t emitted = 0;
-    while (emitted < n)
+    if (repeat)
+    {
+        foreach (_; 0 .. n)
+            repBulk(o, obj.set.keyAt(randSlot()));
+        return;
+    }
+    if (n == obj.set.length) // whole set
     {
         foreach (i; 0 .. obj.set.capacity)
-        {
-            if (emitted == n)
-                break;
             if (obj.set.slotLive(i))
-            {
                 repBulk(o, obj.set.keyAt(i));
-                emitted++;
-            }
-        }
+        return;
     }
+    // distinct sample: reservoir over the live slots
+    auto res = arena.allocArray!size_t(n);
+    size_t seen = 0;
+    foreach (i; 0 .. obj.set.capacity)
+    {
+        if (!obj.set.slotLive(i))
+            continue;
+        if (seen < n)
+            res[seen] = i;
+        else
+        {
+            auto j = randBelow(seen + 1);
+            if (j < n)
+                res[j] = i;
+        }
+        seen++;
+    }
+    foreach (slot; res)
+        repBulk(o, obj.set.keyAt(slot));
 }
 
 private void sintercard(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
+    if (args.length < 2)
+    {
+        arityErr(o, "sintercard");
+        return;
+    }
     long numkeys;
-    if (args.length < 2 || !parseLong(args[0].str, numkeys) || numkeys < 1
-            || args.length < 1 + cast(size_t) numkeys)
+    if (!parseLong(args[0].str, numkeys) || numkeys < 1)
     {
         repError(o, "ERR numkeys should be greater than 0");
+        return;
+    }
+    if (args.length < 1 + cast(size_t) numkeys)
+    {
+        repError(o, "ERR Number of keys can't be greater than number of args");
         return;
     }
     long limit = 0;

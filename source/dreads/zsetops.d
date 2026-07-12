@@ -367,7 +367,9 @@ public void zrandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @
         repError(o, "ERR value is not an integer or out of range");
         return;
     }
-    if (count == long.min) // -count would overflow (Redis rejects LLONG_MIN)
+    // Redis range: rejects LLONG_MIN; WITHSCORES halves it since every member
+    // yields two elements (count*2 must not overflow)
+    if (count == long.min || (withScores && (count < -(long.max / 2) || count > long.max / 2)))
     {
         repError(o, "ERR value is out of range");
         return;
@@ -387,26 +389,53 @@ public void zrandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @
             repNullBulk(o);
         return;
     }
+    import dreads.rand : randBelow;
+    import dreads.resp : gRespProto;
+
     if (!withCount)
     {
-        obj.zset.walkRange(0, 1, false, (m, s) { repBulk(o, m); return 0; });
+        obj.zset.walkRange(randBelow(obj.zset.length), 1, false, (m, s) {
+            repBulk(o, m);
+            return 0;
+        });
         return;
     }
     bool repeat = count < 0;
     auto want = cast(size_t)(repeat ? -count : count);
     auto n = repeat ? want : (want < obj.zset.length ? want : obj.zset.length);
-    repArrayHeader(o, n * (withScores ? 2 : 1));
-    size_t emitted = 0;
-    while (emitted < n)
+    // RESP3 WITHSCORES nests [member, score] pairs; RESP2 flattens to 2n
+    bool pairs = withScores && gRespProto >= 3;
+    repArrayHeader(o, pairs ? n : n * (withScores ? 2 : 1));
+    void emit(const(char)[] m, double s) @nogc nothrow
+    {
+        if (pairs)
+            repArrayHeader(o, 2);
+        repBulk(o, m);
+        if (withScores)
+            repDouble(o, s);
+    }
+
+    if (repeat) // independent rank draws, repeats allowed
+    {
+        foreach (_; 0 .. n)
+            obj.zset.walkRange(randBelow(obj.zset.length), 1, false, (m, s) {
+                emit(m, s);
+                return 0;
+            });
+        return;
+    }
+    // distinct: selection sampling over ranks (uniform, streaming, no memory)
+    size_t needed = n;
+    size_t remaining = obj.zset.length;
     {
         obj.zset.walkRange(0, obj.zset.length, false, (m, s) {
-            if (emitted == n)
-                return 1;
-            repBulk(o, m);
-            if (withScores)
-                repDouble(o, s);
-            emitted++;
-            return 0;
+            if (randBelow(remaining) < needed)
+            {
+                emit(m, s);
+                needed--;
+            }
+            remaining--;
+            return needed == 0 ? 1 : 0;
         });
     }
 }

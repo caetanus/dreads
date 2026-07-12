@@ -95,10 +95,12 @@ public int runServer(ushort port, const(char)[] aofPath = null)
     }
     {
         import dreads.obj : lruClock, gActiveExpire;
+        import dreads.rand : seedRand;
         import dreads.stream : nowMs;
 
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
+        seedRand(nowMs()); // shuffle the random-pick commands per boot
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
             foreach (ref d; gDbs) // drop-soon sweep across every database

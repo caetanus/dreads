@@ -522,8 +522,10 @@ public void lcs(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena
     repInt(o, total);
 }
 
-/// HRANDFIELD key [count [WITHVALUES]] — deterministic (first live slots).
-public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+/// HRANDFIELD key [count [WITHVALUES]] — uniform draws (reservoir for the
+/// distinct form). RESP3 WITHVALUES replies [field, value] pairs.
+public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
+        ref Arena arena) @nogc nothrow
 {
     if (args.length < 1 || args.length > 3)
     {
@@ -565,38 +567,71 @@ public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
             repNullBulk(o);
         return;
     }
+    import dreads.rand : randBelow;
+    import dreads.resp : gRespProto;
+
+    // uniform live slot: uniform start, wrapping scan to the next live one
+    size_t randSlot() @nogc nothrow
+    {
+        auto i = randBelow(obj.hash.capacity);
+        while (!obj.hash.slotLive(i))
+            i = i + 1 == obj.hash.capacity ? 0 : i + 1;
+        return i;
+    }
+
     if (!withCount)
     {
-        foreach (i2; 0 .. obj.hash.capacity)
-        {
-            if (obj.hash.slotLive(i2))
-            {
-                repBulk(o, obj.hash.keyAt(i2));
-                break;
-            }
-        }
+        repBulk(o, obj.hash.keyAt(randSlot()));
         return;
     }
     bool repeat = count < 0;
     auto want = cast(size_t)(repeat ? -count : count);
     auto n = repeat ? want : (want < obj.hash.length ? want : obj.hash.length);
-    repArrayHeader(o, n * (withValues ? 2 : 1));
-    size_t emitted = 0;
-    while (emitted < n)
+    // RESP3 WITHVALUES nests [field, value] pairs; RESP2 flattens to 2n
+    bool pairs = withValues && gRespProto >= 3;
+    repArrayHeader(o, pairs ? n : n * (withValues ? 2 : 1));
+    void emit(size_t slot) @nogc nothrow
     {
-        foreach (i2; 0 .. obj.hash.capacity)
+        if (pairs)
+            repArrayHeader(o, 2);
+        repBulk(o, obj.hash.keyAt(slot));
+        if (withValues)
         {
-            if (emitted == n)
-                break;
-            if (!obj.hash.slotLive(i2))
-                continue;
-            repBulk(o, obj.hash.keyAt(i2));
-            if (withValues)
-            {
-                char[24] sb = void;
-                repBulk(o, obj.hash.valAt(i2).bytes(sb));
-            }
-            emitted++;
+            char[24] sb = void;
+            repBulk(o, obj.hash.valAt(slot).bytes(sb));
         }
     }
+
+    if (repeat) // independent draws, repeats allowed
+    {
+        foreach (_; 0 .. n)
+            emit(randSlot());
+        return;
+    }
+    if (n == obj.hash.length) // whole hash: emit every live slot
+    {
+        foreach (i2; 0 .. obj.hash.capacity)
+            if (obj.hash.slotLive(i2))
+                emit(i2);
+        return;
+    }
+    // distinct sample: reservoir over the live slots
+    auto res = arena.allocArray!size_t(n);
+    size_t seen = 0;
+    foreach (i2; 0 .. obj.hash.capacity)
+    {
+        if (!obj.hash.slotLive(i2))
+            continue;
+        if (seen < n)
+            res[seen] = i2;
+        else
+        {
+            auto j = randBelow(seen + 1);
+            if (j < n)
+                res[j] = i2;
+        }
+        seen++;
+    }
+    foreach (slot; res)
+        emit(slot);
 }
