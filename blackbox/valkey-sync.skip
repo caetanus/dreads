@@ -1,0 +1,27 @@
+# Tests that require SYNC/PSYNC via attach_to_replication_stream.
+# dreads replicates through Raft; SYNC is a deliberate noop, so these are
+# N/A by design (see BLACKBOX-TODO.md). Pass to runtest with:
+#   ./runtest --host H --port P --single <file> --skipfile <this file>
+# Lines are exact test names (or /regexp). Regenerate with:
+#   grep -B40 attach_to_replication_stream tests/unit/**/*.tcl | grep 'test {'
+GETDEL propagate as DEL command to replica
+GETEX without argument does not propagate to replica
+MSETEX with past EXAT/PXAT - key stored but logically expired
+MSETEX lazy expire with all expiration options
+MSETEX active expire with all expiration options
+MSETEX propagate as MSETEX with PXAT to replica
+SET EXAT / PXAT Expiration time is expired
+DELIFEQ propagate as DEL command to replica
+SWAPDB wants to wake blocked client, but the key already expired
+MULTI + LPUSH + EXPIRE + DEBUG SLEEP on blocked client, key already expired
+BLMPOP propagate as pop with count command to replica
+LMPOP propagate as pop with count command to replica
+Command being unblocked cause another command to get unblocked execution order test
+SPOP new implementation: code path #1 propagate as DEL or UNLINK
+ZMPOP propagate as pop with count command to replica
+BZMPOP propagate as pop with count command to replica
+All TTL in commands are propagated as absolute timestamp in replication stream
+GETEX propagate as to replica as PERSIST, UNLINK, or nothing
+Server should not propagate the read command on lazy expire
+SCAN: Lazy-expire should not be wrapped in MULTI/EXEC
+RANDOMKEY: Lazy-expire should not be wrapped in MULTI/EXEC
