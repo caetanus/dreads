@@ -277,7 +277,10 @@ public void repBulk(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
 // (default), 3 = RESP3. Reply builders whose *shape* differs between versions
 // consult this; pub/sub delivery to OTHER connections cannot use it (it frames
 // per-subscriber — see repPushHeader / connSink).
-public __gshared int gRespProto = 2;
+// THREAD-LOCAL: the main loop, the raft apply thread and the Lua script thread
+// each frame replies at their own connection's level without racing. (Was
+// __gshared; that broke once scripts ran on a dedicated thread.)
+public int gRespProto = 2;
 
 public void repNullBulk(ref ByteBuffer o) @nogc nothrow
 {

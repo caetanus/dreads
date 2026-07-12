@@ -74,6 +74,11 @@ public __gshared void function(scope const(ubyte)[]) @nogc nothrow gScriptEffect
 /// True when the last EVAL performed at least one effective write.
 public __gshared bool gScriptWrote;
 
+// The script's current RESP level (redis.setresp). Thread-local: only the VM
+// thread touches it. Controls how redis.call replies convert to Lua AND the
+// gRespProto the round-trip runs the command at.
+private int gScriptResp = 2;
+
 // --- sandbox: memory accounting and script deadline ---
 private __gshared ulong gLuaBytes; // bytes currently allocated by the state
 private __gshared long gLuaDeadlineMsecs; // MonoTime as msecs; 0 = no limit
@@ -138,6 +143,7 @@ private static immutable lua51CompatChunk = "unpack = table.unpack\n"
 // io/os/package/debug, escape hatches pruned, and _G protected against
 // global creation (scripts share one state; globals would leak across them).
 private static immutable protectGlobalsChunk = q{
+    local real_setmetatable = setmetatable
     local mt = {}
     mt.__newindex = function(t, n, v)
         error("Attempt to modify a readonly table", 2)
@@ -145,7 +151,24 @@ private static immutable protectGlobalsChunk = q{
     mt.__index = function(t, n)
         error("Script attempted to access nonexistent global variable '" .. tostring(n) .. "'", 2)
     end
-    setmetatable(_G, mt)
+    -- Redis marks _G read-only at the VM level; we run stock Lua, so a script
+    -- could otherwise wipe the protection with setmetatable(_G, {}), which
+    -- also silently poisons every later script sharing this state. Guard it:
+    -- getmetatable(_G) returns a write-protected table (so g.__index = {}
+    -- raises), and setmetatable refuses the tables we registered as protected.
+    local guard = real_setmetatable({}, {__newindex = function()
+        error("Attempt to modify a readonly table", 2)
+    end})
+    mt.__metatable = guard
+    real_setmetatable(_G, mt)
+    local protected = real_setmetatable({}, {__mode = "k"})
+    protected[_G] = true
+    setmetatable = function(t, m)
+        if protected[t] then
+            error("Attempt to modify a readonly table", 2)
+        end
+        return real_setmetatable(t, m)
+    end
 };
 
 /// Make the table on top of the stack read-only: writes raise "Attempt to
@@ -213,6 +236,8 @@ private bool ensureState() nothrow
     }
     lua_pushcclosure(gL, &luaRegisterFunction, 0);
     lua_setfield(gL, -2, "register_function");
+    lua_pushcclosure(gL, &luaAclCheckCmd, 0);
+    lua_setfield(gL, -2, "acl_check_cmd");
     // redis.log severity constants (scripts pass them as the first argument)
     foreach (i, lvl; ["LOG_DEBUG\0", "LOG_VERBOSE\0", "LOG_NOTICE\0", "LOG_WARNING\0"])
     {
@@ -251,6 +276,10 @@ private bool ensureState() nothrow
     }
     lua_getglobal(gL, "redis"); // server aliases the read-only redis proxy
     lua_setglobal(gL, "server");
+    // loadstring exists but rejects everything (nil): loading dumped bytecode
+    // then calling the nil result is Valkey's "attempt to call a nil value"
+    lua_pushcclosure(gL, &luaLoadstringStub, 0);
+    lua_setglobal(gL, "loadstring");
     // pre-create KEYS/ARGV so reading them never trips the protection
     lua_createtable(gL, 0, 0);
     lua_setglobal(gL, "KEYS");
@@ -312,6 +341,23 @@ extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
     char[40] hex = void;
     sha1Hex(p[0 .. len], hex);
     lua_pushlstring(L, hex.ptr, 40);
+    return 1;
+}
+
+/// redis.acl_check_cmd(cmd, ...): dreads has no ACL layer, so every command
+/// is permitted — answer true (the script's user is effectively unrestricted).
+extern (C) private int luaAclCheckCmd(lua_State* L) nothrow @nogc
+{
+    if (lua_gettop(L) < 1)
+        return raiseErr(L, "ERR Please specify at least one argument for this redis lib call");
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/// loadstring stub: always nil (see the setglobal note).
+extern (C) private int luaLoadstringStub(lua_State* L) nothrow @nogc
+{
+    lua_pushnil(L);
     return 1;
 }
 
@@ -377,12 +423,13 @@ extern (C) private int luaReplicateCommands(lua_State* L) nothrow @nogc
     return 1;
 }
 
-/// redis.setresp(2|3): scripts see RESP2-shaped conversions either way today.
+/// redis.setresp(2|3): sets the RESP level redis.call replies convert at.
 extern (C) private int luaSetResp(lua_State* L) nothrow @nogc
 {
     auto v = lua_tointegerx(L, 1, null);
     if (v != 2 && v != 3)
         return raiseErr(L, "ERR RESP version must be 2 or 3.");
+    gScriptResp = cast(int) v;
     return 0;
 }
 
@@ -626,27 +673,28 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     {
         // INLINE mode: run it right here against the bound keyspace.
         alias ExFn = int function(ref Keyspace, const ref RVal, scope const(RVal)[],
-                bool, ulong, ref Arena, ref ByteBuffer, ref ByteBuffer) @nogc nothrow;
+                bool, ulong, int, ref Arena, ref ByteBuffer, ref ByteBuffer) @nogc nothrow;
         st = (cast(ExFn)&executeScriptCommand)(*gCtx.ks, cmd, arr, isWrite,
-                gCtx.clock, *gCtx.arena, gCtx.replyBuf, gCtx.effectBuf);
+                gCtx.clock, gScriptResp, *gCtx.arena, gCtx.replyBuf, gCtx.effectBuf);
     }
     if (st == 1)
         return raiseErr(L, "READONLY You can't write against a read only replica.");
     if (st == 2)
         return raiseErr(L, "ERR replication error");
 
-    RVal reply;
-    size_t pos = 0;
-    if (parseValue(gCtx.replyBuf.data, pos, *gCtx.arena, reply) != ParseStatus.ok)
+    auto rbytes = cast(const(char)[]) gCtx.replyBuf.data;
+    if (rbytes.length == 0)
     {
         lua_pushlstring(L, "internal error decoding command reply".ptr, 37);
         return lua_error(L);
     }
-    if (reply.type == RType.Error)
+    // top-level error: apply the bridge's wording (scripts/suite match these)
+    if (rbytes[0] == '-')
     {
-        // two error classes get the BRIDGE's wording, like Redis (scripts
-        // and the suite match on these exact phrases)
-        auto emsg = reply.str;
+        size_t e = 1;
+        while (e < rbytes.length && rbytes[e] != '\r')
+            e++;
+        auto emsg = rbytes[1 .. e];
         if (emsg.length >= 19 && emsg[0 .. 19] == "ERR unknown command")
             emsg = "Unknown command called from script";
         else
@@ -670,8 +718,183 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
             return lua_error(L); // longjmp; no D destructors live on this frame
         return 1;
     }
-    pushRespToLua(L, reply);
+    // non-error: parse the RESP (RESP2 or RESP3, per the script's setresp)
+    // straight into a Lua value
+    size_t pos = 0;
+    respBytesToLua(L, rbytes, pos);
     return 1;
+}
+
+/// Parses one RESP value from `b` at `pos` (advancing it) and pushes the Lua
+/// equivalent, using Redis's conversion rules AND handling RESP3 types the way
+/// a script at `setresp(3)` sees them: map -> {map={...}}, set -> {set={...}},
+/// double -> {double=n}, big number -> {big_number="..."}, bool -> true/false,
+/// verbatim -> the string, null -> false.
+private void respBytesToLua(lua_State* L, scope const(char)[] b, ref size_t pos) nothrow @nogc
+{
+    if (pos >= b.length)
+    {
+        lua_pushboolean(L, 0);
+        return;
+    }
+    char lead = b[pos++];
+    auto line = readLine(b, pos); // content up to (not incl) CRLF; advances pos
+    switch (lead)
+    {
+    case '+': // simple string -> {ok=...}
+        lua_createtable(L, 0, 1);
+        lua_pushlstring(L, line.ptr, line.length);
+        lua_setfield(L, -2, "ok");
+        break;
+    case '-': // error (nested) -> {err=...}
+        lua_createtable(L, 0, 1);
+        lua_pushlstring(L, line.ptr, line.length);
+        lua_setfield(L, -2, "err");
+        break;
+    case ':': // integer
+        lua_pushinteger(L, parseI(line));
+        break;
+    case ',': // RESP3 double -> {double=n}
+        lua_createtable(L, 0, 1);
+        lua_pushnumber(L, parseF(line));
+        lua_setfield(L, -2, "double");
+        break;
+    case '(': // RESP3 big number -> {big_number="..."}
+        lua_createtable(L, 0, 1);
+        lua_pushlstring(L, line.ptr, line.length);
+        lua_setfield(L, -2, "big_number");
+        break;
+    case '#': // RESP3 boolean
+        lua_pushboolean(L, line.length && line[0] == 't');
+        break;
+    case '_': // RESP3 null -> Lua nil (re-emits as the client's null, unlike
+        lua_pushnil(L); // a #f boolean which round-trips as #f)
+        break;
+    case '$': // bulk string ($-1 -> false)
+        {
+            auto n = parseI(line);
+            if (n < 0)
+            {
+                lua_pushboolean(L, 0);
+                break;
+            }
+            auto s = b[pos .. pos + cast(size_t) n];
+            pos += cast(size_t) n + 2; // content + CRLF
+            lua_pushlstring(L, s.ptr, s.length);
+            break;
+        }
+    case '=': // RESP3 verbatim -> {format="txt", string="..."} (re-emittable)
+        {
+            auto n = parseI(line);
+            auto s = b[pos .. pos + cast(size_t) n];
+            pos += cast(size_t) n + 2;
+            const(char)[] fmt = "txt", payload = s;
+            if (s.length >= 4 && s[3] == ':')
+            {
+                fmt = s[0 .. 3];
+                payload = s[4 .. $];
+            }
+            lua_createtable(L, 0, 2);
+            lua_pushlstring(L, fmt.ptr, fmt.length);
+            lua_setfield(L, -2, "format");
+            lua_pushlstring(L, payload.ptr, payload.length);
+            lua_setfield(L, -2, "string");
+            break;
+        }
+    case '*': // array (*-1 -> false)
+    case '>': // RESP3 push -> array
+    case '~': // RESP3 set -> {set={member=true,...}}
+        {
+            auto n = parseI(line);
+            if (n < 0)
+            {
+                lua_pushboolean(L, 0);
+                break;
+            }
+            if (lead == '~')
+            {
+                lua_createtable(L, 0, 1);
+                lua_createtable(L, 0, cast(int) n); // the set members table
+                foreach (_; 0 .. n)
+                {
+                    respBytesToLua(L, b, pos); // member (key)
+                    lua_pushboolean(L, 1);
+                    lua_rawset(L, -3);
+                }
+                lua_setfield(L, -2, "set");
+            }
+            else
+            {
+                lua_createtable(L, cast(int) n, 0);
+                foreach (i; 0 .. n)
+                {
+                    respBytesToLua(L, b, pos);
+                    lua_rawseti(L, -2, cast(long) i + 1);
+                }
+            }
+            break;
+        }
+    case '|': // RESP3 attribute -> skipped (not exposed to scripts); the real
+        {         // reply follows, so parse and return THAT
+            auto n = parseI(line); // pair count
+            foreach (_; 0 .. n * 2)
+            {
+                respBytesToLua(L, b, pos); // parse each attr child...
+                lua_settop(L, lua_gettop(L) - 1); // ...and discard it
+            }
+            respBytesToLua(L, b, pos); // the actual reply
+            break;
+        }
+    case '%': // RESP3 map -> {map={k=v,...}}
+        {
+            auto n = parseI(line); // pair count
+            lua_createtable(L, 0, 1);
+            lua_createtable(L, 0, cast(int) n);
+            foreach (_; 0 .. n)
+            {
+                respBytesToLua(L, b, pos); // key
+                respBytesToLua(L, b, pos); // value
+                lua_rawset(L, -3);
+            }
+            lua_setfield(L, -2, "map");
+            break;
+        }
+    default:
+        lua_pushboolean(L, 0);
+        break;
+    }
+}
+
+private const(char)[] readLine(scope const(char)[] b, ref size_t pos) nothrow @nogc
+{
+    size_t start = pos;
+    while (pos < b.length && b[pos] != '\r')
+        pos++;
+    auto s = b[start .. pos];
+    pos += 2; // skip CRLF
+    return s;
+}
+
+private long parseI(scope const(char)[] s) nothrow @nogc
+{
+    long v = 0;
+    bool neg = s.length && s[0] == '-';
+    foreach (c; s[neg ? 1 : 0 .. $])
+        if (c >= '0' && c <= '9')
+            v = v * 10 + (c - '0');
+    return neg ? -v : v;
+}
+
+private double parseF(scope const(char)[] s) nothrow @nogc
+{
+    import core.stdc.stdlib : strtod;
+
+    char[64] buf = void;
+    if (s.length >= buf.length)
+        return 0;
+    buf[0 .. s.length] = s[];
+    buf[s.length] = 0;
+    return strtod(buf.ptr, null);
 }
 
 /// Issue #3663: every error a script surfaces must carry an error code, so
@@ -714,10 +937,18 @@ private void encodeEffect(scope const(RVal)[] arr) nothrow @nogc
 /// keyspace writer) — inline for tests/standalone, or the cmd-drain in pool
 /// mode. NOT @nogc: the raft path parks the fiber awaiting consensus.
 package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
-        scope const(RVal)[] arr, bool isWrite, ulong clock, ref Arena arena,
-        ref ByteBuffer reply, ref ByteBuffer effScratch) nothrow
+        scope const(RVal)[] arr, bool isWrite, ulong clock, int respLevel,
+        ref Arena arena, ref ByteBuffer reply, ref ByteBuffer effScratch) nothrow
 {
-    import dreads.det : freezeClock;
+    import dreads.resp : gRespProto;
+
+    // run the command at the script's RESP level so its reply (e.g. DEBUG
+    // PROTOCOL, HGETALL) is framed the way redis.call should see it; restore
+    // the client's level right after (dispatch of reads doesn't yield)
+    auto savedProto = gRespProto;
+    gRespProto = respLevel;
+    scope (exit)
+        gRespProto = savedProto;
 
     reply.clear();
     if (!isWrite)
@@ -797,6 +1028,7 @@ private struct ReqSlot
     bool bySha, readOnly;
     ushort db;
     ulong clock;
+    int clientResp; // the client's RESP level (final reply framing on worker)
     ByteBuffer args; // RESP-encoded arg array (stable across the hand-off)
     ByteBuffer reply; // filled by the Lua thread
     shared(ManualEvent) done;
@@ -810,6 +1042,7 @@ private struct CmdSlot
     ushort db;
     ulong clock;
     bool isWrite;
+    int resp; // gRespProto to run the command at (script's setresp)
     ByteBuffer reply;
     int status; // 0 ok / 1 readonly-replica / 2 repl error
     shared(ManualEvent) done;
@@ -860,6 +1093,7 @@ private int poolRoundTrip(scope const(RVal)[] arr, bool isWrite, ref ByteBuffer 
     gCmdSlot.db = gCtx.db;
     gCmdSlot.clock = gCtx.clock;
     gCmdSlot.isWrite = isWrite;
+    gCmdSlot.resp = gScriptResp;
     gCmdSlot.ready = false;
     gCmdSlot.status = 0;
     try
@@ -914,6 +1148,7 @@ public void luaExecOnPool(LuaReqKind kind, scope const(RVal)[] args, bool bySha,
     slot.readOnly = readOnly;
     slot.db = db;
     slot.clock = clock;
+    slot.clientResp = gRespProto; // main-thread TLS: this connection's level
     encodeCmd(slot.args, args);
     slot.ready = false;
     try
@@ -1020,6 +1255,7 @@ private static void luaThreadEntry() nothrow
                     gPoolMode = true;
                     gPoolDb = slot.db;
                     gPoolClock = slot.clock;
+                    gRespProto = slot.clientResp; // frame the final reply here
                     scope (exit)
                         gPoolMode = false;
                     auto a = cmd.arr;
@@ -1083,7 +1319,7 @@ private void cmdDrainLoop() nothrow
                 {
                     auto dbi = slot.db < NUM_DBS ? slot.db : 0;
                     slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr,
-                            slot.isWrite, slot.clock, arena, slot.reply, eff);
+                            slot.isWrite, slot.clock, slot.resp, arena, slot.reply, eff);
                 }
                 else
                     repError(slot.reply, "ERR internal script command error");
@@ -1136,10 +1372,14 @@ private void pushRespToLua(lua_State* L, const ref RVal v) nothrow @nogc
 private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) nothrow @nogc
 {
     // deep/recursive tables would overflow the C stack; Redis caps the
-    // conversion and emits this sentinel (the reply so far is already framed)
-    if (depth > 1000)
+    // conversion and emits this sentinel (the reply so far is already framed).
+    // Each level also pushes onto the Lua stack, which the C API does NOT grow
+    // on its own: past the reserved slots lua_rawgeti would write out of bounds
+    // and silently corrupt the shared state, so reserve room before descending
+    // and treat exhaustion as the same limit.
+    if (depth > 1000 || lua_checkstack(L, 4) == 0)
     {
-        repError(o, "reached lua stack limit");
+        repError(o, "ERR reached lua stack limit");
         return;
     }
     switch (lua_type(L, idx))
@@ -1148,7 +1388,11 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) n
         repNullBulk(o);
         break;
     case LUA_TBOOLEAN:
-        if (lua_toboolean(L, idx))
+        // at setresp(3) booleans are real RESP3 booleans (#t/#f, or :1/:0
+        // to a RESP2 client); the legacy setresp(2) rule is true->:1, false->nil
+        if (gScriptResp >= 3)
+            repBool(o, lua_toboolean(L, idx) != 0);
+        else if (lua_toboolean(L, idx))
             repInt(o, 1);
         else
             repNullBulk(o);
@@ -1192,6 +1436,29 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) n
                 break;
             }
             lua_settop(L, lua_gettop(L) - 1);
+            // {format="txt", string="..."} -> RESP3 verbatim / RESP2 bulk
+            lua_pushlstring(L, "format".ptr, 6);
+            if (lua_rawget(L, idx) == LUA_TSTRING)
+            {
+                size_t fl;
+                auto fp = lua_tolstring(L, -1, &fl);
+                char[3] fmt = ['t', 'x', 't'];
+                if (fl >= 3)
+                    fmt[] = fp[0 .. 3];
+                lua_settop(L, lua_gettop(L) - 1);
+                lua_pushlstring(L, "string".ptr, 6);
+                if (lua_rawget(L, idx) == LUA_TSTRING)
+                {
+                    size_t sl;
+                    auto sp = lua_tolstring(L, -1, &sl);
+                    repVerbatim(o, fmt[], sp[0 .. sl]);
+                    lua_settop(L, lua_gettop(L) - 1);
+                    break;
+                }
+                lua_settop(L, lua_gettop(L) - 1);
+            }
+            else
+                lua_settop(L, lua_gettop(L) - 1);
             // {double=n} -> RESP3 double / RESP2 bulk string
             lua_pushlstring(L, "double".ptr, 6);
             if (lua_rawget(L, idx) == LUA_TNUMBER)
@@ -1210,7 +1477,14 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) n
             {
                 size_t bl;
                 auto bp = lua_tolstring(L, -1, &bl);
-                repBigNumber(o, bp[0 .. bl]);
+                // a big number is a single logical line: CR/LF in the value
+                // (malformed input) is sanitized to spaces, like Redis, so it
+                // can't desync the reply stream
+                static ByteBuffer bnb; // TLS
+                bnb.clear();
+                foreach (ch; bp[0 .. bl])
+                    bnb.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
+                repBigNumber(o, cast(const(char)[]) bnb.data);
                 lua_settop(L, lua_gettop(L) - 1);
                 break;
             }
@@ -1234,6 +1508,29 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) n
                     // key at -2, value at -1; emit both, keep key for next
                     luaToResp(L, lua_gettop(L) - 1, o, depth + 1);
                     luaToResp(L, lua_gettop(L), o, depth + 1);
+                    lua_settop(L, lua_gettop(L) - 1);
+                }
+                lua_settop(L, lua_gettop(L) - 1);
+                break;
+            }
+            lua_settop(L, lua_gettop(L) - 1);
+            // {set={member=true,...}} -> RESP3 set / RESP2 array
+            lua_pushlstring(L, "set".ptr, 3);
+            if (lua_rawget(L, idx) == LUA_TTABLE)
+            {
+                int setIdx = lua_gettop(L);
+                size_t members = 0;
+                lua_pushnil(L);
+                while (lua_next(L, setIdx) != 0)
+                {
+                    members++;
+                    lua_settop(L, lua_gettop(L) - 1);
+                }
+                repSetHeader(o, members);
+                lua_pushnil(L);
+                while (lua_next(L, setIdx) != 0)
+                {
+                    luaToResp(L, lua_gettop(L) - 1, o, depth + 1); // the member key
                     lua_settop(L, lua_gettop(L) - 1);
                 }
                 lua_settop(L, lua_gettop(L) - 1);
@@ -1367,6 +1664,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
     bindBridgeContext(&ks); // sets ks/viaPool/db/clock for inline or pool mode
+    gScriptResp = 2; // redis.setresp default per script
     gScriptWrote = false; // per-EVAL: the server signals WATCH/blocked wakes
     // deterministic per-invocation RNG (replicas/replay must agree)
     lua_getglobal(gL, "math");
@@ -2107,6 +2405,7 @@ public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
     bindBridgeContext(&ks);
+    gScriptResp = 2;
     gScriptWrote = false;
     // deterministic per-invocation RNG, script deadline, state recycling —
     // the same run discipline as EVAL
@@ -2234,6 +2533,44 @@ unittest // errors
     assert(compile[0 .. 28] == "-ERR Error compiling script:");
     auto runtime = evalRun(ks, "error('boom')");
     assert(runtime[0 .. 26] == "-ERR Error running script:");
+}
+
+unittest // sandbox: _G protection, pruned globals, recursion guard
+{
+    import std.algorithm : canFind;
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+
+    // _G is read-only: creating a global, replacing its metatable, or reaching
+    // through getmetatable(_G) all raise "Attempt to modify a readonly table".
+    // Stock Lua lets setmetatable(_G,{}) succeed, which would also silently
+    // wipe the protection for every later script sharing the state — guard it.
+    foreach (trick; [
+            "x = 1", "_G = {}", "redis = function() return 1 end",
+            "setmetatable(_G, {})", "local g = getmetatable(_G); g.__index = {}"
+        ])
+    {
+        auto r = evalRun(ks, trick);
+        assert(r[0] == '-' && r.canFind("readonly table"), trick ~ " => " ~ r);
+    }
+    // the guard must not have broken legitimate setmetatable on a script table
+    assert(evalRun(ks,
+            "local t = setmetatable({}, {__index=function() return 5 end}); return t.foo")
+            == ":5\r\n");
+    // and the wipe attempt above must not have poisoned undefined-global reads
+    foreach (g; ["loadfile", "dofile", "print", "load"])
+    {
+        auto r = evalRun(ks, g ~ "('x')");
+        assert(r.canFind("nonexistent global variable '" ~ g ~ "'"), g ~ " => " ~ r);
+    }
+
+    // deep self-referential tables are capped, not a C-stack overflow, and the
+    // capped conversion must leave the shared state intact for the next script
+    auto rec = evalRun(ks, "local a = {}; local b = {a}; a[1] = b; return a");
+    assert(rec.canFind("ERR reached lua stack limit"), rec);
+    assert(evalRun(ks, "return string.upper('ok')") == "$2\r\nOK\r\n");
 }
 
 unittest // SCRIPT LOAD/EXISTS/FLUSH + EVALSHA

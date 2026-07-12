@@ -2904,6 +2904,100 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
             break;
         }
+    case "DEBUG":
+        {
+            // Dispatch-level DEBUG: reached from scripts (redis.call('debug',…))
+            // and replay. The rich, connection-aware DEBUG lives at the server
+            // layer; here we serve PROTOCOL (the test helper that emits each
+            // RESP type at the current gRespProto) and accept the benign stubs.
+            if (args.length >= 2 && eqICKeyword(args[0].str, "PROTOCOL"))
+            {
+                auto t = args[1].str;
+                if (t == "string")
+                    repSimple(o, "Simple status string");
+                else if (t == "integer")
+                    repInt(o, 12_345);
+                else if (t == "double")
+                    repDouble(o, 3.141);
+                else if (t == "bignum")
+                    repBigNumber(o, "1234567999999999999999999999999999999");
+                else if (t == "null")
+                    repNullBulk(o); // `_` in RESP3, `$-1` in RESP2
+                else if (t == "true")
+                    repBool(o, true);
+                else if (t == "false")
+                    repBool(o, false);
+                else if (t == "verbatim")
+                    repVerbatim(o, "txt", "This is a verbatim\nstring");
+                else if (t == "map")
+                {
+                    repMapHeader(o, 3);
+                    foreach (i; 0 .. 3)
+                    {
+                        repInt(o, i);
+                        repBool(o, i == 1);
+                    }
+                }
+                else if (t == "set")
+                {
+                    repSetHeader(o, 3);
+                    foreach (i; 0 .. 3)
+                        repInt(o, i);
+                }
+                else if (t == "attrib")
+                {
+                    // RESP3 attribute precedes the real reply; RESP2 emits only
+                    // the reply
+                    if (gRespProto >= 3)
+                    {
+                        o.append("|1\r\n");
+                        repBulk(o, "key-popularity");
+                        repArrayHeader(o, 2);
+                        repBulk(o, "key:123");
+                        repInt(o, 90);
+                    }
+                    repBulk(o, "Some real reply following the attribute");
+                }
+                else if (t == "err")
+                    repError(o, "An error message");
+                else
+                    repError(o, "ERR Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|verbatim|true|false");
+                break;
+            }
+            // DEBUG SLEEP reaches here when invoked from a script
+            // (redis.call('DEBUG','SLEEP',n)); real blocking sleep so wall-clock
+            // advances (the script's clock stays frozen, but keys set with short
+            // TTLs expire once the script returns and the real clock is restored)
+            if (args.length >= 2 && eqICKeyword(args[0].str, "SLEEP"))
+            {
+                import core.thread : Thread;
+                import core.time : usecs;
+
+                // NUL-terminate into a small stack buffer for strtod (@nogc)
+                char[64] slbuf = void;
+                auto sarg = args[1].str;
+                double secs = 0;
+                if (sarg.length < slbuf.length)
+                {
+                    memcpy(slbuf.ptr, sarg.ptr, sarg.length);
+                    slbuf[sarg.length] = '\0';
+                    secs = strtod(slbuf.ptr, null);
+                }
+                if (secs > 0)
+                {
+                    try
+                        Thread.sleep(usecs(cast(long)(secs * 1_000_000)));
+                    catch (Exception)
+                    {
+                    }
+                }
+                repSimple(o, "OK");
+                break;
+            }
+            // benign no-op stubs scripts/tests toggle
+            repSimple(o, "OK");
+            break;
+        }
     case "SLOWLOG":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
@@ -2988,6 +3082,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repBulk(o, "user default on nopass ~* &* +@all");
             }
             else if (args.length >= 1 && eqICKeyword(args[0].str, "CAT"))
+                repArrayHeader(o, 0);
+            else if (args.length >= 1 && (eqICKeyword(args[0].str, "SETUSER")
+                    || eqICKeyword(args[0].str, "DELUSER") || eqICKeyword(args[0].str, "SAVE")
+                    || eqICKeyword(args[0].str, "LOAD")))
+                repSimple(o, "OK"); // no ACL enforcement; accept the config
+            else if (args.length >= 1 && eqICKeyword(args[0].str, "GETUSER"))
                 repArrayHeader(o, 0);
             else
                 repUnknownSubcommand(o, "ACL", args.length ? args[0].str : "");

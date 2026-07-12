@@ -63,6 +63,15 @@ These exist but do not match Redis exactly:
   (globals they create die with the execution — fresh-interpreter isolation
   at shared-state cost) and the state is recycled past 32MB of heap.
   Helper libraries: `cjson` and `cmsgpack` (in-project D implementations),
+  Redis marks `_G` and the library tables read-only at the Lua VM level (a
+  patch we don't have on stock 5.4), so protection is emulated: library tables
+  are read-only proxies, and `setmetatable`/`getmetatable` are guarded so a
+  script can't wipe `_G`'s protective metatable (`setmetatable(_G, {})`) or
+  reach through it. `cmsgpack` packs a self-referential table to a fixed depth
+  (16) exactly like Redis, but the byte order of the packed map depends on Lua's
+  hash iteration and 5.4 differs from 5.1 (semantics/unpack identical; only the
+  hex dump differs). Deep-table reply conversion reserves Lua stack via
+  `lua_checkstack` and caps at "reached lua stack limit" rather than overflowing.
   `redis.sha1hex`, `bit`, `redis.log` (accepted, dropped), `redis.setresp`,
   `redis.set_repl` and a **Lua 5.1 compat layer** (`unpack`, `table.getn`,
   `math.pow`, `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4).

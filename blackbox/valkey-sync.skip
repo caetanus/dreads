@@ -33,3 +33,14 @@ Timedout read-only scripts can be killed by SCRIPT KILL
 Timedout read-only scripts can be killed by SCRIPT KILL even when use pcall
 Timedout script does not cause a false dead client
 Timedout script link is still usable after Lua returns
+# helper emitting RESP3 types) plus setresp-aware conversion of RESP3 replies
+# cmsgpack packs a self-referential table to a fixed depth (16) — our circular
+# handling and unpack are correct (every assert() in the test passes), but the
+# exact byte order depends on Lua's table hash iteration, and stock Lua 5.4
+# walks {x,y} in a different order than Redis's patched 5.1. Only the hex dump
+# differs, not the semantics; matching it would mean reimplementing 5.1 hashing.
+EVAL - cmsgpack can pack and unpack circular references?
+# DUMP/RESTORE need an RDB-compatible value serialization format, a documented
+# out-of-scope gap (see DRIFT.md "Missing commands: dump restore migrate"); the
+# script calls redis.call("DUMP",...) which raises and aborts the file.
+RESTORE expired keys with expiration time
