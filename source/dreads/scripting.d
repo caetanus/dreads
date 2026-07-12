@@ -645,7 +645,8 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
         auto t = lua_type(L, i + 1);
         if (t != LUA_TSTRING && t != LUA_TNUMBER)
         {
-            lua_pushlstring(L, "Lua redis lib command arguments must be strings or integers".ptr, 60);
+            enum m = "ERR Command arguments must be strings or integers";
+            lua_pushlstring(L, m.ptr, m.length);
             return lua_error(L);
         }
         size_t len;
@@ -705,6 +706,24 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
                 lua_pushlstring(L, oom.ptr, oom.length);
                 lua_setfield(L, -2, "err");
                 return lua_error(L);
+            }
+            // SELECT inside a script switches the db for the rest of THIS script
+            // (subsequent redis.call target the new db) without touching the
+            // caller's connection db. Update the bridge's db before the command
+            // runs; an out-of-range index falls through and the dispatch of
+            // SELECT returns the error, leaving the context unchanged.
+            if (uc == "SELECT" && argc >= 2)
+            {
+                import dreads.commands : parseLong;
+                import dreads.obj : gDbs, NUM_DBS;
+
+                long dbn;
+                if (parseLong(arr[1].str, dbn) && dbn >= 0 && dbn < NUM_DBS)
+                {
+                    gCtx.db = cast(ushort) dbn;
+                    if (!gCtx.viaPool)
+                        gCtx.ks = &gDbs[cast(size_t) dbn];
+                }
             }
         }
     }
