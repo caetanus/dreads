@@ -218,6 +218,44 @@ version (unittest)
         // MSETEX: non-integer expire value is a not-an-integer error
         ks.run("MSETEX", "1", "k", "v", "EX", "abc")
             .expect.to.equal("-ERR value is not an integer or out of range\r\n");
+        // a non-positive time is invalid for every option, absolute included
+        ks.run("MSETEX", "1", "k", "v", "EX", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "k", "v", "EXAT", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "k", "v", "PXAT", "-1")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+    }
+
+    @("blackbox.compare_and_set")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // SET ... IFEQ: write only when the current value matches
+        ks.run("SET", "foo", "initial");
+        ks.run("SET", "foo", "newv", "IFEQ", "initial").expect.to.equal("+OK\r\n");
+        ks.run("GET", "foo").expect.to.equal("$4\r\nnewv\r\n");
+        ks.run("SET", "foo", "nope", "IFEQ", "wrong").expect.to.equal("$-1\r\n"); // no match
+        ks.run("GET", "foo").expect.to.equal("$4\r\nnewv\r\n");
+        // IFEQ + GET returns the old value on a match
+        ks.run("SET", "foo", "x2", "IFEQ", "newv", "GET").expect.to.equal("$4\r\nnewv\r\n");
+        // IFEQ is incompatible with NX/XX; a non-string current value is WRONGTYPE
+        ks.run("SET", "foo", "v", "IFEQ", "x2", "XX").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("SADD", "s", "m");
+        ks.run("SET", "s", "v", "IFEQ", "m")
+            .expect.to.equal("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+
+        // DELIFEQ: delete only when the current value matches
+        ks.run("DELIFEQ", "ghost", "v").expect.to.equal(":0\r\n");
+        ks.run("SET", "k", "v");
+        ks.run("DELIFEQ", "k", "nope").expect.to.equal(":0\r\n");
+        ks.run("EXISTS", "k").expect.to.equal(":1\r\n");
+        ks.run("DELIFEQ", "k", "v").expect.to.equal(":1\r\n");
+        ks.run("EXISTS", "k").expect.to.equal(":0\r\n");
+        ks.run("DELIFEQ", "s", "m")
+            .expect.to.equal("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
     }
 
     @("blackbox.expire_flags_and_overflow")
