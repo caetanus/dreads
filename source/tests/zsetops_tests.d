@@ -61,6 +61,20 @@ version (unittest)
         // LIMIT without BY* errors
         ks.run("ZRANGE", "z", "0", "1", "LIMIT", "0", "1")
             .expect.to.contain("LIMIT is only supported");
+        // invalid option combinations are a syntax error, checked before the
+        // bounds are parsed (so BYLEX+WITHSCORES doesn't fail on "0" as a lex
+        // bound), and options a legacy form doesn't own are rejected
+        ks.run("ZRANGE", "z", "0", "-1", "BYLEX", "WITHSCORES")
+            .expect.to.equal("-ERR syntax error\r\n");
+        ks.run("ZREVRANGE", "z", "0", "-1", "BYSCORE").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("ZRANGEBYSCORE", "z", "0", "-1", "REV").expect.to.equal("-ERR syntax error\r\n");
+        // ZRANGESTORE rejects WITHSCORES and LIMIT-without-BY (was silently stored)
+        ks.run("ZRANGESTORE", "d", "z", "0", "-1", "WITHSCORES").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("ZRANGESTORE", "d", "z", "0", "-1", "LIMIT", "1", "2")
+            .expect.to.contain("LIMIT is only supported");
+        // ZUNION with no keys names the command in the error
+        ks.run("ZUNION", "0", "k").expect.to.contain("for 'zunion' command");
+        ks.run("ZDIFFSTORE", "d", "0", "k").expect.to.contain("for 'zdiffstore' command");
         // legacy variants route through the same core
         ks.run("ZREVRANGEBYSCORE", "z", "3", "1")
             .expect.to.equal("*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n");
