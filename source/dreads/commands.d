@@ -1953,16 +1953,32 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             n = snprintf(b.ptr, b.length,
                     "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
             ib.append(b[0 .. n]);
+            // Persistence: dreads has no RDB, but the common fields tests read
+            // via `s <field>` must exist and be numeric. rdb_changes_since_last_
+            // save tracks effective writes (monotonic; not Redis's exact
+            // per-mutation dirty count — see BLACKBOX-TODO.md).
+            {
+                import dreads.server : gWriteEpoch;
+
+                ib.append("# Persistence\r\nloading:0\r\n");
+                n = snprintf(b.ptr, b.length, "rdb_changes_since_last_save:%llu\r\n",
+                        cast(ulong) gWriteEpoch);
+                ib.append(b[0 .. n]);
+                ib.append("rdb_bgsave_in_progress:0\r\nrdb_last_save_time:0\r\n"
+                        ~ "rdb_last_bgsave_status:ok\r\naof_enabled:0\r\n"
+                        ~ "aof_rewrite_in_progress:0\r\naof_last_bgrewrite_status:ok\r\n"
+                        ~ "aof_last_write_status:ok\r\n");
+            }
             ib.append("# Keyspace\r\n");
-            // count what a client would see: logically-expired keys are gone
+            // raw dict count, like Redis/DBSIZE: a logically-expired key that
+            // hasn't been reaped yet still counts (the test with active-expire
+            // off relies on this). `expires` counts keys carrying a TTL.
             static void dbLine(ref ByteBuffer ib, ref char[192] b, size_t idx,
                     ref Keyspace db) @nogc nothrow
             {
                 size_t live = 0, volatileKeys = 0;
                 foreach (k, ref v; db)
                 {
-                    if (v.expired())
-                        continue;
                     live++;
                     if (v.expireAtMs != 0)
                         volatileKeys++;
@@ -3550,10 +3566,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 {
                     examined++;
                     auto obj = ks.d.valAt(i);
-                    bool dead = obj.expireAtMs != 0 && now >= obj.expireAtMs;
-                    if (!dead && (!filterType || obj.type == wantType)
-                            && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
-                        found[got++] = ks.d.keyAt(i);
+                    // a TYPE filter gates the passive expiry: only type-matching
+                    // expired keys are reaped, a non-matching one is skipped and
+                    // survives (Redis semantics)
+                    bool typeOk = !filterType || obj.type == wantType;
+                    if (typeOk)
+                    {
+                        if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                            ks.lookup(ks.d.keyAt(i)); // drop it via the lazy-expire path
+                        else if (pat.length == 0 || globMatch(pat, ks.d.keyAt(i)))
+                            found[got++] = ks.d.keyAt(i);
+                    }
                 }
                 i++;
             }
@@ -3627,8 +3650,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long cursor;
             const(char)[] pat;
             long count;
+            bool noScores;
             if (!parseLong(args[1].str, cursor) || cursor < 0
-                    || !parseScanOpts(args[2 .. $], pat, count, false))
+                    || !parseScanOpts(args[2 .. $], pat, count, false, &noScores, null, true))
             {
                 repError(o, "ERR syntax error");
                 break;
@@ -3655,13 +3679,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             auto cn = snprintf(cb.ptr, cb.length, "%llu", cast(ulong) next);
             repArrayHeader(o, 2);
             repBulk(o, cb[0 .. cn]);
-            repArrayHeader(o, matched * 2);
+            repArrayHeader(o, matched * (noScores ? 1 : 2));
             if (n)
                 obj.zset.walkRange(start, n, false, (m, s) {
                     if (pat.length == 0 || globMatch(pat, m))
                     {
                         repBulk(o, m);
-                        repDouble(o, s);
+                        if (!noScores)
+                            repDouble(o, s);
                     }
                     return 0;
                 });
@@ -4377,7 +4402,8 @@ private void repEntry(ref ByteBuffer o, StreamID id, const(FieldPair)[] pairs) @
 
 /// [MATCH pat] [COUNT n] [NOVALUES] tail options of the SCAN family.
 private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long count,
-        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null) @nogc nothrow
+        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null,
+        bool allowNoScores = false) @nogc nothrow
 {
     count = 10;
     size_t i = 0;
@@ -4397,6 +4423,11 @@ private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long c
         else if (allowNoValues && noValues !is null && eqICKeyword(opts[i].str, "NOVALUES"))
         {
             *noValues = true;
+            i++;
+        }
+        else if (allowNoScores && noValues !is null && eqICKeyword(opts[i].str, "NOSCORES"))
+        {
+            *noValues = true; // ZSCAN: omit the score column, mirror NOVALUES
             i++;
         }
         else if (typeOut !is null && eqICKeyword(opts[i].str, "TYPE") && i + 1 < opts.length)

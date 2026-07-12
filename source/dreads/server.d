@@ -49,7 +49,7 @@ private __gshared PubSub gPubSub;
 private __gshared PubSub gShardPubSub; // single node: shard = plain, own namespace
 private __gshared Aof gAof;
 private __gshared const(char)[] gAofPath;
-private __gshared ulong gWriteEpoch; // bumped on every effective write (WATCH)
+public __gshared ulong gWriteEpoch; // bumped on every effective write (WATCH + INFO changes)
 private __gshared ulong gClientIds;
 // MONITOR feed: registered connections receive every executed command
 private __gshared Conn*[64] gMonitors;
