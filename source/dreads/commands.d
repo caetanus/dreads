@@ -10,6 +10,7 @@ import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
+import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
@@ -3259,7 +3260,7 @@ private void sintercard(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
         return;
     }
     auto keys = args[1 .. 1 + cast(size_t) numkeys];
-    auto sets = arena.allocArray!(const(Dict!Unit)*)(keys.length);
+    auto sets = arena.allocArray!(const(SmallSet)*)(keys.length);
     foreach (i, ref a; keys)
     {
         bool wrong;
@@ -3304,7 +3305,7 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
         return;
     }
     auto srcs = args[1 .. $];
-    Dict!Unit tmp;
+    SmallSet tmp;
     if (op == 'U')
     {
         foreach (ref a; srcs)
@@ -3325,8 +3326,8 @@ private void setStore(ref Keyspace ks, const(RVal)[] args, char op,
     }
     else
     {
-        auto others = arena.allocArray!(const(Dict!Unit)*)(srcs.length - 1);
-        const(Dict!Unit)* base;
+        auto others = arena.allocArray!(const(SmallSet)*)(srcs.length - 1);
+        const(SmallSet)* base;
         foreach (i, ref a; srcs)
         {
             bool wrong;
@@ -3492,8 +3493,8 @@ private void setCombine(ref Keyspace ks, const(RVal)[] args, bool inter,
         arityErr(o, inter ? "sinter" : "sdiff");
         return;
     }
-    auto others = arena.allocArray!(const(Dict!Unit)*)(args.length - 1);
-    const(Dict!Unit)* base;
+    auto others = arena.allocArray!(const(SmallSet)*)(args.length - 1);
+    const(SmallSet)* base;
     foreach (i, ref a; args)
     {
         bool wrong;
@@ -3546,7 +3547,7 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
         arityErr(o, "sunion");
         return;
     }
-    Dict!Unit acc;
+    SmallSet acc;
     scope (exit)
         acc.free();
     foreach (ref a; args)
