@@ -38,6 +38,7 @@ private struct BridgeCtx
     Keyspace* ks;
     Arena* arena;
     bool readOnly; // EVAL_RO / EVALSHA_RO
+    bool sawRandom; // a non-deterministic command ran; writes must be refused
     ByteBuffer replyBuf; // staging for bridge replies, reused across calls
 }
 
@@ -337,7 +338,6 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     cmd.type = RType.Array;
     cmd.arr = arr;
 
-    if (gCtx.readOnly)
     {
         import dreads.commands : isWriteCommand;
 
@@ -347,17 +347,43 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
         {
             foreach (ci, ch; cname)
                 up[ci] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            if (isWriteCommand(up[0 .. cname.length]))
+            auto uname = up[0 .. cname.length];
+            if (gCtx.readOnly && isWriteCommand(uname))
             {
                 lua_pushlstring(L,
                         "Write commands are not allowed from read-only scripts.".ptr, 55);
                 return lua_error(L);
             }
+            // Scripts replicate verbatim (the EVAL itself is the AOF/raft
+            // entry), so a replay must retrace every step: once a random-
+            // reply command ran, further writes would diverge — refuse them,
+            // like pre-effects Redis. The clock is frozen per EVAL, so TIME
+            // stays deterministic and needs no flag.
+            if (gCtx.sawRandom && isWriteCommand(uname))
+            {
+                enum msg = "Write commands not allowed after non deterministic commands";
+                lua_pushlstring(L, msg.ptr, msg.length);
+                return lua_error(L);
+            }
+            switch (uname)
+            {
+            case "RANDOMKEY", "SRANDMEMBER", "HRANDFIELD", "ZRANDMEMBER":
+                gCtx.sawRandom = true;
+                break;
+            default:
+                break;
+            }
         }
     }
 
     gCtx.replyBuf.clear();
-    dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena);
+    // keep the EVAL entry's frozen clock: inner dispatch must NOT re-freeze
+    // to the wall clock, or TTL commands inside a replayed script drift
+    {
+        import dreads.det : detNow = now;
+
+        dispatch(cmd, *gCtx.ks, gCtx.replyBuf, *gCtx.arena, detNow());
+    }
 
     RVal reply;
     size_t pos = 0;
@@ -587,6 +613,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     gCtx.ks = &ks;
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    gCtx.sawRandom = false;
     // deterministic per-invocation RNG (replicas/replay must agree)
     lua_getglobal(gL, "math");
     lua_getfield(gL, -1, "randomseed");
@@ -640,10 +667,17 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     lua_setfield(gL, -2, "__index");
     lua_setmetatable(gL, -2);
     lua_setupvalue(gL, -2, 1);
-    if (lua_pcall(gL, 0, 1, 0) != LUA_OK)
     {
-        luaErrToResp(o, "ERR Error running script: ");
-        return;
+        import dreads.commands : gInScript;
+
+        gInScript = true;
+        scope (exit)
+            gInScript = false;
+        if (lua_pcall(gL, 0, 1, 0) != LUA_OK)
+        {
+            luaErrToResp(o, "ERR Error running script: ");
+            return;
+        }
     }
     luaToResp(gL, lua_gettop(gL), o);
 }

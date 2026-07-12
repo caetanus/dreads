@@ -1018,6 +1018,49 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             bool bySha = uname == "EVALSHA" || uname == "EVALSHA_RO";
             bool readOnly = uname == "EVAL_RO" || uname == "EVALSHA_RO";
+            // under raft a write-capable script IS a write: it must reach the
+            // log through consensus, or followers never see redis.call effects.
+            // Propose the EVAL form (EVALSHA is rewritten so followers don't
+            // depend on their script cache); the apply loop runs it.
+            if (gReplicator !is null && !readOnly)
+            {
+                import dreads.stream : nowMs;
+
+                if (!gReplicator.isLeader)
+                {
+                    repError(o, "READONLY You can't write against a read only replica.");
+                    return true;
+                }
+                const(ubyte)[] entry = rawCmd;
+                static ByteBuffer evalBuf; // TLS: EVALSHA -> EVAL rewrite
+                if (bySha)
+                {
+                    if (args.length == 0)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'evalsha' command");
+                        return true;
+                    }
+                    auto body_ = cachedScript(args[0].str);
+                    if (body_ is null)
+                    {
+                        repError(o,
+                                "NOSCRIPT No matching script. Please use EVAL.");
+                        return true;
+                    }
+                    evalBuf.clear();
+                    repArrayHeader(evalBuf, 1 + args.length);
+                    repBulk(evalBuf, "EVAL");
+                    repBulk(evalBuf, body_);
+                    foreach (ref a; args[1 .. $])
+                        repBulk(evalBuf, a.str);
+                    entry = evalBuf.data;
+                }
+                try
+                    gReplicator.proposeWrite(entry, nowMs(), cast(ushort)(c.dbp - &gDbs[0]), o);
+                catch (Exception)
+                    repError(o, "ERR replication error");
+                return true;
+            }
             auto outBefore = o.length;
             evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
             // scripts may write; log unless the script itself errored.
@@ -1055,7 +1098,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // (gReplicator is null) falls straight through with zero added cost.
     if (gReplicator !is null)
     {
-        if (isWriteCommand(uname))
+        // GETEX is not a logged write (a plain GETEX changes nothing and the
+        // AOF stays clean via the PEXPIREAT/PERSIST override), but under raft
+        // its TTL mutation must still reach followers: propose it and let the
+        // injected clock keep the replay deterministic.
+        if (isWriteCommand(uname) || uname == "GETEX")
         {
             import dreads.stream : nowMs;
 

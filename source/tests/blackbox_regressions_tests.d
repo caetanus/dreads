@@ -268,6 +268,31 @@ version (unittest)
             .expect.to.equal("-ERR invalid expire time in 'getex' command\r\n");
     }
 
+    @("blackbox.replication_rewrites")
+    unittest
+    {
+        // what reaches the AOF/raft log must replay to the same state
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        // MSETEX with a relative expire propagates the ABSOLUTE deadline
+        ks.run("MSETEX", "2", "a", "1", "b", "2", "EX", "100").expect.to.equal(":1\r\n");
+        auto prop = (cast(string) propagationOverride.data).idup;
+        prop.expect.to.contain("PXAT");
+        prop.expect.to.contain("MSETEX");
+        // GETEX rewrites to PEXPIREAT / PERSIST
+        ks.run("GETEX", "a", "EX", "50");
+        (cast(string) propagationOverride.data).expect.to.contain("PEXPIREAT");
+        ks.run("GETEX", "a", "PERSIST");
+        (cast(string) propagationOverride.data).expect.to.contain("PERSIST");
+        // SORT BY nosort with STORE forces a deterministic (alphabetical)
+        // order: set slot order is not replay-stable
+        ks.run("SADD", "s", "c", "a", "b");
+        ks.run("SORT", "s", "BY", "nosort", "ALPHA", "STORE", "dst").expect.to.equal(":3\r\n");
+        ks.run("LRANGE", "dst", "0", "-1")
+            .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    }
+
     @("blackbox.lpos_rank_zero_message")
     unittest
     {

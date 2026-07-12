@@ -363,10 +363,21 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     }
     import core.stdc.string : memchr;
 
+    import dreads.commands : gInScript;
+
     // BY with a '*'-less pattern means "don't sort" (Redis uses it to fetch
     // GET projections in container order)
     bool dontsort = byPat.length != 0
         && memchr(byPat.ptr, '*', byPat.length) is null;
+    // ...except when the result must be reproducible: a STOREd list re-enters
+    // via AOF/raft replay and scripts replay verbatim, so Redis forces
+    // alphabetical order there (set slot order isn't replay-stable)
+    if (dontsort && (storeKey.length != 0 || gInScript))
+    {
+        dontsort = false;
+        byPat = null;
+        alpha = true;
+    }
     size_t total = obj is null ? 0 : obj.containerLen;
     auto items = arena.allocArray!SortItem(total);
     size_t n = 0;

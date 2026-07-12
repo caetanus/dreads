@@ -63,11 +63,18 @@ These exist but do not match Redis exactly:
   (globals they create die with the execution — fresh-interpreter isolation
   at shared-state cost) and the state is recycled past 32MB of heap.
   Helper libraries: `cjson` and `cmsgpack` (in-project D implementations),
-  `redis.sha1hex` and `bit` are provided; still missing: `struct`, and
-  `SCRIPT KILL` (the time limit hard-aborts instead — with a single-threaded
-  event loop no other command can arrive mid-script anyway); scripts log
-  verbatim, so time-dependent commands *inside* scripts (relative `EXPIRE`,
-  `XADD *`) can drift on replay.
+  `redis.sha1hex`, `bit`, `redis.log` (accepted, dropped), `redis.setresp`
+  and a **Lua 5.1 compat layer** (`unpack`, `table.getn`, `math.pow`,
+  `math.log10`, `math.ldexp` — Redis embeds 5.1, we run 5.4). Still missing:
+  `struct`, and `SCRIPT KILL` (the time limit hard-aborts instead — with a
+  single-threaded event loop no other command can arrive mid-script anyway).
+  **Replication model: scripts replicate VERBATIM** (the EVAL itself is the
+  raft/AOF entry, EVALSHA rewritten to EVAL). Determinism is enforced: the
+  clock is frozen for the whole EVAL (relative `EXPIRE`/`TIME`/`XADD *`
+  inside a script resolve identically on replay) and a write after a
+  random-reply command (SRANDMEMBER/HRANDFIELD/ZRANDMEMBER/RANDOMKEY) is
+  refused, like pre-effects Redis. `redis.replicate_commands()` honestly
+  answers **false** — effects replication is future work.
 - **Protocol**: RESP2 **and RESP3** (branch `resp3-oracle`). `HELLO 2`/`HELLO 3`
   negotiate per-connection (`Conn.resp3`); `HELLO 3` replies as a map. RESP3
   types implemented: null (`_`), boolean (`#`), double (`,`), big number (`(`),

@@ -26,6 +26,11 @@ import dreads.det : detNow = now;
 /// thread, and the test runner gets one buffer per thread.
 public ByteBuffer propagationOverride;
 
+/// True while an EVAL is running. Scripts replicate verbatim, so commands
+/// whose output order is only incidentally stable (SORT BY nosort on a set)
+/// must pick the deterministic path when they see this.
+public __gshared bool gInScript;
+
 /// Redis's proto-max-bulk-len default: 512MB per string value.
 private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
 
@@ -848,6 +853,26 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 notifyKeyspaceEvent(NClass.str, "set", args[j].str);
                 if (expireGiven)
                     notifyKeyspaceEvent(NClass.generic, "expire", args[j].str);
+            }
+            if (expireGiven)
+            {
+                // propagate the ABSOLUTE deadline (PXAT): a relative EX
+                // replayed later would compute a different expiry (Valkey
+                // rewrites MSETEX the same way)
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride,
+                        1 + pairsEnd + (nx || xx ? 1 : 0) + 2);
+                repBulk(propagationOverride, "MSETEX");
+                foreach (j; 0 .. pairsEnd)
+                    repBulk(propagationOverride, args[j].str);
+                if (nx)
+                    repBulk(propagationOverride, "NX");
+                else if (xx)
+                    repBulk(propagationOverride, "XX");
+                repBulk(propagationOverride, "PXAT");
+                char[24] eb = void;
+                auto en = snprintf(eb.ptr, eb.length, "%lld", absExpire);
+                repBulk(propagationOverride, eb[0 .. en]);
             }
             repInt(o, 1);
             break;
