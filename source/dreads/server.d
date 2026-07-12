@@ -594,7 +594,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             }
             if (c.watching && c.watchEpoch != gWriteEpoch)
             {
-                o.append("*-1\r\n");
+                repNullArray(o); // aborted EXEC: RESP3 null
                 return true;
             }
             repArrayHeader(o, c.multiCount);
@@ -1646,16 +1646,22 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
     auto keys = args[0 .. $ - 1];
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
     for (;;)
     {
         foreach (ref k; keys)
         {
             bool wrong;
-            auto obj = gKeys.lookupTyped(k.str, ObjType.list, wrong);
+            auto obj = c.dbp.lookupTyped(k.str, ObjType.list, wrong);
             if (wrong)
             {
-                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
-                return;
+                // once blocked, a wrong-typed key never wakes the client
+                if (firstPass)
+                {
+                    repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                    return;
+                }
+                continue;
             }
             if (obj is null || obj.list.length == 0)
                 continue;
@@ -1666,13 +1672,14 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
                 obj.list.popFront();
             else
                 obj.list.popBack();
-            gKeys.delIfEmpty(k.str, obj);
+            c.dbp.delIfEmpty(k.str, obj);
             logEffect(fromLeft ? "LPOP" : "RPOP", k.str);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            repNullArray(o);
             return;
         }
     }
@@ -1699,16 +1706,22 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
     auto keys = args[0 .. $ - 1];
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
     for (;;)
     {
         foreach (ref k; keys)
         {
             bool wrong;
-            auto obj = gKeys.lookupTyped(k.str, ObjType.zset, wrong);
+            auto obj = c.dbp.lookupTyped(k.str, ObjType.zset, wrong);
             if (wrong)
             {
-                repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
-                return;
+                // once blocked, a wrong-typed key never wakes the client
+                if (firstPass)
+                {
+                    repError(o, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                    return;
+                }
+                continue;
             }
             if (obj is null || obj.zset.length == 0)
                 continue;
@@ -1722,13 +1735,14 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
                 return 0;
             });
             obj.zset.remove(victim);
-            gKeys.delIfEmpty(k.str, obj);
+            c.dbp.delIfEmpty(k.str, obj);
             logEffect(popMax ? "ZPOPMAX" : "ZPOPMIN", k.str);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            repNullArray(o);
             return;
         }
     }
@@ -1753,6 +1767,10 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
 
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
+    // the rewritten command replies through the connection's protocol, so the
+    // "nothing to serve" sentinel is `_` under RESP3
+    auto nil = gRespProto >= 3 ? "_\r\n" : nilReply;
     for (;;)
     {
         attempt.clear();
@@ -1763,15 +1781,21 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
-        dispatch(cmd2, gKeys, attempt, arena);
+        dispatch(cmd2, *c.dbp, attempt, arena);
         propagationOverride.clear();
         auto rep = cast(const(char)[]) attempt.data;
         if (rep.length > 0 && rep[0] == '-')
         {
-            o.append(attempt.data); // real error: surface it
-            return;
+            // surface errors only before blocking; once blocked, a key that
+            // turned wrong-typed must not wake (or fail) the client
+            if (firstPass)
+            {
+                o.append(attempt.data);
+                return;
+            }
+            rep = nil; // treat as "not ready", keep waiting
         }
-        if (rep != nilReply)
+        if (rep != nil)
         {
             o.append(attempt.data);
             if (gAof.enabled)
@@ -1780,9 +1804,10 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             gKeyActivity.emit();
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        firstPass = false;
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append(nilReply);
+            o.append(nil);
             return;
         }
     }
@@ -1829,7 +1854,7 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             // resolve to the stream's current last id
             auto keyIdx = i - half;
             bool wrong;
-            auto obj = gKeys.lookupTyped(args[keyIdx].str, ObjType.stream, wrong);
+            auto obj = c.dbp.lookupTyped(args[keyIdx].str, ObjType.stream, wrong);
             char[48] b = void;
             auto ms = obj is null ? 0 : obj.stream.lastId.ms;
             auto seq = obj is null ? 0 : obj.stream.lastId.seq;
@@ -1853,16 +1878,17 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
-        dispatch(cmd2, gKeys, attempt, arena);
+        dispatch(cmd2, *c.dbp, attempt, arena);
         auto rep = cast(const(char)[]) attempt.data;
-        if (rep != "*-1\r\n")
+        auto nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
+        if (rep != nil)
         {
             o.append(attempt.data);
             return;
         }
-        if (c.inMulti || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
-            o.append("*-1\r\n");
+            o.append(nil);
             return;
         }
     }
