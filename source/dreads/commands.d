@@ -1182,37 +1182,152 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // --- sorted sets ---
     case "ZADD":
         {
-            if (args.length < 3 || (args.length - 1) % 2 != 0)
+            import core.stdc.math : isnan;
+
+            if (args.length < 3)
             {
                 arityErr(o, "zadd");
                 break;
             }
+            // leading flags: [NX|XX] [GT|LT] [CH] [INCR], then score/member pairs
+            bool nx, xx, gt, lt, ch, incr;
+            size_t i = 1;
+            for (; i < args.length; i++)
+            {
+                auto f = args[i].str;
+                if (eqICKeyword(f, "NX"))
+                    nx = true;
+                else if (eqICKeyword(f, "XX"))
+                    xx = true;
+                else if (eqICKeyword(f, "GT"))
+                    gt = true;
+                else if (eqICKeyword(f, "LT"))
+                    lt = true;
+                else if (eqICKeyword(f, "CH"))
+                    ch = true;
+                else if (eqICKeyword(f, "INCR"))
+                    incr = true;
+                else
+                    break;
+            }
+            if (nx && xx)
+            {
+                repError(o, "ERR XX and NX options at the same time are not compatible");
+                break;
+            }
+            if ((gt && lt) || (nx && (gt || lt)))
+            {
+                repError(o, "ERR GT, LT, and/or NX options at the same time are not compatible");
+                break;
+            }
+            auto pairs = args[i .. $];
+            if (pairs.length == 0 || pairs.length % 2 != 0)
+            {
+                arityErr(o, "zadd");
+                break;
+            }
+            if (incr && pairs.length != 2)
+            {
+                repError(o, "ERR INCR option supports a single increment-element pair");
+                break;
+            }
             // validate every score before touching the keyspace
-            for (size_t i = 1; i < args.length; i += 2)
+            for (size_t j = 0; j < pairs.length; j += 2)
             {
                 double s;
-                if (!parseDouble(args[i].str, s))
+                if (!parseDouble(pairs[j].str, s))
                 {
                     repError(o, "ERR value is not a valid float");
                     return true;
                 }
             }
             bool wrong;
-            auto obj = ks.getOrCreate(args[0].str, ObjType.zset, wrong);
-            if (wrong)
+            RObj* obj;
+            if (xx) // XX never creates the key
             {
-                repWrongType(o);
-                break;
+                obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    break;
+                }
+                if (obj is null)
+                {
+                    if (incr)
+                        repNullBulk(o);
+                    else
+                        repInt(o, 0);
+                    break;
+                }
             }
-            long added = 0;
-            for (size_t i = 1; i < args.length; i += 2)
+            else
+            {
+                obj = ks.getOrCreate(args[0].str, ObjType.zset, wrong);
+                if (wrong)
+                {
+                    repWrongType(o);
+                    break;
+                }
+            }
+            long added = 0, changed = 0;
+            bool incrReplied = false;
+            for (size_t j = 0; j < pairs.length; j += 2)
             {
                 double s;
-                parseDouble(args[i].str, s);
-                added += obj.zset.add(s, args[i + 1].str) ? 1 : 0;
+                parseDouble(pairs[j].str, s);
+                auto member = pairs[j + 1].str;
+                double cur;
+                bool exists = obj.zset.score(member, cur);
+                if ((nx && exists) || (xx && !exists))
+                {
+                    if (incr)
+                    {
+                        repNullBulk(o);
+                        incrReplied = true;
+                    }
+                    continue;
+                }
+                double newScore = (incr && exists) ? cur + s : s;
+                if (incr && exists && isnan(newScore))
+                {
+                    repError(o, "ERR resulting score is not a number (NaN)");
+                    return true;
+                }
+                // GT/LT gate updates only (they never block a brand-new member)
+                if (exists && ((gt && newScore <= cur) || (lt && newScore >= cur)))
+                {
+                    if (incr)
+                    {
+                        repNullBulk(o);
+                        incrReplied = true;
+                    }
+                    continue;
+                }
+                if (!exists || newScore != cur)
+                {
+                    obj.zset.add(newScore, member);
+                    if (!exists)
+                        added++;
+                    changed++;
+                }
+                if (incr)
+                {
+                    repDouble(o, newScore);
+                    incrReplied = true;
+                }
             }
-            notifyKeyspaceEvent(NClass.zset, "zadd", args[0].str);
-            repInt(o, added);
+            if (added || changed)
+                notifyKeyspaceEvent(NClass.zset, "zadd", args[0].str);
+            // XX may have created no members; drop an empty key it produced
+            if (!xx)
+                ks.delIfEmpty(args[0].str, obj);
+            if (incr)
+            {
+                if (!incrReplied)
+                    repNullBulk(o);
+            }
+            else
+                repInt(o, ch ? changed : added);
             break;
         }
     case "ZREM":
@@ -2229,27 +2344,70 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "COPY":
         {
-            if (args.length < 2 || args.length > 3)
+            if (args.length < 2)
             {
                 arityErr(o, "copy");
                 break;
             }
-            bool replace = args.length == 3 && eqICKeyword(args[2].str, "REPLACE");
-            if (args.length == 3 && !replace)
+            // COPY source destination [DB n] [REPLACE]
+            bool replace = false;
+            long destDb = -1; // -1 = same as the current db
+            for (size_t oi = 2; oi < args.length;)
             {
-                repError(o, "ERR syntax error");
+                if (eqICKeyword(args[oi].str, "REPLACE"))
+                {
+                    replace = true;
+                    oi++;
+                }
+                else if (eqICKeyword(args[oi].str, "DB") && oi + 1 < args.length)
+                {
+                    if (!parseLong(args[oi + 1].str, destDb))
+                    {
+                        repError(o, "ERR value is not an integer or out of range");
+                        return true;
+                    }
+                    if (destDb < 0 || destDb >= NUM_DBS)
+                    {
+                        repError(o, "ERR DB index is out of range");
+                        return true;
+                    }
+                    oi += 2;
+                }
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    return true;
+                }
+            }
+            // resolve the destination keyspace (which db am I on?)
+            int curIdx = -1;
+            foreach (k, ref d; gDbs)
+                if (&d is &ks)
+                {
+                    curIdx = cast(int) k;
+                    break;
+                }
+            Keyspace* destKs = &ks;
+            if (destDb >= 0 && destDb != curIdx)
+                destKs = &gDbs[cast(size_t) destDb];
+            if (destKs is &ks && args[0].str == args[1].str)
+            {
+                repError(o, "ERR source and destination objects are the same");
                 break;
             }
             auto src = ks.lookup(args[0].str);
-            if (src is null || (!replace && ks.exists(args[1].str)))
+            if (src is null || (!replace && destKs.exists(args[1].str)))
             {
                 repInt(o, 0);
                 break;
             }
             auto copy = src.deepDup(); // src pointer dies on the next line's rehash
-            ks.d.set(args[1].str, copy);
-            ks.armExpire(args[1].str, copy.expireAtMs); // the copy keeps the TTL
-            notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
+            if (replace)
+                destKs.del(args[1].str); // free any prior value + its TTL slot
+            destKs.d.set(args[1].str, copy);
+            destKs.armExpire(args[1].str, copy.expireAtMs); // the copy keeps the TTL
+            if (destKs is &ks)
+                notifyKeyspaceEvent(NClass.generic, "copy_to", args[1].str);
             repInt(o, 1);
             break;
         }
@@ -2673,10 +2831,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long cursor;
             const(char)[] pat;
             long count;
+            const(char)[] typeName;
             if (!parseLong(args[0].str, cursor) || cursor < 0
-                    || !parseScanOpts(args[1 .. $], pat, count, false))
+                    || !parseScanOpts(args[1 .. $], pat, count, false, null, &typeName))
             {
                 repError(o, "ERR syntax error");
+                break;
+            }
+            ObjType wantType;
+            bool filterType = typeName.length != 0;
+            if (filterType && !typeNameKnown(typeName, wantType))
+            {
+                repError(o, "ERR unknown type name");
                 break;
             }
             auto cap = ks.d.capacity;
@@ -2691,7 +2857,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     examined++;
                     auto obj = ks.d.valAt(i);
                     bool dead = obj.expireAtMs != 0 && now >= obj.expireAtMs;
-                    if (!dead && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
+                    if (!dead && (!filterType || obj.type == wantType)
+                            && (pat.length == 0 || globMatch(pat, ks.d.keyAt(i))))
                         found[got++] = ks.d.keyAt(i);
                 }
                 i++;
@@ -3467,7 +3634,7 @@ private void repEntry(ref ByteBuffer o, StreamID id, const(FieldPair)[] pairs) @
 
 /// [MATCH pat] [COUNT n] [NOVALUES] tail options of the SCAN family.
 private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long count,
-        bool allowNoValues, bool* noValues = null) @nogc nothrow
+        bool allowNoValues, bool* noValues = null, const(char)[]* typeOut = null) @nogc nothrow
 {
     count = 10;
     size_t i = 0;
@@ -3489,10 +3656,28 @@ private bool parseScanOpts(const(RVal)[] opts, out const(char)[] pat, out long c
             *noValues = true;
             i++;
         }
+        else if (typeOut !is null && eqICKeyword(opts[i].str, "TYPE") && i + 1 < opts.length)
+        {
+            *typeOut = opts[i + 1].str;
+            i += 2;
+        }
         else
             return false;
     }
     return true;
+}
+
+/// The `TYPE x` filter name matching an object's type, or false for the
+/// six type names Redis knows (so an unknown name can be rejected distinctly).
+private bool typeNameKnown(scope const(char)[] name, out ObjType t) @nogc nothrow
+{
+    if (eqICKeyword(name, "STRING")) { t = ObjType.str; return true; }
+    if (eqICKeyword(name, "LIST")) { t = ObjType.list; return true; }
+    if (eqICKeyword(name, "SET")) { t = ObjType.set; return true; }
+    if (eqICKeyword(name, "ZSET")) { t = ObjType.zset; return true; }
+    if (eqICKeyword(name, "HASH")) { t = ObjType.hash; return true; }
+    if (eqICKeyword(name, "STREAM")) { t = ObjType.stream; return true; }
+    return false;
 }
 
 /// *2 [next-cursor][items...]
