@@ -58,18 +58,20 @@ from taking that first result seriously once the answer looked like *yes*.
 
 ## Why — the numbers
 
-Competitive with real Redis, measured with `redis-benchmark` against the
-official Redis 8.8 image (Docker, host network, persistence off), LDC release
-build with jemalloc:
+A fair head-to-head: same host, same `redis-benchmark` invocation, both with
+jemalloc and persistence off — dreads (LDC release) vs **Valkey 9.1.0**
+(`--save '' --appendonly no`), `-P 16`, 50 connections, 1M requests each:
 
-| Command (`-P 16`, 50 conns) | dreads | Redis 8.8 | |
+| Command (`-P 16`, 50 conns) | dreads | Valkey 9.1 | |
 |---|---|---|---|
-| SET | **1.20M rps** (p50 0.31 ms) | 862k (0.67 ms) | 1.4× |
-| GET | **1.32M** (0.31 ms) | 1.16M (0.52 ms) | 1.1× |
-| LPUSH | **1.20M** (0.40 ms) | 1.04M (0.61 ms) | 1.2× |
-| ZADD | **1.40M** (0.38 ms) | 905k (0.71 ms) | 1.5× |
+| SET | **1.50M rps** (p50 0.30 ms) | 1.04M | 1.45× |
+| GET | **1.62M** (0.26 ms) | 1.25M | 1.30× |
+| INCR | **1.58M** | 1.27M | 1.25× |
+| LPUSH | **1.51M** (0.50 ms) | 1.08M | 1.40× |
+| SADD | **1.62M** | 1.20M | 1.35× |
+| ZADD | **1.40M** (0.54 ms) | 1.01M | 1.39× |
 
-One core does ~1.39M ops/s; because the model is single-threaded-per-shard,
+One core does ~1.5M ops/s; because the model is single-threaded-per-shard,
 scaling is horizontal (two shards → ~2.51M measured with parallel plain
 clients). Unpipelined throughput is round-trip bound on both sides (~95–100k
 rps); the pipelined numbers show the real per-command cost.
@@ -96,7 +98,8 @@ rps); the pipelined numbers show the real per-command cost.
   honest gap list and every semantic difference. All data types including
   **streams** with consumer groups; **GEO** (geohash-scored zsets, Redis-exact
   outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**; TTL/expiration with
-  the full `SET` option set and opt-in active expiry; the `SCAN` family;
+  the full `SET` option set (including Valkey's `SET ... IFEQ` / `DELIFEQ`
+compare-and-set) and opt-in active expiry; the `SCAN` family;
   `SORT`, `LCS`, `OBJECT ENCODING`; **16 logical databases** (`SELECT`,
   `SWAPDB`, `MOVE`, per-connection keyspace); transactions
   (`MULTI`/`EXEC`/`WATCH`); **blocking commands** (`BLPOP`, `BLMOVE`,
