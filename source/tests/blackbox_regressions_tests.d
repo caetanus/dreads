@@ -210,6 +210,16 @@ version (unittest)
         ks.run("ZLEXCOUNT", "z", "-", "+").expect.to.equal(":3\r\n");
         // dangling score without member is a syntax error, not arity
         ks.run("ZADD", "z", "1", "x", "2").expect.to.equal("-ERR syntax error\r\n");
+        // a score spelled out to DBL_MAX's full ~325-digit decimal still parses
+        // (strtod handles any length; our copy buffer must not cap it)
+        enum dblmax = "179769313486231570814527423731704356798070567525844996"
+            ~ "598917476803157260780028538760589558632766878171540458953514"
+            ~ "382464234321326889464182768467546703537516986049910576551282"
+            ~ "076245490090389328944075868508455133942304583236903222948165"
+            ~ "808559332123348274797826204144723168738177180919299881250404"
+            ~ "026184124858368.00000000000000000";
+        ks.run("ZADD", "zbig", dblmax, "m").expect.to.equal(":1\r\n");
+        ks.run("ZSCORE", "zbig", "m").expect.to.equal("$23\r\n1.7976931348623157e+308\r\n");
         // +inf + -inf aggregates to 0 (never NaN)
         ks.run("ZADD", "zi1", "inf", "k");
         ks.run("ZADD", "zi2", "-inf", "k");

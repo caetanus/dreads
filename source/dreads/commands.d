@@ -4958,8 +4958,7 @@ public bool parseLong(scope const(char)[] s, out long v) @nogc nothrow
 
 public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trusted
 {
-    char[64] tmp = void;
-    if (s.length == 0 || s.length >= tmp.length)
+    if (s.length == 0)
         return false;
     // Redis rejects leading whitespace (strtod would silently skip it, so "  11"
     // must NOT parse as 11); trailing garbage is caught by the endp check below.
@@ -4970,11 +4969,29 @@ public bool parseDouble(scope const(char)[] s, out double v) @nogc nothrow @trus
     default:
         break;
     }
-    tmp[0 .. s.length] = s[]; // slice copy, not memcpy
-    tmp[s.length] = 0;
+    // strtod needs a NUL-terminated copy. The short case (every normal score)
+    // stays on the stack; the rare long decimal — e.g. DBL_MAX spelled out to
+    // ~325 digits — falls back to a growable TLS buffer, so no fixed length cap
+    // rejects a value strtod would accept.
+    char[64] tmp = void;
+    char* cstr;
+    if (s.length < tmp.length)
+    {
+        tmp[0 .. s.length] = s[];
+        tmp[s.length] = 0;
+        cstr = tmp.ptr;
+    }
+    else
+    {
+        static ByteBuffer big; // TLS scratch, reused across calls
+        big.clear();
+        big.append(s);
+        big.appendByte(0);
+        cstr = cast(char*) big.data.ptr;
+    }
     char* endp;
-    v = strtod(tmp.ptr, &endp);
-    if (endp !is tmp.ptr + s.length)
+    v = strtod(cstr, &endp);
+    if (endp !is cstr + s.length)
         return false;
     return v == v; // reject NaN like Redis
 }
