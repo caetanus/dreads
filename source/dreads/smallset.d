@@ -100,11 +100,18 @@ struct SmallSet
         foreach (i; 0 .. count)
             if (at(i) == m)
                 return false;
+        import dreads.config : gConfig;
+
         long iv;
         immutable mIsInt = canonicalInt(m, iv);
         immutable staysInt = !hasNonInt && mIsInt;
-        immutable limit = staysInt ? MAX_INTSET : MAX_ENTRIES;
-        if (count >= limit || (!mIsInt && m.length > MAX_MEMBER))
+        // live thresholds — the suite flips them via CONFIG SET (enums above
+        // document the Redis defaults)
+        immutable cfgLimit = staysInt ? gConfig.setMaxIntsetEntries : gConfig.setMaxListpackEntries;
+        immutable limit = cfgLimit < 0 ? 0 : cast(size_t) cfgLimit;
+        immutable maxMember = gConfig.setMaxListpackValue < 0 ? 0
+            : cast(size_t) gConfig.setMaxListpackValue;
+        if (count >= limit || (!mIsInt && m.length > maxMember))
         {
             spill();
             return large.set(m, Unit());

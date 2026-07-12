@@ -100,7 +100,14 @@ struct SmallHash
                 vals[i] = v;
                 return false;
             }
-        if (count >= MAX_ENTRIES || k.length > MAX_VALUE || v.len() > MAX_VALUE)
+        import dreads.config : gConfig;
+
+        // live thresholds — the suite flips them via CONFIG SET
+        immutable limit = gConfig.hashMaxListpackEntries < 0 ? 0
+            : cast(size_t) gConfig.hashMaxListpackEntries;
+        immutable maxVal = gConfig.hashMaxListpackValue < 0 ? 0
+            : cast(size_t) gConfig.hashMaxListpackValue;
+        if (count >= limit || k.length > maxVal || v.len() > maxVal)
         {
             spill();
             return large.set(k, v);

@@ -800,10 +800,12 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     case "BLMPOP":
     case "BZMPOP":
         {
-            // B*MPOP timeout numkeys ... -> *MPOP numkeys ...
-            if (args.length < 3)
+            // B*MPOP timeout numkeys key [key ...] WHERE -> *MPOP numkeys ...
+            if (args.length < 4)
             {
-                repError(o, "ERR wrong number of arguments");
+                repError(o, uname == "BLMPOP"
+                        ? "ERR wrong number of arguments for 'blmpop' command"
+                        : "ERR wrong number of arguments for 'bzmpop' command");
                 return true;
             }
             ulong timeoutMs;

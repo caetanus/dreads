@@ -1477,9 +1477,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto pairs = args[i .. $];
-            if (pairs.length == 0 || pairs.length % 2 != 0)
+            if (pairs.length == 0)
             {
                 arityErr(o, "zadd");
+                break;
+            }
+            if (pairs.length % 2 != 0) // dangling score without a member
+            {
+                repError(o, "ERR syntax error");
                 break;
             }
             if (incr && pairs.length != 2)
@@ -2269,8 +2274,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             notifyKeyspaceEvent(NClass.set, "srem", args[0].str);
             bool w3;
             auto dst = ks.getOrCreate(args[1].str, ObjType.set, w3); // may rehash: src is stale now
-            dst.set.set(args[2].str, Unit());
-            notifyKeyspaceEvent(NClass.set, "sadd", args[1].str);
+            if (dst.set.set(args[2].str, Unit())) // notify only a real addition
+                notifyKeyspaceEvent(NClass.set, "sadd", args[1].str);
             auto src2 = ks.lookup(args[0].str);
             if (src2 !is null)
                 ks.delIfEmpty(args[0].str, src2);
@@ -3835,6 +3840,25 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
         arityErr(o, byRank ? "zremrangebyrank" : "zremrangebyscore");
         return;
     }
+    // validate the range before touching the key (Valkey errors on bad
+    // bounds even for a missing key)
+    long start, stop;
+    double min, max;
+    bool minExcl, maxExcl;
+    if (byRank)
+    {
+        if (!parseLong(args[1].str, start) || !parseLong(args[2].str, stop))
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return;
+        }
+    }
+    else if (!parseScoreBound(args[1].str, min, minExcl)
+            || !parseScoreBound(args[2].str, max, maxExcl))
+    {
+        repError(o, "ERR min or max is not a float");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.zset, wrong);
     if (wrong)
@@ -3851,12 +3875,6 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
     size_t n = 0;
     if (byRank)
     {
-        long start, stop;
-        if (!parseLong(args[1].str, start) || !parseLong(args[2].str, stop))
-        {
-            repError(o, "ERR value is not an integer or out of range");
-            return;
-        }
         auto len = cast(long) obj.zset.length;
         normalizeRange(start, stop, len);
         if (start <= stop)
@@ -3867,14 +3885,6 @@ private void zremrange(ref Keyspace ks, const(RVal)[] args, bool byRank,
     }
     else
     {
-        double min, max;
-        bool minExcl, maxExcl;
-        if (!parseScoreBound(args[1].str, min, minExcl) || !parseScoreBound(args[2].str,
-                max, maxExcl))
-        {
-            repError(o, "ERR min or max is not a float");
-            return;
-        }
         obj.zset.walkScoreRange(min, minExcl, max, maxExcl, (m, s) {
             victims[n++] = arena.dupString(m);
             return 0;
@@ -4329,7 +4339,34 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
             return "raw";
         }
     case ObjType.list:
-        return "linkedlist";
+        {
+            // Storage is one DList either way; the reported tier follows
+            // Valkey's conversion rule (t_list.c listTypeTryConvertListpack):
+            // listpack until quicklistNodeExceedsLimit(fill, lpBytes, count).
+            import dreads.config : gConfig;
+
+            size_t lpBytes = 7; // listpack header + terminator
+            foreach (v; obj.list)
+            {
+                auto entry = v.length + (v.length < 64 ? 1 : v.length < 4096 ? 2 : 5);
+                entry += entry < 128 ? 1 : entry < 16_384 ? 2 : 5; // backlen
+                lpBytes += entry;
+            }
+            auto fill = gConfig.listMaxListpackSize;
+            bool small;
+            if (fill >= 0)
+            {
+                enum sizeSafetyLimit = 8192;
+                small = obj.list.length <= cast(ulong) fill && lpBytes <= sizeSafetyLimit;
+            }
+            else
+            {
+                static immutable size_t[5] optLevel = [4096, 8192, 16_384, 32_768, 65_536];
+                auto idx = cast(size_t)(-fill - 1);
+                small = lpBytes <= optLevel[idx > 4 ? 4 : idx];
+            }
+            return small ? "listpack" : "quicklist";
+        }
     case ObjType.hash:
         return obj.hash.encoding(); // listpack | hashtable (real state)
     case ObjType.set:

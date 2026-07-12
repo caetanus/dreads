@@ -33,7 +33,8 @@ public void lpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Aren
             if (!parseLong(args[i + 1].str, rank) || rank == 0)
             {
                 repError(o,
-                        "ERR RANK can't be zero. Use 1 to start searching from the first matching element, or the negative number to start searching from the end.");
+                        "ERR RANK can't be zero: use 1 to start from the first match, "
+                        ~ "2 from the second ... or use negative to start from the end of the list");
                 return;
             }
             i += 2;
@@ -123,11 +124,20 @@ public void lpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Aren
 /// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
 public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
+    if (args.length < 3)
+    {
+        repError(o, "ERR wrong number of arguments for 'lmpop' command");
+        return;
+    }
     long numkeys;
-    if (args.length < 3 || !parseLong(args[0].str, numkeys) || numkeys < 1
-            || args.length < 1 + cast(size_t) numkeys + 1)
+    if (!parseLong(args[0].str, numkeys) || numkeys < 1)
     {
         repError(o, "ERR numkeys should be greater than 0");
+        return;
+    }
+    if (args.length < 1 + cast(size_t) numkeys + 1) // no room for LEFT|RIGHT
+    {
+        repError(o, "ERR syntax error");
         return;
     }
     auto keys = args[1 .. 1 + cast(size_t) numkeys];

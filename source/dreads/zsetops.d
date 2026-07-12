@@ -103,6 +103,8 @@ private MS[] collectRange(RObj* obj, const ref RangeSpec sp, ref Arena arena) @n
         });
         break;
     case RangeMode.lex:
+        if (lexRangeEmpty(sp.lmin, sp.lmax))
+            return null;
         obj.zset.walkLexRange(sp.lmin.v, sp.lmin.excl, sp.lmin.negInf,
                 sp.lmax.v, sp.lmax.excl, sp.lmax.posInf, (m, s) {
             buf[n++] = MS(m, s);
@@ -130,11 +132,21 @@ private MS[] collectRange(RObj* obj, const ref RangeSpec sp, ref Arena arena) @n
     return hits;
 }
 
+private enum RangeErr
+{
+    none,
+    syntax,
+    notFloat, // score bound didn't parse
+    notLex, // lex bound didn't parse
+    notInt // index bound didn't parse
+}
+
 /// Parses [BYSCORE|BYLEX] [REV] [LIMIT o c] [WITHSCORES] plus the bounds.
 /// boundsRev: bounds arrive as (max, min) — the legacy ZREV* forms.
 private bool parseRangeArgs(const(RVal)[] bounds, const(RVal)[] opts, bool boundsRev,
-        ref RangeSpec sp, ref bool withScores, ref bool limitUsed) @nogc nothrow
+        ref RangeSpec sp, ref bool withScores, ref bool limitUsed, out RangeErr err) @nogc nothrow
 {
+    err = RangeErr.syntax;
     size_t i = 0;
     while (i < opts.length)
     {
@@ -178,11 +190,14 @@ private bool parseRangeArgs(const(RVal)[] bounds, const(RVal)[] opts, bool bound
     final switch (sp.mode)
     {
     case RangeMode.index:
+        err = RangeErr.notInt;
         return parseLong(first, sp.start) && parseLong(second, sp.stop);
     case RangeMode.score:
+        err = RangeErr.notFloat;
         return parseScoreBound(minTok, sp.smin, sp.sminX)
             && parseScoreBound(maxTok, sp.smax, sp.smaxX);
     case RangeMode.lex:
+        err = RangeErr.notLex;
         return parseLexBound(minTok, sp.lmin) && parseLexBound(maxTok, sp.lmax);
     }
 }
@@ -224,9 +239,25 @@ public void zrangeGeneric(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     default:
         break;
     }
-    if (!parseRangeArgs(args[1 .. 3], args[3 .. $], boundsRev, sp, withScores, limitUsed))
+    RangeErr rerr;
+    if (!parseRangeArgs(args[1 .. 3], args[3 .. $], boundsRev, sp, withScores, limitUsed, rerr))
     {
-        repError(o, "ERR syntax error");
+        final switch (rerr)
+        {
+        case RangeErr.none:
+        case RangeErr.syntax:
+            repError(o, "ERR syntax error");
+            break;
+        case RangeErr.notFloat:
+            repError(o, "ERR min or max is not a float");
+            break;
+        case RangeErr.notLex:
+            repError(o, "ERR min or max not valid string range item");
+            break;
+        case RangeErr.notInt:
+            repError(o, "ERR value is not an integer or out of range");
+            break;
+        }
         return;
     }
     if (limitUsed && sp.mode == RangeMode.index)
@@ -271,7 +302,9 @@ public void zrangestore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
     }
     RangeSpec sp;
     bool withScores, limitUsed;
-    if (!parseRangeArgs(args[2 .. 4], args[4 .. $], false, sp, withScores, limitUsed) || withScores)
+    RangeErr rerr;
+    if (!parseRangeArgs(args[2 .. 4], args[4 .. $], false, sp, withScores, limitUsed, rerr)
+            || withScores)
     {
         repError(o, "ERR syntax error");
         return;
@@ -303,6 +336,18 @@ public void zrangestore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, r
     repInt(o, cast(long) hits.length);
 }
 
+/// True when a lex range can't match anything (min sorts after max).
+private bool lexRangeEmpty(ref const LexBound lmin, ref const LexBound lmax) @nogc nothrow
+{
+    if (lmin.posInf || lmax.negInf)
+        return true;
+    if (lmin.negInf || lmax.posInf)
+        return false;
+    if (lmin.v > lmax.v)
+        return true;
+    return lmin.v == lmax.v && (lmin.excl || lmax.excl);
+}
+
 /// ZLEXCOUNT key min max / ZREMRANGEBYLEX key min max
 public void zlexRange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         ref Arena arena, bool remove) @nogc nothrow
@@ -326,7 +371,7 @@ public void zlexRange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repWrongTypeZ(o);
         return;
     }
-    if (obj is null)
+    if (obj is null || lexRangeEmpty(lmin, lmax))
     {
         repInt(o, 0);
         return;
@@ -447,11 +492,20 @@ public void zrandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @
 /// ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]
 public void zmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
+    if (args.length < 3)
+    {
+        repError(o, "ERR wrong number of arguments for 'zmpop' command");
+        return;
+    }
     long numkeys;
-    if (args.length < 3 || !parseLong(args[0].str, numkeys) || numkeys < 1
-            || args.length < 1 + cast(size_t) numkeys + 1)
+    if (!parseLong(args[0].str, numkeys) || numkeys < 1)
     {
         repError(o, "ERR numkeys should be greater than 0");
+        return;
+    }
+    if (args.length < 1 + cast(size_t) numkeys + 1) // no room for MIN|MAX
+    {
+        repError(o, "ERR syntax error");
         return;
     }
     auto keys = args[1 .. 1 + cast(size_t) numkeys];
@@ -527,10 +581,15 @@ private enum Agg
 private int eachMemberScore(RObj* obj, double weight,
         scope int delegate(const(char)[] m, double s) @nogc nothrow dg) @nogc nothrow
 {
+    import std.math : isNaN;
+
     if (obj is null)
         return 0;
     if (obj.type == ObjType.zset)
-        return obj.zset.walkRange(0, obj.zset.length, false, (m, s) => dg(m, s * weight));
+        return obj.zset.walkRange(0, obj.zset.length, false, (m, s) {
+            auto w = s * weight;
+            return dg(m, isNaN(w) ? 0 : w); // Redis: 0 × inf weighs 0, not NaN
+        });
     foreach (i; 0 .. obj.set.capacity)
     {
         if (!obj.set.slotLive(i))
@@ -558,10 +617,13 @@ private bool memberScore(RObj* obj, scope const(char)[] m, out double s) @nogc n
 
 private double aggregate(Agg agg, double a, double b) @nogc nothrow
 {
+    import std.math : isNaN;
+
     final switch (agg)
     {
     case Agg.sum:
-        return a + b;
+        auto r = a + b;
+        return isNaN(r) ? 0 : r; // Redis: +inf + -inf aggregates to 0
     case Agg.min:
         return a < b ? a : b;
     case Agg.max:

@@ -108,7 +108,14 @@ struct SmallZSet
             insert(s, member);
             return false;
         }
-        if (count >= MAX_ENTRIES || member.length > MAX_VALUE)
+        import dreads.config : gConfig;
+
+        // live thresholds — the suite flips them via CONFIG SET
+        immutable limit = gConfig.zsetMaxListpackEntries < 0 ? 0
+            : cast(size_t) gConfig.zsetMaxListpackEntries;
+        immutable maxVal = gConfig.zsetMaxListpackValue < 0 ? 0
+            : cast(size_t) gConfig.zsetMaxListpackValue;
+        if (count >= limit || member.length > maxVal)
         {
             spill();
             return large.add(s, member);
