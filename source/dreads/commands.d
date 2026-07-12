@@ -3922,7 +3922,7 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     case ObjType.list:
         return "linkedlist";
     case ObjType.hash:
-        return "hashtable";
+        return obj.hash.encoding(); // listpack | hashtable (real state)
     case ObjType.set:
         return obj.set.encoding(); // intset | listpack | hashtable (real state)
     case ObjType.zset:
