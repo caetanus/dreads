@@ -30,13 +30,13 @@ These exist but do not match Redis exactly:
 - **EXPIRE family**: no `NX/XX/GT/LT` flags. **ZADD**: no
   `NX/XX/GT/LT/CH/INCR` flags (GEOADD does implement NX/XX/CH).
 - **SET**: full option set implemented (`EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET`).
-- **SPOP/SRANDMEMBER/ZRANDMEMBER/HRANDFIELD/RANDOMKEY**: deterministic
-  (first live slots/ranks), not random. SPOP propagates as `SREM`, so
+- **SRANDMEMBER/ZRANDMEMBER/HRANDFIELD**: real uniform draws (xorshift64*,
+  reservoir sampling for the distinct-count form). **SPOP/RANDOMKEY** remain
+  deterministic (first live slot). SPOP propagates as `SREM`, so
   persistence/replication are unaffected.
 - **SCAN family**: cursor is a slot index; a concurrent rehash can miss or
   duplicate elements (Redis's reverse-binary cursor guarantees stability).
   ZSCAN is rank-based (ordered).
-- **SORT**: no `BY`/`GET` patterns (explicit error).
 - **WATCH**: global write epoch — *any* write since WATCH aborts EXEC
   (stricter than Redis's per-key tracking). MULTI queues without validating
   commands, so unknown commands fail inside EXEC instead of at queue time;

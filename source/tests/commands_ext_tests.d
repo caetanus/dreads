@@ -277,6 +277,41 @@ version (unittest)
         ks.run("EXISTS", "gone").expect.to.equal(":0\r\n");
     }
 
+    @("ext.msetex")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+        ks.run("MSETEX", "2", "a", "1", "b", "2").expect.to.equal(":1\r\n");
+        ks.run("GET", "a").expect.to.equal("$1\r\n1\r\n");
+        ks.run("MSETEX", "1", "c", "3", "EX", "100").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c")[0].expect.to.equal(':');
+        ks.run("PTTL", "c").expect.to.not.equal(":-1\r\n");
+        // NX blocks when any key exists; XX blocks when any is missing
+        ks.run("MSETEX", "2", "a", "9", "new", "9", "NX").expect.to.equal(":0\r\n");
+        ks.run("EXISTS", "new").expect.to.equal(":0\r\n");
+        ks.run("MSETEX", "2", "a", "9", "ghost", "9", "XX").expect.to.equal(":0\r\n");
+        ks.run("MSETEX", "1", "a", "9", "XX").expect.to.equal(":1\r\n");
+        ks.run("GET", "a").expect.to.equal("$1\r\n9\r\n");
+        // plain MSETEX clears a TTL; KEEPTTL keeps it
+        ks.run("MSETEX", "1", "c", "4").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c").expect.to.equal(":-1\r\n");
+        ks.run("EXPIRE", "c", "100");
+        ks.run("MSETEX", "1", "c", "5", "KEEPTTL").expect.to.equal(":1\r\n");
+        ks.run("TTL", "c").expect.to.not.equal(":-1\r\n");
+        // errors
+        ks.run("MSETEX", "0", "a", "1")
+            .expect.to.equal("-ERR invalid numkeys value or out of range\r\n");
+        ks.run("MSETEX", "3", "a", "1", "b", "2").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "NX", "XX").expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "EX", "100", "KEEPTTL")
+            .expect.to.equal("-ERR syntax error\r\n");
+        ks.run("MSETEX", "1", "a", "1", "EX", "0")
+            .expect.to.equal("-ERR invalid expire time in 'msetex' command\r\n");
+        ks.run("MSETEX", "1", "a", "1", "BOGUS").expect.to.equal("-ERR syntax error\r\n");
+    }
+
     @("ext.info_keyspace")
     unittest
     {

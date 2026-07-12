@@ -318,6 +318,32 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repInt(o, obj !is null && obj.stream.groups.del(gname) ? 1 : 0);
         return;
     }
+    if (eqICKeyword(sub, "SETID"))
+    {
+        // XGROUP SETID key group id|$ [ENTRIESREAD n] — n is accepted, unused
+        if (args.length != 4 && !(args.length == 6 && eqICKeyword(args[4].str, "ENTRIESREAD")))
+        {
+            repError(o, "ERR wrong number of arguments for 'xgroup' command");
+            return;
+        }
+        auto g = obj is null ? null : obj.stream.groups.get(gname);
+        if (g is null)
+        {
+            repNoGroup(o, gname, key);
+            return;
+        }
+        StreamID at;
+        if (args[3].str == "$")
+            at = obj.stream.lastId;
+        else if (!parseId(args[3].str, 0, at))
+        {
+            repError(o, "ERR Invalid stream ID specified as stream command argument");
+            return;
+        }
+        g.lastDelivered = at;
+        repSimple(o, "OK");
+        return;
+    }
     if (eqICKeyword(sub, "CREATECONSUMER") || eqICKeyword(sub, "DELCONSUMER"))
     {
         if (args.length != 4)

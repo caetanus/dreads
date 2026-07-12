@@ -199,16 +199,49 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             // EXPIRE(6)/EXPIREAT(8) take seconds; EXPIRE(6)/PEXPIRE(7) are relative
             bool isSec = name.length == 6 || name.length == 8;
             bool isRel = name.length <= 7;
-            if (args.length != 2)
+            auto lname = isRel ? (isSec ? "expire" : "pexpire") : (isSec
+                    ? "expireat" : "pexpireat");
+            if (args.length < 2)
             {
-                arityErr(o, isRel ? (isSec ? "expire" : "pexpire") : (isSec
-                        ? "expireat" : "pexpireat"));
+                arityErr(o, lname);
                 break;
             }
             long v;
             if (!parseLong(args[1].str, v))
             {
                 repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            bool fNX, fXX, fGT, fLT, badOpt;
+            foreach (ref a; args[2 .. $])
+            {
+                if (eqICKeyword(a.str, "NX"))
+                    fNX = true;
+                else if (eqICKeyword(a.str, "XX"))
+                    fXX = true;
+                else if (eqICKeyword(a.str, "GT"))
+                    fGT = true;
+                else if (eqICKeyword(a.str, "LT"))
+                    fLT = true;
+                else
+                {
+                    o.append("-ERR Unsupported option ");
+                    o.append(a.str.length > 128 ? a.str[0 .. 128] : a.str);
+                    o.append("\r\n");
+                    badOpt = true;
+                    break;
+                }
+            }
+            if (badOpt)
+                break;
+            if (fNX && (fXX || fGT || fLT))
+            {
+                repError(o, "ERR NX and XX, GT or LT options at the same time are not compatible");
+                break;
+            }
+            if (fGT && fLT)
+            {
+                repError(o, "ERR GT and LT options at the same time are not compatible");
                 break;
             }
             auto obj = ks.lookup(args[0].str);
@@ -220,11 +253,37 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long absMs;
             if (!resolveExpireMs(v, isSec, isRel, absMs))
             {
-                repError(o, "ERR invalid expire time");
+                o.append("-ERR invalid expire time in '");
+                o.append(lname);
+                o.append("' command\r\n");
                 break;
             }
             immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
-            ks.retimeExpire(args[0].str, obj.expireAtMs, newAt); // re-EXPIRE: drop the old deadline
+            // a key without a TTL counts as +infinity for GT/LT
+            immutable ulong curAt = obj.expireAtMs;
+            if ((fNX && curAt != 0) || (fXX && curAt == 0)
+                    || (fGT && (curAt == 0 || newAt <= curAt))
+                    || (fLT && curAt != 0 && newAt >= curAt))
+            {
+                repInt(o, 0);
+                break;
+            }
+            if (absMs <= cast(long) detNow())
+            {
+                // already past: Valkey deletes right away and counts the expiry
+                import dreads.obj : gExpiredKeys;
+
+                ks.del(args[0].str);
+                gExpiredKeys++;
+                notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 2);
+                repBulk(propagationOverride, "DEL");
+                repBulk(propagationOverride, args[0].str);
+                repInt(o, 1);
+                break;
+            }
+            ks.retimeExpire(args[0].str, curAt, newAt); // re-EXPIRE: drop the old deadline
             obj.expireAtMs = newAt;
             notifyKeyspaceEvent(NClass.generic, "expire", args[0].str);
             propagatePexpireat(args[0].str, obj.expireAtMs);
@@ -443,11 +502,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 bool isRel = opt.length == 2;
                 bool isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
                 if (!(eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX")
-                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT"))
-                        || !parseLong(args[2].str, v) || (isRel && v <= 0)
-                        || !resolveExpireMs(v, isSec, isRel, absMs))
+                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT")))
                 {
                     repError(o, "ERR syntax error");
+                    break;
+                }
+                if (!parseLong(args[2].str, v))
+                {
+                    repError(o, "ERR value is not an integer or out of range");
+                    break;
+                }
+                if ((isRel && v <= 0) || !resolveExpireMs(v, isSec, isRel, absMs))
+                {
+                    repError(o, "ERR invalid expire time in 'getex' command");
                     break;
                 }
             }
@@ -656,6 +723,133 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 notifyKeyspaceEvent(NClass.str, "set", args[i].str);
             }
             repSimple(o, "OK");
+            break;
+        }
+    case "MSETEX":
+        {
+            // MSETEX numkeys k v [k v ...] [NX|XX]
+            //        [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
+            if (args.length < 3)
+            {
+                arityErr(o, "msetex");
+                break;
+            }
+            long numkeys;
+            if (!parseLong(args[0].str, numkeys) || numkeys < 1 || numkeys > int.max)
+            {
+                repError(o, "ERR invalid numkeys value or out of range");
+                break;
+            }
+            auto pairsEnd = 1 + cast(size_t) numkeys * 2;
+            if (pairsEnd > args.length)
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            long absExpire = -1; // resolved absolute ms; -1 = none given
+            bool nx, xx, keepttl, badSyntax, badExpire, badInt, expireGiven;
+            size_t i = pairsEnd;
+            while (i < args.length)
+            {
+                auto opt = args[i].str;
+                if (eqICKeyword(opt, "NX"))
+                {
+                    nx = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "XX"))
+                {
+                    xx = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "KEEPTTL"))
+                {
+                    keepttl = true;
+                    i++;
+                }
+                else if (eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX")
+                        || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT"))
+                {
+                    if (expireGiven || i + 1 >= args.length)
+                    {
+                        badSyntax = true;
+                        break;
+                    }
+                    long v;
+                    if (!parseLong(args[i + 1].str, v))
+                    {
+                        badInt = true;
+                        break;
+                    }
+                    expireGiven = true;
+                    bool isRel = opt.length == 2;
+                    bool isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
+                    if ((isRel && v <= 0) || !resolveExpireMs(v, isSec, isRel, absExpire))
+                    {
+                        badExpire = true;
+                        break;
+                    }
+                    i += 2;
+                }
+                else
+                {
+                    badSyntax = true;
+                    break;
+                }
+            }
+            if (badInt)
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (badExpire)
+            {
+                repError(o, "ERR invalid expire time in 'msetex' command");
+                break;
+            }
+            if (badSyntax || (nx && xx) || (keepttl && expireGiven))
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            if (nx || xx) // all-or-nothing key-level conditions
+            {
+                bool blocked = false;
+                for (size_t j = 1; j < pairsEnd; j += 2)
+                {
+                    auto existing = ks.lookup(args[j].str);
+                    if ((nx && existing !is null) || (xx && existing is null))
+                    {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked)
+                {
+                    repInt(o, 0);
+                    break;
+                }
+            }
+            for (size_t j = 1; j < pairsEnd; j += 2)
+            {
+                auto existing = ks.lookup(args[j].str);
+                immutable ulong oldTtl = existing !is null ? existing.expireAtMs : 0;
+                ulong kept = keepttl ? oldTtl : 0;
+                ks.setStr(args[j].str, args[j + 1].str);
+                auto obj = ks.lookup(args[j].str);
+                ulong newTtl = 0;
+                if (absExpire >= 0)
+                    newTtl = absExpire == 0 ? 1 : cast(ulong) absExpire;
+                else if (keepttl)
+                    newTtl = kept;
+                if (oldTtl != 0 || newTtl != 0)
+                    ks.retimeExpire(args[j].str, oldTtl, newTtl);
+                obj.expireAtMs = newTtl;
+                notifyKeyspaceEvent(NClass.str, "set", args[j].str);
+                if (expireGiven)
+                    notifyKeyspaceEvent(NClass.generic, "expire", args[j].str);
+            }
+            repInt(o, 1);
             break;
         }
     case "MGET":
@@ -942,6 +1136,62 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 notifyKeyspaceEvent(NClass.hash, "hdel", args[0].str);
             ks.delIfEmpty(args[0].str, obj);
             repInt(o, n);
+            break;
+        }
+    case "HGETDEL":
+        {
+            // HGETDEL key FIELDS numfields field [field ...] — reply the
+            // values (nulls for misses) and delete those fields
+            if (args.length < 4)
+            {
+                arityErr(o, "hgetdel");
+                break;
+            }
+            if (!eqICKeyword(args[1].str, "FIELDS"))
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            long nf;
+            if (!parseLong(args[2].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (nf <= 0 || cast(size_t) nf != args.length - 3)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            long deleted = 0;
+            repArrayHeader(o, cast(size_t) nf);
+            foreach (ref a; args[3 .. $])
+            {
+                auto f = obj is null ? null : obj.hash.get(a.str);
+                if (f is null)
+                {
+                    repNullBulk(o);
+                    continue;
+                }
+                repStrVal(o, *f);
+                if (obj.hash.del(a.str))
+                    deleted++;
+            }
+            if (deleted > 0)
+            {
+                notifyKeyspaceEvent(NClass.hash, "hdel", args[0].str);
+                if (obj.hash.length == 0)
+                    notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+                ks.delIfEmpty(args[0].str, obj);
+            }
             break;
         }
     case "HLEN":
@@ -4353,12 +4603,12 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     switch (uname)
     {
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
-    case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX":
+    case "SETEX", "PSETEX", "GETDEL", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
     case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
-    case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT":
+    case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT", "HGETDEL":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":

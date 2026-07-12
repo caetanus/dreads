@@ -190,7 +190,8 @@ public void lmpop(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
 
 private struct SortItem
 {
-    const(char)[] v;
+    const(char)[] v; // the element (what SORT returns / stores)
+    const(char)[] sv; // what it sorts by: the element, or its BY-pattern weight
     double num;
 }
 
@@ -207,18 +208,74 @@ extern (C) private int sortAlphaAsc(scope const void* a, scope const void* b) no
 
     auto x = cast(const(SortItem)*) a;
     auto y = cast(const(SortItem)*) b;
-    auto minl = x.v.length < y.v.length ? x.v.length : y.v.length;
+    auto minl = x.sv.length < y.sv.length ? x.sv.length : y.sv.length;
     if (minl)
     {
-        auto c = memcmp(x.v.ptr, y.v.ptr, minl);
+        auto c = memcmp(x.sv.ptr, y.sv.ptr, minl);
         if (c)
             return c < 0 ? -1 : 1;
     }
-    return x.v.length < y.v.length ? -1 : (x.v.length > y.v.length ? 1 : 0);
+    return x.sv.length < y.sv.length ? -1 : (x.sv.length > y.sv.length ? 1 : 0);
 }
 
-/// SORT key [LIMIT off count] [ASC|DESC] [ALPHA] [STORE dst]
-/// (BY/GET patterns are not supported — documented in DRIFT.md)
+/// SORT BY/GET pattern lookup: the first '*' becomes the element; an optional
+/// "->field" tail reads a hash field. False = no value (missing key/field).
+private bool lookupPattern(ref Keyspace ks, const(char)[] pat, const(char)[] e,
+        ref Arena arena, out const(char)[] val) @nogc nothrow
+{
+    import core.stdc.string : memchr;
+
+    if (pat == "#") // GET #: the element itself
+    {
+        val = e;
+        return true;
+    }
+    const(char)[] keyPat = pat, fieldPat;
+    if (pat.length >= 2)
+    {
+        foreach (idx; 0 .. pat.length - 1)
+        {
+            if (pat[idx] == '-' && pat[idx + 1] == '>')
+            {
+                keyPat = pat[0 .. idx];
+                fieldPat = pat[idx + 2 .. $];
+                break;
+            }
+        }
+    }
+    if (keyPat.length == 0)
+        return false;
+    auto star = cast(const(char)*) memchr(keyPat.ptr, '*', keyPat.length);
+    if (star is null)
+        return false; // Redis: a '*'-less pattern never matches anything
+    auto pos = cast(size_t)(star - keyPat.ptr);
+    auto key = arena.allocArray!char(keyPat.length - 1 + e.length);
+    key[0 .. pos] = keyPat[0 .. pos];
+    key[pos .. pos + e.length] = e[];
+    key[pos + e.length .. $] = keyPat[pos + 1 .. $];
+    bool wrong;
+    char[24] sb = void;
+    if (fieldPat.length)
+    {
+        auto ho = ks.lookupTyped(key, ObjType.hash, wrong);
+        if (ho is null)
+            return false; // missing or wrong type both read as no value
+        auto f = ho.hash.get(fieldPat);
+        if (f is null)
+            return false;
+        val = arena.dupString(f.bytes(sb));
+        return true;
+    }
+    auto so = ks.lookupTyped(key, ObjType.str, wrong);
+    if (so is null)
+        return false;
+    val = arena.dupString(so.str.bytes(sb));
+    return true;
+}
+
+/// SORT key [BY pat] [LIMIT off count] [GET pat ...] [ASC|DESC] [ALPHA]
+/// [STORE dst] — full Redis surface, including hash-field patterns (k*->f)
+/// and the "BY without '*' skips sorting" rule.
 public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         ref Arena arena, bool readOnly) @nogc nothrow
 {
@@ -230,6 +287,9 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     bool alpha, desc;
     long limOff = 0, limCnt = -1;
     const(char)[] storeKey;
+    const(char)[] byPat;
+    const(char)[][] getPats;
+    size_t ngets = 0, getCap = 0;
     size_t i = 1;
     while (i < args.length)
     {
@@ -261,10 +321,22 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
             storeKey = args[i + 1].str;
             i += 2;
         }
-        else if (eqICKeyword(w, "BY") || eqICKeyword(w, "GET"))
+        else if (eqICKeyword(w, "BY") && i + 1 < args.length)
         {
-            repError(o, "ERR BY/GET patterns are not supported");
-            return;
+            byPat = args[i + 1].str;
+            i += 2;
+        }
+        else if (eqICKeyword(w, "GET") && i + 1 < args.length)
+        {
+            if (ngets == getCap) // grow-by-double in the arena (n is tiny)
+            {
+                auto bigger = arena.allocArray!(const(char)[])(getCap ? getCap * 2 : 4);
+                bigger[0 .. ngets] = getPats[0 .. ngets];
+                getPats = bigger;
+                getCap = getPats.length;
+            }
+            getPats[ngets++] = args[i + 1].str;
+            i += 2;
         }
         else
         {
@@ -279,6 +351,12 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repWrongTypeM(o);
         return;
     }
+    import core.stdc.string : memchr;
+
+    // BY with a '*'-less pattern means "don't sort" (Redis uses it to fetch
+    // GET projections in container order)
+    bool dontsort = byPat.length != 0
+        && memchr(byPat.ptr, '*', byPat.length) is null;
     size_t total = obj is null ? 0 : obj.containerLen;
     auto items = arena.allocArray!SortItem(total);
     size_t n = 0;
@@ -288,7 +366,8 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         int take(const(char)[] v) @nogc nothrow
         {
             items[n].v = v;
-            if (!alpha && !parseDouble(v, items[n].num))
+            items[n].sv = v;
+            if (!dontsort && byPat.length == 0 && !alpha && !parseDouble(v, items[n].num))
                 numFail = true;
             n++;
             return 0;
@@ -307,19 +386,35 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         else
             obj.zset.walkRange(0, total, false, (m, s) => take(m));
     }
+    if (byPat.length && !dontsort) // sort by the pattern's weight keys
+    {
+        foreach (ref it; items[0 .. n])
+        {
+            const(char)[] w;
+            if (!lookupPattern(ks, byPat, it.v, arena, w))
+                w = null; // missing weight sorts first (alpha "" / score 0)
+            it.sv = w;
+            it.num = 0;
+            if (!alpha && w.length && !parseDouble(w, it.num))
+                numFail = true;
+        }
+    }
     if (numFail)
     {
         repError(o, "ERR One or more scores can't be converted into double");
         return;
     }
-    qsort(items.ptr, n, SortItem.sizeof, alpha ? &sortAlphaAsc : &sortNumAsc);
-    if (desc)
+    if (!dontsort)
     {
-        foreach (k; 0 .. n / 2)
+        qsort(items.ptr, n, SortItem.sizeof, alpha ? &sortAlphaAsc : &sortNumAsc);
+        if (desc)
         {
-            auto t = items[k];
-            items[k] = items[n - 1 - k];
-            items[n - 1 - k] = t;
+            foreach (k; 0 .. n / 2)
+            {
+                auto t = items[k];
+                items[k] = items[n - 1 - k];
+                items[n - 1 - k] = t;
+            }
         }
     }
     auto hits = items[0 .. n];
@@ -338,18 +433,48 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
             it.v = arena.dupString(it.v);
         RObj lst;
         lst.type = ObjType.list;
+        size_t stored = 0;
         foreach (ref it; hits)
-            lst.list.pushBack(it.v);
-        if (hits.length == 0)
+        {
+            if (ngets == 0)
+            {
+                lst.list.pushBack(it.v);
+                stored++;
+                continue;
+            }
+            foreach (pat; getPats[0 .. ngets]) // nil projections store as ""
+            {
+                const(char)[] val;
+                lst.list.pushBack(lookupPattern(ks, pat, it.v, arena, val) ? val : "");
+                stored++;
+            }
+        }
+        if (stored == 0)
             ks.del(storeKey);
         else
             ks.d.set(storeKey, lst);
-        repInt(o, cast(long) hits.length);
+        repInt(o, cast(long) stored);
         return;
     }
-    repArrayHeader(o, hits.length);
+    if (ngets == 0)
+    {
+        repArrayHeader(o, hits.length);
+        foreach (ref it; hits)
+            repBulk(o, it.v);
+        return;
+    }
+    repArrayHeader(o, hits.length * ngets);
     foreach (ref it; hits)
-        repBulk(o, it.v);
+    {
+        foreach (pat; getPats[0 .. ngets])
+        {
+            const(char)[] val;
+            if (lookupPattern(ks, pat, it.v, arena, val))
+                repBulk(o, val);
+            else
+                repNullBulk(o);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
