@@ -42,12 +42,20 @@ struct AclPerm
     Vector!KeyPat keyPats;
     Vector!(const(char)[]) chanPats; // malloc'd
 
+    // command-rule text, kept verbatim so ACL GETUSER/LIST can echo the rules
+    // instead of reverse-engineering the bitset (Valkey's approach — a category
+    // grant like "+@read" prints as "+@read", not 40 expanded "+cmd"s).
+    bool cmdBaseAll; // base is "+@all" (true) or "-@all" (false, the fresh default)
+    Vector!(const(char)[]) cmdRules; // malloc'd delta tokens since the last base
+
     ~this() @nogc nothrow @trusted
     {
         foreach (i; 0 .. keyPats.length)
             freeSlice(keyPats[i].pat);
         foreach (i; 0 .. chanPats.length)
             freeSlice(chanPats[i]);
+        foreach (i; 0 .. cmdRules.length)
+            freeSlice(cmdRules[i]);
     }
 
     void reset() @nogc nothrow @trusted
@@ -60,6 +68,26 @@ struct AclPerm
         foreach (i; 0 .. chanPats.length)
             freeSlice(chanPats[i]);
         chanPats.clear();
+        clearCmdRules();
+    }
+
+    // reset the command-rule text to a base (does NOT touch the bitset)
+    void setCmdBase(bool all) @nogc nothrow @trusted
+    {
+        cmdBaseAll = all;
+        clearCmdRules();
+    }
+
+    void addCmdRule(scope const(char)[] tok) @nogc nothrow @trusted
+    {
+        cmdRules.put(cast(const(char)[]) mallocDup(tok));
+    }
+
+    private void clearCmdRules() @nogc nothrow @trusted
+    {
+        foreach (i; 0 .. cmdRules.length)
+            freeSlice(cmdRules[i]);
+        cmdRules.clear();
     }
 }
 
@@ -158,8 +186,18 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
         freeChanPats(u);
         return true;
     }
-    if (tok == "allcommands" || tok == "+@all") { allowAll(u.root, true); return true; }
-    if (tok == "nocommands" || tok == "-@all") { allowAll(u.root, false); return true; }
+    if (tok == "allcommands" || tok == "+@all")
+    {
+        allowAll(u.root, true);
+        u.root.setCmdBase(true);
+        return true;
+    }
+    if (tok == "nocommands" || tok == "-@all")
+    {
+        allowAll(u.root, false);
+        u.root.setCmdBase(false);
+        return true;
+    }
     // accepted no-ops: sanitize-payload is a DUMP-safety flag (dreads has no
     // DUMP), clearselectors clears ACL v2 selectors (Phase 2 — not stored yet)
     if (tok == "sanitize-payload" || tok == "nosanitize-payload"
@@ -218,9 +256,15 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
             return true;
         }
     case '+':
-        return applyCmdRule(u, tok[1 .. $], true, err);
+        if (!applyCmdRule(u, tok[1 .. $], true, err))
+            return false;
+        u.root.addCmdRule(tok);
+        return true;
     case '-':
-        return applyCmdRule(u, tok[1 .. $], false, err);
+        if (!applyCmdRule(u, tok[1 .. $], false, err))
+            return false;
+        u.root.addCmdRule(tok);
+        return true;
     case '~':
         u.root.keyPats.put(KeyPat(cast(const(char)[]) mallocDup(tok[1 .. $])));
         return true;
@@ -409,6 +453,68 @@ immutable(string)[] aclPasswordHashes(const(AclUser)* u) @trusted
     return cast(immutable(string)[]) arr;
 }
 
+// --- rule description (ACL GETUSER / LIST) -----------------------------------
+
+import dreads.mem : ByteBuffer;
+
+/// Append the command-rule string ("-@all +get +set", "+@all", ...) — the base
+/// plus the verbatim delta tokens kept at apply time, matching Valkey's output.
+void aclDescribeCommands(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
+{
+    o.append(u.root.cmdBaseAll ? "+@all" : "-@all");
+    foreach (i; 0 .. u.root.cmdRules.length)
+    {
+        o.append(" ");
+        o.append(u.root.cmdRules[i]);
+    }
+}
+
+/// Append the key-pattern string: "~*" if allkeys, else space-joined patterns
+/// with their read/write qualifier (`~p`, `%R~p`, `%W~p`) as Valkey formats them.
+void aclDescribeKeys(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
+{
+    if (u.root.allKeys)
+    {
+        o.append("~*");
+        return;
+    }
+    foreach (i; 0 .. u.root.keyPats.length)
+    {
+        if (i)
+            o.append(" ");
+        auto p = u.root.keyPats[i];
+        if (p.read && p.write)
+            o.append("~");
+        else
+        {
+            o.append("%");
+            if (p.read)
+                o.append("R");
+            if (p.write)
+                o.append("W");
+            o.append("~");
+        }
+        o.append(p.pat);
+    }
+}
+
+/// Append the channel-pattern string: "&*" if allchannels, else "&p" joined.
+void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
+{
+    if (u.root.allChannels)
+    {
+        o.append("&*");
+        return;
+    }
+    foreach (i; 0 .. u.root.chanPats.length)
+    {
+        if (i)
+            o.append(" ");
+        o.append("&");
+        o.append(u.root.chanPats[i]);
+    }
+}
+
 /// Verify a plaintext password against this user (nopass or any stored hash).
 /// Runs Argon2 — call OFF the event loop.
 bool aclCheckPassword(const(AclUser)* u, scope const(char)[] pass) @trusted nothrow
@@ -481,6 +587,7 @@ void aclInit() @trusted
     def.enabled = true;
     def.nopass = true;
     allowAll(def.root, true);
+    def.root.setCmdBase(true); // rule text: "+@all" (matches the full bitset)
     def.root.allKeys = true;
     def.root.allChannels = true;
     gUsers.set("default", def);
@@ -639,4 +746,40 @@ unittest // long command names (>16 chars) are catalogued and gated
     assert(aclCanRunCmd(u, aclCmdIndex("geoadd")));
     assert(!aclCanRunCmd(u, aclCmdIndex("georadiusbymember")));
     assert(!aclCanRunCmd(u, aclCmdIndex("georadiusbymember_ro")));
+}
+
+unittest // ACL GETUSER rule description echoes the applied rules (Valkey format)
+{
+    import dreads.mem : ByteBuffer;
+
+    static string describe(void function(const(AclUser)*, ref ByteBuffer) f, const(AclUser)* u)
+    {
+        ByteBuffer b;
+        f(u, b);
+        return (cast(const(char)[]) b.data).idup;
+    }
+
+    aclInit();
+    // default is the seeded unrestricted user: "+@all ~* &*"
+    auto def = aclUser("default");
+    assert(describe(&aclDescribeCommands, def) == "+@all");
+    assert(describe(&aclDescribeKeys, def) == "~*");
+    assert(describe(&aclDescribeChannels, def) == "&*");
+
+    const(char)[] err;
+    auto u = aclGetOrCreate("descr");
+    scope (exit)
+        aclDelUser("descr");
+    foreach (r; ["on", "+@list", "+get", "-lpush", "~k*", "%R~ro:*", "&news"])
+        assert(aclApplyRule(u, r, err), cast(string) err);
+    // base "-@all" + verbatim delta tokens, in order
+    assert(describe(&aclDescribeCommands, u) == "-@all +@list +get -lpush");
+    assert(describe(&aclDescribeKeys, u) == "~k* %R~ro:*");
+    assert(describe(&aclDescribeChannels, u) == "&news");
+
+    // a later +@all resets the command-rule base and drops earlier deltas
+    assert(aclApplyRule(u, "+@all", err));
+    assert(describe(&aclDescribeCommands, u) == "+@all");
+    assert(aclApplyRule(u, "-del", err));
+    assert(describe(&aclDescribeCommands, u) == "+@all -del");
 }

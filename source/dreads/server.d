@@ -25,7 +25,8 @@ import vibe.core.task : Task;
 
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
-    aclUnrestricted, gAclActive;
+    aclUnrestricted, aclDescribeCommands, aclDescribeKeys,
+    aclDescribeChannels, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -730,6 +731,46 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             case "WHOAMI":
                 repBulk(o, c.user !is null ? c.user.name : "default");
                 return true;
+            case "GETUSER":
+                {
+                    if (cmd.arr.length != 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|getuser' command");
+                        return true;
+                    }
+                    auto u = aclUser(cmd.arr[2].str);
+                    if (u is null)
+                    {
+                        repNullBulk(o); // Valkey addReplyNull for an unknown user
+                        return true;
+                    }
+                    static ByteBuffer db; // TLS scratch for describe strings
+                    repMapHeader(o, 6);
+                    repBulk(o, "flags");
+                    repSetHeader(o, 1 + (u.nopass ? 1 : 0));
+                    repBulk(o, u.enabled ? "on" : "off");
+                    if (u.nopass)
+                        repBulk(o, "nopass");
+                    repBulk(o, "passwords");
+                    repArrayHeader(o, u.passwords.length);
+                    foreach (i; 0 .. u.passwords.length)
+                        repBulk(o, u.passwords[i]);
+                    repBulk(o, "commands");
+                    db.clear();
+                    aclDescribeCommands(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "keys");
+                    db.clear();
+                    aclDescribeKeys(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "channels");
+                    db.clear();
+                    aclDescribeChannels(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "selectors");
+                    repArrayHeader(o, 0); // ACL v2 selectors: Phase 2
+                    return true;
+                }
             case "SETUSER":
                 {
                     if (cmd.arr.length < 3)
@@ -785,6 +826,37 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     repArrayHeader(o, n);
                     aclEachUser((AclUser* u) @nogc nothrow {
                         repBulk(o, u.name);
+                        return 0;
+                    });
+                    return true;
+                }
+            case "LIST":
+                {
+                    // config-file format per user: "user <name> <flags> <keys>
+                    // <channels> <commands>" (matches Valkey ACLDescribeUser order)
+                    size_t n = 0;
+                    aclEachUser((AclUser* u) @nogc nothrow { n++; return 0; });
+                    repArrayHeader(o, n);
+                    static ByteBuffer lb; // TLS
+                    aclEachUser((AclUser* u) @nogc nothrow {
+                        lb.clear();
+                        lb.append("user ");
+                        lb.append(u.name);
+                        lb.append(u.enabled ? " on" : " off");
+                        if (u.nopass)
+                            lb.append(" nopass");
+                        foreach (i; 0 .. u.passwords.length)
+                        {
+                            lb.append(" #");
+                            lb.append(u.passwords[i]);
+                        }
+                        lb.append(" ");
+                        aclDescribeKeys(u, lb);
+                        lb.append(" ");
+                        aclDescribeChannels(u, lb);
+                        lb.append(" ");
+                        aclDescribeCommands(u, lb);
+                        repBulk(o, cast(const(char)[]) lb.data);
                         return 0;
                     });
                     return true;
