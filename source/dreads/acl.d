@@ -15,6 +15,9 @@ import dreads.aclcat : AclCat, gCmdCats, aclCatBit;
 import dreads.mem : mallocDup, freeSlice;
 import emplace.vector : Vector;
 
+/// All ACL category names (for `ACL CAT`), derived from the generated enum.
+public immutable string[] aclCatNames = [__traits(allMembers, AclCat)];
+
 enum size_t NCMD = gCmdCats.length;
 enum size_t NW = (NCMD + 63) / 64;
 
@@ -148,7 +151,7 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
             auto h = tok[1 .. $];
             if (!isSha256Hex(h))
             {
-                err = "Error in ACL SETUSER modifier '#': Invalid password hash"
+                err = "ERR Error in ACL SETUSER modifier '#': Invalid password hash"
                     ~ " provided. It must be exactly 64 characters and contain"
                     ~ " only lowercase hexadecimal characters";
                 return false;
@@ -170,7 +173,7 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
         u.root.chanPats.put(cast(const(char)[]) mallocDup(tok[1 .. $]));
         return true;
     default:
-        err = "Error in ACL SETUSER modifier: Syntax error";
+        err = "ERR Error in ACL SETUSER modifier: Syntax error";
         return false;
     }
 }
@@ -185,7 +188,7 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
         auto bit = aclCatBit(spec[1 .. $]);
         if (bit == 0)
         {
-            err = "Error in ACL SETUSER modifier: Unknown command or category name in ACL";
+            err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
             return false;
         }
         allowCategory(u.root, bit, allow);
@@ -207,7 +210,7 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
     auto idx = aclCmdIndex(lb[0 .. name.length]);
     if (idx < 0)
     {
-        err = "Error in ACL SETUSER modifier: Unknown command or category name in ACL";
+        err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
         return false;
     }
     bitSet(u.root.allowed, idx, allow);
@@ -228,13 +231,13 @@ private bool applyKeyPatWithFlags(AclUser* u, scope const(char)[] spec,
             w = true;
         else
         {
-            err = "Error in ACL SETUSER modifier: Syntax error";
+            err = "ERR Error in ACL SETUSER modifier: Syntax error";
             return false;
         }
     }
     if (i >= spec.length || spec[i] != '~' || (!r && !w))
     {
-        err = "Error in ACL SETUSER modifier: Syntax error";
+        err = "ERR Error in ACL SETUSER modifier: Syntax error";
         return false;
     }
     u.root.keyPats.put(KeyPat(cast(const(char)[]) mallocDup(spec[i + 1 .. $]), r, w));
@@ -349,7 +352,7 @@ private __gshared Dict!(AclUser*) gUsers;
 private __gshared bool gAclInited;
 
 /// Malloc + construct a fresh, disabled, no-permission user with `name`.
-AclUser* aclNewUser(scope const(char)[] name) @trusted
+AclUser* aclNewUser(scope const(char)[] name) @trusted nothrow
 {
     import core.lifetime : emplace;
     import core.stdc.stdlib : malloc;
@@ -361,7 +364,7 @@ AclUser* aclNewUser(scope const(char)[] name) @trusted
 }
 
 /// Run ~this (frees name/passwords/patterns) and free the user.
-void aclFreeUser(AclUser* u) @trusted
+void aclFreeUser(AclUser* u) @trusted nothrow
 {
     import core.stdc.stdlib : free;
 
@@ -392,7 +395,7 @@ AclUser* aclUser(scope const(char)[] name) @nogc nothrow
 }
 
 /// The user, creating a fresh disabled one if absent (ACL SETUSER semantics).
-AclUser* aclGetOrCreate(scope const(char)[] name) @trusted
+AclUser* aclGetOrCreate(scope const(char)[] name) @trusted nothrow
 {
     if (auto u = aclUser(name))
         return u;
@@ -402,7 +405,7 @@ AclUser* aclGetOrCreate(scope const(char)[] name) @trusted
 }
 
 /// Remove a user (never `default`). Returns true if one was deleted.
-bool aclDelUser(scope const(char)[] name) @trusted
+bool aclDelUser(scope const(char)[] name) @trusted nothrow
 {
     if (name == "default")
         return false;
@@ -413,6 +416,19 @@ bool aclDelUser(scope const(char)[] name) @trusted
     gUsers.remove(name);
     aclFreeUser(u);
     return true;
+}
+
+/// Iterate every registered user (ACL LIST/USERS). Delegate returns non-zero to
+/// stop early.
+int aclEachUser(scope int delegate(AclUser* u) @nogc nothrow dg) @nogc nothrow
+{
+    return gUsers.opApply((const(char)[] k, ref AclUser* u) => dg(u));
+}
+
+/// Number of registered users.
+size_t aclUserCount() @nogc nothrow
+{
+    return gUsers.length;
 }
 
 /// True when `u` is unrestricted (enabled ∧ every command ∧ all keys/channels)

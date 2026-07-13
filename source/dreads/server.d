@@ -22,7 +22,8 @@ import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
-import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword;
+import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
+    aclApplyRule, aclDelUser, aclEachUser, aclCatNames;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -637,6 +638,109 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 keep = executeCommand(c, qcmd, c.multiQueue.data[qstart .. qpos], o, arena) && keep;
             }
             return keep;
+        }
+    case "ACL":
+        {
+            if (cmd.arr.length < 2)
+            {
+                repError(o, "ERR wrong number of arguments for 'acl' command");
+                return true;
+            }
+            auto sub = cmd.arr[1].str;
+            char[12] sbuf = void;
+            const(char)[] su = sub;
+            if (sub.length <= sbuf.length)
+            {
+                foreach (i, ch; sub)
+                    sbuf[i] = (ch >= 'a' && ch <= 'z') ? cast(char)(ch - 32) : ch;
+                su = sbuf[0 .. sub.length];
+            }
+            switch (su)
+            {
+            case "WHOAMI":
+                repBulk(o, c.user !is null ? c.user.name : "default");
+                return true;
+            case "SETUSER":
+                {
+                    if (cmd.arr.length < 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|setuser' command");
+                        return true;
+                    }
+                    // NOTE: >pass hashes with the slow KDF inline (perf follow-up)
+                    auto u = aclGetOrCreate(cmd.arr[2].str);
+                    const(char)[] err;
+                    try
+                    {
+                        foreach (ref r; cmd.arr[3 .. $])
+                            if (!aclApplyRule(u, r.str, err))
+                            {
+                                repError(o, err); // "ERR Error in ACL SETUSER modifier…"
+                                return true;
+                            }
+                    }
+                    catch (Exception)
+                    {
+                        repError(o, "ERR ACL SETUSER failed to hash a password");
+                        return true;
+                    }
+                    repSimple(o, "OK");
+                    return true;
+                }
+            case "DELUSER":
+                {
+                    if (cmd.arr.length < 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|deluser' command");
+                        return true;
+                    }
+                    long n = 0;
+                    foreach (ref a; cmd.arr[2 .. $])
+                        if (aclDelUser(a.str))
+                            n++;
+                    repInt(o, n);
+                    return true;
+                }
+            case "USERS":
+                {
+                    size_t n = 0;
+                    aclEachUser((AclUser* u) @nogc nothrow { n++; return 0; });
+                    repArrayHeader(o, n);
+                    aclEachUser((AclUser* u) @nogc nothrow {
+                        repBulk(o, u.name);
+                        return 0;
+                    });
+                    return true;
+                }
+            case "CAT":
+                repArrayHeader(o, aclCatNames.length);
+                foreach (nm; aclCatNames)
+                    repBulk(o, nm);
+                return true;
+            case "GENPASS":
+                {
+                    import dreads.rand : nextRand;
+
+                    long bits = 256;
+                    if (cmd.arr.length >= 3 && (!parseLong(cmd.arr[2].str, bits)
+                            || bits <= 0 || bits > 4096))
+                    {
+                        repError(o, "ERR ACL GENPASS argument must be the number"
+                                ~ " of bits for the output password, a positive number up to 4096");
+                        return true;
+                    }
+                    auto nchars = cast(size_t)((bits + 3) / 4);
+                    static immutable hexd = "0123456789abcdef";
+                    char[1024] hb = void;
+                    foreach (i; 0 .. nchars)
+                        hb[i] = hexd[nextRand() & 0xf];
+                    repBulk(o, hb[0 .. nchars]);
+                    return true;
+                }
+            default:
+                repUnknownSubcommand(o, "ACL", sub);
+                return true;
+            }
         }
     case "AUTH":
         {
