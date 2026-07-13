@@ -28,7 +28,8 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
     aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
     aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
-    aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive;
+    aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive, aclDeniedDb,
+    aclCanAccessDb;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -459,9 +460,11 @@ private void serveClient(TCPConnection tcp) nothrow
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
     // ACL: start as the default user; a nopass default is authenticated at once,
-    // a password-protected one (requirepass) must AUTH first.
+    // a password-protected one (requirepass) must AUTH first. A DISABLED default
+    // (`ACL SETUSER default off`) never pre-authenticates — new connections start
+    // unauthenticated and get NOAUTH until they AUTH as another user.
     c.user = aclUser("default");
-    c.authed = c.user is null || c.user.nopass;
+    c.authed = c.user is null || (c.user.enabled && c.user.nopass);
     c.sub.ctx = &c;
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
@@ -675,6 +678,52 @@ private void aclLogViolation(ref Conn c, string reason, scope const(char)[] obj,
             c.user !is null ? c.user.name : "default", cast(const(char)[]) ci.data, nowMs());
 }
 
+// Authenticate `c` as user `who` with `pass`. On success sets c.user/c.authed
+// and returns true; on failure returns false (the caller emits the error) after
+// logging the attempt. Shared by the AUTH command and the HELLO AUTH option.
+// Argon2 verify runs on a vibe WORKER THREAD — never inline: the KDF is
+// ~15-30 ms and would stall the single event loop (a DoS vector under a flood).
+private bool authenticateConn(ref Conn c, scope const(char)[] who, scope const(char)[] pass) @trusted nothrow
+{
+    import dreads.stream : nowMs;
+
+    auto u = aclUser(who);
+    bool ok = false;
+    if (u !is null && u.enabled)
+    {
+        if (u.nopass)
+            ok = true;
+        else
+        {
+            try
+            {
+                import vibe.core.concurrency : async;
+                import dreads.acl : aclPasswordHashes;
+
+                auto pw = pass.idup; // isolate for the worker thread
+                auto hashes = aclPasswordHashes(u);
+                ok = async(&authVerifyJob, pw, hashes).getResult();
+            }
+            catch (Exception)
+                ok = false;
+        }
+    }
+    // re-validate after yielding: the user may have been deleted/disabled
+    u = aclUser(who);
+    if (!ok || u is null || !u.enabled)
+    {
+        static ByteBuffer ai; // TLS
+        ai.clear();
+        ai.append("id=0 addr=? cmd=auth");
+        aclLogAdd("auth", c.inMulti ? "multi" : "toplevel", "AUTH", who,
+                cast(const(char)[]) ai.data, nowMs());
+        return false;
+    }
+    c.user = u;
+    c.authed = true;
+    return true;
+}
+
 // age-seconds as a float string ("0.001"), from a millisecond delta.
 private void appendAge(ref ByteBuffer o, long ms) @nogc nothrow
 {
@@ -802,6 +851,20 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 {
                     aclLogViolation(c, "channel", dch, lname);
                     repError(o, "NOPERM No permissions to access a channel");
+                    return true;
+                }
+            }
+            // database ACL (`db=`): restrict which DBs the user may touch —
+            // dbid-argument commands (SELECT/MOVE/COPY/SWAPDB), whole-db commands
+            // (FLUSHALL) and keyspace commands against the connection's current db.
+            if (!c.user.root.allDbs)
+            {
+                auto ddb = aclDeniedDb(c.user, lname, cmd.arr,
+                        cast(int)(c.dbp - &gDbs[0]));
+                if (ddb !is null)
+                {
+                    aclLogViolation(c, "database", ddb, lname);
+                    repError(o, "NOPERM No permissions to access database");
                     return true;
                 }
             }
@@ -1325,47 +1388,13 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 repError(o, "ERR wrong number of arguments for 'auth' command");
                 return true;
             }
-            // Argon2 verify runs on a vibe WORKER THREAD — never inline: the KDF
-            // is ~15-30 ms and would stall the single event loop (and be a DoS
-            // vector under an AUTH flood). getResult() yields this fiber; the
-            // loop keeps serving other clients until the worker signals.
-            auto u = aclUser(who);
-            bool ok = false;
-            if (u !is null && u.enabled)
+            // getResult() (inside authenticateConn) yields this fiber; the loop
+            // keeps serving other clients until the Argon2 worker signals.
+            if (!authenticateConn(c, who, pass))
             {
-                if (u.nopass)
-                    ok = true;
-                else
-                {
-                    try
-                    {
-                        import vibe.core.concurrency : async;
-                        import dreads.acl : aclPasswordHashes;
-
-                        auto pw = pass.idup; // isolate for the worker thread
-                        auto hashes = aclPasswordHashes(u);
-                        ok = async(&authVerifyJob, pw, hashes).getResult();
-                    }
-                    catch (Exception)
-                        ok = false;
-                }
-            }
-            // re-validate after yielding: the user may have been deleted/disabled
-            u = aclUser(who);
-            if (!ok || u is null || !u.enabled)
-            {
-                import dreads.stream : nowMs;
-
-                static ByteBuffer ai; // TLS
-                ai.clear();
-                ai.append("id=0 addr=? cmd=auth");
-                aclLogAdd("auth", c.inMulti ? "multi" : "toplevel", "AUTH", who,
-                        cast(const(char)[]) ai.data, nowMs());
                 repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
                 return true;
             }
-            c.user = u;
-            c.authed = true;
             repSimple(o, "OK");
             return true;
         }
@@ -1593,12 +1622,21 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                     return true;
                 }
             }
-            // optional [AUTH user pass] [SETNAME name]; dreads has no auth, so
-            // AUTH is accepted and ignored (no requirepass), SETNAME is applied.
+            // optional [AUTH user pass] [SETNAME name]. Multiple AUTH options are
+            // parsed but only the LAST takes effect (Valkey precedence); the
+            // actual authentication happens after the whole line is parsed so a
+            // failing AUTH leaves the connection's prior auth untouched.
+            const(char)[] authWho, authPass;
+            bool haveAuth;
             for (size_t i = 1; i < args.length;)
             {
                 if (eqICDebug(args[i].str, "AUTH") && i + 2 < args.length)
+                {
+                    authWho = args[i + 1].str;
+                    authPass = args[i + 2].str;
+                    haveAuth = true;
                     i += 3;
+                }
                 else if (eqICDebug(args[i].str, "SETNAME") && i + 1 < args.length)
                 {
                     c.clientName.freeSlice;
@@ -1610,6 +1648,24 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                     repError(o, "ERR Syntax error in HELLO");
                     return true;
                 }
+            }
+            if (haveAuth)
+            {
+                if (!authenticateConn(c, authWho, authPass))
+                {
+                    repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
+                    return true;
+                }
+            }
+            else if (!c.authed)
+            {
+                // not authenticated and no AUTH supplied — Valkey requires the
+                // client to be authenticated before HELLO can report the info map.
+                repError(o, "NOAUTH HELLO must be called with the client already"
+                        ~ " authenticated, otherwise the HELLO <proto> AUTH <user> <pass>"
+                        ~ " option can be used to authenticate the client and"
+                        ~ " select the RESP protocol version at the same time");
+                return true;
             }
             c.resp3 = ver == 3;
             gRespProto = ver; // the HELLO reply itself is encoded in the new proto

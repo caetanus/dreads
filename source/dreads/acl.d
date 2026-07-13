@@ -58,6 +58,13 @@ struct AclPerm
     Vector!(const(char)[]) cmdRules; // malloc'd delta tokens since the last base
     Vector!SubRule subRules; // per-subcommand overrides (+client|id, …)
 
+    // database permissions (Valkey `db=`/`alldbs`/`resetdbs`). dreads has NUM_DBS
+    // (16) databases, so the allowed-db set is a bitmask — zero-alloc. `allDbs`
+    // (the default) means every db; when false only bits set in `dbMask` are
+    // allowed. See dreads.obj.NUM_DBS.
+    bool allDbs = true;
+    ushort dbMask;
+
     ~this() @nogc nothrow @trusted
     {
         foreach (i; 0 .. keyPats.length)
@@ -83,6 +90,8 @@ struct AclPerm
         cmdBaseAll = false;
         clearCmdRules();
         clearSubRules();
+        allDbs = true;
+        dbMask = 0;
     }
 
     // reset the command-rule text to a base (does NOT touch the bitset)
@@ -336,6 +345,11 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
         freeChanPats(u);
         return true;
     }
+    if (tok == "alldbs") { u.root.allDbs = true; u.root.dbMask = 0; return true; }
+    if (tok == "resetdbs") { u.root.allDbs = false; u.root.dbMask = 0; return true; }
+    if (tok.length >= 3 && (tok[0] == 'd' || tok[0] == 'D')
+            && (tok[1] == 'b' || tok[1] == 'B') && tok[2] == '=')
+        return applyDbRule(u, tok[3 .. $], err);
     if (tok == "allcommands" || tok == "+@all")
     {
         allowAll(u.root, true);
@@ -431,6 +445,57 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
         err = "ERR Error in ACL SETUSER modifier: Syntax error";
         return false;
     }
+}
+
+// Parse a `db=<id>[,<id>...]` rule into the allowed-db bitmask. Rejects empty
+// lists, leading/trailing/empty tokens (syntax error) and out-of-range ids
+// (dreads has NUM_DBS databases). Matches Valkey `db=` semantics.
+private bool applyDbRule(AclUser* u, scope const(char)[] list,
+        ref const(char)[] err) @trusted
+{
+    import dreads.obj : NUM_DBS;
+
+    if (list.length == 0 || list[0] == ',' || list[$ - 1] == ',')
+    {
+        err = "ERR Error in ACL SETUSER modifier: Syntax error";
+        return false;
+    }
+    ushort mask;
+    size_t i;
+    while (i < list.length)
+    {
+        size_t j = i;
+        while (j < list.length && list[j] != ',')
+            j++;
+        auto tok = list[i .. j];
+        if (tok.length == 0) // empty token between commas
+        {
+            err = "ERR Error in ACL SETUSER modifier: Syntax error";
+            return false;
+        }
+        long v;
+        foreach (ch; tok)
+        {
+            if (ch < '0' || ch > '9')
+            {
+                err = "ERR Error in ACL SETUSER modifier: Syntax error";
+                return false;
+            }
+            v = v * 10 + (ch - '0');
+            if (v > NUM_DBS) // clamp early — anything past range is rejected
+                break;
+        }
+        if (v >= NUM_DBS)
+        {
+            err = "ERR Error in ACL SETUSER modifier: The provided database ID is out of range";
+            return false;
+        }
+        mask |= cast(ushort)(1 << cast(uint) v);
+        i = (j < list.length) ? j + 1 : j;
+    }
+    u.root.allDbs = false;
+    u.root.dbMask = mask;
+    return true;
 }
 
 private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
@@ -799,6 +864,100 @@ private const(char)[] aclKeywordDeniedKey(const(AclUser)* u, scope const(char)[]
     }
 }
 
+// --- database (db=) permission checks ---------------------------------------
+
+/// Can this user touch database `dbid`? `allDbs` (the default) allows every db;
+/// otherwise only the bits set in `dbMask` (dreads has NUM_DBS databases).
+bool aclCanAccessDb(const(AclUser)* u, int dbid) @nogc nothrow @safe
+{
+    import dreads.obj : NUM_DBS;
+
+    if (u.root.allDbs)
+        return true;
+    if (dbid < 0 || dbid >= NUM_DBS)
+        return false;
+    return (u.root.dbMask & (1 << dbid)) != 0;
+}
+
+/// Enforce db= restrictions for a command. Returns the offending object (the
+/// denied db-id argument, or the command name for whole-db / current-db
+/// violations) or null when allowed. Mirrors Valkey ACLSelectorCheckCmd's db
+/// block: dbid-argument commands (SELECT/MOVE/COPY/SWAPDB), whole-db commands
+/// (FLUSHALL), and every keyspace/read/write command against the current db.
+/// `cmdLower` is the lowercase command name; `currentDb` is the connection's
+/// selected database. Callers gate on `!u.root.allDbs` for the fast path.
+const(char)[] aclDeniedDb(const(AclUser)* u, return const(char)[] cmdLower,
+        scope const(RVal)[] arr, int currentDb) @trusted nothrow @nogc
+{
+    if (u.root.allDbs)
+        return null;
+    immutable argc = cast(int) arr.length;
+
+    // helper: parse a small non-negative db-id argument
+    static bool argDb(scope const(char)[] s, out int d) @nogc nothrow @safe
+    {
+        long v;
+        if (!parseKeyCount(s, v) || v > int.max)
+            return false;
+        d = cast(int) v;
+        return true;
+    }
+
+    switch (cmdLower)
+    {
+    case "select":
+        if (argc > 1)
+        {
+            int d;
+            if (argDb(arr[1].str, d) && !aclCanAccessDb(u, d))
+                return arr[1].str;
+        }
+        return null;
+    case "move": // MOVE key db  → db at arg 2
+        if (argc > 2)
+        {
+            int d;
+            if (argDb(arr[2].str, d) && !aclCanAccessDb(u, d))
+                return arr[2].str;
+        }
+        return null;
+    case "swapdb": // SWAPDB idx1 idx2 → both args are db-ids
+        foreach (i; 1 .. (argc < 3 ? argc : 3))
+        {
+            int d;
+            if (argDb(arr[i].str, d) && !aclCanAccessDb(u, d))
+                return arr[i].str;
+        }
+        return null;
+    case "copy": // COPY src dst [DB dest] [REPLACE] → db after a "DB" token
+        for (int i = 3; i + 1 < argc; i++)
+        {
+            auto t = arr[i].str;
+            if (t.length == 2 && (t[0] == 'd' || t[0] == 'D') && (t[1] == 'b' || t[1] == 'B'))
+            {
+                int d;
+                if (argDb(arr[i + 1].str, d) && !aclCanAccessDb(u, d))
+                    return arr[i + 1].str;
+                break;
+            }
+        }
+        return null;
+    case "flushall": // whole-db command: needs access to EVERY database
+        return cmdLower; // object = command name (Valkey uses argv[0])
+    default:
+        // every keyspace/read/write command is checked against the current db
+        auto idx = aclCmdIndex(cmdLower);
+        if (idx >= 0)
+        {
+            immutable cats = gCmdCats[idx].cats;
+            enum uint restrict = AclCat.keyspace | AclCat.read | AclCat.write;
+            if ((cats & restrict) && !aclCanAccessDb(u, currentDb))
+                return cmdLower;
+        }
+        return null;
+    }
+}
+
 // small @nogc decimal parse for the numkeys arg (avoids importing the dispatch
 // layer into acl.d); accepts a plain non-negative integer, rejects anything else.
 private bool parseKeyCount(scope const(char)[] s, out long v) @nogc nothrow @safe
@@ -914,6 +1073,43 @@ void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o, bool withReset = f
     }
 }
 
+/// Fill `tb` with the database-permission token: `db=<id>[,<id>...]` or
+/// `resetdbs` (empty set). Returns false when the user is `alldbs` (the default,
+/// which Valkey omits from ACL strings for compatibility) — no token to emit.
+bool aclDbToken(const(AclUser)* u, ref ByteBuffer tb) @trusted nothrow @nogc
+{
+    import dreads.obj : NUM_DBS;
+
+    if (u.root.allDbs)
+        return false;
+    tb.clear();
+    if (u.root.dbMask == 0)
+    {
+        tb.append("resetdbs");
+        return true;
+    }
+    tb.append("db=");
+    bool first = true;
+    foreach (d; 0 .. NUM_DBS)
+        if (u.root.dbMask & (1 << d))
+        {
+            if (!first)
+                tb.append(",");
+            first = false;
+            char[4] nb = void;
+            size_t k = nb.length;
+            uint x = d;
+            do
+            {
+                nb[--k] = cast(char)('0' + x % 10);
+                x /= 10;
+            }
+            while (x);
+            tb.append(cast(const(char)[]) nb[k .. $]);
+        }
+    return true;
+}
+
 // --- canonical propagation form (AOF / raft log) ----------------------------
 
 import dreads.resp : repArrayHeader, repBulk, RVal;
@@ -931,6 +1127,8 @@ void aclEncodeCanonicalSetuser(const(AclUser)* u, ref ByteBuffer o) @trusted not
     n += u.passwords.length;
     n += u.root.allKeys ? 1 : u.root.keyPats.length;
     n += u.root.allChannels ? 1 : u.root.chanPats.length;
+    if (!u.root.allDbs)
+        n++; // db= / resetdbs token
     n += 1 + u.root.cmdRules.length; // command base + delta tokens
 
     repArrayHeader(o, n);
@@ -981,6 +1179,8 @@ void aclEncodeCanonicalSetuser(const(AclUser)* u, ref ByteBuffer o) @trusted not
             tb.append(u.root.chanPats[i]);
             repBulk(o, cast(const(char)[]) tb.data);
         }
+    if (aclDbToken(u, tb))
+        repBulk(o, cast(const(char)[]) tb.data);
     repBulk(o, u.root.cmdBaseAll ? "+@all" : "-@all");
     foreach (i; 0 .. u.root.cmdRules.length)
         repBulk(o, u.root.cmdRules[i]);
@@ -1478,6 +1678,67 @@ unittest
     foreach (r; ["+config|get", "+config", "-config|set"])
         assert(aclApplyRule(u, r, err), err);
     assert(cmds(u) == "-@all +config -config|set", cmds(u));
+}
+
+// database ACL (`db=`): parse into a bitmask, enforce dbid-argument commands
+// (SELECT/MOVE/COPY/SWAPDB), whole-db commands (FLUSHALL) and keyspace commands
+// against the current db. Regression for the blackbox "log database access
+// violations" test.
+unittest
+{
+    import dreads.resp : RVal, RType;
+
+    static RVal[] mk(string[] toks...)
+    {
+        auto a = new RVal[toks.length];
+        foreach (i, t; toks)
+        {
+            a[i].type = RType.BulkString;
+            a[i].str = t;
+        }
+        return a;
+    }
+
+    auto u = freshUser("dbu");
+    scope (exit)
+        freeUser(u);
+    const(char)[] err;
+
+    assert(aclCanAccessDb(u, 5)); // fresh user is alldbs
+    foreach (r; ["on", "+@all", "~*", "db=0"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(!u.root.allDbs);
+    assert(aclCanAccessDb(u, 0));
+    assert(!aclCanAccessDb(u, 1));
+
+    // dbid-argument commands: object = the offending dbid arg
+    assert(aclDeniedDb(u, "select", mk("SELECT", "1"), 0) == "1");
+    assert(aclDeniedDb(u, "select", mk("SELECT", "0"), 0) is null);
+    assert(aclDeniedDb(u, "swapdb", mk("SWAPDB", "0", "2"), 0) == "2");
+    assert(aclDeniedDb(u, "move", mk("MOVE", "k", "3"), 0) == "3");
+    assert(aclDeniedDb(u, "copy", mk("COPY", "a", "b", "DB", "4"), 0) == "4");
+    // whole-db command: object = command name
+    assert(aclDeniedDb(u, "flushall", mk("FLUSHALL"), 0) == "flushall");
+    // keyspace command vs current db: allowed on db 0, denied on db 1
+    assert(aclDeniedDb(u, "get", mk("GET", "k"), 0) is null);
+    assert(aclDeniedDb(u, "get", mk("GET", "k"), 1) == "get");
+
+    // multi-db list + resetdbs + alldbs
+    auto v = freshUser("dbv");
+    scope (exit)
+        freeUser(v);
+    assert(aclApplyRule(v, "db=1,3,5", err), err);
+    assert(aclCanAccessDb(v, 1) && aclCanAccessDb(v, 3) && aclCanAccessDb(v, 5));
+    assert(!aclCanAccessDb(v, 2));
+    assert(aclApplyRule(v, "resetdbs", err), err);
+    assert(!aclCanAccessDb(v, 1)); // empty set → nothing allowed
+    assert(aclApplyRule(v, "alldbs", err), err);
+    assert(aclCanAccessDb(v, 9)); // back to all
+    // malformed lists are rejected
+    assert(!aclApplyRule(v, "db=", err));
+    assert(!aclApplyRule(v, "db=1,", err));
+    assert(!aclApplyRule(v, "db=1,,2", err));
+    assert(!aclApplyRule(v, "db=x", err));
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate
