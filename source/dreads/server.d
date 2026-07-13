@@ -1673,8 +1673,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "CLIENT":
         {
-            clientCmd(c, args, o);
-            return true;
+            return clientCmd(c, args, o); // false ⇒ CLIENT KILL closed this conn
         }
     case "CONFIG":
         {
@@ -3109,7 +3108,7 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
         o.append(b[0 .. n]);
 }
 
-private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     import core.stdc.stdio : snprintf;
 
@@ -3118,7 +3117,7 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     if (args.length == 0)
     {
         repError(o, "ERR wrong number of arguments for 'client' command");
-        return;
+        return true;
     }
     auto sub = args[0].str;
     if (eqICDebug(sub, "ID"))
@@ -3132,7 +3131,7 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
             if (ch == ' ' || ch == '\n' || ch == '\r')
             {
                 repError(o, "ERR Client names cannot contain spaces, newlines or special characters.");
-                return;
+                return true;
             }
         }
         c.clientName.freeSlice;
@@ -3155,6 +3154,8 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
             appendConnInfo(p, lb);
         repBulk(o, cast(const(char)[]) lb.data);
     }
+    else if (eqICDebug(sub, "KILL"))
+        return clientKill(c, args[1 .. $], o);
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
@@ -3162,6 +3163,109 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         repHelp!"CLIENT"(o);
     else
         repUnknownSubcommand(o, "CLIENT", sub);
+    return true;
+}
+
+// CLIENT KILL — the operational lever to sever a rogue user/connection so it
+// can't take the server down with it (see [[acl-script-enforcement]]). Two forms:
+//   CLIENT KILL <addr:port>                      (legacy: +OK / -No such client)
+//   CLIENT KILL <FILTER value>...                (new: reply = count killed)
+// Filters: ID <id>, USER <name>, ADDR/LADDR <a>, TYPE <t>, SKIPME yes|no
+// (default yes). dreads has no peer address, so ADDR/LADDR never match; MAXAGE is
+// unsupported. Returns false only when the CALLER killed itself (SKIPME no) so
+// the read loop closes it AFTER this reply flushes.
+private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    if (args.length == 0)
+    {
+        repError(o, "ERR syntax error");
+        return true;
+    }
+    // legacy single-argument form: CLIENT KILL addr:port
+    if (args.length == 1)
+    {
+        // dreads doesn't track peer addresses, so no client can ever match.
+        repError(o, "ERR No such client");
+        return true;
+    }
+    if (args.length % 2 != 0)
+    {
+        repError(o, "ERR syntax error");
+        return true;
+    }
+    // parse filters
+    long byId = -1;
+    const(char)[] byUser, byAddr;
+    bool haveId, haveUser, haveAddr, skipme = true, unmatched = false;
+    for (size_t i = 0; i + 1 < args.length; i += 2)
+    {
+        auto f = args[i].str;
+        auto v = args[i + 1].str;
+        if (eqICDebug(f, "ID"))
+        {
+            if (!parseLong(v, byId) || byId < 0)
+            {
+                repError(o, "ERR client-id should be greater than 0");
+                return true;
+            }
+            haveId = true;
+        }
+        else if (eqICDebug(f, "USER"))
+        {
+            byUser = v;
+            haveUser = true;
+        }
+        else if (eqICDebug(f, "ADDR") || eqICDebug(f, "LADDR"))
+        {
+            byAddr = v;
+            haveAddr = true; // no peer address in dreads ⇒ never matches
+        }
+        else if (eqICDebug(f, "SKIPME"))
+            skipme = eqICDebug(v, "YES");
+        else if (eqICDebug(f, "TYPE") || eqICDebug(f, "MAXAGE"))
+        {
+            // TYPE/MAXAGE are accepted but not modelled (no replica/age tracking);
+            // an unmodelled filter matches nothing so we never over-kill.
+            unmatched = true;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
+            return true;
+        }
+    }
+    long killed = 0;
+    bool killSelf = false;
+    if (!unmatched && !haveAddr) // ADDR/unmodelled filters can't match anything
+        for (auto p = gConnHead; p !is null;)
+        {
+            auto nxt = p.regNext;
+            bool match = true;
+            if (haveId && p.id != cast(ulong) byId)
+                match = false;
+            if (match && haveUser
+                    && !(p.user !is null && p.user.name == byUser))
+                match = false;
+            if (match && skipme && p is &c)
+                match = false;
+            if (match)
+            {
+                killed++;
+                if (p is &c)
+                    killSelf = true; // defer: reply must flush before we close
+                else
+                    killConn(p);
+            }
+            p = nxt;
+        }
+    repInt(o, killed);
+    if (killSelf)
+    {
+        c.user = null;
+        c.authed = false;
+        return false; // close self after the count reply flushes
+    }
+    return true;
 }
 
 private bool eqICDebug(scope const(char)[] s, scope const(char)[] upper) @nogc nothrow
