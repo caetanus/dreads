@@ -286,6 +286,11 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) 
 
     ByteBuffer buf;
     dumpKeyspace(ks, buf);
+    // ACL registry is global (not per-db): re-emit users so the compacted AOF
+    // still recreates them on replay.
+    import dreads.acl : aclDumpUsers;
+
+    aclDumpUsers(buf);
     bool ioOk = buf.empty || fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
     fflush(f);
     version (Posix)

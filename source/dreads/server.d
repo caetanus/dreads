@@ -25,8 +25,8 @@ import vibe.core.task : Task;
 
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
-    aclUnrestricted, aclDescribeCommands, aclDescribeKeys,
-    aclDescribeChannels, gAclActive;
+    aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
+    aclEncodeCanonicalSetuser, aclApplyCanonical, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -65,6 +65,15 @@ private __gshared LocalManualEvent gKeyActivity;
 
 public int runServer(ushort port, const(char)[] aofPath = null)
 {
+    // ACL must be live BEFORE any AOF replay / raft catch-up: replayed
+    // "ACL SETUSER … reset …" entries apply through gAclApplyHook.
+    initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
+    aclInit(); // seed the default ACL user (on nopass +@all ~* &*)
+    {
+        import dreads.commands : gAclApplyHook;
+
+        gAclApplyHook = &aclApplyCanonical; // apply-path (replay/commit) ACL
+    }
     if (aofPath !is null)
     {
         auto replayed = aofLoad(aofPath, gKeys);
@@ -107,8 +116,6 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
         seedRand(nowMs()); // shuffle the random-pick commands per boot
-        initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
-        aclInit(); // seed the default ACL user (on nopass +@all ~* &*)
         {
             // effects replication: script writes reach the AOF one by one
             import dreads.scripting : gScriptEffectSink, startLuaScriptPool;
@@ -539,6 +546,38 @@ private bool authVerifyJob(string pw, immutable(string)[] hashes) nothrow
     return false;
 }
 
+// Replicate an ACL mutation. Under raft: propose the log form and block until
+// commit — the commit re-applies it on every node (leader included, idempotent).
+// Standalone: append to the AOF. Returns false (error already written) if a
+// follower can't take the write. Rare control-plane command, so a blocking
+// round-trip is fine.
+private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) nothrow
+{
+    import dreads.stream : nowMs;
+
+    if (gReplicator !is null)
+    {
+        static ByteBuffer discard; // the commit's OK reply is already sent locally
+        discard.clear();
+        try
+        {
+            if (!gReplicator.proposeWrite(logForm, nowMs(), 0, discard))
+            {
+                repError(o, "READONLY You can't write against a read only replica.");
+                return false;
+            }
+        }
+        catch (Exception)
+        {
+            repError(o, "ERR replication error");
+            return false;
+        }
+    }
+    else if (gAof.enabled)
+        gAof.append(logForm);
+    return true;
+}
+
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
@@ -784,7 +823,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                             repError(o, "ERR Usernames can't contain spaces or null characters");
                             return true;
                         }
-                    // NOTE: >pass hashes with the slow KDF inline (perf follow-up)
+                    // ACL mutations replicate; a follower can't accept them
+                    if (gReplicator !is null && !gReplicator.isLeader)
+                    {
+                        repError(o, "READONLY You can't write against a read only replica.");
+                        return true;
+                    }
                     auto u = aclGetOrCreate(cmd.arr[2].str);
                     const(char)[] err;
                     try
@@ -802,6 +846,13 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         return true;
                     }
                     gAclActive = true; // enforcement turns on once ACL is used
+                    // replicate the canonical, fully-hashed form (deterministic
+                    // replay — followers never re-run the Argon2 KDF)
+                    static ByteBuffer canon;
+                    canon.clear();
+                    aclEncodeCanonicalSetuser(u, canon);
+                    if (!propagateAclLog(canon.data, o))
+                        return true;
                     repSimple(o, "OK");
                     return true;
                 }
@@ -812,10 +863,18 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         repError(o, "ERR wrong number of arguments for 'acl|deluser' command");
                         return true;
                     }
+                    if (gReplicator !is null && !gReplicator.isLeader)
+                    {
+                        repError(o, "READONLY You can't write against a read only replica.");
+                        return true;
+                    }
                     long n = 0;
                     foreach (ref a; cmd.arr[2 .. $])
                         if (aclDelUser(a.str))
                             n++;
+                    // DELUSER is already canonical + idempotent — log it verbatim
+                    if (!propagateAclLog(rawCmd, o))
+                        return true;
                     repInt(o, n);
                     return true;
                 }

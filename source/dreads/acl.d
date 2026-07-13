@@ -68,6 +68,7 @@ struct AclPerm
         foreach (i; 0 .. chanPats.length)
             freeSlice(chanPats[i]);
         chanPats.clear();
+        cmdBaseAll = false;
         clearCmdRules();
     }
 
@@ -216,7 +217,11 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
     case '#':
         {
             auto h = tok[1 .. $];
-            if (!isSha256Hex(h))
+            // A bare SHA-256 hex (Valkey interop) OR a dreads Argon2id PHC string.
+            // The latter is what the canonical propagation form carries so the
+            // AOF/raft log stores the already-hashed password verbatim (no
+            // re-hash on replay — deterministic, and Argon2 is too slow to redo).
+            if (!isSha256Hex(h) && !(h.length >= 7 && h[0 .. 7] == "$argon2"))
             {
                 err = "ERR Error in ACL SETUSER modifier '#': Invalid password hash"
                     ~ " provided. It must be exactly 64 characters and contain"
@@ -515,6 +520,133 @@ void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @
     }
 }
 
+// --- canonical propagation form (AOF / raft log) ----------------------------
+
+import dreads.resp : repArrayHeader, repBulk, RVal;
+
+/// RESP-encode the canonical `ACL SETUSER <name> reset …` that fully rebuilds
+/// this user from scratch — the deterministic, idempotent propagation form for
+/// the AOF/raft log. Passwords go in verbatim as `#<stored-hash>` (already
+/// Argon2id-hashed), so replay never re-hashes and every node converges. Because
+/// it is a full-state `reset`, compaction is trivial: the newest one wins.
+void aclEncodeCanonicalSetuser(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
+{
+    size_t n = 5; // ACL SETUSER <name> reset <on|off>
+    if (u.nopass)
+        n++;
+    n += u.passwords.length;
+    n += u.root.allKeys ? 1 : u.root.keyPats.length;
+    n += u.root.allChannels ? 1 : u.root.chanPats.length;
+    n += 1 + u.root.cmdRules.length; // command base + delta tokens
+
+    repArrayHeader(o, n);
+    repBulk(o, "ACL");
+    repBulk(o, "SETUSER");
+    repBulk(o, u.name);
+    repBulk(o, "reset");
+    repBulk(o, u.enabled ? "on" : "off");
+    if (u.nopass)
+        repBulk(o, "nopass");
+
+    static ByteBuffer tb; // TLS scratch to assemble prefixed tokens
+    foreach (i; 0 .. u.passwords.length)
+    {
+        tb.clear();
+        tb.append("#");
+        tb.append(u.passwords[i]);
+        repBulk(o, cast(const(char)[]) tb.data);
+    }
+    if (u.root.allKeys)
+        repBulk(o, "~*");
+    else
+        foreach (i; 0 .. u.root.keyPats.length)
+        {
+            tb.clear();
+            auto p = u.root.keyPats[i];
+            if (p.read && p.write)
+                tb.append("~");
+            else
+            {
+                tb.append("%");
+                if (p.read)
+                    tb.append("R");
+                if (p.write)
+                    tb.append("W");
+                tb.append("~");
+            }
+            tb.append(p.pat);
+            repBulk(o, cast(const(char)[]) tb.data);
+        }
+    if (u.root.allChannels)
+        repBulk(o, "&*");
+    else
+        foreach (i; 0 .. u.root.chanPats.length)
+        {
+            tb.clear();
+            tb.append("&");
+            tb.append(u.root.chanPats[i]);
+            repBulk(o, cast(const(char)[]) tb.data);
+        }
+    repBulk(o, u.root.cmdBaseAll ? "+@all" : "-@all");
+    foreach (i; 0 .. u.root.cmdRules.length)
+        repBulk(o, u.root.cmdRules[i]);
+}
+
+/// Apply a canonical ACL command on the REPLAY / raft-commit path (never a live
+/// client — the server layer handles those). `args` is the command minus "ACL":
+/// `[SETUSER, name, reset, …]` or `[DELUSER, name, …]`.
+void aclApplyCanonical(const(RVal)[] args) @trusted nothrow
+{
+    if (args.length < 2)
+        return;
+    static bool eqIC(scope const(char)[] a, scope const(char)[] b) @nogc nothrow @safe
+    {
+        if (a.length != b.length)
+            return false;
+        foreach (i, ch; a)
+        {
+            auto x = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            auto y = (b[i] >= 'A' && b[i] <= 'Z') ? cast(char)(b[i] + 32) : b[i];
+            if (x != y)
+                return false;
+        }
+        return true;
+    }
+
+    if (eqIC(args[0].str, "setuser"))
+    {
+        auto u = aclGetOrCreate(args[1].str);
+        if (u is null)
+            return;
+        const(char)[] err;
+        foreach (ref r; args[2 .. $])
+        {
+            try
+                aclApplyRule(u, r.str, err); // canonical never uses `>` (no hashing)
+            catch (Exception)
+            {
+            }
+        }
+        gAclActive = true;
+    }
+    else if (eqIC(args[0].str, "deluser"))
+    {
+        foreach (ref a; args[1 .. $])
+            aclDelUser(a.str);
+    }
+}
+
+/// Append a canonical `ACL SETUSER … reset …` for EVERY user — the ACL half of
+/// AOF rewrite / raft snapshot, so a compacted log still rebuilds the registry.
+/// (default included: its line re-affirms the seeded state, or carries changes.)
+void aclDumpUsers(ref ByteBuffer buf) @trusted nothrow @nogc
+{
+    aclEachUser((AclUser* u) @nogc nothrow {
+        aclEncodeCanonicalSetuser(u, buf);
+        return 0;
+    });
+}
+
 /// Verify a plaintext password against this user (nopass or any stored hash).
 /// Runs Argon2 — call OFF the event loop.
 bool aclCheckPassword(const(AclUser)* u, scope const(char)[] pass) @trusted nothrow
@@ -782,4 +914,44 @@ unittest // ACL GETUSER rule description echoes the applied rules (Valkey format
     assert(describe(&aclDescribeCommands, u) == "+@all");
     assert(aclApplyRule(u, "-del", err));
     assert(describe(&aclDescribeCommands, u) == "+@all -del");
+}
+
+unittest // canonical propagation: encode a user, apply it back, state matches
+{
+    import dreads.mem : ByteBuffer, Arena;
+    import dreads.resp : parseValue, ParseStatus, RVal, RType;
+
+    aclInit();
+    const(char)[] err;
+    auto src = aclGetOrCreate("canon_src");
+    scope (exit)
+        aclDelUser("canon_src");
+    // give it a password by hash (no Argon2 in the test), keys, channels, commands
+    enum h64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    foreach (r; ["on", "#" ~ h64, "~app:*", "%R~ro:*", "&news", "+@read", "+set", "-get"])
+        assert(aclApplyRule(src, r, err), cast(string) err);
+
+    // encode the canonical ACL SETUSER … and parse it back into an RVal array
+    ByteBuffer enc;
+    aclEncodeCanonicalSetuser(src, enc);
+    Arena arena;
+    RVal cmd;
+    size_t pos = 0;
+    assert(parseValue(enc.data, pos, arena, cmd) == ParseStatus.ok);
+    assert(cmd.type == RType.Array && cmd.arr[0].str == "ACL");
+
+    // apply it to a DIFFERENT registry name and confirm the rebuilt user matches
+    // (rename the target in the parsed command)
+    aclDelUser("canon_dst");
+    cmd.arr[2].str = "canon_dst";
+    aclApplyCanonical(cmd.arr[1 .. $]);
+    scope (exit)
+        aclDelUser("canon_dst");
+    auto dst = aclUser("canon_dst");
+    assert(dst !is null && dst.enabled);
+    assert(aclCanRunCmd(dst, aclCmdIndex("set")) && aclCanRunCmd(dst, aclCmdIndex("mget")));
+    assert(!aclCanRunCmd(dst, aclCmdIndex("get"))); // -get after +@read
+    assert(!dst.nopass && dst.passwords.length == 1 && dst.passwords[0] == h64);
+    assert(dst.root.allKeys == false && dst.root.keyPats.length == 2);
+    assert(dst.root.chanPats.length == 1 && dst.root.chanPats[0] == "news");
 }
