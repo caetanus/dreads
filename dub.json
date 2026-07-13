@@ -43,6 +43,7 @@
 		"draft": {
 			"path": "vendor/raft"
 		},
+		"libsodiumd": "~>0.2",
 		"vibe-core": "~>2.8"
 	},
 	"description": "a dlang redis implementation",
@@ -50,7 +51,8 @@
 		"-mcpu=x86-64-v3"
 	],
 	"libs": [
-		"lua5.4"
+		"lua5.4",
+		"sodium"
 	],
 	"libs-linux": [
 		"jemalloc"
