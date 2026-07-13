@@ -115,29 +115,27 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
 - **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
 
 ## ACL / AUTH (2026-07-13, `auth-acl` → `master`)
-- **acl.tcl block-1 now runs to completion: 86 ok / 2 err** (was 17 at the start
-  of the ACL push). Achieved by implementing, across the session: GETUSER/LIST,
-  subcommand + first-arg rules, ACL CAT/DRYRUN, canonical AOF/raft persistence,
-  key + channel enforcement, ACL LOG (aggregation, contexts, metrics), `db=`
-  database selectors, default-user-off auth, HELLO AUTH/SETNAME, DELUSER edges
-  (default-protected + self-disconnect), ACL HELP/LOAD, GETUSER lossless
-  compaction, EXEC-replay + blocked-client ACL re-check. Every fix has an own
-  unit test (per `blackbox-internal-coverage`); server-layer-only bits noted
-  here.
-- **The 2 remaining acl.tcl block-1 failures are NOT ACL logic — they need
-  separate infrastructure:**
-  1. *"Subscribers are pardoned …"* — asserts on `CLIENT LIST` enumerating OTHER
-     clients (greps a subscriber's name). dreads' `CLIENT LIST` reports only the
-     calling connection (no global connection registry). Needs a registry of all
-     live `Conn*` (also unblocks `CLIENT KILL`/`CLIENT LIST` generally, and
-     killing OTHER clients on `ACL DELUSER`/channel-revoke). Cross-cutting.
-  2. *"blocked command gets rejected when reprocessed after permission change"* —
-     the ACL part (NOPERM on the woken BLPOP) now PASSES; the remaining assertion needs
-     INFO **commandstats** (`cmdstat_blpop: … rejected_calls=1,failed_calls=0`),
-     a per-command call/rejected/failed counter subsystem dreads doesn't have.
-- **DELUSER of a user other clients are authed as**: only the SELF connection is
-  disconnected today (deleting the user it uses). Killing OTHER sessions needs
-  the same global connection registry as (1) above.
+- **acl.tcl block-1 now runs to completion: 87 ok / 1 err** (was 17 at the start
+  of the ACL push). Achieved across the session: GETUSER/LIST, subcommand +
+  first-arg rules, ACL CAT/DRYRUN, canonical AOF/raft persistence, key + channel
+  enforcement, ACL LOG (aggregation, contexts, metrics), `db=` database
+  selectors, default-user-off auth, HELLO AUTH/SETNAME, DELUSER edges
+  (default-protected + self/other-session disconnect), ACL HELP/LOAD, GETUSER
+  lossless compaction, EXEC-replay + blocked-client ACL re-check, and a global
+  connection registry (CLIENT LIST enumeration + channel kill-on-revoke). Every
+  fix has an own unit test (per `blackbox-internal-coverage`); server-layer-only
+  bits noted here.
+- **The 1 remaining acl.tcl block-1 failure is NOT ACL logic:**
+  *"blocked command gets rejected when reprocessed after permission change"* —
+  the ACL part (NOPERM on the woken BLPOP) PASSES; the remaining assertion needs
+  INFO **commandstats** (`cmdstat_blpop: … rejected_calls=1,failed_calls=0`), a
+  per-command call/rejected/failed counter subsystem dreads doesn't have.
+- **Connection registry (commit 702f79c):** intrusive doubly-linked list of every
+  live `Conn*` (each lives on its serveClient fiber stack; single event loop ⇒ no
+  locking). Powers `CLIENT LIST` (all clients), channel kill-on-revoke, and
+  DELUSER disconnecting OTHER sessions. `CLIENT KILL` is still a stub — the
+  registry makes it a small follow-up (match by id/addr → killConn). `addr` is
+  still `?` (no peer-address plumbing).
 - Later acl.tcl `start_server` blocks (aclfile-based) remain `external:skip`:
   dreads persists users via the AOF/raft log, not an `aclfile` (see
   `aof-is-ours`), so `ACL LOAD/SAVE` return "not configured to use an ACL file".
