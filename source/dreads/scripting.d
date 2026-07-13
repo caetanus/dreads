@@ -1029,11 +1029,14 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
 
     // ACL: a redis.call must obey the CALLER's permissions, not the fact that
     // the caller was allowed to run EVAL. `userId` rides in from the connection
-    // (invisible to Lua) — resolve it here on the writer thread and reject any
-    // command the user can't run, exactly like the top-level enforcement does.
+    // (invisible to Lua) — resolve it here on the writer thread and enforce
+    // command/key/channel exactly like the top-level. This is why EVAL/FCALL need
+    // no key-spec of their own: each redis.call round-trips here as a real command
+    // (SET, GET, …) and is checked transparently, keys and all.
     if (userId != 0 && arr.length > 0)
     {
-        import dreads.acl : aclUserById, aclUnrestricted, aclCanRunCmd, aclCmdIndex;
+        import dreads.acl : aclUserById, aclUnrestricted, aclCanRunCmd, aclCmdIndex,
+            aclKeyDenied, aclCanAccessChannel;
 
         auto u = aclUserById(userId);
         if (u !is null && !aclUnrestricted(u))
@@ -1056,6 +1059,20 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
                     eb.append(lname);
                     eb.append("' command");
                     repError(reply, cast(const(char)[]) eb.data);
+                    return 0;
+                }
+                if (!u.root.allKeys && aclKeyDenied(u, lname, arr))
+                {
+                    reply.clear();
+                    repError(reply, "NOPERM No permissions to access a key");
+                    return 0;
+                }
+                if (!u.root.allChannels && arr.length >= 2
+                        && (lname == "publish" || lname == "spublish")
+                        && !aclCanAccessChannel(u, arr[1].str))
+                {
+                    reply.clear();
+                    repError(reply, "NOPERM No permissions to access a channel");
                     return 0;
                 }
             }
