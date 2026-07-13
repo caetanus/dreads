@@ -298,10 +298,92 @@ private struct Conn
     LocalManualEvent oqEvt;
     Task oqWriter;
     bool oqClosing;
+    // Intrusive registry links (all live connections, for CLIENT LIST and
+    // killing sessions on ACL DELUSER / channel revoke). Single event-loop
+    // thread ⇒ no locking.
+    Conn* regPrev, regNext;
 
     @property size_t totalSubs() const @nogc nothrow
     {
         return sub.subCount + shardSub.subCount;
+    }
+}
+
+// Registry of every live connection (intrusive doubly-linked list). All access
+// is on the single event-loop thread, so no synchronisation is needed.
+private __gshared Conn* gConnHead;
+
+private void registerConn(Conn* c) @nogc nothrow
+{
+    c.regPrev = null;
+    c.regNext = gConnHead;
+    if (gConnHead !is null)
+        gConnHead.regPrev = c;
+    gConnHead = c;
+}
+
+private void unregisterConn(Conn* c) @nogc nothrow
+{
+    if (c.regPrev !is null)
+        c.regPrev.regNext = c.regNext;
+    else if (gConnHead is c)
+        gConnHead = c.regNext;
+    if (c.regNext !is null)
+        c.regNext.regPrev = c.regPrev;
+    c.regPrev = c.regNext = null;
+}
+
+// Force-close another connection: its serveClient fiber unblocks from
+// waitForData with an error and runs its own scope(exit) cleanup (which
+// unregisters it). Safe to call from a different fiber on the one event loop.
+private void killConn(Conn* c) nothrow
+{
+    try
+        c.tcp.close();
+    catch (Exception)
+    {
+    }
+}
+
+// After an ACL SETUSER changes a user's channel permissions, disconnect any of
+// that user's connections whose active (P)subscriptions include a channel the
+// user may no longer access — Valkey's kill-on-revoke. A connection that retains
+// permission for ALL of its subscriptions (or the user gaining allchannels) is
+// pardoned.
+private void aclKillRevokedSubscribers(const(AclUser)* u) nothrow
+{
+    if (u is null || u.root.allChannels)
+        return; // gaining allchannels can never revoke an existing subscription
+    for (auto p = gConnHead; p !is null;)
+    {
+        auto nxt = p.regNext; // p may be unlinked by killConn
+        if (p.user is u && p.totalSubs > 0)
+        {
+            bool revoked = false;
+            foreach (ch, ref _u1; p.sub.channels)
+                if (!aclCanAccessChannel(u, ch))
+                {
+                    revoked = true;
+                    break;
+                }
+            if (!revoked)
+                foreach (pat, ref _u2; p.sub.patterns)
+                    if (!aclCanAccessChannel(u, pat, true)) // literal match for patterns
+                    {
+                        revoked = true;
+                        break;
+                    }
+            if (!revoked)
+                foreach (ch, ref _u3; p.shardSub.channels)
+                    if (!aclCanAccessChannel(u, ch))
+                    {
+                        revoked = true;
+                        break;
+                    }
+            if (revoked)
+                killConn(p);
+        }
+        p = nxt;
     }
 }
 
@@ -469,6 +551,7 @@ private void serveClient(TCPConnection tcp) nothrow
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
     c.shardSub.sink = &connSink;
+    registerConn(&c);
     scope (exit)
     {
         gPubSub.dropAll(&c.sub); // no further connSink after this
@@ -477,6 +560,7 @@ private void serveClient(TCPConnection tcp) nothrow
         c.sub.free();
         c.shardSub.free();
         unregisterMonitor(&c);
+        unregisterConn(&c);
         import dreads.mem : freeSlice;
 
         c.clientName.freeSlice;
@@ -1159,6 +1243,9 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         return true;
                     }
                     gAclActive = true; // enforcement turns on once ACL is used
+                    // a channel permission change may revoke a live subscriber's
+                    // active subscriptions — disconnect those (pardon the rest)
+                    aclKillRevokedSubscribers(u);
                     // replicate the canonical, fully-hashed form (deterministic
                     // replay — followers never re-run the Argon2 KDF)
                     static ByteBuffer canon;
@@ -1199,6 +1286,17 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                                 selfDeleted = true;
                                 break;
                             }
+                    // disconnect OTHER sessions authed as a deleted user (the
+                    // self connection is handled after the reply via selfDeleted).
+                    // Done BEFORE aclDelUser frees the AclUser (we compare c.user).
+                    foreach (ref a; cmd.arr[2 .. $])
+                        for (auto p = gConnHead; p !is null;)
+                        {
+                            auto nxt = p.regNext;
+                            if (p !is &c && p.user !is null && p.user.name == a.str)
+                                killConn(p);
+                            p = nxt;
+                        }
                     long n = 0;
                     foreach (ref a; cmd.arr[2 .. $])
                         if (aclDelUser(a.str))
@@ -2993,6 +3091,24 @@ private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
 }
 
 /// CLIENT GETNAME/SETNAME/ID/INFO/NO-EVICT/NO-TOUCH/LIST (minimal).
+// One CLIENT LIST / CLIENT INFO line for a connection (newline-terminated).
+private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    char[224] b = void;
+    auto n = snprintf(b.ptr, b.length,
+            "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
+            ~ " multi=%d cmd=client|list user=%.*s resp=%d\n",
+            c.id, cast(int) c.clientName.length, c.clientName.ptr,
+            cast(int)(c.dbp - &gDbs[0]), cast(int) c.sub.subCount, 0,
+            cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
+            cast(int)(c.user !is null ? c.user.name.length : 7),
+            c.user !is null ? c.user.name.ptr : "default".ptr, c.resp3 ? 3 : 2);
+    if (n > 0)
+        o.append(b[0 .. n]);
+}
+
 private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     import core.stdc.stdio : snprintf;
@@ -3023,13 +3139,21 @@ private void clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         c.clientName = mallocDup(args[1].str);
         repSimple(o, "OK");
     }
-    else if (eqICDebug(sub, "INFO") || eqICDebug(sub, "LIST"))
+    else if (eqICDebug(sub, "INFO"))
     {
-        char[160] b = void;
-        auto n = snprintf(b.ptr, b.length, "id=%llu addr=? name=%.*s db=%d cmd=client\n",
-                c.id, cast(int) c.clientName.length, c.clientName.ptr,
-                cast(int)(c.dbp - &gDbs[0]));
-        repBulk(o, b[0 .. n]);
+        static ByteBuffer lb; // TLS
+        lb.clear();
+        appendConnInfo(&c, lb);
+        repBulk(o, cast(const(char)[]) lb.data);
+    }
+    else if (eqICDebug(sub, "LIST"))
+    {
+        // enumerate every live connection (the registry) — one info line each
+        static ByteBuffer lb; // TLS
+        lb.clear();
+        for (auto p = gConnHead; p !is null; p = p.regNext)
+            appendConnInfo(p, lb);
+        repBulk(o, cast(const(char)[]) lb.data);
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
