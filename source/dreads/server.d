@@ -713,6 +713,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         repError(o, "ERR wrong number of arguments for 'acl|setuser' command");
                         return true;
                     }
+                    foreach (ch; cmd.arr[2].str)
+                        if (ch == ' ' || ch == '\0')
+                        {
+                            repError(o, "ERR Usernames can't contain spaces or null characters");
+                            return true;
+                        }
                     // NOTE: >pass hashes with the slow KDF inline (perf follow-up)
                     auto u = aclGetOrCreate(cmd.arr[2].str);
                     const(char)[] err;

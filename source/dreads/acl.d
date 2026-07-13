@@ -95,13 +95,31 @@ private bool bitGet(ref const ulong[NW] bits, size_t i) @nogc nothrow @safe
     return (bits[i >> 6] & (1UL << (i & 63))) != 0;
 }
 
-/// Command name (lowercase) -> its index in gCmdCats, or -1.
-int aclCmdIndex(scope const(char)[] lower) @nogc nothrow @safe
+import dreads.dict : Dict;
+
+// name (lowercase) -> index in gCmdCats, built once at boot so the enforcement
+// hot path is an O(1) hash lookup, not a 258-command linear scan.
+private __gshared Dict!int gCmdIdx;
+
+private __gshared bool gCmdIdxBuilt;
+
+// lazy (not a module ctor — that would cycle with dreads.scripting): built on
+// the first lookup, then a single bool test on the hot path.
+private void ensureCmdIndex() @trusted nothrow
 {
+    if (gCmdIdxBuilt)
+        return;
+    gCmdIdxBuilt = true;
     foreach (i, ref c; gCmdCats)
-        if (c.name == lower)
-            return cast(int) i;
-    return -1;
+        gCmdIdx.set(c.name, cast(int) i);
+}
+
+/// Command name (lowercase) -> its index in gCmdCats, or -1. O(1) after warmup.
+int aclCmdIndex(scope const(char)[] lower) @trusted nothrow
+{
+    ensureCmdIndex();
+    auto p = gCmdIdx.get(lower);
+    return p ? *p : -1;
 }
 
 private void allowCategory(ref AclPerm p, uint catBit, bool allow) @nogc nothrow @safe
@@ -123,7 +141,7 @@ private void allowAll(ref AclPerm p, bool allow) @nogc nothrow @safe
 /// control-plane cost, ~tens of ms — SETUSER is an admin command).
 bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @trusted
 {
-    import dreads.authpw : hashPassword;
+    import dreads.authpw : hashPassword, verifyPassword;
 
     if (tok.length == 0)
         return true;
@@ -144,9 +162,17 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
     }
     if (tok == "allcommands" || tok == "+@all") { allowAll(u.root, true); return true; }
     if (tok == "nocommands" || tok == "-@all") { allowAll(u.root, false); return true; }
+    // accepted no-ops: sanitize-payload is a DUMP-safety flag (dreads has no
+    // DUMP), clearselectors clears ACL v2 selectors (Phase 2 — not stored yet)
+    if (tok == "sanitize-payload" || tok == "nosanitize-payload"
+            || tok == "skip-sanitize-payload" || tok == "clearselectors")
+        return true;
 
     switch (tok[0])
     {
+    case '(':
+        // ACL v2 selector `(rules)` — accepted but not yet enforced (Phase 2)
+        return true;
     case '>':
         u.nopass = false;
         u.passwords.put(cast(const(char)[]) mallocDup(hashPassword(tok[1 .. $])));
@@ -163,6 +189,34 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
             }
             u.nopass = false;
             u.passwords.put(cast(const(char)[]) mallocDup(h));
+            return true;
+        }
+    case '<':
+        // remove a password by plaintext (verify against each stored hash)
+        foreach (i; 0 .. u.passwords.length)
+            if (verifyPassword(tok[1 .. $], u.passwords[i]))
+            {
+                removePasswordAt(u, i);
+                break;
+            }
+        return true;
+    case '!':
+        {
+            // remove a password by its (SHA-256 hex) hash
+            auto h = tok[1 .. $];
+            if (!isSha256Hex(h))
+            {
+                err = "ERR Error in ACL SETUSER modifier '!': Invalid password hash"
+                    ~ " provided. It must be exactly 64 characters and contain"
+                    ~ " only lowercase hexadecimal characters";
+                return false;
+            }
+            foreach (i; 0 .. u.passwords.length)
+                if (u.passwords[i] == h)
+                {
+                    removePasswordAt(u, i);
+                    break;
+                }
             return true;
         }
     case '+':
@@ -254,6 +308,16 @@ private void clearPasswords(AclUser* u) @nogc nothrow @trusted
     foreach (i; 0 .. u.passwords.length)
         freeSlice(u.passwords[i]);
     u.passwords.clear();
+}
+
+/// Remove the password hash at `idx` (order-agnostic swap-remove).
+private void removePasswordAt(AclUser* u, size_t idx) @nogc nothrow @trusted
+{
+    freeSlice(u.passwords[idx]);
+    immutable last = u.passwords.length - 1;
+    if (idx != last)
+        u.passwords[idx] = u.passwords[last];
+    u.passwords.popBack();
 }
 
 private void freeKeyPats(AclUser* u) @nogc nothrow @trusted
