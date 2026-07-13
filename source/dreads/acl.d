@@ -481,7 +481,61 @@ bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)
                 return true;
         }
     }
-    return false;
+    // keyword-positioned keys — idiosyncratic, hand-coded (the source keys of
+    // georadius/sort are already caught by their static spec above; here we add
+    // the STORE dests, XREAD's STREAMS keys, and MIGRATE's KEYS list).
+    return aclKeywordKeyDenied(u, name, arr, argc);
+}
+
+private bool aclKeywordKeyDenied(const(AclUser)* u, scope const(char)[] name,
+        scope const(RVal)[] arr, int argc) @trusted nothrow @nogc
+{
+    static bool kw(scope const(char)[] a, scope const(char)[] lit) @nogc nothrow @safe
+    {
+        if (a.length != lit.length)
+            return false;
+        foreach (i, c; a)
+            if (((c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c) != lit[i])
+                return false;
+        return true;
+    }
+
+    switch (name)
+    {
+    case "georadius", "georadiusbymember", "sort", "sort_ro":
+        // STORE <dest> / STOREDIST <dest> — the dest is a write key
+        for (int i = 1; i + 1 < argc; i++)
+            if ((kw(arr[i].str, "store") || kw(arr[i].str, "storedist"))
+                    && !aclCanAccessKey(u, arr[i + 1].str, false, true))
+                return true;
+        return false;
+    case "xread", "xreadgroup":
+        // STREAMS key… id… — the first half after STREAMS are read keys
+        for (int i = 1; i < argc; i++)
+            if (kw(arr[i].str, "streams"))
+            {
+                immutable rest = argc - (i + 1);
+                immutable nkeys = rest / 2;
+                foreach (j; 0 .. nkeys)
+                    if (!aclCanAccessKey(u, arr[i + 1 + j].str, true, false))
+                        return true;
+                break;
+            }
+        return false;
+    case "migrate":
+        // MIGRATE … KEYS key… — every key after KEYS is read+deleted
+        for (int i = 1; i < argc; i++)
+            if (kw(arr[i].str, "keys"))
+            {
+                foreach (j; i + 1 .. argc)
+                    if (!aclCanAccessKey(u, arr[j].str, true, true))
+                        return true;
+                break;
+            }
+        return false;
+    default:
+        return false;
+    }
 }
 
 // small @nogc decimal parse for the numkeys arg (avoids importing the dispatch
@@ -966,6 +1020,15 @@ unittest // reset + allkeys/allcommands + %RW flags
     assert(!aclKeyDenied(ku, "lmpop", mk("LMPOP", "2", "foo:1", "foo:2", "LEFT")));
     assert(aclKeyDenied(ku, "lmpop", mk("LMPOP", "2", "foo:1", "bar:1", "LEFT")));
     assert(aclKeyDenied(ku, "sintercard", mk("SINTERCARD", "2", "foo:a", "bar:b")));
+
+    // keyword-positioned keys: STORE dest, XREAD STREAMS, MIGRATE KEYS
+    assert(!aclKeyDenied(ku, "georadius", mk("GEORADIUS", "foo:g", "13", "38", "1", "km", "STORE", "foo:d")));
+    assert(aclKeyDenied(ku, "georadius", mk("GEORADIUS", "foo:g", "13", "38", "1", "km", "STORE", "bar:d")));
+    assert(!aclKeyDenied(ku, "xread", mk("XREAD", "STREAMS", "foo:a", "foo:b", "0", "0")));
+    assert(aclKeyDenied(ku, "xread", mk("XREAD", "STREAMS", "foo:a", "bar:b", "0", "0")));
+    assert(!aclKeyDenied(ku, "sort", mk("SORT", "foo:l", "STORE", "foo:d")));
+    assert(aclKeyDenied(ku, "sort", mk("SORT", "foo:l", "STORE", "bar:d")));
+    assert(aclKeyDenied(ku, "migrate", mk("MIGRATE", "h", "0", "", "0", "5000", "KEYS", "foo:1", "bar:2")));
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate
