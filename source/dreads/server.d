@@ -27,7 +27,8 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
     aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
     aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
-    aclCanRunCmdSub, aclCmdHasSubRule, gAclActive;
+    aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
+    aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -638,21 +639,53 @@ private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) not
 
 // Channel ACL for the pub/sub commands: which args are channels depends on the
 // command (PUBLISH/SPUBLISH → arg 1; SUBSCRIBE/SSUBSCRIBE/PSUBSCRIBE → args 1..).
-// PSUBSCRIBE patterns match literally, plain channels glob-match. Called from the
+// PSUBSCRIBE patterns match literally, plain channels glob-match. Returns the
+// first denied channel (for the ACL LOG object) or null. Called from the
 // top-level enforcement block so it also gates a channel at MULTI queue time.
-private bool aclCmdChannelDenied(const(AclUser)* u, scope const(char)[] lname,
+private const(char)[] aclCmdDeniedChannel(const(AclUser)* u, scope const(char)[] lname,
         scope const(RVal)[] arr) @trusted nothrow @nogc
 {
     if (lname == "publish" || lname == "spublish")
-        return arr.length >= 2 && !aclCanAccessChannel(u, arr[1].str);
+        return (arr.length >= 2 && !aclCanAccessChannel(u, arr[1].str)) ? arr[1].str : null;
     if (lname == "subscribe" || lname == "ssubscribe" || lname == "psubscribe")
     {
         immutable isPat = lname[0] == 'p';
         foreach (i; 1 .. arr.length)
             if (!aclCanAccessChannel(u, arr[i].str, isPat))
-                return true;
+                return arr[i].str;
     }
-    return false;
+    return null;
+}
+
+// Record a denied attempt in the ACL LOG with a minimal client-info (the suite
+// greps `cmd=<name>`). Context is multi inside a transaction, else toplevel.
+private void aclLogViolation(ref Conn c, string reason, scope const(char)[] obj,
+        scope const(char)[] cmdName) nothrow
+{
+    import dreads.stream : nowMs;
+
+    static ByteBuffer ci; // TLS
+    ci.clear();
+    ci.append("id=0 addr=? name=");
+    if (c.clientName.length)
+        ci.append(c.clientName);
+    ci.append(" cmd=");
+    ci.append(cmdName);
+    aclLogAdd(reason, c.inMulti ? "multi" : "toplevel", obj,
+            c.user !is null ? c.user.name : "default", cast(const(char)[]) ci.data, nowMs());
+}
+
+// age-seconds as a float string ("0.001"), from a millisecond delta.
+private void appendAge(ref ByteBuffer o, long ms) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    if (ms < 0)
+        ms = 0;
+    char[32] b = void;
+    auto n = snprintf(b.ptr, b.length, "%.3f", cast(double) ms / 1000.0);
+    if (n > 0)
+        o.append(b[0 .. n]);
 }
 
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
@@ -728,18 +761,23 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         repError(o, "NOAUTH Authentication required.");
                         return true;
                     }
+                    // object = command, or command|sub when under sub-ACL
+                    static ByteBuffer ob; // TLS
+                    ob.clear();
+                    ob.append(lname);
+                    if (sub.length && (aclIsContainer(lname) || aclCmdHasSubRule(c.user, cidx)))
+                    {
+                        ob.append("|");
+                        ob.append(sub);
+                    }
+                    auto obj = cast(const(char)[]) ob.data;
+                    aclLogViolation(c, "command", obj, lname);
                     static ByteBuffer eb; // TLS
                     eb.clear();
                     eb.append("NOPERM User ");
                     eb.append(c.user.name);
                     eb.append(" has no permissions to run the '");
-                    eb.append(lname);
-                    // name the subcommand (client|kill) when it's under sub-ACL
-                    if (sub.length && aclCmdHasSubRule(c.user, cidx))
-                    {
-                        eb.append("|");
-                        eb.append(sub);
-                    }
+                    eb.append(obj);
                     eb.append("' command");
                     repError(o, cast(const(char)[]) eb.data);
                     return true;
@@ -747,18 +785,25 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             }
             // key-pattern ACL: the command is allowed — now reject it if it
             // touches a key outside the user's ~patterns (allkeys users skip).
-            if (!c.user.root.allKeys && aclKeyDenied(c.user, lname, cmd.arr))
+            auto dk = aclDeniedKey(c.user, lname, cmd.arr);
+            if (dk !is null)
             {
+                aclLogViolation(c, "key", dk, lname);
                 repError(o, "NOPERM No permissions to access a key");
                 return true;
             }
             // channel-pattern ACL for pub/sub — checked HERE (before the switch
             // AND before MULTI queuing), so an unauthorized channel is rejected
             // at queue time, matching Valkey.
-            if (!c.user.root.allChannels && aclCmdChannelDenied(c.user, lname, cmd.arr))
+            if (!c.user.root.allChannels)
             {
-                repError(o, "NOPERM No permissions to access a channel");
-                return true;
+                auto dch = aclCmdDeniedChannel(c.user, lname, cmd.arr);
+                if (dch !is null)
+                {
+                    aclLogViolation(c, "channel", dch, lname);
+                    repError(o, "NOPERM No permissions to access a channel");
+                    return true;
+                }
             }
         }
     }
@@ -937,7 +982,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         de.append(du.name);
                         de.append(" has no permissions to run the '");
                         de.append(tlname);
-                        if (dsub.length && aclCmdHasSubRule(du, tci))
+                        if (dsub.length && (aclIsContainer(tlname) || aclCmdHasSubRule(du, tci)))
                         {
                             de.append("|");
                             de.append(dsub);
@@ -1192,6 +1237,62 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     repBulk(o, hb[0 .. nchars]);
                     return true;
                 }
+            case "LOG":
+                {
+                    if (cmd.arr.length == 3 && eqICDebug(cmd.arr[2].str, "RESET"))
+                    {
+                        aclLogReset();
+                        repSimple(o, "OK");
+                        return true;
+                    }
+                    if (cmd.arr.length > 3)
+                    {
+                        repError(o, "ERR unknown subcommand or wrong number of"
+                                ~ " arguments for 'LOG'. Try ACL HELP.");
+                        return true;
+                    }
+                    long lim = 10; // Valkey's default entry count
+                    if (cmd.arr.length == 3 && !parseLong(cmd.arr[2].str, lim))
+                    {
+                        repError(o, "ERR Got a non-integer or invalid count argument for 'ACL LOG'");
+                        return true;
+                    }
+                    immutable total = aclLogCount();
+                    size_t n = (lim < 0 || lim > total) ? total : cast(size_t) lim;
+                    import dreads.stream : nowMs;
+
+                    auto now = nowMs();
+                    repArrayHeader(o, n);
+                    static ByteBuffer ab; // TLS for age-seconds
+                    foreach (i; 0 .. n)
+                    {
+                        auto e = aclLogAt(i); // 0 = newest
+                        repMapHeader(o, 10);
+                        repBulk(o, "count");
+                        repInt(o, cast(long) e.count);
+                        repBulk(o, "reason");
+                        repBulk(o, e.reason);
+                        repBulk(o, "context");
+                        repBulk(o, e.ctx);
+                        repBulk(o, "object");
+                        repBulk(o, e.obj);
+                        repBulk(o, "username");
+                        repBulk(o, e.user);
+                        repBulk(o, "age-seconds");
+                        ab.clear();
+                        appendAge(ab, now - e.created);
+                        repBulk(o, cast(const(char)[]) ab.data);
+                        repBulk(o, "client-info");
+                        repBulk(o, e.cinfo);
+                        repBulk(o, "entry-id");
+                        repInt(o, cast(long) e.id);
+                        repBulk(o, "timestamp-created");
+                        repInt(o, e.created);
+                        repBulk(o, "timestamp-last-updated");
+                        repInt(o, e.updated);
+                    }
+                    return true;
+                }
             default:
                 repUnknownSubcommand(o, "ACL", sub);
                 return true;
@@ -1253,6 +1354,13 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             u = aclUser(who);
             if (!ok || u is null || !u.enabled)
             {
+                import dreads.stream : nowMs;
+
+                static ByteBuffer ai; // TLS
+                ai.clear();
+                ai.append("id=0 addr=? cmd=auth");
+                aclLogAdd("auth", c.inMulti ? "multi" : "toplevel", "AUTH", who,
+                        cast(const(char)[]) ai.data, nowMs());
                 repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
                 return true;
             }
@@ -1985,7 +2093,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             "zset-max-listpack-entries", "zset-max-listpack-value",
             "zset-max-ziplist-entries", "zset-max-ziplist-value",
             "stream-node-max-entries", "stream-node-max-bytes",
-            "proto-max-bulk-len", "client-query-buffer-limit",
+            "proto-max-bulk-len", "client-query-buffer-limit", "acllog-max-len",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -2096,6 +2204,10 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 auto n = snprintf(b.ptr, b.length, "%llu", gConfig.clientQueryBufferLimit);
                 repBulk(o, b[0 .. n]);
                 break;
+            case "acllog-max-len":
+                auto n = snprintf(b.ptr, b.length, "%lld", gAclLogMaxLen);
+                repBulk(o, b[0 .. n]);
+                break;
             default:
                 repBulk(o, ""); // known name with no value formatter
             }
@@ -2115,6 +2227,18 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         }
         catch (Exception)
         {
+        }
+        if (lname == "acllog-max-len") // maps to the ACL LOG cap, not gConfig
+        {
+            long v;
+            if (parseLong(value, v) && v >= 0)
+            {
+                gAclLogMaxLen = v; // does not retroactively trim existing entries
+                repSimple(o, "OK");
+            }
+            else
+                repError(o, "ERR CONFIG SET failed - unable to set the value");
+            return;
         }
         if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
         {

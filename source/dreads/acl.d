@@ -98,6 +98,51 @@ struct AclPerm
         cmdRules.put(cast(const(char)[]) mallocDup(tok));
     }
 
+    // Record a +/- command/category rule token, normalized to lowercase (command,
+    // category and subcommand names are case-insensitive; GETUSER echoes them
+    // lowercased). For categories, drop any prior rule for the same category so a
+    // re-added `-@hash` moves to the end (lossless compaction, Valkey semantics).
+    // Command/subcommand dedup already happened in applyCmdRule via dropCmdRuleFor.
+    void addCmdRuleNorm(scope const(char)[] tok) @nogc nothrow @trusted
+    {
+        char[256] lb = void;
+        if (tok.length < 2 || tok.length > lb.length)
+        {
+            addCmdRule(tok);
+            return;
+        }
+        lb[0] = tok[0]; // sign (+/-) kept verbatim
+        foreach (i; 1 .. tok.length)
+        {
+            auto ch = tok[i];
+            lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+        }
+        auto ntok = cast(const(char)[]) lb[0 .. tok.length];
+        if (tok[1] == '@')
+            dropCatRule(ntok[2 .. $]); // dedup by category name (any sign)
+        addCmdRule(ntok);
+    }
+
+    // Drop any cmdRule that is a category (+@x / -@x) whose name equals catLower.
+    void dropCatRule(scope const(char)[] catLower) @nogc nothrow @trusted
+    {
+        size_t w = 0;
+        foreach (r; 0 .. cmdRules.length)
+        {
+            auto t = cmdRules[r];
+            bool isCat = t.length >= 2 && (t[0] == '+' || t[0] == '-') && t[1] == '@';
+            if (isCat && eqLower(t[2 .. $], catLower))
+                freeSlice(cmdRules[r]);
+            else
+            {
+                cmdRules[w] = cmdRules[r];
+                w++;
+            }
+        }
+        while (cmdRules.length > w)
+            cmdRules.popBack();
+    }
+
     // Engulf: adding `+memory` collapses a prior `+memory|doctor` so GETUSER
     // shows the whole command, not stale subcommand tokens (Valkey semantics).
     // `whole` drops every rule for the command; else only the exact cmd|sub.
@@ -367,12 +412,12 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
     case '+':
         if (!applyCmdRule(u, tok[1 .. $], true, err))
             return false;
-        u.root.addCmdRule(tok);
+        u.root.addCmdRuleNorm(tok);
         return true;
     case '-':
         if (!applyCmdRule(u, tok[1 .. $], false, err))
             return false;
-        u.root.addCmdRule(tok);
+        u.root.addCmdRuleNorm(tok);
         return true;
     case '~':
         u.root.keyPats.put(KeyPat(cast(const(char)[]) mallocDup(tok[1 .. $])));
@@ -395,7 +440,16 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
         return false;
     if (spec[0] == '@')
     {
-        auto bit = aclCatBit(spec[1 .. $]);
+        // category names are case-insensitive (@HASH == @hash)
+        char[64] cb = void;
+        auto cat = spec[1 .. $];
+        uint bit;
+        if (cat.length && cat.length <= cb.length)
+        {
+            foreach (i, ch; cat)
+                cb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            bit = aclCatBit(cast(const(char)[]) cb[0 .. cat.length]);
+        }
         if (bit == 0)
         {
             err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
@@ -587,8 +641,10 @@ private bool isSha256Hex(scope const(char)[] s) @nogc nothrow @safe
 /// not gated until they are catalogued.
 bool aclCanRunCmd(const(AclUser)* u, int cmdIdx) @nogc nothrow @safe
 {
-    if (!u.enabled)
-        return false;
+    // NOTE: `off` (disabled) is an AUTH-time concern only — it blocks new logins
+    // (checked in the AUTH path), but an already-authenticated connection retains
+    // its command permissions, and ACL DRYRUN ignores on/off entirely. So the
+    // enablement flag must NOT gate command checks here.
     if (cmdIdx < 0)
         return true;
     return bitGet(u.root.allowed, cast(size_t) cmdIdx);
@@ -604,7 +660,7 @@ bool aclCanRunCmdSub(const(AclUser)* u, int cmdIdx, scope const(char)[] sub) @no
         {
             auto sr = u.root.subRules[i];
             if (sr.cmd == cmdIdx && sr.sub == sub)
-                return u.enabled && sr.allow;
+                return sr.allow;
         }
     return aclCanRunCmd(u, cmdIdx);
 }
@@ -646,13 +702,19 @@ bool aclCanAccessKey(const(AclUser)* u, scope const(char)[] key, bool needRead,
 /// KEYS) are still Phase 2.5. `arr` is the full command array (arr[0] = name).
 bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
 {
+    return aclDeniedKey(u, name, arr) !is null;
+}
+
+/// The first key this command touches that the user CANNOT access, or null if
+/// all are allowed (used both for enforcement and for the ACL LOG object name).
+const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
+{
     import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
 
     if (u.root.allKeys)
-        return false;
+        return null;
     immutable argc = cast(int) arr.length;
-    // static index+range specs
-    foreach (ref ks; gCmdKeySpecs)
+    foreach (ref ks; gCmdKeySpecs) // static index+range specs
     {
         if (ks.name != name)
             continue;
@@ -662,11 +724,10 @@ bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)
             if (idx < 1)
                 continue;
             if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
-                return true;
+                return arr[idx].str;
         }
     }
-    // numkeys-based specs: read N from arr[pos+keynumidx], keys from pos+firstkey
-    foreach (ref ks; gCmdKeyNumSpecs)
+    foreach (ref ks; gCmdKeyNumSpecs) // numkeys-based specs
     {
         if (ks.name != name)
             continue;
@@ -683,16 +744,14 @@ bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)
             if (idx < 1 || idx >= argc)
                 break;
             if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
-                return true;
+                return arr[idx].str;
         }
     }
-    // keyword-positioned keys — idiosyncratic, hand-coded (the source keys of
-    // georadius/sort are already caught by their static spec above; here we add
-    // the STORE dests, XREAD's STREAMS keys, and MIGRATE's KEYS list).
-    return aclKeywordKeyDenied(u, name, arr, argc);
+    // keyword-positioned keys (STORE dests, XREAD STREAMS keys, MIGRATE KEYS)
+    return aclKeywordDeniedKey(u, name, arr, argc);
 }
 
-private bool aclKeywordKeyDenied(const(AclUser)* u, scope const(char)[] name,
+private const(char)[] aclKeywordDeniedKey(const(AclUser)* u, scope const(char)[] name,
         scope const(RVal)[] arr, int argc) @trusted nothrow @nogc
 {
     static bool kw(scope const(char)[] a, scope const(char)[] lit) @nogc nothrow @safe
@@ -708,14 +767,12 @@ private bool aclKeywordKeyDenied(const(AclUser)* u, scope const(char)[] name,
     switch (name)
     {
     case "georadius", "georadiusbymember", "sort", "sort_ro":
-        // STORE <dest> / STOREDIST <dest> — the dest is a write key
         for (int i = 1; i + 1 < argc; i++)
             if ((kw(arr[i].str, "store") || kw(arr[i].str, "storedist"))
                     && !aclCanAccessKey(u, arr[i + 1].str, false, true))
-                return true;
-        return false;
+                return arr[i + 1].str;
+        return null;
     case "xread", "xreadgroup":
-        // STREAMS key… id… — the first half after STREAMS are read keys
         for (int i = 1; i < argc; i++)
             if (kw(arr[i].str, "streams"))
             {
@@ -723,23 +780,22 @@ private bool aclKeywordKeyDenied(const(AclUser)* u, scope const(char)[] name,
                 immutable nkeys = rest / 2;
                 foreach (j; 0 .. nkeys)
                     if (!aclCanAccessKey(u, arr[i + 1 + j].str, true, false))
-                        return true;
+                        return arr[i + 1 + j].str;
                 break;
             }
-        return false;
+        return null;
     case "migrate":
-        // MIGRATE … KEYS key… — every key after KEYS is read+deleted
         for (int i = 1; i < argc; i++)
             if (kw(arr[i].str, "keys"))
             {
                 foreach (j; i + 1 .. argc)
                     if (!aclCanAccessKey(u, arr[j].str, true, true))
-                        return true;
+                        return arr[j].str;
                 break;
             }
-        return false;
+        return null;
     default:
-        return false;
+        return null;
     }
 }
 
@@ -1107,16 +1163,126 @@ size_t aclUserCount() @nogc nothrow
     return gUsers.length;
 }
 
-/// True when `u` is unrestricted (enabled ∧ every command ∧ all keys/channels)
-/// — the enforcement fast case; such a user passes any `command ∈ cap_set` test.
+/// True when `u` is unrestricted (every command ∧ all keys/channels) — the
+/// enforcement fast case; such a user passes any `command ∈ cap_set` test.
+/// on/off is deliberately NOT consulted (it gates AUTH, not authed perms).
 bool aclUnrestricted(const(AclUser)* u) @nogc nothrow @safe
 {
-    if (!u.enabled || !u.root.allKeys || !u.root.allChannels)
+    if (!u.root.allKeys || !u.root.allChannels)
         return false;
     foreach (w; u.root.allowed)
         if (w != ulong.max)
             return false;
     return true;
+}
+
+// --- ACL LOG (denied-attempt log) --------------------------------------------
+
+/// One ACL LOG entry. Similar violations aggregate (count++), keeping the
+/// entry-id and created time, refreshing updated. A pure VALUE type — the
+/// object/user/client-info live in INLINE fixed buffers, so there is no
+/// per-string malloc and nothing to free: the containing `Vector!AclLogEntry`
+/// owns the single backing allocation (RAII), and shifting/eviction is plain
+/// value assignment. reason/ctx are interned literals. Stored newest-LAST.
+struct AclLogEntry
+{
+    ulong id;
+    ulong count;
+    long created; // ms
+    long updated; // ms
+    string reason; // "command" | "key" | "channel" | "auth" (literal)
+    string ctx; // "toplevel" | "multi" | "lua" (literal)
+    private char[128] objBuf = void;
+    private char[64] userBuf = void;
+    private char[192] ciBuf = void;
+    private ushort objN, userN, ciN;
+
+    void setObj(scope const(char)[] s) @nogc nothrow @trusted
+    {
+        objN = cast(ushort)(s.length > objBuf.length ? objBuf.length : s.length);
+        objBuf[0 .. objN] = s[0 .. objN];
+    }
+
+    void setUser(scope const(char)[] s) @nogc nothrow @trusted
+    {
+        userN = cast(ushort)(s.length > userBuf.length ? userBuf.length : s.length);
+        userBuf[0 .. userN] = s[0 .. userN];
+    }
+
+    void setCinfo(scope const(char)[] s) @nogc nothrow @trusted
+    {
+        ciN = cast(ushort)(s.length > ciBuf.length ? ciBuf.length : s.length);
+        ciBuf[0 .. ciN] = s[0 .. ciN];
+    }
+
+    const(char)[] obj() const @nogc nothrow @trusted return => objBuf[0 .. objN];
+    const(char)[] user() const @nogc nothrow @trusted return => userBuf[0 .. userN];
+    const(char)[] cinfo() const @nogc nothrow @trusted return => ciBuf[0 .. ciN];
+}
+
+private __gshared Vector!AclLogEntry gAclLog; // index 0 = oldest, last = newest
+private __gshared ulong gAclLogSeq;
+public __gshared long gAclLogMaxLen = 128; // CONFIG acllog-max-len
+
+/// Record (or aggregate) a denied attempt. reason/ctx are interned literals.
+void aclLogAdd(string reason, string ctx, scope const(char)[] obj,
+        scope const(char)[] user, scope const(char)[] cinfo, long nowMs) @trusted nothrow @nogc
+{
+    if (gAclLogMaxLen <= 0)
+        return;
+    // aggregate a matching recent entry (scan newest-first)
+    foreach_reverse (i; 0 .. gAclLog.length)
+    {
+        auto e = &gAclLog[i];
+        if (e.reason == reason && e.ctx == ctx && e.obj == obj && e.user == user)
+        {
+            e.count++;
+            e.updated = nowMs;
+            if (i != gAclLog.length - 1) // bubble to the newest slot (the end)
+            {
+                auto tmp = gAclLog[i];
+                foreach (j; i .. gAclLog.length - 1)
+                    gAclLog[j] = gAclLog[j + 1];
+                gAclLog[gAclLog.length - 1] = tmp;
+            }
+            return;
+        }
+    }
+    AclLogEntry ne;
+    ne.id = ++gAclLogSeq;
+    ne.count = 1;
+    ne.created = ne.updated = nowMs;
+    ne.reason = reason;
+    ne.ctx = ctx;
+    ne.setObj(obj);
+    ne.setUser(user);
+    ne.setCinfo(cinfo);
+    gAclLog.put(ne);
+    if (gAclLog.length > gAclLogMaxLen) // drop the oldest (front), no free needed
+    {
+        foreach (j; 0 .. gAclLog.length - 1)
+            gAclLog[j] = gAclLog[j + 1];
+        gAclLog.popBack();
+    }
+}
+
+void aclLogReset() @trusted nothrow @nogc
+{
+    gAclLog.clear(); // value entries — nothing to free
+}
+
+/// Number of entries currently held.
+size_t aclLogCount() @trusted nothrow @nogc
+{
+    return gAclLog.length;
+}
+
+/// The entry at reverse index `ri` (0 = newest), or null if out of range.
+const(AclLogEntry)* aclLogAt(size_t ri) @trusted nothrow @nogc
+{
+    if (ri >= gAclLog.length)
+        return null;
+    return &gAclLog[gAclLog.length - 1 - ri];
 }
 
 // --- tests -------------------------------------------------------------------
@@ -1234,6 +1400,84 @@ unittest // reset + allkeys/allcommands + %RW flags
     assert(!aclKeyDenied(ku, "sort", mk("SORT", "foo:l", "STORE", "foo:d")));
     assert(aclKeyDenied(ku, "sort", mk("SORT", "foo:l", "STORE", "bar:d")));
     assert(aclKeyDenied(ku, "migrate", mk("MIGRATE", "h", "0", "", "0", "5000", "KEYS", "foo:1", "bar:2")));
+}
+
+// `off` (disabled) is an AUTH-time concern only — an already-authed connection
+// keeps its command permissions, and ACL DRYRUN ignores on/off. Regression for
+// the blackbox "ACL GETUSER provides correct results" / self-reset abort where a
+// user that reset itself (→ off) was wrongly denied every command.
+unittest
+{
+    auto u = freshUser("u");
+    scope (exit)
+        freeUser(u);
+    const(char)[] err;
+    // reset without `on` leaves the user disabled but +@all still grants commands
+    foreach (r; ["reset", "+@all", "~*", "-@string", "+incr", "-debug", "+debug|digest"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(!u.enabled);                                  // reset disabled it
+    assert(aclCanRunCmd(u, aclCmdIndex("acl")));         // acl ∈ +@all — allowed
+    assert(aclCanRunCmd(u, aclCmdIndex("incr")));        // +incr
+    assert(!aclCanRunCmd(u, aclCmdIndex("get")));        // -@string
+    assert(aclUnrestricted(u) == false);                // -@string ⇒ not unrestricted
+    // a disabled +@all ~* &* user still counts as unrestricted (on/off ignored)
+    auto a = freshUser("a");
+    scope (exit)
+        freeUser(a);
+    foreach (r; ["+@all", "allkeys", "allchannels"])    // no `on` → stays off
+        assert(aclApplyRule(a, r, err), err);
+    assert(!a.enabled);
+    assert(aclUnrestricted(a));
+}
+
+// ACL GETUSER lossless compaction: categories are case-insensitive and a
+// re-added rule (any sign) moves to the end. Regression for the blackbox
+// "ACL GETUSER provides correct results" reorder/dedup + `+@HASH` case aborts.
+unittest
+{
+    import dreads.mem : ByteBuffer;
+
+    auto u = freshUser("u");
+    scope (exit)
+        freeUser(u);
+    const(char)[] err;
+
+    static string cmds(const(AclUser)* u) @trusted
+    {
+        ByteBuffer b;
+        aclDescribeCommands(u, b);
+        return (cast(const(char)[]) b.data).idup;
+    }
+
+    foreach (r; ["+@all", "-@hash", "-@slow", "+hget"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(cmds(u) == "+@all -@hash -@slow +hget", cmds(u));
+
+    // re-adding -@hash moves it to the end (no duplicate)
+    assert(aclApplyRule(u, "-@hash", err), err);
+    assert(cmds(u) == "+@all -@slow +hget -@hash", cmds(u));
+
+    // inverting a category replaces the prior one in place-at-end order
+    assert(aclApplyRule(u, "+@hash", err), err);
+    assert(cmds(u) == "+@all -@slow +hget +@hash", cmds(u));
+
+    // categories are case-insensitive and collapse to one lowercase token
+    assert(aclApplyRule(u, "-@all", err), err);
+    foreach (r; ["+@HASH", "+@hash", "+@HaSh"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(cmds(u) == "-@all +@hash", cmds(u));
+
+    // commands are case-insensitive too
+    assert(aclApplyRule(u, "-@all", err), err);
+    foreach (r; ["+HGET", "+hget", "+hGeT"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(cmds(u) == "-@all +hget", cmds(u));
+
+    // whole-command rule engulfs subcommand tokens
+    assert(aclApplyRule(u, "-@all", err), err);
+    foreach (r; ["+config|get", "+config", "-config|set"])
+        assert(aclApplyRule(u, r, err), err);
+    assert(cmds(u) == "-@all +config -config|set", cmds(u));
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate
