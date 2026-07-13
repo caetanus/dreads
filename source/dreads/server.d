@@ -23,7 +23,7 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
-    aclApplyRule, aclDelUser, aclEachUser, aclCatNames;
+    aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -545,6 +545,39 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
+    // ACL enforcement — a single `command ∈ cap_set` test, only while ACL is in
+    // use (gAclActive false in the default no-ACL deployment => zero cost). The
+    // always-allowed connection commands run regardless so a client can (re)auth.
+    // (Key/channel-pattern checks are a follow-up; command-level only for now.)
+    if (gAclActive && c.user !is null)
+    {
+        bool alwaysOk = uname == "AUTH" || uname == "HELLO" || uname == "RESET" || uname == "QUIT";
+        if (!alwaysOk)
+        {
+            char[16] lb = void;
+            foreach (i, ch; name)
+                lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            auto lname = cast(const(char)[]) lb[0 .. name.length];
+            if (!c.authed)
+            {
+                repError(o, "NOAUTH Authentication required.");
+                return true;
+            }
+            if (!aclCanRunCmd(c.user, aclCmdIndex(lname)))
+            {
+                static ByteBuffer eb; // TLS
+                eb.clear();
+                eb.append("NOPERM User ");
+                eb.append(c.user.name);
+                eb.append(" has no permissions to run the '");
+                eb.append(lname);
+                eb.append("' command");
+                repError(o, cast(const(char)[]) eb.data);
+                return true;
+            }
+        }
+    }
+
     switch (uname)
     {
     case "SELECT":
@@ -684,6 +717,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         repError(o, "ERR ACL SETUSER failed to hash a password");
                         return true;
                     }
+                    gAclActive = true; // enforcement turns on once ACL is used
                     repSimple(o, "OK");
                     return true;
                 }
