@@ -11,6 +11,7 @@ module dreads.server;
 // vibe-core owns only the socket lifecycle; nothing here allocates on the GC
 // heap per request (the mutex and TCPConnection are one-time per connection).
 
+import core.builtins : expect;
 import core.stdc.stdio : printf;
 import core.stdc.stdlib : malloc, cfree = free;
 
@@ -585,7 +586,11 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             // a single bitset test and short-circuits everything below — the hot
             // path for any real ACL user. Only the miss falls to the connection
             // commands that are allowed regardless (AUTH/HELLO/RESET/QUIT).
-            if (!(c.authed && aclCanRunCmd(c.user, aclCmdIndex(lname))))
+            // `expect(..., false)`: in real traffic a client almost never issues a
+            // command it lacks, so the deny path is cold — hint the branch so the
+            // predictor keeps the allow path straight (varied real workloads don't
+            // train it the way a single-command benchmark does).
+            if (expect(!(c.authed && aclCanRunCmd(c.user, aclCmdIndex(lname))), false))
             {
                 bool alwaysOk = uname == "AUTH" || uname == "HELLO"
                     || uname == "RESET" || uname == "QUIT";
