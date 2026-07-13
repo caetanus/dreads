@@ -433,6 +433,33 @@ bool aclCanAccessKey(const(AclUser)* u, scope const(char)[] key, bool needRead,
     return false;
 }
 
+/// Does the user lack access to any key this command touches? Uses the static
+/// key-spec table (dreads.aclkeys) to locate key args; movable/numkeys-key
+/// commands aren't in the table and are NOT checked yet (Phase 2.5). `arr` is
+/// the full command array (arr[0] = command name).
+bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
+{
+    import dreads.aclkeys : gCmdKeySpecs;
+
+    if (u.root.allKeys)
+        return false;
+    immutable argc = cast(int) arr.length;
+    foreach (ref ks; gCmdKeySpecs)
+    {
+        if (ks.name != name)
+            continue;
+        immutable last = ks.last >= 0 ? ks.first + ks.last : argc + ks.last;
+        for (int idx = ks.first; idx <= last && idx < argc; idx += ks.step)
+        {
+            if (idx < 1)
+                continue;
+            if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
+                return true;
+        }
+    }
+    return false;
+}
+
 /// Can this user use pub/sub `channel`? A plain channel (PUBLISH/SUBSCRIBE) is
 /// glob-matched against the allowed `&patterns`; a subscribe PATTERN (PSUBSCRIBE)
 /// is matched LITERALLY (a client may only subscribe to a pattern the ACL grants
@@ -511,16 +538,20 @@ void aclDescribeKeys(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
 }
 
 /// Append the channel-pattern string: "&*" if allchannels, else "&p" joined.
-void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
+/// `withReset` prepends the `resetchannels` token (the ACL LIST / config-file
+/// form uses it; the ACL GETUSER `channels` field does not).
+void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o, bool withReset = false) @trusted nothrow @nogc
 {
     if (u.root.allChannels)
     {
         o.append("&*");
         return;
     }
+    if (withReset)
+        o.append("resetchannels");
     foreach (i; 0 .. u.root.chanPats.length)
     {
-        if (i)
+        if (withReset || i)
             o.append(" ");
         o.append("&");
         o.append(u.root.chanPats[i]);
@@ -859,6 +890,33 @@ unittest // reset + allkeys/allcommands + %RW flags
     assert(aclCanAccessChannel(cu, "news:*", true));     // PSUBSCRIBE: literal == &news:*
     assert(!aclCanAccessChannel(cu, "news:1", true));    // literal: "news:1" != any pattern
     assert(!aclCanAccessChannel(cu, "chat:*", true));
+
+    // key ACL via the static key-spec table (dreads.aclkeys)
+    import dreads.resp : RVal, RType;
+
+    static RVal[] mk(string[] toks...)
+    {
+        auto a = new RVal[toks.length];
+        foreach (i, t; toks)
+        {
+            a[i].type = RType.BulkString;
+            a[i].str = t;
+        }
+        return a;
+    }
+
+    auto ku = freshUser("ku");
+    scope (exit)
+        freeUser(ku);
+    foreach (r; ["on", "+@all", "~foo:*", "%R~ro:*"])
+        assert(aclApplyRule(ku, r, err), err);
+    assert(!aclKeyDenied(ku, "set", mk("SET", "foo:1", "v")));   // write ~foo:*
+    assert(aclKeyDenied(ku, "set", mk("SET", "bar:1", "v")));    // key not covered
+    assert(aclKeyDenied(ku, "set", mk("SET", "ro:1", "v")));     // ro:* is read-only
+    assert(!aclKeyDenied(ku, "get", mk("GET", "ro:1")));         // read ok
+    assert(!aclKeyDenied(ku, "mget", mk("MGET", "foo:1", "foo:2")));
+    assert(aclKeyDenied(ku, "mset", mk("MSET", "foo:1", "v", "bar:2", "w"))); // 2nd key denied
+    assert(!aclKeyDenied(ku, "ping", mk("PING"))); // keyless
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate
@@ -910,13 +968,19 @@ unittest // ACL GETUSER rule description echoes the applied rules (Valkey format
         f(u, b);
         return (cast(const(char)[]) b.data).idup;
     }
+    static string describeCh(const(AclUser)* u, bool reset = false)
+    {
+        ByteBuffer b;
+        aclDescribeChannels(u, b, reset);
+        return (cast(const(char)[]) b.data).idup;
+    }
 
     aclInit();
     // default is the seeded unrestricted user: "+@all ~* &*"
     auto def = aclUser("default");
     assert(describe(&aclDescribeCommands, def) == "+@all");
     assert(describe(&aclDescribeKeys, def) == "~*");
-    assert(describe(&aclDescribeChannels, def) == "&*");
+    assert(describeCh(def) == "&*");
 
     const(char)[] err;
     auto u = aclGetOrCreate("descr");
@@ -927,7 +991,8 @@ unittest // ACL GETUSER rule description echoes the applied rules (Valkey format
     // base "-@all" + verbatim delta tokens, in order
     assert(describe(&aclDescribeCommands, u) == "-@all +@list +get -lpush");
     assert(describe(&aclDescribeKeys, u) == "~k* %R~ro:*");
-    assert(describe(&aclDescribeChannels, u) == "&news");
+    assert(describeCh(u) == "&news"); // GETUSER form: no resetchannels prefix
+    assert(describeCh(u, true) == "resetchannels &news"); // LIST form
 
     // a later +@all resets the command-rule base and drops earlier deltas
     assert(aclApplyRule(u, "+@all", err));

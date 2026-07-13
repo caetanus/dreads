@@ -26,7 +26,8 @@ import vibe.core.task : Task;
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
     aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
-    aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, gAclActive;
+    aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
+    gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -670,6 +671,13 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     return true;
                 }
             }
+            // key-pattern ACL: the command is allowed — now reject it if it
+            // touches a key outside the user's ~patterns (allkeys users skip).
+            if (!c.user.root.allKeys && aclKeyDenied(c.user, lname, cmd.arr))
+            {
+                repError(o, "NOPERM No permissions to access a key");
+                return true;
+            }
         }
     }
 
@@ -927,10 +935,16 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                             lb.append(" #");
                             lb.append(u.passwords[i]);
                         }
+                        // keys section is omitted entirely when the user has no
+                        // key access (no `~*`, no patterns) — Valkey emits nothing
+                        // there, so a blank one would leave a stray double space.
+                        if (u.root.allKeys || u.root.keyPats.length)
+                        {
+                            lb.append(" ");
+                            aclDescribeKeys(u, lb);
+                        }
                         lb.append(" ");
-                        aclDescribeKeys(u, lb);
-                        lb.append(" ");
-                        aclDescribeChannels(u, lb);
+                        aclDescribeChannels(u, lb, true); // LIST form: resetchannels prefix
                         lb.append(" ");
                         aclDescribeCommands(u, lb);
                         repBulk(o, cast(const(char)[]) lb.data);
