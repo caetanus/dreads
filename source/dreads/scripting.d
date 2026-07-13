@@ -93,6 +93,21 @@ private struct BridgeCtx
     ulong clock; // frozen per-script clock threaded through every round-trip
     ByteBuffer replyBuf; // staging for bridge replies, reused across calls
     ByteBuffer effectBuf; // re-encoded inner command (effect capture / propose)
+    ulong userId; // the calling ACL user (0 = unrestricted/no ACL); rides each
+    // redis.call to the main thread, which resolves + enforces it
+}
+
+// The calling ACL user id for the script about to run — set by the server on
+// the main thread right before EVAL/FCALL and captured SYNCHRONOUSLY into the
+// pool request (no yield in between), so concurrent scripts never race on it.
+// 0 = the common case (unrestricted user / no ACL) => no enforcement.
+package ulong gPendingScriptUser;
+private ulong gPoolScriptUser; // Lua-thread-local copy, taken from the request
+
+/// Server hook: which user is about to run a script (0 to disable enforcement).
+public void scriptSetPendingUser(ulong userId) nothrow @nogc
+{
+    gPendingScriptUser = userId;
 }
 
 // Bridge context lives wherever the VM runs: __gshared for inline (main), and
@@ -743,9 +758,9 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
     {
         // INLINE mode: run it right here against the bound keyspace.
         alias ExFn = int function(ref Keyspace, const ref RVal, scope const(RVal)[],
-                bool, ulong, int, ref Arena, ref ByteBuffer, ref ByteBuffer) @nogc nothrow;
+                bool, ulong, ulong, int, ref Arena, ref ByteBuffer, ref ByteBuffer) @nogc nothrow;
         st = (cast(ExFn)&executeScriptCommand)(*gCtx.ks, cmd, arr, isWrite,
-                gCtx.clock, gScriptResp, *gCtx.arena, gCtx.replyBuf, gCtx.effectBuf);
+                gCtx.clock, gCtx.userId, gScriptResp, *gCtx.arena, gCtx.replyBuf, gCtx.effectBuf);
     }
     if (st == 1)
         return raiseErr(L, "READONLY You can't write against a read only replica.");
@@ -1007,10 +1022,45 @@ private void encodeEffect(scope const(RVal)[] arr) nothrow @nogc
 /// keyspace writer) — inline for tests/standalone, or the cmd-drain in pool
 /// mode. NOT @nogc: the raft path parks the fiber awaiting consensus.
 package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
-        scope const(RVal)[] arr, bool isWrite, ulong clock, int respLevel,
+        scope const(RVal)[] arr, bool isWrite, ulong clock, ulong userId, int respLevel,
         ref Arena arena, ref ByteBuffer reply, ref ByteBuffer effScratch) nothrow
 {
     import dreads.resp : gRespProto;
+
+    // ACL: a redis.call must obey the CALLER's permissions, not the fact that
+    // the caller was allowed to run EVAL. `userId` rides in from the connection
+    // (invisible to Lua) — resolve it here on the writer thread and reject any
+    // command the user can't run, exactly like the top-level enforcement does.
+    if (userId != 0 && arr.length > 0)
+    {
+        import dreads.acl : aclUserById, aclUnrestricted, aclCanRunCmd, aclCmdIndex;
+
+        auto u = aclUserById(userId);
+        if (u !is null && !aclUnrestricted(u))
+        {
+            auto nm = arr[0].str;
+            char[32] lbuf = void;
+            if (nm.length <= lbuf.length)
+            {
+                foreach (i, ch; nm)
+                    lbuf[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                auto lname = cast(const(char)[]) lbuf[0 .. nm.length];
+                if (!aclCanRunCmd(u, aclCmdIndex(lname)))
+                {
+                    reply.clear();
+                    static ByteBuffer eb; // TLS scratch for the message text
+                    eb.clear();
+                    eb.append("NOPERM User ");
+                    eb.append(u.name);
+                    eb.append(" has no permissions to run the '");
+                    eb.append(lname);
+                    eb.append("' command");
+                    repError(reply, cast(const(char)[]) eb.data);
+                    return 0;
+                }
+            }
+        }
+    }
 
     // run the command at the script's RESP level so its reply (e.g. DEBUG
     // PROTOCOL, HGETALL) is framed the way redis.call should see it; restore
@@ -1098,6 +1148,7 @@ private struct ReqSlot
     bool bySha, readOnly;
     ushort db;
     ulong clock;
+    ulong userId; // the calling ACL user (0 = no enforcement)
     int clientResp; // the client's RESP level (final reply framing on worker)
     ByteBuffer args; // RESP-encoded arg array (stable across the hand-off)
     ByteBuffer reply; // filled by the Lua thread
@@ -1111,6 +1162,7 @@ private struct CmdSlot
     ByteBuffer bytes; // RESP command from the bridge
     ushort db;
     ulong clock;
+    ulong userId; // calling ACL user (0 = no enforcement), rides the round-trip
     bool isWrite;
     int resp; // gRespProto to run the command at (script's setresp)
     ByteBuffer reply;
@@ -1145,6 +1197,7 @@ private void bindBridgeContext(Keyspace* ks) nothrow @nogc
         gCtx.viaPool = true;
         gCtx.db = gPoolDb;
         gCtx.clock = gPoolClock;
+        gCtx.userId = gPoolScriptUser;
     }
     else
     {
@@ -1152,6 +1205,7 @@ private void bindBridgeContext(Keyspace* ks) nothrow @nogc
         gCtx.viaPool = false;
         gCtx.db = 0;
         gCtx.clock = detNow();
+        gCtx.userId = gPendingScriptUser;
     }
 }
 
@@ -1162,6 +1216,7 @@ private int poolRoundTrip(scope const(RVal)[] arr, bool isWrite, ref ByteBuffer 
     encodeCmd(gCmdSlot.bytes, arr);
     gCmdSlot.db = gCtx.db;
     gCmdSlot.clock = gCtx.clock;
+    gCmdSlot.userId = gCtx.userId;
     gCmdSlot.isWrite = isWrite;
     gCmdSlot.resp = gScriptResp;
     gCmdSlot.ready = false;
@@ -1210,7 +1265,7 @@ public void startLuaScriptPool() nothrow
 
 /// Main-side: hand a script request to the Lua thread and await its reply.
 public void luaExecOnPool(LuaReqKind kind, scope const(RVal)[] args, bool bySha,
-        bool readOnly, ushort db, ulong clock, ref ByteBuffer o) nothrow
+        bool readOnly, ushort db, ulong clock, ulong userId, ref ByteBuffer o) nothrow
 {
     auto slot = acquireReqSlot();
     slot.kind = kind;
@@ -1218,6 +1273,7 @@ public void luaExecOnPool(LuaReqKind kind, scope const(RVal)[] args, bool bySha,
     slot.readOnly = readOnly;
     slot.db = db;
     slot.clock = clock;
+    slot.userId = userId; // captured here (main thread) before the hand-off
     slot.clientResp = gRespProto; // main-thread TLS: this connection's level
     encodeCmd(slot.args, args);
     slot.ready = false;
@@ -1281,7 +1337,7 @@ private bool routeToPool(LuaReqKind kind, scope const(RVal)[] args, ref Keyspace
     auto dbi = cast(size_t)(&ks - &gDbs[0]);
     if (dbi >= NUM_DBS)
         dbi = 0;
-    luaExecOnPool(kind, args, bySha, readOnly, cast(ushort) dbi, detNow(), o);
+    luaExecOnPool(kind, args, bySha, readOnly, cast(ushort) dbi, detNow(), gPendingScriptUser, o);
     return true;
 }
 
@@ -1325,6 +1381,7 @@ private static void luaThreadEntry() nothrow
                     gPoolMode = true;
                     gPoolDb = slot.db;
                     gPoolClock = slot.clock;
+                    gPoolScriptUser = slot.userId;
                     gRespProto = slot.clientResp; // frame the final reply here
                     scope (exit)
                         gPoolMode = false;
@@ -1389,7 +1446,7 @@ private void cmdDrainLoop() nothrow
                 {
                     auto dbi = slot.db < NUM_DBS ? slot.db : 0;
                     slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr,
-                            slot.isWrite, slot.clock, slot.resp, arena, slot.reply, eff);
+                            slot.isWrite, slot.clock, slot.userId, slot.resp, arena, slot.reply, eff);
                 }
                 else
                     repError(slot.reply, "ERR internal script command error");
@@ -1934,7 +1991,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
     {
         import dreads.det : detNow = now;
 
-        luaExecOnPool(LuaReqKind.script, args, false, false, 0, detNow(), o);
+        luaExecOnPool(LuaReqKind.script, args, false, false, 0, detNow(), gPendingScriptUser, o);
         return;
     }
     gLuaLock.lock_nothrow();
@@ -2756,6 +2813,39 @@ unittest // redis.call bridge
 
     auto caught = evalRun(ks, "local e = redis.pcall('INCR', 'k'); return e.err");
     assert(caught[0] == '$' && caught.canFind("not an integer"));
+}
+
+unittest // ACL: redis.call obeys the caller's permissions, not just +eval
+{
+    import dreads.acl : aclInit, aclGetOrCreate, aclApplyRule, aclDelUser;
+    import std.algorithm : canFind;
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+
+    aclInit();
+    auto u = aclGetOrCreate("scripttest");
+    const(char)[] err;
+    foreach (rule; ["on", "~*", "+eval", "+get"]) // note: NO +set
+        assert(aclApplyRule(u, rule, err), rule ~ " => " ~ cast(string) err);
+
+    // inline path reads the pending user; set it for the duration of the calls
+    scriptSetPendingUser(u.id);
+    scope (exit)
+    {
+        scriptSetPendingUser(0);
+        aclDelUser("scripttest");
+    }
+
+    // a permitted command inside the script still works...
+    assert(evalRun(ks, "return redis.call('GET', 'k')") == "$-1\r\n");
+    // ...but SET is refused even though the user could run EVAL (no leak)
+    auto blocked = evalRun(ks, "return redis.call('SET', 'k', 'v')");
+    assert(blocked[0] == '-' && blocked.canFind("NOPERM") && blocked.canFind("'set'"), blocked);
+    // redis.pcall surfaces the same NOPERM as a Lua error table
+    auto viaPcall = evalRun(ks, "local e = redis.pcall('SET','k','v'); return e.err");
+    assert(viaPcall.canFind("NOPERM"), viaPcall);
 }
 
 unittest // errors

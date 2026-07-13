@@ -66,6 +66,7 @@ struct AclPerm
 /// An ACL user.
 struct AclUser
 {
+    ulong id; // stable, monotonic — lets a script carry "which user" as a scalar
     const(char)[] name; // malloc'd
     bool enabled;
     bool nopass;
@@ -431,6 +432,7 @@ import dreads.dict : Dict;
 
 private __gshared Dict!(AclUser*) gUsers;
 private __gshared bool gAclInited;
+private __gshared ulong gUserSeq; // monotonic user-id source (0 = "no user")
 
 /// Malloc + construct a fresh, disabled, no-permission user with `name`.
 AclUser* aclNewUser(scope const(char)[] name) @trusted nothrow
@@ -440,8 +442,27 @@ AclUser* aclNewUser(scope const(char)[] name) @trusted nothrow
 
     auto u = cast(AclUser*) malloc(AclUser.sizeof);
     emplace(u);
+    u.id = ++gUserSeq;
     u.name = cast(const(char)[]) mallocDup(name);
     return u;
+}
+
+/// The user with this stable id, or null (deleted). Linear over the registry —
+/// used off the hot path (script redis.call enforcement), few users.
+AclUser* aclUserById(ulong id) @nogc nothrow
+{
+    if (id == 0)
+        return null;
+    AclUser* found;
+    aclEachUser((AclUser* u) @nogc nothrow {
+        if (u.id == id)
+        {
+            found = u;
+            return 1;
+        }
+        return 0;
+    });
+    return found;
 }
 
 /// Run ~this (frees name/passwords/patterns) and free the user.

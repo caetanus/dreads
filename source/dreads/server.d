@@ -34,7 +34,7 @@ import dreads.obj : Keyspace, gDbs, NUM_DBS;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
-import dreads.scripting : cachedScript, evalCommand, scriptCommand;
+import dreads.scripting : cachedScript, evalCommand, scriptCommand, scriptSetPendingUser;
 
 private enum READ_CHUNK = 16 * 1024;
 
@@ -564,6 +564,10 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     // (Key/channel-pattern checks are a follow-up; command-level only for now.)
     if (gAclActive && c.user !is null)
     {
+        // Ride the caller's identity into the script bridge: a redis.call inside
+        // EVAL/FCALL re-checks THIS user's permissions on the writer thread, so
+        // `+eval -set` can't smuggle a SET through a script. Invisible to Lua.
+        scriptSetPendingUser(c.user.id);
         bool alwaysOk = uname == "AUTH" || uname == "HELLO" || uname == "RESET" || uname == "QUIT";
         if (!alwaysOk)
         {
