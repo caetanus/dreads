@@ -96,27 +96,22 @@ Deny → `-NOPERM …` (Redis's exact strings: `this user has no permissions to
 run the '<cmd>' command`, `… to access one of the keys …`, `… channels …`) and
 an ACL LOG entry (§7).
 
-**Perf — minimum indirection via a per-session bypass bit + epoch (mirrors the
-WATCH epoch dreads already has):** the common case (no ACL configured, or an
-admin user) must cost ~zero, and must NOT chase the `AclUser*` on the hot path.
+**Perf — there is only one question: `command ∈ cap_set`.** No admin/bypass
+branch. Every command does the same single capability-set membership test on the
+current user; the `default`/admin user simply has a full cap_set (all bits set),
+so it passes the very same test — admin is not special-cased.
 
 ```
-Conn:  AclUser* user;  bool aclBypass;  ulong aclEpoch;
-__gshared ulong gAclEpoch;   // bumped only on requirepass / ACL SETUSER|DELUSER (rare)
-
-// per command, in handleCommand:
-if (c.aclEpoch != gAclEpoch) refreshBypass(c);   // almost never taken
-if (!c.aclBypass) { ...enforce (unauthed → NOAUTH; restricted → the 3 checks)... }
+// per command, in handleCommand (c.user is the connection's user):
+if (!bitGet(c.user.caps, cmdCapIdx)) { NOPERM/NOAUTH; return; }
 ```
 
-`refreshBypass(c)` sets `c.aclBypass = c.authed && isUnrestricted(c.user)` and
-`c.aclEpoch = gAclEpoch`. With no ACL activity, both comparisons are on hot Conn
-fields, branch-predicted, and `aclBypass` is true → the enforcement block is
-skipped entirely. **Two predictable branches, zero pointer chase, no fan-out to
-connections on SETUSER, no stale cache** — the same `gWriteEpoch`/`c.watchEpoch`
-pattern used for WATCH. `isUnrestricted` = enabled ∧ all command bits set ∧
-allKeys ∧ allChannels. Benchmark SET/GET after wiring to confirm the gate is
-free.
+One bitset test (a word load + AND). The only requirement is that the command's
+cap index is resolved cheaply — resolve it ONCE where the command is already
+identified (attach the ACL index to dispatch / a name→index table filled at
+boot), never a per-command linear scan. Key/channel checks run only for commands
+that actually carry keys/channels (allKeys/allChannels short-circuit). No epoch,
+no per-session bypass bit, no fan-out. Benchmark SET/GET after wiring.
 
 ## 6. requirepass ↔ default user
 
