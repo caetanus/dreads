@@ -636,21 +636,22 @@ private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) not
     return true;
 }
 
-// Channel ACL: a user with restricted channels (`&pattern`, not `&*`) may only
-// touch channels the ACL grants. Returns true (and writes -NOPERM) when denied.
-// PSUBSCRIBE patterns match literally; plain channels glob-match. Checked BEFORE
-// the command runs, so a rejected multi-channel SUBSCRIBE touches nothing.
-private bool aclChannelDenied(ref Conn c, scope const(RVal)[] channels, bool isPattern,
-        ref ByteBuffer o) nothrow
+// Channel ACL for the pub/sub commands: which args are channels depends on the
+// command (PUBLISH/SPUBLISH → arg 1; SUBSCRIBE/SSUBSCRIBE/PSUBSCRIBE → args 1..).
+// PSUBSCRIBE patterns match literally, plain channels glob-match. Called from the
+// top-level enforcement block so it also gates a channel at MULTI queue time.
+private bool aclCmdChannelDenied(const(AclUser)* u, scope const(char)[] lname,
+        scope const(RVal)[] arr) @trusted nothrow @nogc
 {
-    if (!gAclActive || c.user is null || c.user.root.allChannels)
-        return false;
-    foreach (ref ch; channels)
-        if (!aclCanAccessChannel(c.user, ch.str, isPattern))
-        {
-            repError(o, "NOPERM No permissions to access a channel");
-            return true;
-        }
+    if (lname == "publish" || lname == "spublish")
+        return arr.length >= 2 && !aclCanAccessChannel(u, arr[1].str);
+    if (lname == "subscribe" || lname == "ssubscribe" || lname == "psubscribe")
+    {
+        immutable isPat = lname[0] == 'p';
+        foreach (i; 1 .. arr.length)
+            if (!aclCanAccessChannel(u, arr[i].str, isPat))
+                return true;
+    }
     return false;
 }
 
@@ -733,6 +734,14 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             if (!c.user.root.allKeys && aclKeyDenied(c.user, lname, cmd.arr))
             {
                 repError(o, "NOPERM No permissions to access a key");
+                return true;
+            }
+            // channel-pattern ACL for pub/sub — checked HERE (before the switch
+            // AND before MULTI queuing), so an unauthorized channel is rejected
+            // at queue time, matching Valkey.
+            if (!c.user.root.allChannels && aclCmdChannelDenied(c.user, lname, cmd.arr))
+            {
+                repError(o, "NOPERM No permissions to access a channel");
                 return true;
             }
         }
@@ -1184,8 +1193,6 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'ssubscribe' command");
                 return true;
             }
-            if (aclChannelDenied(c, args, false, o))
-                return true;
             enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
@@ -1215,8 +1222,6 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'spublish' command");
                 return true;
             }
-            if (aclChannelDenied(c, args[0 .. 1], false, o))
-                return true;
             repInt(o, gShardPubSub.publish(args[0].str, args[1].str, "smessage"));
             return true;
         }
@@ -1379,8 +1384,6 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                         : "ERR wrong number of arguments for 'subscribe' command");
                 return true;
             }
-            if (aclChannelDenied(c, args, pattern, o))
-                return true;
             enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
@@ -1437,8 +1440,6 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'publish' command");
                 return true;
             }
-            if (aclChannelDenied(c, args[0 .. 1], false, o))
-                return true;
             repInt(o, gPubSub.publish(args[0].str, args[1].str));
             return true;
         }
