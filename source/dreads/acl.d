@@ -433,17 +433,20 @@ bool aclCanAccessKey(const(AclUser)* u, scope const(char)[] key, bool needRead,
     return false;
 }
 
-/// Does the user lack access to any key this command touches? Uses the static
-/// key-spec table (dreads.aclkeys) to locate key args; movable/numkeys-key
-/// commands aren't in the table and are NOT checked yet (Phase 2.5). `arr` is
-/// the full command array (arr[0] = command name).
+/// Does the user lack access to any key this command touches? Locates key args
+/// via the generated spec tables (dreads.aclkeys): static index+range specs, and
+/// numkeys-based ones (ZUNIONSTORE, LMPOP, …). EVAL/FCALL are NOT here — their
+/// keys are checked transparently as each redis.call round-trips. A few
+/// keyword-positioned keys (GEORADIUS STORE, XREAD STREAMS, SORT BY/GET, MIGRATE
+/// KEYS) are still Phase 2.5. `arr` is the full command array (arr[0] = name).
 bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
 {
-    import dreads.aclkeys : gCmdKeySpecs;
+    import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
 
     if (u.root.allKeys)
         return false;
     immutable argc = cast(int) arr.length;
+    // static index+range specs
     foreach (ref ks; gCmdKeySpecs)
     {
         if (ks.name != name)
@@ -457,7 +460,45 @@ bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)
                 return true;
         }
     }
+    // numkeys-based specs: read N from arr[pos+keynumidx], keys from pos+firstkey
+    foreach (ref ks; gCmdKeyNumSpecs)
+    {
+        if (ks.name != name)
+            continue;
+        immutable numAt = ks.pos + ks.keynumidx;
+        if (numAt < 1 || numAt >= argc)
+            continue;
+        long nk;
+        if (!parseKeyCount(arr[numAt].str, nk) || nk <= 0)
+            continue;
+        immutable first = ks.pos + ks.firstkey;
+        for (long i = 0; i < nk; i++)
+        {
+            immutable idx = first + cast(int) i * ks.step;
+            if (idx < 1 || idx >= argc)
+                break;
+            if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
+                return true;
+        }
+    }
     return false;
+}
+
+// small @nogc decimal parse for the numkeys arg (avoids importing the dispatch
+// layer into acl.d); accepts a plain non-negative integer, rejects anything else.
+private bool parseKeyCount(scope const(char)[] s, out long v) @nogc nothrow @safe
+{
+    if (s.length == 0 || s.length > 18)
+        return false;
+    long acc = 0;
+    foreach (c; s)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        acc = acc * 10 + (c - '0');
+    }
+    v = acc;
+    return true;
 }
 
 /// Can this user use pub/sub `channel`? A plain channel (PUBLISH/SUBSCRIBE) is
@@ -917,6 +958,14 @@ unittest // reset + allkeys/allcommands + %RW flags
     assert(!aclKeyDenied(ku, "mget", mk("MGET", "foo:1", "foo:2")));
     assert(aclKeyDenied(ku, "mset", mk("MSET", "foo:1", "v", "bar:2", "w"))); // 2nd key denied
     assert(!aclKeyDenied(ku, "ping", mk("PING"))); // keyless
+
+    // numkeys-based specs: ZUNIONSTORE dest (static) + srcs (keynum), LMPOP
+    assert(!aclKeyDenied(ku, "zunionstore", mk("ZUNIONSTORE", "foo:d", "2", "foo:a", "foo:b")));
+    assert(aclKeyDenied(ku, "zunionstore", mk("ZUNIONSTORE", "bar:d", "2", "foo:a", "foo:b"))); // dest
+    assert(aclKeyDenied(ku, "zunionstore", mk("ZUNIONSTORE", "foo:d", "2", "foo:a", "bar:b"))); // src
+    assert(!aclKeyDenied(ku, "lmpop", mk("LMPOP", "2", "foo:1", "foo:2", "LEFT")));
+    assert(aclKeyDenied(ku, "lmpop", mk("LMPOP", "2", "foo:1", "bar:1", "LEFT")));
+    assert(aclKeyDenied(ku, "sintercard", mk("SINTERCARD", "2", "foo:a", "bar:b")));
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate

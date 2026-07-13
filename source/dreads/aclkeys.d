@@ -1,11 +1,11 @@
-// GENERATED from Valkey src/commands/*.json key_specs (begin_search.index +
-// find_keys.range). Static specs only; movable/numkeys-key commands (below) are
-// NOT yet key-checked (Phase 2.5). Shard pub/sub (spublish/ssubscribe) are
-// excluded — their key-spec is really the CHANNEL, ACL-checked as a channel.
+// GENERATED from Valkey src/commands/*.json key_specs. Per-spec: a command
+// with both a static dest and numkeys srcs contributes to BOTH tables.
+// Shard pub/sub excluded (channel-as-key); EVAL/FCALL excluded (transparent).
+// Keyword-positioned keys (GEORADIUS STORE, XREAD STREAMS, …) are Phase 2.5.
 // Do not hand-edit.
 module dreads.aclkeys;
 
-/// One static key spec: keys at arr[first], arr[first+step], … up to
+/// Static spec: keys at arr[first], arr[first+step], … up to
 /// (last>=0 ? first+last : arr.length+last). needR/needW = access type.
 struct CmdKeySpec { string name; int first; int last; int step; bool needR; bool needW; }
 
@@ -48,7 +48,9 @@ immutable CmdKeySpec[] gCmdKeySpecs = [
     {"geodist", 1, 0, 1, true, false},
     {"geohash", 1, 0, 1, true, false},
     {"geopos", 1, 0, 1, true, false},
+    {"georadius", 1, 0, 1, true, false},
     {"georadius_ro", 1, 0, 1, true, false},
+    {"georadiusbymember", 1, 0, 1, true, false},
     {"georadiusbymember_ro", 1, 0, 1, true, false},
     {"geosearch", 1, 0, 1, true, false},
     {"geosearchstore", 1, 0, 1, false, true},
@@ -107,6 +109,7 @@ immutable CmdKeySpec[] gCmdKeySpecs = [
     {"lset", 1, 0, 1, true, true},
     {"ltrim", 1, 0, 1, true, true},
     {"mget", 1, -1, 1, true, false},
+    {"migrate", 3, 0, 1, true, true},
     {"move", 1, 0, 1, true, true},
     {"mset", 1, -1, 2, false, true},
     {"msetnx", 1, -1, 2, false, true},
@@ -152,6 +155,8 @@ immutable CmdKeySpec[] gCmdKeySpecs = [
     {"smismember", 1, 0, 1, true, false},
     {"smove", 1, 0, 1, true, true},
     {"smove", 2, 0, 1, true, true},
+    {"sort", 1, 0, 1, true, false},
+    {"sort_ro", 1, 0, 1, true, false},
     {"spop", 1, 0, 1, true, true},
     {"srandmember", 1, 0, 1, true, false},
     {"srem", 1, 0, 1, true, true},
@@ -182,7 +187,9 @@ immutable CmdKeySpec[] gCmdKeySpecs = [
     {"zadd", 1, 0, 1, true, true},
     {"zcard", 1, 0, 1, true, false},
     {"zcount", 1, 0, 1, true, false},
+    {"zdiffstore", 1, 0, 1, false, true},
     {"zincrby", 1, 0, 1, true, true},
+    {"zinterstore", 1, 0, 1, false, true},
     {"zlexcount", 1, 0, 1, true, false},
     {"zmscore", 1, 0, 1, true, false},
     {"zpopmax", 1, 0, 1, true, true},
@@ -204,4 +211,24 @@ immutable CmdKeySpec[] gCmdKeySpecs = [
     {"zrevrank", 1, 0, 1, true, false},
     {"zscan", 1, 0, 1, true, false},
     {"zscore", 1, 0, 1, true, false},
+    {"zunionstore", 1, 0, 1, false, true},
+];
+
+/// numkeys spec: N = arr[pos+keynumidx]; first key at arr[pos+firstkey], step.
+struct CmdKeyNumSpec { string name; int pos; int keynumidx; int firstkey; int step; bool needR; bool needW; }
+
+immutable CmdKeyNumSpec[] gCmdKeyNumSpecs = [
+    {"blmpop", 2, 0, 1, 1, true, true},
+    {"bzmpop", 2, 0, 1, 1, true, true},
+    {"lmpop", 1, 0, 1, 1, true, true},
+    {"msetex", 1, 0, 1, 2, false, true},
+    {"sintercard", 1, 0, 1, 1, true, false},
+    {"zdiff", 1, 0, 1, 1, true, false},
+    {"zdiffstore", 2, 0, 1, 1, true, false},
+    {"zinter", 1, 0, 1, 1, true, false},
+    {"zintercard", 1, 0, 1, 1, true, false},
+    {"zinterstore", 2, 0, 1, 1, true, false},
+    {"zmpop", 1, 0, 1, 1, true, true},
+    {"zunion", 1, 0, 1, 1, true, false},
+    {"zunionstore", 2, 0, 1, 1, true, false},
 ];
