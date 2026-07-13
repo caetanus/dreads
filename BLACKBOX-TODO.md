@@ -114,6 +114,18 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
   that dispatches with a fixed `ks` can silently target the wrong DB.
 - **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
 
+## ACL / AUTH (2026-07-13, `auth-acl` branch)
+- **acl.tcl aborts on `ACL GETUSER`** (not implemented): `ERR unknown
+  subcommand … 'getuser'`. GETUSER needs reverse rule formatting (flags,
+  passwords, commands, keys, channels, selectors). Implementing it unblocks
+  the next layer of acl.tcl. `ACL LIST`/`ACL GETUSER` share that formatter.
+- In **external-server mode** almost all of `auth.tcl` / `acl.tcl` /
+  `acl-v2.tcl` are `external:skip` (they need their own `start_server` with an
+  `aclfile`), so the suite reports `0 passed, 0 failed` — near-zero real ACL
+  coverage. Meaningful validation lives in unit tests + live smoke, per
+  `blackbox-internal-coverage`. AUTH + command-level enforcement + the
+  script-`redis.call` ACL check are covered by UTs and verified live.
+
 ## Method to complete the catalog
 1. Land group 1 (CONFIG) + group 2 (DEBUG stubs) — the two blockers gating
    the most files.

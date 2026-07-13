@@ -622,3 +622,24 @@ unittest // registry: default user, get/create/del, unrestricted predicate
     assert(aclDelUser("alice") && aclUser("alice") is null);
     assert(!aclDelUser("default")); // default can't be deleted
 }
+
+unittest // long command names (>16 chars) are catalogued and gated
+{
+    // Regression: handleCommand uppercased into a char[16] buffer and took a
+    // raw-dispatch path for longer names, SKIPPING ACL enforcement. The command
+    // table must know these names so the (now char[32]) enforcement path gates
+    // them. GEORADIUSBYMEMBER_RO (20 chars) is the longest command token.
+    assert(aclCmdIndex("georadiusbymember") >= 0);
+    assert(aclCmdIndex("georadiusbymember_ro") >= 0);
+
+    aclInit();
+    const(char)[] err;
+    auto u = aclGetOrCreate("geotest");
+    scope (exit)
+        aclDelUser("geotest");
+    foreach (r; ["on", "~*", "+get", "+geoadd"]) // no geo-read perms
+        assert(aclApplyRule(u, r, err), cast(string) err);
+    assert(aclCanRunCmd(u, aclCmdIndex("geoadd")));
+    assert(!aclCanRunCmd(u, aclCmdIndex("georadiusbymember")));
+    assert(!aclCanRunCmd(u, aclCmdIndex("georadiusbymember_ro")));
+}

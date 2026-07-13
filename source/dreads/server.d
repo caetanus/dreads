@@ -23,7 +23,8 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
-    aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd, gAclActive;
+    aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
+    aclUnrestricted, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -551,7 +552,10 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             return dispatch(cmd, *c.dbp, o, arena);
     }
     auto name = cmd.arr[0].str;
-    char[16] nbuf = void;
+    // 32 covers every command token (longest is GEORADIUSBYMEMBER_RO, 20) — must
+    // NOT be shorter than the longest name, or that command would take the raw
+    // `return dispatch` path below and SKIP ACL enforcement (a silent bypass).
+    char[32] nbuf = void;
     if (name.length > nbuf.length)
         return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
@@ -568,29 +572,35 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         // EVAL/FCALL re-checks THIS user's permissions on the writer thread, so
         // `+eval -set` can't smuggle a SET through a script. Invisible to Lua.
         scriptSetPendingUser(c.user.id);
-        bool alwaysOk = uname == "AUTH" || uname == "HELLO" || uname == "RESET" || uname == "QUIT";
-        if (!alwaysOk)
+        // An all-permissions, already-authed user (default/admin) can't be denied
+        // anything — skip the per-command lookup entirely. Restricted users fall
+        // through to the real check.
+        if (!(c.authed && aclUnrestricted(c.user)))
         {
-            char[16] lb = void;
-            foreach (i, ch; name)
-                lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
-            auto lname = cast(const(char)[]) lb[0 .. name.length];
-            if (!c.authed)
+            bool alwaysOk = uname == "AUTH" || uname == "HELLO" || uname == "RESET" || uname == "QUIT";
+            if (!alwaysOk)
             {
-                repError(o, "NOAUTH Authentication required.");
-                return true;
-            }
-            if (!aclCanRunCmd(c.user, aclCmdIndex(lname)))
-            {
-                static ByteBuffer eb; // TLS
-                eb.clear();
-                eb.append("NOPERM User ");
-                eb.append(c.user.name);
-                eb.append(" has no permissions to run the '");
-                eb.append(lname);
-                eb.append("' command");
-                repError(o, cast(const(char)[]) eb.data);
-                return true;
+                char[32] lb = void;
+                foreach (i, ch; name)
+                    lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                auto lname = cast(const(char)[]) lb[0 .. name.length];
+                if (!c.authed)
+                {
+                    repError(o, "NOAUTH Authentication required.");
+                    return true;
+                }
+                if (!aclCanRunCmd(c.user, aclCmdIndex(lname)))
+                {
+                    static ByteBuffer eb; // TLS
+                    eb.clear();
+                    eb.append("NOPERM User ");
+                    eb.append(c.user.name);
+                    eb.append(" has no permissions to run the '");
+                    eb.append(lname);
+                    eb.append("' command");
+                    repError(o, cast(const(char)[]) eb.data);
+                    return true;
+                }
             }
         }
     }
