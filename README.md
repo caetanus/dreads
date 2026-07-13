@@ -91,9 +91,10 @@ pipelined numbers show the real per-command cost.
   buffer; incomplete input is a status, not an exception.
 - **Real data structures.** Open-addressing hash tables (FNV-1a, tombstones),
   intrusive doubly-linked lists, a skiplist with per-level spans for O(log n)
-  ZRANK, plus **LLVM-style small containers** (contiguous array + linear scan
-  that promotes to the full structure past a threshold) so small sets/hashes/
-  zsets cost far less memory than a full dict.
+  ZRANK, plus **small containers inspired by LLVM's SmallVector/SmallSet
+  family**: a compact contiguous representation with linear scan that promotes
+  to the full structure past a threshold, so small sets/hashes/zsets cost far
+  less memory than a full dict.
 - **vibe-core front-end.** Fiber per connection on a single-threaded event
   loop; fibers and connections are recycled, so steady state allocates nothing.
 
@@ -192,7 +193,7 @@ source/dreads/
   resp.d       RESP2/RESP3 zero-copy parser + encoder           @nogc
   respvariant  RValue tree + lazy, zero-alloc reply oracle      @nogc
   dict.d       open-addressing Dict!V + StrVal tagged union     @nogc
-  smallset.d   LLVM-style small containers (array → dict/skip)  @nogc
+  smallset.d   LLVM-inspired small containers (array → dict/skip) @nogc
   list.d       doubly-linked list, inline payload               @nogc
   zset.d       skiplist with spans + score dict                 @nogc
   stream.d     stream entries, binary-searched ranges           @nogc

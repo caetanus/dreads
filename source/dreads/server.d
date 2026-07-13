@@ -22,6 +22,8 @@ import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
+import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword;
+import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
@@ -101,6 +103,8 @@ public int runServer(ushort port, const(char)[] aofPath = null)
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         lruClock = cast(uint)(nowMs() / 1000);
         seedRand(nowMs()); // shuffle the random-pick commands per boot
+        initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
+        aclInit(); // seed the default ACL user (on nopass +@all ~* &*)
         {
             // effects replication: script writes reach the AOF one by one
             import dreads.scripting : gScriptEffectSink, startLuaScriptPool;
@@ -196,6 +200,11 @@ private struct Conn
     Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
     const(char)[] clientName; // malloc'd
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
+    // ACL: the connection's user (default at connect) and whether it has cleared
+    // authentication (nopass default => true immediately; requirepass => set at
+    // AUTH). Enforcement is `command in c.user's cap_set` (see dreads.acl).
+    AclUser* user;
+    bool authed;
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     size_t multiCount;
@@ -379,6 +388,10 @@ private void serveClient(TCPConnection tcp) nothrow
     c.tcp = tcp;
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
+    // ACL: start as the default user; a nopass default is authenticated at once,
+    // a password-protected one (requirepass) must AUTH first.
+    c.user = aclUser("default");
+    c.authed = c.user is null || c.user.nopass;
     c.sub.ctx = &c;
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
@@ -625,6 +638,46 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             }
             return keep;
         }
+    case "AUTH":
+        {
+            const(char)[] who, pass;
+            if (cmd.arr.length == 2)
+            {
+                // AUTH <pass> — the default user; if it has no password set,
+                // Redis returns the classic hint rather than WRONGPASS
+                auto def = aclUser("default");
+                if (def !is null && def.nopass)
+                {
+                    repError(o, "ERR Client sent AUTH, but no password is set."
+                            ~ " Did you mean AUTH <username> <password>?");
+                    return true;
+                }
+                who = "default";
+                pass = cmd.arr[1].str;
+            }
+            else if (cmd.arr.length == 3)
+            {
+                who = cmd.arr[1].str;
+                pass = cmd.arr[2].str;
+            }
+            else
+            {
+                repError(o, "ERR wrong number of arguments for 'auth' command");
+                return true;
+            }
+            // NOTE: verifyPassword runs the slow KDF inline for now (blocks the
+            // loop); the auth worker thread is the tracked perf follow-up.
+            auto u = aclUser(who);
+            if (u is null || !u.enabled || !aclCheckPassword(u, pass))
+            {
+                repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
+                return true;
+            }
+            c.user = u;
+            c.authed = true;
+            repSimple(o, "OK");
+            return true;
+        }
     case "RESET":
         {
             c.inMulti = false;
@@ -632,6 +685,8 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             c.watching = false;
             gPubSub.dropAll(&c.sub);
             gShardPubSub.dropAll(&c.shardSub);
+            c.user = aclUser("default"); // back to the default user
+            c.authed = c.user is null || c.user.nopass;
             repSimple(o, "RESET");
             return true;
         }
