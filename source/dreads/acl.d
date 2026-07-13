@@ -1424,10 +1424,25 @@ private __gshared Vector!AclLogEntry gAclLog; // index 0 = oldest, last = newest
 private __gshared ulong gAclLogSeq;
 public __gshared long gAclLogMaxLen = 128; // CONFIG acllog-max-len
 
+// ACL denial metrics — surfaced by INFO stats (acl_access_denied_*). Bumped on
+// every denied attempt, independent of whether the LOG itself is enabled.
+public __gshared ulong gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey,
+    gAclDeniedChannel, gAclDeniedDb;
+
 /// Record (or aggregate) a denied attempt. reason/ctx are interned literals.
 void aclLogAdd(string reason, string ctx, scope const(char)[] obj,
         scope const(char)[] user, scope const(char)[] cinfo, long nowMs) @trusted nothrow @nogc
 {
+    // count the denial for INFO metrics (before the log-enabled gate)
+    switch (reason)
+    {
+    case "auth": gAclDeniedAuth++; break;
+    case "command": gAclDeniedCmd++; break;
+    case "key": gAclDeniedKey++; break;
+    case "channel": gAclDeniedChannel++; break;
+    case "database": gAclDeniedDb++; break;
+    default: break;
+    }
     if (gAclLogMaxLen <= 0)
         return;
     // aggregate a matching recent entry (scan newest-first)

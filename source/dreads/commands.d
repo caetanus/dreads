@@ -2015,6 +2015,16 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             n = snprintf(b.ptr, b.length,
                     "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
             ib.append(b[0 .. n]);
+            {
+                import dreads.acl : gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey,
+                    gAclDeniedChannel;
+
+                n = snprintf(b.ptr, b.length,
+                        "acl_access_denied_auth:%llu\r\nacl_access_denied_cmd:%llu\r\n"
+                        ~ "acl_access_denied_key:%llu\r\nacl_access_denied_channel:%llu\r\n",
+                        gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey, gAclDeniedChannel);
+                ib.append(b[0 .. n]);
+            }
             // Persistence: dreads has no RDB, but the common fields tests read
             // via `s <field>` must exist and be numeric. rdb_changes_since_last_
             // save tracks effective writes (monotonic; not Redis's exact
