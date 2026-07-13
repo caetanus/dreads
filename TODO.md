@@ -18,6 +18,19 @@ external mode (`/tmp/valkey/runtest --host … --port … --single <file>`), on 
   (embstr/raw) + `i64` are live; `f64`/`nul`/`big` are reserved enum slots. The
   original design is a union over int|string|float|null|bigint. See memory
   `string-value-storage`.
+- **Patch Lua for VM-level readonly tables (the `_G` protection).** We run stock
+  Lua 5.4, so `_G`/library protection is *emulated* with metatables — which
+  cannot stop `rawset(_G, …)` or protect the shared *type* metatables
+  (`getmetatable('').__index = …`). That's why `Try trick readonly table on
+  basic types metatable` is skipped and why the guard is fragile. Redis/Valkey
+  ship a patched Lua with `lua_enablereadonlytable`/`lua_isreadonlytable`
+  (an out-of-band readonly flag on the VM's `Table`, enforced in `lvm.c`'s
+  set-path so *every* write — raw or not — raises). Options: (a) vendor Lua and
+  apply the same VM patch (matches Redis exactly, closes the skip, drops the
+  metatable hack in scripting.d); (b) the userdata-`_G` route (make `_ENV`/`_G`
+  a D-backed userdata so `rawset`/`setmetatable` simply don't apply — no patch,
+  but `_G` stops being the real globals table). (a) is the faithful fix. Own
+  branch; re-run unit/scripting after. See DRIFT.md "readonly emulation".
 
 ## Blackbox long-tail (type files run to completion; these are edge cases)
 
