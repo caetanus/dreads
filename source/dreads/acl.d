@@ -33,6 +33,15 @@ struct KeyPat
     bool read = true, write = true;
 }
 
+/// A per-subcommand override (`+client|id`, `-config|set`). Overrides the base
+/// command bit for that one subcommand; later rules for the same pair win.
+struct SubRule
+{
+    int cmd; // aclCmdIndex of the container command
+    const(char)[] sub; // malloc'd, lowercase subcommand name
+    bool allow;
+}
+
 /// One permission set (a user's root, or later an ACL v2 selector).
 struct AclPerm
 {
@@ -47,6 +56,7 @@ struct AclPerm
     // grant like "+@read" prints as "+@read", not 40 expanded "+cmd"s).
     bool cmdBaseAll; // base is "+@all" (true) or "-@all" (false, the fresh default)
     Vector!(const(char)[]) cmdRules; // malloc'd delta tokens since the last base
+    Vector!SubRule subRules; // per-subcommand overrides (+client|id, …)
 
     ~this() @nogc nothrow @trusted
     {
@@ -56,6 +66,8 @@ struct AclPerm
             freeSlice(chanPats[i]);
         foreach (i; 0 .. cmdRules.length)
             freeSlice(cmdRules[i]);
+        foreach (i; 0 .. subRules.length)
+            freeSlice(subRules[i].sub);
     }
 
     void reset() @nogc nothrow @trusted
@@ -70,6 +82,7 @@ struct AclPerm
         chanPats.clear();
         cmdBaseAll = false;
         clearCmdRules();
+        clearSubRules();
     }
 
     // reset the command-rule text to a base (does NOT touch the bitset)
@@ -77,6 +90,7 @@ struct AclPerm
     {
         cmdBaseAll = all;
         clearCmdRules();
+        clearSubRules(); // +@all/-@all wipe per-subcommand overrides too
     }
 
     void addCmdRule(scope const(char)[] tok) @nogc nothrow @trusted
@@ -84,11 +98,44 @@ struct AclPerm
         cmdRules.put(cast(const(char)[]) mallocDup(tok));
     }
 
+    // record a per-subcommand override; drop any earlier one for the same pair
+    void setSubRule(int cmd, scope const(char)[] sub, bool allow) @nogc nothrow @trusted
+    {
+        foreach (i; 0 .. subRules.length)
+            if (subRules[i].cmd == cmd && subRules[i].sub == sub)
+            {
+                subRules[i].allow = allow;
+                return;
+            }
+        subRules.put(SubRule(cmd, cast(const(char)[]) mallocDup(sub), allow));
+    }
+
+    // a whole-command rule (+client / -client) supersedes its subcommand rules
+    void dropSubRules(int cmd) @nogc nothrow @trusted
+    {
+        for (size_t i = 0; i < subRules.length;)
+            if (subRules[i].cmd == cmd)
+            {
+                freeSlice(subRules[i].sub);
+                subRules[i] = subRules[subRules.length - 1];
+                subRules.popBack();
+            }
+            else
+                i++;
+    }
+
     private void clearCmdRules() @nogc nothrow @trusted
     {
         foreach (i; 0 .. cmdRules.length)
             freeSlice(cmdRules[i]);
         cmdRules.clear();
+    }
+
+    private void clearSubRules() @nogc nothrow @trusted
+    {
+        foreach (i; 0 .. subRules.length)
+            freeSlice(subRules[i].sub);
+        subRules.clear();
     }
 }
 
@@ -300,12 +347,14 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
         allowCategory(u.root, bit, allow);
         return true;
     }
-    // strip a |subcommand suffix for now (phase 2 tracks per-subcommand rules)
+    // split an optional |subcommand suffix (+client|id → cmd "client", sub "id")
     auto name = spec;
+    const(char)[] sub;
     foreach (i, ch; spec)
         if (ch == '|')
         {
             name = spec[0 .. i];
+            sub = spec[i + 1 .. $];
             break;
         }
     char[64] lb = void;
@@ -319,6 +368,19 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
         err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
         return false;
     }
+    if (sub.length)
+    {
+        // per-subcommand override: record it, leave the base command bit alone
+        char[64] sb = void;
+        if (sub.length > sb.length)
+            return false;
+        foreach (i, ch; sub)
+            sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+        u.root.setSubRule(idx, sb[0 .. sub.length], allow);
+        return true;
+    }
+    // a whole-command rule supersedes any subcommand overrides for it
+    u.root.dropSubRules(idx);
     bitSet(u.root.allowed, idx, allow);
     return true;
 }
@@ -412,6 +474,31 @@ bool aclCanRunCmd(const(AclUser)* u, int cmdIdx) @nogc nothrow @safe
     if (cmdIdx < 0)
         return true;
     return bitGet(u.root.allowed, cast(size_t) cmdIdx);
+}
+
+/// Like aclCanRunCmd but honours per-subcommand overrides (`+client|id`): a
+/// matching subrule wins over the base command bit. `sub` is the (lowercase)
+/// subcommand arg, empty for a bare command. Fast path when the user has none.
+bool aclCanRunCmdSub(const(AclUser)* u, int cmdIdx, scope const(char)[] sub) @nogc nothrow @safe
+{
+    if (sub.length && u.root.subRules.length)
+        foreach (i; 0 .. u.root.subRules.length)
+        {
+            auto sr = u.root.subRules[i];
+            if (sr.cmd == cmdIdx && sr.sub == sub)
+                return u.enabled && sr.allow;
+        }
+    return aclCanRunCmd(u, cmdIdx);
+}
+
+/// True if the user has any per-subcommand rule for this command — the denial
+/// message then names the `command|subcommand` (as Valkey does for containers).
+bool aclCmdHasSubRule(const(AclUser)* u, int cmdIdx) @nogc nothrow @safe
+{
+    foreach (i; 0 .. u.root.subRules.length)
+        if (u.root.subRules[i].cmd == cmdIdx)
+            return true;
+    return false;
 }
 
 /// Can this user touch `key` for the required access (read and/or write)?
@@ -1047,6 +1134,30 @@ unittest // registry: default user, get/create/del, unrestricted predicate
 
     assert(aclDelUser("alice") && aclUser("alice") is null);
     assert(!aclDelUser("default")); // default can't be deleted
+}
+
+unittest // per-subcommand ACL: +@all -client +client|id
+{
+    const(char)[] err;
+    auto u = aclGetOrCreate("subtest");
+    scope (exit)
+        aclDelUser("subtest");
+    foreach (r; ["on", "+@all", "-client", "+client|id", "+client|setname"])
+        assert(aclApplyRule(u, r, err), cast(string) err);
+
+    immutable ci = aclCmdIndex("client");
+    assert(!aclCanRunCmd(u, ci)); // base client denied by -client
+    assert(aclCanRunCmdSub(u, ci, "id")); // re-allowed subcommand
+    assert(aclCanRunCmdSub(u, ci, "setname"));
+    assert(!aclCanRunCmdSub(u, ci, "kill")); // no subrule → base (denied)
+    assert(aclCmdHasSubRule(u, ci)); // denial message names client|<sub>
+    // a bare command still works via the base bit (config allowed by +@all)
+    assert(aclCanRunCmdSub(u, aclCmdIndex("config"), "get"));
+
+    // a later whole-command rule supersedes the subrules
+    assert(aclApplyRule(u, "+client", err));
+    assert(aclCanRunCmd(u, ci) && !aclCmdHasSubRule(u, ci));
+    assert(aclCanRunCmdSub(u, ci, "kill"));
 }
 
 unittest // long command names (>16 chars) are catalogued and gated

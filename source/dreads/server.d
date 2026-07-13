@@ -27,7 +27,7 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
     aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
     aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
-    gAclActive;
+    aclCanRunCmdSub, aclCmdHasSubRule, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -707,7 +707,17 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             // command it lacks, so the deny path is cold — hint the branch so the
             // predictor keeps the allow path straight (varied real workloads don't
             // train it the way a single-command benchmark does).
-            if (expect(!(c.authed && aclCanRunCmd(c.user, aclCmdIndex(lname))), false))
+            immutable cidx = aclCmdIndex(lname);
+            // per-subcommand ACL: lowercase arg[1] (e.g. CLIENT KILL → "kill")
+            char[32] sb = void;
+            const(char)[] sub;
+            if (cmd.arr.length >= 2 && cmd.arr[1].str.length <= sb.length)
+            {
+                foreach (i, ch; cmd.arr[1].str)
+                    sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                sub = cast(const(char)[]) sb[0 .. cmd.arr[1].str.length];
+            }
+            if (expect(!(c.authed && aclCanRunCmdSub(c.user, cidx, sub)), false))
             {
                 bool alwaysOk = uname == "AUTH" || uname == "HELLO"
                     || uname == "RESET" || uname == "QUIT";
@@ -724,6 +734,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     eb.append(c.user.name);
                     eb.append(" has no permissions to run the '");
                     eb.append(lname);
+                    // name the subcommand (client|kill) when it's under sub-ACL
+                    if (sub.length && aclCmdHasSubRule(c.user, cidx))
+                    {
+                        eb.append("|");
+                        eb.append(sub);
+                    }
                     eb.append("' command");
                     repError(o, cast(const(char)[]) eb.data);
                     return true;
