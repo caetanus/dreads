@@ -341,9 +341,15 @@ bool aclCheckPassword(const(AclUser)* u, scope const(char)[] pass) @trusted noth
     return false;
 }
 
-// --- tests -------------------------------------------------------------------
+// --- global registry ---------------------------------------------------------
 
-version (unittest) private AclUser* freshUser(string name)
+import dreads.dict : Dict;
+
+private __gshared Dict!(AclUser*) gUsers;
+private __gshared bool gAclInited;
+
+/// Malloc + construct a fresh, disabled, no-permission user with `name`.
+AclUser* aclNewUser(scope const(char)[] name) @trusted
 {
     import core.lifetime : emplace;
     import core.stdc.stdlib : malloc;
@@ -354,13 +360,77 @@ version (unittest) private AclUser* freshUser(string name)
     return u;
 }
 
-version (unittest) private void freeUser(AclUser* u)
+/// Run ~this (frees name/passwords/patterns) and free the user.
+void aclFreeUser(AclUser* u) @trusted
 {
     import core.stdc.stdlib : free;
 
-    destroy(*u); // object.destroy — runs ~this on the Vectors
+    destroy(*u);
     free(u);
 }
+
+/// Seed the always-present `default` user (`on nopass +@all ~* &*`). Idempotent.
+void aclInit() @trusted
+{
+    if (gAclInited)
+        return;
+    gAclInited = true;
+    auto def = aclNewUser("default");
+    def.enabled = true;
+    def.nopass = true;
+    allowAll(def.root, true);
+    def.root.allKeys = true;
+    def.root.allChannels = true;
+    gUsers.set("default", def);
+}
+
+/// The user by name, or null.
+AclUser* aclUser(scope const(char)[] name) @nogc nothrow
+{
+    auto pp = gUsers.get(name);
+    return pp ? *pp : null;
+}
+
+/// The user, creating a fresh disabled one if absent (ACL SETUSER semantics).
+AclUser* aclGetOrCreate(scope const(char)[] name) @trusted
+{
+    if (auto u = aclUser(name))
+        return u;
+    auto u = aclNewUser(name);
+    gUsers.set(name, u);
+    return u;
+}
+
+/// Remove a user (never `default`). Returns true if one was deleted.
+bool aclDelUser(scope const(char)[] name) @trusted
+{
+    if (name == "default")
+        return false;
+    auto pp = gUsers.get(name);
+    if (pp is null)
+        return false;
+    auto u = *pp;
+    gUsers.remove(name);
+    aclFreeUser(u);
+    return true;
+}
+
+/// True when `u` is unrestricted (enabled ∧ every command ∧ all keys/channels)
+/// — the enforcement fast case; such a user passes any `command ∈ cap_set` test.
+bool aclUnrestricted(const(AclUser)* u) @nogc nothrow @safe
+{
+    if (!u.enabled || !u.root.allKeys || !u.root.allChannels)
+        return false;
+    foreach (w; u.root.allowed)
+        if (w != ulong.max)
+            return false;
+    return true;
+}
+
+// --- tests -------------------------------------------------------------------
+
+version (unittest) private alias freshUser = aclNewUser;
+version (unittest) private alias freeUser = aclFreeUser;
 
 unittest // the scripting-ACL scenario: bob = on >123 +@scripting +set ~x*
 {
@@ -415,4 +485,22 @@ unittest // reset + allkeys/allcommands + %RW flags
         assert(aclApplyRule(u, r, err), err);
     assert(aclCanAccessKey(u, "ro:1", true, false));   // read ok
     assert(!aclCanAccessKey(u, "ro:1", false, true));  // write denied
+}
+
+unittest // registry: default user, get/create/del, unrestricted predicate
+{
+    aclInit();
+    auto def = aclUser("default");
+    assert(def !is null && aclUnrestricted(def)); // on nopass +@all ~* &*
+
+    const(char)[] err;
+    auto alice = aclGetOrCreate("alice");
+    assert(alice !is null && aclUser("alice") is alice);
+    assert(!aclUnrestricted(alice)); // fresh user is disabled + empty
+    foreach (r; ["on", "+@all", "allkeys", "allchannels"])
+        aclApplyRule(alice, r, err);
+    assert(aclUnrestricted(alice)); // now full
+
+    assert(aclDelUser("alice") && aclUser("alice") is null);
+    assert(!aclDelUser("default")); // default can't be deleted
 }
