@@ -29,7 +29,7 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
     aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
     aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive, aclDeniedDb,
-    aclCanAccessDb;
+    aclCanAccessDb, aclCanAccessKey;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -2656,6 +2656,17 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
     bool firstPass = true;
     for (;;)
     {
+        // re-check key ACL on every pass: a blocked client whose key permission
+        // was revoked while it waited must be rejected when the command is
+        // reprocessed on wake (Valkey behaviour). BLPOP/BRPOP need read+write.
+        if (gAclActive && c.user !is null && !c.user.root.allKeys)
+            foreach (ref k; keys)
+                if (!aclCanAccessKey(c.user, k.str, true, true))
+                {
+                    aclLogViolation(c, "key", k.str, fromLeft ? "blpop" : "brpop");
+                    repError(o, "NOPERM No permissions to access a key");
+                    return;
+                }
         foreach (ref k; keys)
         {
             bool wrong;
@@ -2716,6 +2727,16 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
     bool firstPass = true;
     for (;;)
     {
+        // re-check key ACL on every pass (see blockingPop) — perms may have been
+        // revoked while blocked. BZPOPMIN/MAX need read+write.
+        if (gAclActive && c.user !is null && !c.user.root.allKeys)
+            foreach (ref k; keys)
+                if (!aclCanAccessKey(c.user, k.str, true, true))
+                {
+                    aclLogViolation(c, "key", k.str, popMax ? "bzpopmax" : "bzpopmin");
+                    repError(o, "NOPERM No permissions to access a key");
+                    return;
+                }
         foreach (ref k; keys)
         {
             bool wrong;
@@ -2788,6 +2809,10 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
+        // re-check ACL on every pass — perms may have been revoked while blocked
+        // (the woken command is reprocessed, so it must be re-validated).
+        if (gAclActive && c.user !is null && aclDenies(c, cmd2, null, verb, o))
+            return;
         dispatch(cmd2, *c.dbp, attempt, arena);
         propagationOverride.clear();
         auto rep = cast(const(char)[]) attempt.data;
@@ -2885,6 +2910,9 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             repError(o, "ERR internal blocking rewrite failed");
             return;
         }
+        // re-check ACL on every pass — perms may have been revoked while blocked.
+        if (gAclActive && c.user !is null && aclDenies(c, cmd2, null, "xread", o))
+            return;
         dispatch(cmd2, *c.dbp, attempt, arena);
         auto rep = cast(const(char)[]) attempt.data;
         auto nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
