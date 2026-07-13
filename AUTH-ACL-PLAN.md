@@ -122,40 +122,42 @@ carries db/clock via the pool round-trip — add the user). `luaAclCheckCmd`
 evaluates the real rules; unknown command → the `Invalid command passed to
 server.acl_check_cmd()` error. Closes `Script ACL check`.
 
-## 9. Password storage + brute-force resistance
+## 9. Password storage — Argon2id, slow by construction
 
-Two separate concerns — conflating them is the mistake.
+The right answer is a **memory-hard KDF**, not a fast hash (SHA-256 alone was
+the mistake). Mirror `orbiflow/apps/auth/.../password.d`:
 
-**Stored hash = SHA-256 (parity, non-negotiable).** Valkey's ACL wire format is
-SHA-256 hex: `>pass` hashes then stores, `#<sha256hex>` sets a hash directly,
-`<pass`/`!hash` remove, and **`ACL GETUSER` returns the SHA-256 hash** — the
-acl.tcl tests assert this. A slow KDF (Argon2/scrypt/bcrypt) in the *stored*
-hash would break `#hash` and GETUSER, so it is out. Add SHA-256 (`std.digest.
-sha : SHA256`, or a small `@nogc` impl for the zero-GC bar; hashing is
-control-plane). **Compare in constant time** (no early-out on the first
-differing byte) to deny timing oracles.
+- **Argon2id via `libsodiumd`** (`crypto_pwhash_str_alg`, `ALG_ARGON2ID13`) is
+  the primary KDF for `ACL SETUSER u >pass`. Tunable m/t/p (start at
+  m=16 MiB, t=2, p=1 → ~15-30 ms/verify), stored as the PHC string
+  `$argon2id$v=19$m=…$salt$hash`. Each brute-force attempt then costs a full
+  memory-hard computation — the "auth lenta" lives in the hash itself.
+- **Multi-format verify**, dispatching on the stored prefix, exactly like
+  orbiflow's argon2/pbkdf2 split:
+  - `$argon2id$…` → `crypto_pwhash_str_verify`;
+  - a bare 64-char SHA-256 hex → the **Valkey-compat path** (`#<sha256hex>` set
+    by a client or imported from an `aclfile` still authenticates), compared in
+    **constant time**.
+- **Timing jitter** after every verify (small uniform delay from the CSPRNG) to
+  dilute timing-distillation — but as a **vibe fiber `sleep`**, never
+  `Thread.sleep`.
 
-**Brute-force resistance lives in AUTH, not the hash.** A fast hash is only safe
-if you cap attempt throughput — so dreads adds a slow-auth layer Valkey does not
-have, on top of the parity-correct storage:
+**dreads-specific twist orbiflow doesn't need — run Argon2 OFF the event loop.**
+A 15-30 ms memory-hard verify is CPU-bound; on dreads' single event-loop thread
+it would stall *every* client for the duration, and under an AUTH flood it is a
+DoS vector. So the verify runs on a **dedicated auth worker thread / bounded
+TaskPool** (the same pattern as the Lua thread): the AUTH fiber posts the job
+and yields; the event loop stays responsive. Bounding the pool also **caps
+concurrent auth attempts by construction** — that *is* the brute-force limiter,
+no separate backoff bookkeeping needed. Failures still feed **ACL LOG** (§7).
 
-- **Non-blocking exponential backoff on failure**, keyed by source (and/or
-  username): each failed AUTH grows a per-key delay before the reply. The delay
-  is a **vibe fiber `sleep`** (yields the fiber) — *never* a `Thread.sleep`,
-  which would stall the single event-loop thread for every other client. Only
-  the attacking connection waits; the server stays responsive. Reset on success.
-- **Optional lockout** after N consecutive failures (config
-  `acl-auth-max-failures`), with a cooldown.
-- **Optional per-AUTH work factor** (`acl-auth-min-delay-ms`): a floor delay on
-  *every* attempt (even the first), capping global attempts/sec regardless of
-  source spoofing.
-- Failures also feed **ACL LOG** (§7), so the operator sees the brute-force.
-
-This keeps the hash Valkey-compatible while making online brute-force
-impractical — a real security edge over stock Valkey, at zero parity cost.
-(An *offline* attack on a leaked SHA-256 hash is only mitigated by password
-strength; that limitation is inherited from the Valkey format and documented,
-not hidden.)
+**Parity: a deliberate security upgrade, documented.** `ACL SETUSER >pass`
+stores Argon2id, so `ACL GETUSER` reflects a stronger hash than Valkey's
+SHA-256 — dreads is *more* secure here on purpose. The acl.tcl assertions that
+expect a SHA-256 back from `>pass` become a documented divergence in DRIFT.md
+(not a bug); `#<sha256hex>` (a client setting a raw SHA-256) still round-trips
+as-is for interop. New dep: `libsodiumd ~>0.2`. Config: `acl-argon2-mem`,
+`acl-argon2-ops`.
 
 ## 10. Replication / persistence
 
@@ -184,10 +186,14 @@ DRIFT.md either way.
 
 - `source/dreads/acl.d` — **new**: AclUser/AclPerm, registry, rule parse/format,
   category table, enforcement predicate, ACL LOG.
-- `source/dreads/server.d` — Conn.user, AUTH/HELLO wiring (with the
-  non-blocking failure backoff + constant-time compare), enforcement call in
-  the command loop, `ACL`/`AUTH` real handlers, requirepass hook. New config:
-  `acl-auth-min-delay-ms`, `acl-auth-max-failures`.
+- `source/dreads/acl.d` (or a sibling `authpw.d`) — Argon2id hash/verify
+  (`libsodiumd`), multi-format dispatch, constant-time SHA-256 path, jitter, and
+  the **auth worker thread** the verify runs on (Lua-thread pattern).
+- `source/dreads/server.d` — Conn.user, AUTH/HELLO wiring (post verify to the
+  auth worker, fiber yields), enforcement call in the command loop,
+  `ACL`/`AUTH` real handlers, requirepass hook. New config: `acl-argon2-mem`,
+  `acl-argon2-ops`.
+- `dub.json` — add `libsodiumd ~>0.2`; link libsodium.
 - `source/dreads/commands.d` — remove AUTH stub; expose key-spec extraction for
   enforcement.
 - `source/dreads/scripting.d` — carry `AclUser*` into the bridge; real
