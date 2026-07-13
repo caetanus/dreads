@@ -133,9 +133,10 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
 - **Connection registry (commit 702f79c):** intrusive doubly-linked list of every
   live `Conn*` (each lives on its serveClient fiber stack; single event loop ⇒ no
   locking). Powers `CLIENT LIST` (all clients), channel kill-on-revoke, and
-  DELUSER disconnecting OTHER sessions. `CLIENT KILL` is still a stub — the
-  registry makes it a small follow-up (match by id/addr → killConn). `addr` is
-  still `?` (no peer-address plumbing).
+  DELUSER disconnecting OTHER sessions, and **CLIENT KILL** (commit 26444e5:
+  ID/USER/SKIPME filters, self-kill closes after reply). `addr` is still `?`
+  (no peer-address plumbing), so ADDR/LADDR filters and the legacy addr form
+  never match; TYPE/MAXAGE are accepted but unmodelled.
 - Later acl.tcl `start_server` blocks (aclfile-based) remain `external:skip`:
   dreads persists users via the AOF/raft log, not an `aclfile` (see
   `aof-is-ours`), so `ACL LOAD/SAVE` return "not configured to use an ACL file".
