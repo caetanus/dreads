@@ -64,8 +64,65 @@ private __gshared size_t gMonitorCount;
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
 
-public int runServer(ushort port, const(char)[] aofPath = null)
+private extern (C) int flock(int fd, int operation) nothrow @nogc;
+private __gshared int gPortLockFd = -1;
+
+/// Refuse to start if a LIVE dreads already holds this port. SO_REUSEPORT would
+/// otherwise let a second instance silently co-bind and split client traffic —
+/// a whole class of "phantom" benchmark/test bugs (a subscribe lands on one, the
+/// publish on another; a stale old binary answers a command). flock is advisory
+/// AND auto-released when the holder dies, so a crashed/killed instance frees it
+/// instantly — which is exactly why we keep reusePort for fast restarts. Path is
+/// `$XDG_RUNTIME_DIR/dreadlock-<port>.lck` (= /var/run/user/<uid>, per-user, no
+/// root) by default, overridable with `--lockfile=`. Always kill servers by PORT.
+private bool acquirePortLock(ushort port, scope const(char)[] lockPath) @trusted nothrow
 {
+    import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+    import core.sys.posix.unistd : close;
+    import core.stdc.stdio : snprintf;
+
+    char[512] path = void;
+    if (lockPath.length && lockPath.length < path.length)
+    {
+        path[0 .. lockPath.length] = lockPath;
+        path[lockPath.length] = 0;
+    }
+    else
+    {
+        // per-user runtime dir (systemd's $XDG_RUNTIME_DIR = /run/user/<uid> =
+        // /var/run/user/<uid>) — writable without root, tmpfs, auto-cleaned on
+        // logout. Falls back to /var/run (needs root) when it isn't set.
+        import core.stdc.stdlib : getenv;
+
+        auto xdg = getenv("XDG_RUNTIME_DIR");
+        if (xdg !is null && *xdg != '\0')
+            snprintf(path.ptr, path.length, "%s/dreadlock-%u.lck", xdg, cast(uint) port);
+        else
+            snprintf(path.ptr, path.length, "/var/run/dreadlock-%u.lck", cast(uint) port);
+    }
+    int fd = open(path.ptr, O_CREAT | O_RDWR, 420); // 0644
+    if (fd < 0)
+        return true; // can't create the lock file (e.g. /var/run not writable) —
+    // don't block startup on it; pass --lockfile= for an alternative location
+    enum LOCK_EX = 2, LOCK_NB = 4;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        close(fd);
+        return false; // another live instance holds this port
+    }
+    gPortLockFd = fd; // held for the process lifetime (auto-unlocks on exit)
+    return true;
+}
+
+public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lockPath = null)
+{
+    // One live dreads per port: reusePort makes a silent co-bind possible, so
+    // gate on an flock before doing any work (see acquirePortLock).
+    if (!acquirePortLock(port, lockPath))
+    {
+        printf("dreads: port %u is already held by a live dreads instance\n", cast(uint) port);
+        return 1;
+    }
     // ACL must be live BEFORE any AOF replay / raft catch-up: replayed
     // "ACL SETUSER … reset …" entries apply through gAclApplyHook.
     initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
