@@ -30,6 +30,7 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
     aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive, aclDeniedDb,
     aclCanAccessDb, aclCanAccessKey;
+import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -63,6 +64,42 @@ private __gshared ulong gClientIds;
 // MONITOR feed: registered connections receive every executed command
 private __gshared Conn*[64] gMonitors;
 private __gshared size_t gMonitorCount;
+
+// Per-command statistics for INFO commandstats (indexed by aclCmdIndex). Counters
+// only — calls/rejected/failed are cheap increments on the command path. We do
+// NOT read a per-command clock (usec stays 0) to keep the hot path clean; see
+// BLACKBOX-TODO.md. `rejected` = rejected before execution (ACL denials);
+// `failed` = executed but returned an error.
+struct CmdStat
+{
+    ulong calls, usec, rejected, failed;
+}
+
+public __gshared CmdStat[gCmdCats.length] gCmdStats;
+
+// A command rejected before execution (ACL denial). idx = aclCmdIndex(name).
+void statRejected(int idx) @nogc nothrow
+{
+    if (idx >= 0 && idx < cast(int) gCmdStats.length)
+        gCmdStats[idx].rejected++;
+}
+
+// A command that executed; `failed` if its reply was an error.
+void statCall(int idx, bool failed) @nogc nothrow
+{
+    if (idx >= 0 && idx < cast(int) gCmdStats.length)
+    {
+        gCmdStats[idx].calls++;
+        if (failed)
+            gCmdStats[idx].failed++;
+    }
+}
+
+public void resetCmdStats() @nogc nothrow
+{
+    foreach (ref s; gCmdStats)
+        s = CmdStat.init;
+}
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
 
@@ -853,6 +890,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
         {
             if (!c.authed)
             {
+                statRejected(cidx);
                 repError(o, "NOAUTH Authentication required.");
                 return true;
             }
@@ -866,6 +904,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
                 ob.append(sub);
             }
             auto obj = cast(const(char)[]) ob.data;
+            statRejected(cidx);
             aclLogViolation(c, "command", obj, lname);
             static ByteBuffer eb; // TLS
             eb.clear();
@@ -883,6 +922,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
     auto dk = aclDeniedKey(c.user, lname, cmd.arr);
     if (dk !is null)
     {
+        statRejected(cidx);
         aclLogViolation(c, "key", dk, lname);
         repError(o, "NOPERM No permissions to access a key");
         return true;
@@ -894,6 +934,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
         auto dch = aclCmdDeniedChannel(c.user, lname, cmd.arr);
         if (dch !is null)
         {
+            statRejected(cidx);
             aclLogViolation(c, "channel", dch, lname);
             repError(o, "NOPERM No permissions to access a channel");
             return true;
@@ -905,6 +946,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
         auto ddb = aclDeniedDb(c.user, lname, cmd.arr, cast(int)(c.dbp - &gDbs[0]));
         if (ddb !is null)
         {
+            statRejected(cidx);
             aclLogViolation(c, "database", ddb, lname);
             repError(o, "NOPERM No permissions to access database");
             return true;
@@ -2083,6 +2125,16 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     }
     auto outBefore = o.length;
     auto keep = dispatch(cmd, *c.dbp, o, arena);
+    immutable errored = o.length > outBefore && o.data[outBefore] == '-';
+    // INFO commandstats: count the executed data command (name.length <= 16 here,
+    // guaranteed by the nbuf check above). Blocking/pubsub/connection commands
+    // handled before this point are not counted — see BLACKBOX-TODO.md.
+    {
+        char[16] lc = void;
+        foreach (i, ch; name)
+            lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+        statCall(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]), errored);
+    }
     if (o.length > outBefore && o.data[outBefore] != '-')
     {
         if (isWriteCommand(uname) || !propagationOverride.empty)
@@ -2496,6 +2548,8 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     }
     if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))
     {
+        if (eqICDebug(args[0].str, "RESETSTAT"))
+            resetCmdStats(); // clear INFO commandstats counters
         repSimple(o, "OK");
         return;
     }
@@ -2760,6 +2814,7 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
             foreach (ref k; keys)
                 if (!aclCanAccessKey(c.user, k.str, true, true))
                 {
+                    statRejected(aclCmdIndex(fromLeft ? "blpop" : "brpop"));
                     aclLogViolation(c, "key", k.str, fromLeft ? "blpop" : "brpop");
                     repError(o, "NOPERM No permissions to access a key");
                     return;
@@ -2830,6 +2885,7 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
             foreach (ref k; keys)
                 if (!aclCanAccessKey(c.user, k.str, true, true))
                 {
+                    statRejected(aclCmdIndex(popMax ? "bzpopmax" : "bzpopmin"));
                     aclLogViolation(c, "key", k.str, popMax ? "bzpopmax" : "bzpopmin");
                     repError(o, "NOPERM No permissions to access a key");
                     return;

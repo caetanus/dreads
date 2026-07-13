@@ -2041,6 +2041,25 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         ~ "aof_rewrite_in_progress:0\r\naof_last_bgrewrite_status:ok\r\n"
                         ~ "aof_last_write_status:ok\r\n");
             }
+            // Per-command stats. Counters are real (calls/rejected/failed); usec
+            // is not tracked (no per-command clock — see BLACKBOX-TODO.md), so it
+            // is reported as 0. Only commands with activity are listed.
+            {
+                import dreads.server : gCmdStats;
+                import dreads.aclcat : gCmdCats;
+
+                ib.append("# Commandstats\r\n");
+                foreach (i, ref s; gCmdStats)
+                    if (s.calls || s.rejected || s.failed)
+                    {
+                        n = snprintf(b.ptr, b.length,
+                                "cmdstat_%.*s:calls=%llu,usec=%llu,usec_per_call=0.00,"
+                                ~ "rejected_calls=%llu,failed_calls=%llu\r\n",
+                                cast(int) gCmdCats[i].name.length, gCmdCats[i].name.ptr,
+                                s.calls, s.usec, s.rejected, s.failed);
+                        ib.append(b[0 .. n]);
+                    }
+            }
             ib.append("# Keyspace\r\n");
             // raw dict count, like Redis/DBSIZE: a logically-expired key that
             // hasn't been reaped yet still counts (the test with active-expire
