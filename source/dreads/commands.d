@@ -42,6 +42,12 @@ public alias FcallHook = void function(const(RVal)[] args, ref Keyspace ks,
         ref ByteBuffer o, ref Arena arena, bool readOnly) nothrow;
 public __gshared FunctionHook gFunctionHook;
 public __gshared FcallHook gFcallHook;
+// ACL mutation on the APPLY path only (AOF replay / raft commit): the log
+// carries a canonical "ACL SETUSER … reset …" / "ACL DELUSER …", and this hook
+// applies it to the user registry. Clients never reach here — the server layer
+// handles ACL before dispatch. Set by dreads.server at boot.
+public alias AclApplyHook = void function(const(RVal)[] args) nothrow;
+public __gshared AclApplyHook gAclApplyHook;
 /// number of scripts in the EVAL cache (INFO Memory); set by the scripting
 /// module so commands.d need not import it (would be a cyclic import)
 public alias ScriptCountHook = size_t function() nothrow @nogc;
@@ -3103,6 +3109,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repUnknownSubcommand(o, "COMMANDLOG", args.length ? args[0].str : "");
             break;
         }
+    case "ACL":
+        {
+            // apply path only (replay/commit): apply the canonical mutation.
+            // A client's ACL is fully handled by the server layer before dispatch.
+            if (gAclApplyHook !is null)
+            {
+                alias NoGcFn = void function(const(RVal)[]) @nogc nothrow;
+                (cast(NoGcFn) gAclApplyHook)(args);
+            }
+            repSimple(o, "OK");
+            break;
+        }
     case "FUNCTION":
         {
             if (gFunctionHook !is null)
@@ -3151,28 +3169,6 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repArrayHeader(o, 0); // LIST: no modules
             break;
         }
-    case "ACL":
-        {
-            if (args.length >= 1 && eqICKeyword(args[0].str, "WHOAMI"))
-                repBulk(o, "default");
-            else if (args.length >= 1 && eqICKeyword(args[0].str, "LIST"))
-            {
-                repArrayHeader(o, 1);
-                repBulk(o, "user default on nopass ~* &* +@all");
-            }
-            else if (args.length >= 1 && eqICKeyword(args[0].str, "CAT"))
-                repArrayHeader(o, 0);
-            else if (args.length >= 1 && (eqICKeyword(args[0].str, "SETUSER")
-                    || eqICKeyword(args[0].str, "DELUSER") || eqICKeyword(args[0].str, "SAVE")
-                    || eqICKeyword(args[0].str, "LOAD")))
-                repSimple(o, "OK"); // no ACL enforcement; accept the config
-            else if (args.length >= 1 && eqICKeyword(args[0].str, "GETUSER"))
-                repArrayHeader(o, 0);
-            else
-                repUnknownSubcommand(o, "ACL", args.length ? args[0].str : "");
-            break;
-        }
-
         // --- string extras (batch) ---
     case "SUBSTR": // deprecated alias of GETRANGE
         goto case "GETRANGE";

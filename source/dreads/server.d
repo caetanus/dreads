@@ -11,6 +11,7 @@ module dreads.server;
 // vibe-core owns only the socket lifecycle; nothing here allocates on the GC
 // heap per request (the mutex and TCPConnection are one-time per connection).
 
+import core.builtins : expect;
 import core.stdc.stdio : printf;
 import core.stdc.stdlib : malloc, cfree = free;
 
@@ -22,6 +23,12 @@ import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
 
+import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
+    aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
+    aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
+    aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
+    aclCanRunCmdSub, aclCmdHasSubRule, gAclActive;
+import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
@@ -31,7 +38,7 @@ import dreads.obj : Keyspace, gDbs, NUM_DBS;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
-import dreads.scripting : cachedScript, evalCommand, scriptCommand;
+import dreads.scripting : cachedScript, evalCommand, scriptCommand, scriptSetPendingUser;
 
 private enum READ_CHUNK = 16 * 1024;
 
@@ -57,8 +64,74 @@ private __gshared size_t gMonitorCount;
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
 
-public int runServer(ushort port, const(char)[] aofPath = null)
+private extern (C) int flock(int fd, int operation) nothrow @nogc;
+private __gshared int gPortLockFd = -1;
+
+/// Refuse to start if a LIVE dreads already holds this port. SO_REUSEPORT would
+/// otherwise let a second instance silently co-bind and split client traffic —
+/// a whole class of "phantom" benchmark/test bugs (a subscribe lands on one, the
+/// publish on another; a stale old binary answers a command). flock is advisory
+/// AND auto-released when the holder dies, so a crashed/killed instance frees it
+/// instantly — which is exactly why we keep reusePort for fast restarts. Path is
+/// `$XDG_RUNTIME_DIR/dreadlock-<port>.lck` (= /var/run/user/<uid>, per-user, no
+/// root) by default, overridable with `--lockfile=`. Always kill servers by PORT.
+private bool acquirePortLock(ushort port, scope const(char)[] lockPath) @trusted nothrow
 {
+    import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+    import core.sys.posix.unistd : close;
+    import core.stdc.stdio : snprintf;
+
+    char[512] path = void;
+    if (lockPath.length && lockPath.length < path.length)
+    {
+        path[0 .. lockPath.length] = lockPath;
+        path[lockPath.length] = 0;
+    }
+    else
+    {
+        // per-user runtime dir (systemd's $XDG_RUNTIME_DIR = /run/user/<uid> =
+        // /var/run/user/<uid>) — writable without root, tmpfs, auto-cleaned on
+        // logout. Falls back to /var/run (needs root) when it isn't set.
+        import core.stdc.stdlib : getenv;
+
+        auto xdg = getenv("XDG_RUNTIME_DIR");
+        if (xdg !is null && *xdg != '\0')
+            snprintf(path.ptr, path.length, "%s/dreadlock-%u.lck", xdg, cast(uint) port);
+        else
+            snprintf(path.ptr, path.length, "/var/run/dreadlock-%u.lck", cast(uint) port);
+    }
+    int fd = open(path.ptr, O_CREAT | O_RDWR, 420); // 0644
+    if (fd < 0)
+        return true; // can't create the lock file (e.g. /var/run not writable) —
+    // don't block startup on it; pass --lockfile= for an alternative location
+    enum LOCK_EX = 2, LOCK_NB = 4;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        close(fd);
+        return false; // another live instance holds this port
+    }
+    gPortLockFd = fd; // held for the process lifetime (auto-unlocks on exit)
+    return true;
+}
+
+public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lockPath = null)
+{
+    // One live dreads per port: reusePort makes a silent co-bind possible, so
+    // gate on an flock before doing any work (see acquirePortLock).
+    if (!acquirePortLock(port, lockPath))
+    {
+        printf("dreads: port %u is already held by a live dreads instance\n", cast(uint) port);
+        return 1;
+    }
+    // ACL must be live BEFORE any AOF replay / raft catch-up: replayed
+    // "ACL SETUSER … reset …" entries apply through gAclApplyHook.
+    initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
+    aclInit(); // seed the default ACL user (on nopass +@all ~* &*)
+    {
+        import dreads.commands : gAclApplyHook;
+
+        gAclApplyHook = &aclApplyCanonical; // apply-path (replay/commit) ACL
+    }
     if (aofPath !is null)
     {
         auto replayed = aofLoad(aofPath, gKeys);
@@ -196,6 +269,11 @@ private struct Conn
     Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
     const(char)[] clientName; // malloc'd
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
+    // ACL: the connection's user (default at connect) and whether it has cleared
+    // authentication (nopass default => true immediately; requirepass => set at
+    // AUTH). Enforcement is `command in c.user's cap_set` (see dreads.acl).
+    AclUser* user;
+    bool authed;
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     size_t multiCount;
@@ -379,6 +457,10 @@ private void serveClient(TCPConnection tcp) nothrow
     c.tcp = tcp;
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
+    // ACL: start as the default user; a nopass default is authenticated at once,
+    // a password-protected one (requirepass) must AUTH first.
+    c.user = aclUser("default");
+    c.authed = c.user is null || c.user.nopass;
     c.sub.ctx = &c;
     c.sub.sink = &connSink;
     c.shardSub.ctx = &c;
@@ -509,6 +591,70 @@ private void flushPending(ref Conn c, ref ByteBuffer o) nothrow
 
 /// Transaction control plus queueing, then the executor. rawCmd holds the
 /// command's original RESP bytes for AOF logging and MULTI queueing.
+/// Runs on a vibe worker thread (via `async`): try the plaintext against each
+/// (isolated, immutable) Argon2/SHA-256 hash. Free function + immutable args so
+/// vibe schedules it off the event loop.
+private bool authVerifyJob(string pw, immutable(string)[] hashes) nothrow
+{
+    import dreads.authpw : verifyPassword;
+
+    foreach (h; hashes)
+        if (verifyPassword(pw, h))
+            return true;
+    return false;
+}
+
+// Replicate an ACL mutation. Under raft: propose the log form and block until
+// commit — the commit re-applies it on every node (leader included, idempotent).
+// Standalone: append to the AOF. Returns false (error already written) if a
+// follower can't take the write. Rare control-plane command, so a blocking
+// round-trip is fine.
+private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) nothrow
+{
+    import dreads.stream : nowMs;
+
+    if (gReplicator !is null)
+    {
+        static ByteBuffer discard; // the commit's OK reply is already sent locally
+        discard.clear();
+        try
+        {
+            if (!gReplicator.proposeWrite(logForm, nowMs(), 0, discard))
+            {
+                repError(o, "READONLY You can't write against a read only replica.");
+                return false;
+            }
+        }
+        catch (Exception)
+        {
+            repError(o, "ERR replication error");
+            return false;
+        }
+    }
+    else if (gAof.enabled)
+        gAof.append(logForm);
+    return true;
+}
+
+// Channel ACL for the pub/sub commands: which args are channels depends on the
+// command (PUBLISH/SPUBLISH → arg 1; SUBSCRIBE/SSUBSCRIBE/PSUBSCRIBE → args 1..).
+// PSUBSCRIBE patterns match literally, plain channels glob-match. Called from the
+// top-level enforcement block so it also gates a channel at MULTI queue time.
+private bool aclCmdChannelDenied(const(AclUser)* u, scope const(char)[] lname,
+        scope const(RVal)[] arr) @trusted nothrow @nogc
+{
+    if (lname == "publish" || lname == "spublish")
+        return arr.length >= 2 && !aclCanAccessChannel(u, arr[1].str);
+    if (lname == "subscribe" || lname == "ssubscribe" || lname == "psubscribe")
+    {
+        immutable isPat = lname[0] == 'p';
+        foreach (i; 1 .. arr.length)
+            if (!aclCanAccessChannel(u, arr[i].str, isPat))
+                return true;
+    }
+    return false;
+}
+
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
@@ -524,12 +670,98 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             return dispatch(cmd, *c.dbp, o, arena);
     }
     auto name = cmd.arr[0].str;
-    char[16] nbuf = void;
+    // 32 covers every command token (longest is GEORADIUSBYMEMBER_RO, 20) — must
+    // NOT be shorter than the longest name, or that command would take the raw
+    // `return dispatch` path below and SKIP ACL enforcement (a silent bypass).
+    char[32] nbuf = void;
     if (name.length > nbuf.length)
         return dispatch(cmd, *c.dbp, o, arena);
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
+
+    // ACL enforcement — a single `command ∈ cap_set` test, only while ACL is in
+    // use (gAclActive false in the default no-ACL deployment => zero cost). The
+    // always-allowed connection commands run regardless so a client can (re)auth.
+    // (Key/channel-pattern checks are a follow-up; command-level only for now.)
+    if (gAclActive && c.user !is null)
+    {
+        // Ride the caller's identity into the script bridge: a redis.call inside
+        // EVAL/FCALL re-checks THIS user's permissions on the writer thread, so
+        // `+eval -set` can't smuggle a SET through a script. Invisible to Lua.
+        scriptSetPendingUser(c.user.id);
+        // An all-permissions, already-authed user (default/admin) can't be denied
+        // anything — skip the per-command lookup entirely. Restricted users fall
+        // through to the real check.
+        if (!(c.authed && aclUnrestricted(c.user)))
+        {
+            char[32] lb = void;
+            foreach (i, ch; name)
+                lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            auto lname = cast(const(char)[]) lb[0 .. name.length];
+            // Permission bit first: an authed user holding this command passes on
+            // a single bitset test and short-circuits everything below — the hot
+            // path for any real ACL user. Only the miss falls to the connection
+            // commands that are allowed regardless (AUTH/HELLO/RESET/QUIT).
+            // `expect(..., false)`: in real traffic a client almost never issues a
+            // command it lacks, so the deny path is cold — hint the branch so the
+            // predictor keeps the allow path straight (varied real workloads don't
+            // train it the way a single-command benchmark does).
+            immutable cidx = aclCmdIndex(lname);
+            // per-subcommand ACL: lowercase arg[1] (e.g. CLIENT KILL → "kill")
+            char[32] sb = void;
+            const(char)[] sub;
+            if (cmd.arr.length >= 2 && cmd.arr[1].str.length <= sb.length)
+            {
+                foreach (i, ch; cmd.arr[1].str)
+                    sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                sub = cast(const(char)[]) sb[0 .. cmd.arr[1].str.length];
+            }
+            if (expect(!(c.authed && aclCanRunCmdSub(c.user, cidx, sub)), false))
+            {
+                bool alwaysOk = uname == "AUTH" || uname == "HELLO"
+                    || uname == "RESET" || uname == "QUIT";
+                if (!alwaysOk)
+                {
+                    if (!c.authed)
+                    {
+                        repError(o, "NOAUTH Authentication required.");
+                        return true;
+                    }
+                    static ByteBuffer eb; // TLS
+                    eb.clear();
+                    eb.append("NOPERM User ");
+                    eb.append(c.user.name);
+                    eb.append(" has no permissions to run the '");
+                    eb.append(lname);
+                    // name the subcommand (client|kill) when it's under sub-ACL
+                    if (sub.length && aclCmdHasSubRule(c.user, cidx))
+                    {
+                        eb.append("|");
+                        eb.append(sub);
+                    }
+                    eb.append("' command");
+                    repError(o, cast(const(char)[]) eb.data);
+                    return true;
+                }
+            }
+            // key-pattern ACL: the command is allowed — now reject it if it
+            // touches a key outside the user's ~patterns (allkeys users skip).
+            if (!c.user.root.allKeys && aclKeyDenied(c.user, lname, cmd.arr))
+            {
+                repError(o, "NOPERM No permissions to access a key");
+                return true;
+            }
+            // channel-pattern ACL for pub/sub — checked HERE (before the switch
+            // AND before MULTI queuing), so an unauthorized channel is rejected
+            // at queue time, matching Valkey.
+            if (!c.user.root.allChannels && aclCmdChannelDenied(c.user, lname, cmd.arr))
+            {
+                repError(o, "NOPERM No permissions to access a channel");
+                return true;
+            }
+        }
+    }
 
     switch (uname)
     {
@@ -625,6 +857,277 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             }
             return keep;
         }
+    case "ACL":
+        {
+            if (cmd.arr.length < 2)
+            {
+                repError(o, "ERR wrong number of arguments for 'acl' command");
+                return true;
+            }
+            auto sub = cmd.arr[1].str;
+            char[12] sbuf = void;
+            const(char)[] su = sub;
+            if (sub.length <= sbuf.length)
+            {
+                foreach (i, ch; sub)
+                    sbuf[i] = (ch >= 'a' && ch <= 'z') ? cast(char)(ch - 32) : ch;
+                su = sbuf[0 .. sub.length];
+            }
+            switch (su)
+            {
+            case "WHOAMI":
+                repBulk(o, c.user !is null ? c.user.name : "default");
+                return true;
+            case "GETUSER":
+                {
+                    if (cmd.arr.length != 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|getuser' command");
+                        return true;
+                    }
+                    auto u = aclUser(cmd.arr[2].str);
+                    if (u is null)
+                    {
+                        repNullBulk(o); // Valkey addReplyNull for an unknown user
+                        return true;
+                    }
+                    static ByteBuffer db; // TLS scratch for describe strings
+                    repMapHeader(o, 6);
+                    repBulk(o, "flags");
+                    repSetHeader(o, 1 + (u.nopass ? 1 : 0));
+                    repBulk(o, u.enabled ? "on" : "off");
+                    if (u.nopass)
+                        repBulk(o, "nopass");
+                    repBulk(o, "passwords");
+                    repArrayHeader(o, u.passwords.length);
+                    foreach (i; 0 .. u.passwords.length)
+                        repBulk(o, u.passwords[i]);
+                    repBulk(o, "commands");
+                    db.clear();
+                    aclDescribeCommands(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "keys");
+                    db.clear();
+                    aclDescribeKeys(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "channels");
+                    db.clear();
+                    aclDescribeChannels(u, db);
+                    repBulk(o, cast(const(char)[]) db.data);
+                    repBulk(o, "selectors");
+                    repArrayHeader(o, 0); // ACL v2 selectors: Phase 2
+                    return true;
+                }
+            case "SETUSER":
+                {
+                    if (cmd.arr.length < 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|setuser' command");
+                        return true;
+                    }
+                    foreach (ch; cmd.arr[2].str)
+                        if (ch == ' ' || ch == '\0')
+                        {
+                            repError(o, "ERR Usernames can't contain spaces or null characters");
+                            return true;
+                        }
+                    // ACL mutations replicate; a follower can't accept them
+                    if (gReplicator !is null && !gReplicator.isLeader)
+                    {
+                        repError(o, "READONLY You can't write against a read only replica.");
+                        return true;
+                    }
+                    auto u = aclGetOrCreate(cmd.arr[2].str);
+                    const(char)[] err;
+                    try
+                    {
+                        foreach (ref r; cmd.arr[3 .. $])
+                            if (!aclApplyRule(u, r.str, err))
+                            {
+                                repError(o, err); // "ERR Error in ACL SETUSER modifier…"
+                                return true;
+                            }
+                    }
+                    catch (Exception)
+                    {
+                        repError(o, "ERR ACL SETUSER failed to hash a password");
+                        return true;
+                    }
+                    gAclActive = true; // enforcement turns on once ACL is used
+                    // replicate the canonical, fully-hashed form (deterministic
+                    // replay — followers never re-run the Argon2 KDF)
+                    static ByteBuffer canon;
+                    canon.clear();
+                    aclEncodeCanonicalSetuser(u, canon);
+                    if (!propagateAclLog(canon.data, o))
+                        return true;
+                    repSimple(o, "OK");
+                    return true;
+                }
+            case "DELUSER":
+                {
+                    if (cmd.arr.length < 3)
+                    {
+                        repError(o, "ERR wrong number of arguments for 'acl|deluser' command");
+                        return true;
+                    }
+                    if (gReplicator !is null && !gReplicator.isLeader)
+                    {
+                        repError(o, "READONLY You can't write against a read only replica.");
+                        return true;
+                    }
+                    long n = 0;
+                    foreach (ref a; cmd.arr[2 .. $])
+                        if (aclDelUser(a.str))
+                            n++;
+                    // DELUSER is already canonical + idempotent — log it verbatim
+                    if (!propagateAclLog(rawCmd, o))
+                        return true;
+                    repInt(o, n);
+                    return true;
+                }
+            case "USERS":
+                {
+                    size_t n = 0;
+                    aclEachUser((AclUser* u) @nogc nothrow { n++; return 0; });
+                    repArrayHeader(o, n);
+                    aclEachUser((AclUser* u) @nogc nothrow {
+                        repBulk(o, u.name);
+                        return 0;
+                    });
+                    return true;
+                }
+            case "LIST":
+                {
+                    // config-file format per user: "user <name> <flags> <keys>
+                    // <channels> <commands>" (matches Valkey ACLDescribeUser order)
+                    size_t n = 0;
+                    aclEachUser((AclUser* u) @nogc nothrow { n++; return 0; });
+                    repArrayHeader(o, n);
+                    static ByteBuffer lb; // TLS
+                    aclEachUser((AclUser* u) @nogc nothrow {
+                        lb.clear();
+                        lb.append("user ");
+                        lb.append(u.name);
+                        lb.append(u.enabled ? " on" : " off");
+                        if (u.nopass)
+                            lb.append(" nopass");
+                        foreach (i; 0 .. u.passwords.length)
+                        {
+                            lb.append(" #");
+                            lb.append(u.passwords[i]);
+                        }
+                        // keys section is omitted entirely when the user has no
+                        // key access (no `~*`, no patterns) — Valkey emits nothing
+                        // there, so a blank one would leave a stray double space.
+                        if (u.root.allKeys || u.root.keyPats.length)
+                        {
+                            lb.append(" ");
+                            aclDescribeKeys(u, lb);
+                        }
+                        lb.append(" ");
+                        aclDescribeChannels(u, lb, true); // LIST form: resetchannels prefix
+                        lb.append(" ");
+                        aclDescribeCommands(u, lb);
+                        repBulk(o, cast(const(char)[]) lb.data);
+                        return 0;
+                    });
+                    return true;
+                }
+            case "CAT":
+                repArrayHeader(o, aclCatNames.length);
+                foreach (nm; aclCatNames)
+                    repBulk(o, nm);
+                return true;
+            case "GENPASS":
+                {
+                    import dreads.rand : nextRand;
+
+                    long bits = 256;
+                    if (cmd.arr.length >= 3 && (!parseLong(cmd.arr[2].str, bits)
+                            || bits <= 0 || bits > 4096))
+                    {
+                        repError(o, "ERR ACL GENPASS argument must be the number"
+                                ~ " of bits for the output password, a positive number up to 4096");
+                        return true;
+                    }
+                    auto nchars = cast(size_t)((bits + 3) / 4);
+                    static immutable hexd = "0123456789abcdef";
+                    char[1024] hb = void;
+                    foreach (i; 0 .. nchars)
+                        hb[i] = hexd[nextRand() & 0xf];
+                    repBulk(o, hb[0 .. nchars]);
+                    return true;
+                }
+            default:
+                repUnknownSubcommand(o, "ACL", sub);
+                return true;
+            }
+        }
+    case "AUTH":
+        {
+            const(char)[] who, pass;
+            if (cmd.arr.length == 2)
+            {
+                // AUTH <pass> — the default user; if it has no password set,
+                // Redis returns the classic hint rather than WRONGPASS
+                auto def = aclUser("default");
+                if (def !is null && def.nopass)
+                {
+                    repError(o, "ERR Client sent AUTH, but no password is set."
+                            ~ " Did you mean AUTH <username> <password>?");
+                    return true;
+                }
+                who = "default";
+                pass = cmd.arr[1].str;
+            }
+            else if (cmd.arr.length == 3)
+            {
+                who = cmd.arr[1].str;
+                pass = cmd.arr[2].str;
+            }
+            else
+            {
+                repError(o, "ERR wrong number of arguments for 'auth' command");
+                return true;
+            }
+            // Argon2 verify runs on a vibe WORKER THREAD — never inline: the KDF
+            // is ~15-30 ms and would stall the single event loop (and be a DoS
+            // vector under an AUTH flood). getResult() yields this fiber; the
+            // loop keeps serving other clients until the worker signals.
+            auto u = aclUser(who);
+            bool ok = false;
+            if (u !is null && u.enabled)
+            {
+                if (u.nopass)
+                    ok = true;
+                else
+                {
+                    try
+                    {
+                        import vibe.core.concurrency : async;
+                        import dreads.acl : aclPasswordHashes;
+
+                        auto pw = pass.idup; // isolate for the worker thread
+                        auto hashes = aclPasswordHashes(u);
+                        ok = async(&authVerifyJob, pw, hashes).getResult();
+                    }
+                    catch (Exception)
+                        ok = false;
+                }
+            }
+            // re-validate after yielding: the user may have been deleted/disabled
+            u = aclUser(who);
+            if (!ok || u is null || !u.enabled)
+            {
+                repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
+                return true;
+            }
+            c.user = u;
+            c.authed = true;
+            repSimple(o, "OK");
+            return true;
+        }
     case "RESET":
         {
             c.inMulti = false;
@@ -632,6 +1135,8 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             c.watching = false;
             gPubSub.dropAll(&c.sub);
             gShardPubSub.dropAll(&c.shardSub);
+            c.user = aclUser("default"); // back to the default user
+            c.authed = c.user is null || c.user.nopass;
             repSimple(o, "RESET");
             return true;
         }

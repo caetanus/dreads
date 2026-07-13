@@ -105,13 +105,26 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
 
 - **Keyspace notifications** publish with a hardcoded `db 0` in the channel
   (`__keyspace@0__`). Should use the connection's current db index.
-- **AOF / raft SELECT-logging**: replay and the command log run on `gDbs[0]`
-  (`gKeys`). A write on db N must log a `SELECT N` marker so replay targets
-  the right dataspace ("alterar o log = dizer qual dataspace foi commitado").
-- **Eviction, blocking re-dispatch, and MULTI-replay** paths still use db 0
-  (`gKeys`) rather than the originating connection's db. SELECT inside MULTI
-  is queued but not honored on EXEC replay (dispatch `ks` is fixed at EXEC).
+- **Standalone AOF SELECT-logging**: replay runs from the log stream and needs
+  a `SELECT N` marker (or equivalent framing) before writes on db N. Raft live
+  proposals already carry the db index; raft snapshots still need per-db
+  framing instead of dumping only db 0.
+- **Eviction, blocking re-dispatch, and MULTI-replay** paths need a multi-DB
+  audit. SELECT inside MULTI must be verified against Valkey; any replay path
+  that dispatches with a fixed `ks` can silently target the wrong DB.
 - **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
+
+## ACL / AUTH (2026-07-13, `auth-acl` branch)
+- **acl.tcl aborts on `ACL GETUSER`** (not implemented): `ERR unknown
+  subcommand … 'getuser'`. GETUSER needs reverse rule formatting (flags,
+  passwords, commands, keys, channels, selectors). Implementing it unblocks
+  the next layer of acl.tcl. `ACL LIST`/`ACL GETUSER` share that formatter.
+- In **external-server mode** almost all of `auth.tcl` / `acl.tcl` /
+  `acl-v2.tcl` are `external:skip` (they need their own `start_server` with an
+  `aclfile`), so the suite reports `0 passed, 0 failed` — near-zero real ACL
+  coverage. Meaningful validation lives in unit tests + live smoke, per
+  `blackbox-internal-coverage`. AUTH + command-level enforcement + the
+  script-`redis.call` ACL check are covered by UTs and verified live.
 
 ## Method to complete the catalog
 1. Land group 1 (CONFIG) + group 2 (DEBUG stubs) — the two blockers gating

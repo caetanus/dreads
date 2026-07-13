@@ -20,6 +20,7 @@ else
         // like redis-server: a non-flag, non-numeric argument is the config file
         string confPath;
         string cliAof;
+        string cliLock; // --lockfile= override (default /var/run/dreads-<port>.lck)
         ushort cliPort = 0;
         foreach (arg; args[1 .. $])
         {
@@ -27,6 +28,8 @@ else
                 cliAof = "dreads.aof";
             else if (arg.startsWith("--appendonly="))
                 cliAof = arg["--appendonly=".length .. $];
+            else if (arg.startsWith("--lockfile="))
+                cliLock = arg["--lockfile=".length .. $];
             else
             {
                 try
@@ -37,7 +40,7 @@ else
                         confPath = arg;
                     else
                     {
-                        stderr.writeln("usage: dreads [conf-file] [port] [--appendonly[=path]]");
+                        stderr.writeln("usage: dreads [conf-file] [port] [--appendonly[=path]] [--lockfile=path]");
                         return 1;
                     }
                 }
@@ -80,6 +83,6 @@ else
         // connection (bounded), not per request. This guarantees no GC pauses.
         GC.disable();
 
-        return runServer(gConfig.port, gConfig.appendonly ? gConfig.appendfilename : null);
+        return runServer(gConfig.port, gConfig.appendonly ? gConfig.appendfilename : null, cliLock);
     }
 }

@@ -6,9 +6,11 @@
 
 <p align="center"><b>A fast, reliable, in-memory data store — written in D.</b></p>
 
-Redis-compatible, built around three commitments: zero GC in the data plane,
-arena memory, and one purpose — speed. It speaks RESP2/RESP3 and tracks
-Redis/Valkey on the supported command surface.
+Redis-compatible, built with D/dub, vibe-core fibers, and the `draft` Raft
+package. The day-to-day build uses reggae+ninja; the runtime is built around
+three commitments: zero GC in the data plane, arena memory, and one purpose —
+speed. It speaks RESP2/RESP3 and tracks Redis/Valkey on the supported command
+surface.
 
 ```
 ⟜ Ultra-light. 16 logical DBs on one event-loop thread.
@@ -60,23 +62,26 @@ from taking that first result seriously once the answer looked like *yes*.
 
 > *don't worry about a thing...* 🐦🐦🐦
 
-A fair head-to-head: same host, same `redis-benchmark` invocation, both with
-jemalloc and persistence off — dreads (LDC release) vs **Valkey 9.1.0**
-(`--save '' --appendonly no`), `-P 16`, 50 connections, 1M requests each:
+A fair head-to-head: same host, same `redis-benchmark` invocation, both
+single-threaded, pinned, jemalloc, persistence off — dreads (LDC release) vs
+**Valkey 9.1.0** (`--save '' --appendonly no --io-threads 1`), `-P 16`, 50
+connections, 1M requests each. The table reports median rps over repeated runs;
+full min/median/max results live in [bench/valkey-comparison.md](bench/valkey-comparison.md).
 
-| Command (`-P 16`, 50 conns) | dreads | Valkey 9.1 | |
-|---|---|---|---|
-| SET | **1.50M rps** (p50 0.30 ms) | 1.04M | 1.45× |
-| GET | **1.62M** (0.26 ms) | 1.25M | 1.30× |
-| INCR | **1.58M** | 1.27M | 1.25× |
-| LPUSH | **1.51M** (0.50 ms) | 1.08M | 1.40× |
-| SADD | **1.62M** | 1.20M | 1.35× |
-| ZADD | **1.40M** (0.54 ms) | 1.01M | 1.39× |
+| Command (`-P 16`, 50 conns) | dreads median | Valkey 9.1 median | |
+|---|---:|---:|---:|
+| GET | **1.07M rps** | 1.05M | 1.02× |
+| SET | **1.03M** | 0.83M | 1.24× |
+| LPUSH | **1.16M** | 0.91M | 1.27× |
+| HSET | **1.01M** | 0.70M | 1.44× |
+| SADD | **1.03M** | 0.83M | 1.24× |
+| ZADD | **0.36M** | 0.34M | 1.05× |
+| INCR | 0.86M | **1.05M** | 0.82× |
 
-One core does ~1.5M ops/s; because the model is single-threaded-per-shard,
-scaling is horizontal (two shards → ~2.51M measured with parallel plain
-clients). Unpipelined throughput is round-trip bound on both sides (~95–100k
-rps); the pipelined numbers show the real per-command cost.
+Peak best-of runs are higher (for example GET 2.34M vs 1.73M and SET 1.33M vs
+0.93M at `-P 32`), but the median table above is the conservative headline.
+Unpipelined throughput is round-trip bound on both sides (~95-100k rps); the
+pipelined numbers show the real per-command cost.
 
 ## How it's fast
 
@@ -88,20 +93,24 @@ rps); the pipelined numbers show the real per-command cost.
   buffer; incomplete input is a status, not an exception.
 - **Real data structures.** Open-addressing hash tables (FNV-1a, tombstones),
   intrusive doubly-linked lists, a skiplist with per-level spans for O(log n)
-  ZRANK, plus **LLVM-style small containers** (contiguous array + linear scan
-  that promotes to the full structure past a threshold) so small sets/hashes/
-  zsets cost far less memory than a full dict.
+  ZRANK, plus **small containers inspired by LLVM's SmallVector/SmallSet
+  family**: a compact contiguous representation with linear scan that promotes
+  to the full structure past a threshold, so small sets/hashes/zsets cost far
+  less memory than a full dict.
 - **vibe-core front-end.** Fiber per connection on a single-threaded event
   loop; fibers and connections are recycled, so steady state allocates nothing.
+- **Lock-free `draft` handoff.** The main event loop and the dedicated `draft`
+  Raft thread communicate through SPSC Lamport-ring queues: atomic head/tail
+  on the hot path, no mutex or syscall unless one side actually parks.
 
 ## Features
 
-- **222 of Redis's 241 core commands** — see [DRIFT.md](DRIFT.md) for the
+- **225 of Redis's 241 core commands** — see [DRIFT.md](DRIFT.md) for the
   honest gap list and every semantic difference. All data types including
   **streams** with consumer groups; **GEO** (geohash-scored zsets, Redis-exact
   outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**; TTL/expiration with
   the full `SET` option set (including Valkey's `SET ... IFEQ` / `DELIFEQ`
-compare-and-set) and opt-in active expiry; the `SCAN` family;
+  compare-and-set) and opt-in active expiry; the `SCAN` family;
   `SORT`, `LCS`, `OBJECT ENCODING`; **16 logical databases** (`SELECT`,
   `SWAPDB`, `MOVE`, per-connection keyspace); transactions
   (`MULTI`/`EXEC`/`WATCH`); **blocking commands** (`BLPOP`, `BLMOVE`,
@@ -115,8 +124,9 @@ compare-and-set) and opt-in active expiry; the `SCAN` family;
   emitted through a proto-aware reply oracle, and pub/sub confirmations/messages
   are framed as Push under RESP3. RESP2 clients are byte-unchanged.
 - **Pub/Sub**: `SUBSCRIBE`/`PSUBSCRIBE` (glob) / `PUBLISH`/`PUBSUB`, shard
-  pub/sub, subscribe-mode command gating, and **keyspace notifications**
-  (`__keyspace@N__` / `__keyevent@N__`).
+  pub/sub, subscribe-mode command gating, and **keyspace notifications**.
+  Notification channel names are still db-0-shaped (`__keyspace@0__` /
+  `__keyevent@0__`) while the multi-DB tail is being closed.
 - **Lua scripting** — system Lua 5.4 with a malloc-backed allocator (its GC
   never touches the D GC), running on a **dedicated thread** off the event loop:
   - `EVAL`/`EVALSHA`(`_RO`), `SCRIPT LOAD|EXISTS|FLUSH|SHOW`, and Redis
@@ -151,6 +161,13 @@ dub build -b release --compiler=ldc2
 redis-cli -p 6390 PING
 ```
 
+Argon2id password hashing for the in-progress ACL/AUTH path is opt-in and links
+libsodium:
+
+```sh
+dub build -c argon2 -b release --compiler=ldc2
+```
+
 Day-to-day builds go through [reggae](https://github.com/atilaneves/reggae)
 (faster incremental builds):
 
@@ -181,12 +198,12 @@ source/dreads/
   resp.d       RESP2/RESP3 zero-copy parser + encoder           @nogc
   respvariant  RValue tree + lazy, zero-alloc reply oracle      @nogc
   dict.d       open-addressing Dict!V + StrVal tagged union     @nogc
-  smallset.d   LLVM-style small containers (array → dict/skip)  @nogc
+  smallset.d   LLVM-inspired small containers (array → dict/skip) @nogc
   list.d       doubly-linked list, inline payload               @nogc
   zset.d       skiplist with spans + score dict                 @nogc
   stream.d     stream entries, binary-searched ranges           @nogc
   obj.d        RObj tagged union + typed Keyspace (TTL-aware)   @nogc
-  commands.d   dispatch, 222 commands, deterministic propagation @nogc
+  commands.d   dispatch, 225 commands, deterministic propagation @nogc
   det.d        the single injectable "now" (frozen per command)  @nogc
   notify.d     keyspace notifications (deferred publish)
   pubsub.d     channel/pattern registry, sink-based delivery
@@ -194,9 +211,10 @@ source/dreads/
   config.d     redis.conf parsing + live CONFIG GET/SET
   cluster.d    command flags / CLUSTER surface
   aof.d        append-only log: write, fsync policy, replay
-  replicator.d Raft integration (cross-thread queues, apply loop)
+  raftq.d      SPSC Lamport-ring CrossQueue for event-loop <-> draft thread
+  replicator.d Raft integration (CrossQueue handoff, apply loop)
   server.d     vibe-core TCP front-end (fiber per connection)
-vendor/raft/   Raft consensus for D (git submodule)
+vendor/raft/   `draft` Raft consensus package (git submodule)
 vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
 ```
 
@@ -206,11 +224,11 @@ vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
   single-machine shared-nothing thread-per-shard model, and where the
   `CLUSTER`/`MOVED`/`ASK` surface lands.
 - **Closing the blackbox tail** — error-stats telemetry (`INFO Errorstats`/
-  `Commandstats`), an ACL engine (`ACL SETUSER`/`AUTH`/`acl_check_cmd`), and the
+  `Commandstats`), the in-progress ACL/AUTH engine (`ACL SETUSER`/`AUTH`/
+  `acl_check_cmd`; password hashing/KDF base is already in-tree), and the
   remaining semantic drift listed in [DRIFT.md](DRIFT.md).
 - **Value serialization** — a documented `DUMP`/`RESTORE`/`MIGRATE` format.
 
 ## License
 
 MIT © Marcelo Aires Caetano
-```

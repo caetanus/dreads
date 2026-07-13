@@ -468,9 +468,12 @@ final class Replicator
     {
         import dreads.aof : dumpKeyspace;
 
+        import dreads.acl : aclDumpUsers;
+
         static ByteBuffer dump;
         dump.clear();
         dumpKeyspace(*keys, dump);
+        aclDumpUsers(dump); // global ACL registry rides in the snapshot too
         ctlQ.put(dump.data, null, appliedIndex, CtlKind.compact);
         lastCompactApplied = appliedIndex;
     }
