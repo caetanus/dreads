@@ -122,12 +122,40 @@ carries db/clock via the pool round-trip — add the user). `luaAclCheckCmd`
 evaluates the real rules; unknown command → the `Invalid command passed to
 server.acl_check_cmd()` error. Closes `Script ACL check`.
 
-## 9. Password hashing
+## 9. Password storage + brute-force resistance
 
-Redis ACL passwords are SHA-256 hex. dreads only has SHA-1 (scripts). Add
-SHA-256 (`std.digest.sha : SHA256`, control-plane so GC there is fine, or a
-small @nogc impl to match the zero-GC bar). `#hash` sets a hash directly,
-`>pass` hashes then stores, `<pass`/`!hash` remove.
+Two separate concerns — conflating them is the mistake.
+
+**Stored hash = SHA-256 (parity, non-negotiable).** Valkey's ACL wire format is
+SHA-256 hex: `>pass` hashes then stores, `#<sha256hex>` sets a hash directly,
+`<pass`/`!hash` remove, and **`ACL GETUSER` returns the SHA-256 hash** — the
+acl.tcl tests assert this. A slow KDF (Argon2/scrypt/bcrypt) in the *stored*
+hash would break `#hash` and GETUSER, so it is out. Add SHA-256 (`std.digest.
+sha : SHA256`, or a small `@nogc` impl for the zero-GC bar; hashing is
+control-plane). **Compare in constant time** (no early-out on the first
+differing byte) to deny timing oracles.
+
+**Brute-force resistance lives in AUTH, not the hash.** A fast hash is only safe
+if you cap attempt throughput — so dreads adds a slow-auth layer Valkey does not
+have, on top of the parity-correct storage:
+
+- **Non-blocking exponential backoff on failure**, keyed by source (and/or
+  username): each failed AUTH grows a per-key delay before the reply. The delay
+  is a **vibe fiber `sleep`** (yields the fiber) — *never* a `Thread.sleep`,
+  which would stall the single event-loop thread for every other client. Only
+  the attacking connection waits; the server stays responsive. Reset on success.
+- **Optional lockout** after N consecutive failures (config
+  `acl-auth-max-failures`), with a cooldown.
+- **Optional per-AUTH work factor** (`acl-auth-min-delay-ms`): a floor delay on
+  *every* attempt (even the first), capping global attempts/sec regardless of
+  source spoofing.
+- Failures also feed **ACL LOG** (§7), so the operator sees the brute-force.
+
+This keeps the hash Valkey-compatible while making online brute-force
+impractical — a real security edge over stock Valkey, at zero parity cost.
+(An *offline* attack on a leaked SHA-256 hash is only mitigated by password
+strength; that limitation is inherited from the Valkey format and documented,
+not hidden.)
 
 ## 10. Replication / persistence
 
@@ -156,8 +184,10 @@ DRIFT.md either way.
 
 - `source/dreads/acl.d` — **new**: AclUser/AclPerm, registry, rule parse/format,
   category table, enforcement predicate, ACL LOG.
-- `source/dreads/server.d` — Conn.user, AUTH/HELLO wiring, enforcement call in
-  the command loop, `ACL`/`AUTH` real handlers, requirepass hook.
+- `source/dreads/server.d` — Conn.user, AUTH/HELLO wiring (with the
+  non-blocking failure backoff + constant-time compare), enforcement call in
+  the command loop, `ACL`/`AUTH` real handlers, requirepass hook. New config:
+  `acl-auth-min-delay-ms`, `acl-auth-max-failures`.
 - `source/dreads/commands.d` — remove AUTH stub; expose key-spec extraction for
   enforcement.
 - `source/dreads/scripting.d` — carry `AclUser*` into the bridge; real
