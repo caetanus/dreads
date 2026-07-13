@@ -97,6 +97,9 @@ pipelined numbers show the real per-command cost.
   less memory than a full dict.
 - **vibe-core front-end.** Fiber per connection on a single-threaded event
   loop; fibers and connections are recycled, so steady state allocates nothing.
+- **Lock-free `draft` handoff.** The main event loop and the dedicated `draft`
+  Raft thread communicate through SPSC Lamport-ring queues: atomic head/tail
+  on the hot path, no mutex or syscall unless one side actually parks.
 
 ## Features
 
@@ -206,7 +209,8 @@ source/dreads/
   config.d     redis.conf parsing + live CONFIG GET/SET
   cluster.d    command flags / CLUSTER surface
   aof.d        append-only log: write, fsync policy, replay
-  replicator.d Raft integration (cross-thread queues, apply loop)
+  raftq.d      SPSC Lamport-ring CrossQueue for event-loop <-> draft thread
+  replicator.d Raft integration (CrossQueue handoff, apply loop)
   server.d     vibe-core TCP front-end (fiber per connection)
 vendor/raft/   `draft` Raft consensus package (git submodule)
 vendor/emplace/ non-GC containers + RAII smart pointers (submodule)

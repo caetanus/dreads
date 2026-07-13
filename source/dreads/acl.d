@@ -18,6 +18,11 @@ import emplace.vector : Vector;
 /// All ACL category names (for `ACL CAT`), derived from the generated enum.
 public immutable string[] aclCatNames = [__traits(allMembers, AclCat)];
 
+/// True once ACL is in use (any SETUSER, or requirepass). While false — the
+/// default deployment with only the unrestricted nopass `default` user — the
+/// command loop skips enforcement entirely (one global bool test, zero cost).
+public __gshared bool gAclActive;
+
 enum size_t NCMD = gCmdCats.length;
 enum size_t NW = (NCMD + 63) / 64;
 
@@ -450,10 +455,10 @@ version (unittest) private alias freeUser = aclFreeUser;
 
 unittest // the scripting-ACL scenario: bob = on >123 +@scripting +set ~x*
 {
-    import dreads.authpw : initAuthPw, configurePbkdf2;
+    import dreads.authpw : initAuthPw, configureArgon;
 
     initAuthPw();
-    configurePbkdf2(1000); // fast for the test
+    configureArgon(1, 8192); // fast for the test
 
     auto bob = freshUser("bob");
     scope (exit)
@@ -476,7 +481,7 @@ unittest // the scripting-ACL scenario: bob = on >123 +@scripting +set ~x*
     assert(aclCanAccessKey(bob, "xx", true, true));
     assert(!aclCanAccessKey(bob, "yy", true, true));
 
-    configurePbkdf2(210_000);
+    configureArgon(2, 16 * 1024 * 1024);
 }
 
 unittest // reset + allkeys/allcommands + %RW flags
