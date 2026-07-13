@@ -1163,6 +1163,24 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                         repError(o, "READONLY You can't write against a read only replica.");
                         return true;
                     }
+                    // the default user can never be removed
+                    foreach (ref a; cmd.arr[2 .. $])
+                        if (a.str == "default")
+                        {
+                            repError(o, "ERR The 'default' user cannot be removed");
+                            return true;
+                        }
+                    // a client authed as a to-be-deleted user is disconnected after
+                    // this reply (Valkey behaviour). Decide BEFORE deleting — the
+                    // AclUser (and c.user.name) is freed by aclDelUser.
+                    bool selfDeleted = false;
+                    if (c.authed && c.user !is null)
+                        foreach (ref a; cmd.arr[2 .. $])
+                            if (a.str == c.user.name)
+                            {
+                                selfDeleted = true;
+                                break;
+                            }
                     long n = 0;
                     foreach (ref a; cmd.arr[2 .. $])
                         if (aclDelUser(a.str))
@@ -1171,6 +1189,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     if (!propagateAclLog(rawCmd, o))
                         return true;
                     repInt(o, n);
+                    if (selfDeleted)
+                    {
+                        c.user = null; // avoid dangling deref before the socket closes
+                        c.authed = false;
+                        return false; // close the connection after the reply flushes
+                    }
                     return true;
                 }
             case "USERS":
@@ -1356,6 +1380,26 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     }
                     return true;
                 }
+            case "HELP":
+                if (cmd.arr.length > 2)
+                {
+                    repError(o, "ERR unknown subcommand or wrong number of"
+                            ~ " arguments for 'acl|help' command");
+                    return true;
+                }
+                repHelp!"ACL"(o);
+                return true;
+            case "LOAD":
+            case "SAVE":
+                // dreads has no ACL file — users persist through the AOF/raft log
+                // (ACL SETUSER/DELUSER are logged), not an aclfile. Match Valkey's
+                // "no aclfile configured" error.
+                repError(o, "ERR This instance is not configured to use an ACL"
+                        ~ " file. You may want to specify users via the ACL"
+                        ~ " SETUSER command and then issue a CONFIG REWRITE"
+                        ~ " (assuming you have a configuration file set) in order"
+                        ~ " to store users in the configuration.");
+                return true;
             default:
                 repUnknownSubcommand(o, "ACL", sub);
                 return true;
@@ -1622,12 +1666,14 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                     return true;
                 }
             }
-            // optional [AUTH user pass] [SETNAME name]. Multiple AUTH options are
-            // parsed but only the LAST takes effect (Valkey precedence); the
-            // actual authentication happens after the whole line is parsed so a
-            // failing AUTH leaves the connection's prior auth untouched.
-            const(char)[] authWho, authPass;
-            bool haveAuth;
+            // optional [AUTH user pass] [SETNAME name]. Multiple AUTH/SETNAME
+            // options are collected with the LAST taking effect (Valkey
+            // precedence). Nothing is APPLIED until the whole line is validated:
+            // an invalid setname or a failing AUTH leaves the connection's prior
+            // name and auth untouched. SETNAME is validated here but only applied
+            // AFTER a successful AUTH.
+            const(char)[] authWho, authPass, setName;
+            bool haveAuth, haveSetname;
             for (size_t i = 1; i < args.length;)
             {
                 if (eqICDebug(args[i].str, "AUTH") && i + 2 < args.length)
@@ -1639,8 +1685,15 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 }
                 else if (eqICDebug(args[i].str, "SETNAME") && i + 1 < args.length)
                 {
-                    c.clientName.freeSlice;
-                    c.clientName = mallocDup(args[i + 1].str);
+                    setName = args[i + 1].str;
+                    foreach (ch; setName)
+                        if (ch == ' ' || ch == '\n' || ch == '\r')
+                        {
+                            repError(o, "ERR Client names cannot contain spaces,"
+                                    ~ " newlines or special characters.");
+                            return true;
+                        }
+                    haveSetname = true;
                     i += 2;
                 }
                 else
@@ -1666,6 +1719,12 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                         ~ " option can be used to authenticate the client and"
                         ~ " select the RESP protocol version at the same time");
                 return true;
+            }
+            // auth (if any) succeeded — now it's safe to apply the client name
+            if (haveSetname)
+            {
+                c.clientName.freeSlice;
+                c.clientName = mallocDup(setName);
             }
             c.resp3 = ver == 3;
             gRespProto = ver; // the HELLO reply itself is encoded in the new proto
