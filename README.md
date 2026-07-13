@@ -56,7 +56,9 @@ event loop (vibe-core) promised a fiber-per-connection model without the weight
 of OS threads. The zero-GC data plane, arena memory, and the Raft log all came
 from taking that first result seriously once the answer looked like *yes*.
 
-## Why — the numbers
+## but is it really fast?
+
+> *don't worry about a thing...* 🐦🐦🐦
 
 A fair head-to-head: same host, same `redis-benchmark` invocation, both with
 jemalloc and persistence off — dreads (LDC release) vs **Valkey 9.1.0**
