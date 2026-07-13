@@ -105,12 +105,13 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
 
 - **Keyspace notifications** publish with a hardcoded `db 0` in the channel
   (`__keyspace@0__`). Should use the connection's current db index.
-- **AOF / raft SELECT-logging**: replay and the command log run on `gDbs[0]`
-  (`gKeys`). A write on db N must log a `SELECT N` marker so replay targets
-  the right dataspace ("alterar o log = dizer qual dataspace foi commitado").
-- **Eviction, blocking re-dispatch, and MULTI-replay** paths still use db 0
-  (`gKeys`) rather than the originating connection's db. SELECT inside MULTI
-  is queued but not honored on EXEC replay (dispatch `ks` is fixed at EXEC).
+- **Standalone AOF SELECT-logging**: replay runs from the log stream and needs
+  a `SELECT N` marker (or equivalent framing) before writes on db N. Raft live
+  proposals already carry the db index; raft snapshots still need per-db
+  framing instead of dumping only db 0.
+- **Eviction, blocking re-dispatch, and MULTI-replay** paths need a multi-DB
+  audit. SELECT inside MULTI must be verified against Valkey; any replay path
+  that dispatches with a fixed `ks` can silently target the wrong DB.
 - **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
 
 ## Method to complete the catalog

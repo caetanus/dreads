@@ -58,23 +58,26 @@ from taking that first result seriously once the answer looked like *yes*.
 
 ## Why — the numbers
 
-A fair head-to-head: same host, same `redis-benchmark` invocation, both with
-jemalloc and persistence off — dreads (LDC release) vs **Valkey 9.1.0**
-(`--save '' --appendonly no`), `-P 16`, 50 connections, 1M requests each:
+A fair head-to-head: same host, same `redis-benchmark` invocation, both
+single-threaded, pinned, jemalloc, persistence off — dreads (LDC release) vs
+**Valkey 9.1.0** (`--save '' --appendonly no --io-threads 1`), `-P 16`, 50
+connections, 1M requests each. The table reports median rps over repeated runs;
+full min/median/max results live in [bench/valkey-comparison.md](bench/valkey-comparison.md).
 
-| Command (`-P 16`, 50 conns) | dreads | Valkey 9.1 | |
-|---|---|---|---|
-| SET | **1.50M rps** (p50 0.30 ms) | 1.04M | 1.45× |
-| GET | **1.62M** (0.26 ms) | 1.25M | 1.30× |
-| INCR | **1.58M** | 1.27M | 1.25× |
-| LPUSH | **1.51M** (0.50 ms) | 1.08M | 1.40× |
-| SADD | **1.62M** | 1.20M | 1.35× |
-| ZADD | **1.40M** (0.54 ms) | 1.01M | 1.39× |
+| Command (`-P 16`, 50 conns) | dreads median | Valkey 9.1 median | |
+|---|---:|---:|---:|
+| GET | **1.07M rps** | 1.05M | 1.02× |
+| SET | **1.03M** | 0.83M | 1.24× |
+| LPUSH | **1.16M** | 0.91M | 1.27× |
+| HSET | **1.01M** | 0.70M | 1.44× |
+| SADD | **1.03M** | 0.83M | 1.24× |
+| ZADD | **0.36M** | 0.34M | 1.05× |
+| INCR | 0.86M | **1.05M** | 0.82× |
 
-One core does ~1.5M ops/s; because the model is single-threaded-per-shard,
-scaling is horizontal (two shards → ~2.51M measured with parallel plain
-clients). Unpipelined throughput is round-trip bound on both sides (~95–100k
-rps); the pipelined numbers show the real per-command cost.
+Peak best-of runs are higher (for example GET 2.34M vs 1.73M and SET 1.33M vs
+0.93M at `-P 32`), but the median table above is the conservative headline.
+Unpipelined throughput is round-trip bound on both sides (~95-100k rps); the
+pipelined numbers show the real per-command cost.
 
 ## How it's fast
 
@@ -94,12 +97,12 @@ rps); the pipelined numbers show the real per-command cost.
 
 ## Features
 
-- **222 of Redis's 241 core commands** — see [DRIFT.md](DRIFT.md) for the
+- **225 of Redis's 241 core commands** — see [DRIFT.md](DRIFT.md) for the
   honest gap list and every semantic difference. All data types including
   **streams** with consumer groups; **GEO** (geohash-scored zsets, Redis-exact
   outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**; TTL/expiration with
   the full `SET` option set (including Valkey's `SET ... IFEQ` / `DELIFEQ`
-compare-and-set) and opt-in active expiry; the `SCAN` family;
+  compare-and-set) and opt-in active expiry; the `SCAN` family;
   `SORT`, `LCS`, `OBJECT ENCODING`; **16 logical databases** (`SELECT`,
   `SWAPDB`, `MOVE`, per-connection keyspace); transactions
   (`MULTI`/`EXEC`/`WATCH`); **blocking commands** (`BLPOP`, `BLMOVE`,
@@ -113,8 +116,9 @@ compare-and-set) and opt-in active expiry; the `SCAN` family;
   emitted through a proto-aware reply oracle, and pub/sub confirmations/messages
   are framed as Push under RESP3. RESP2 clients are byte-unchanged.
 - **Pub/Sub**: `SUBSCRIBE`/`PSUBSCRIBE` (glob) / `PUBLISH`/`PUBSUB`, shard
-  pub/sub, subscribe-mode command gating, and **keyspace notifications**
-  (`__keyspace@N__` / `__keyevent@N__`).
+  pub/sub, subscribe-mode command gating, and **keyspace notifications**.
+  Notification channel names are still db-0-shaped (`__keyspace@0__` /
+  `__keyevent@0__`) while the multi-DB tail is being closed.
 - **Lua scripting** — system Lua 5.4 with a malloc-backed allocator (its GC
   never touches the D GC), running on a **dedicated thread** off the event loop:
   - `EVAL`/`EVALSHA`(`_RO`), `SCRIPT LOAD|EXISTS|FLUSH|SHOW`, and Redis
@@ -139,8 +143,8 @@ compare-and-set) and opt-in active expiry; the `SCAN` family;
 
 ## Build & run
 
-Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4, and
-on Linux jemalloc (linked automatically).
+Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4,
+libsodium, and on Linux jemalloc (linked automatically).
 
 ```sh
 dub build -b release --compiler=ldc2
@@ -184,7 +188,7 @@ source/dreads/
   zset.d       skiplist with spans + score dict                 @nogc
   stream.d     stream entries, binary-searched ranges           @nogc
   obj.d        RObj tagged union + typed Keyspace (TTL-aware)   @nogc
-  commands.d   dispatch, 222 commands, deterministic propagation @nogc
+  commands.d   dispatch, 225 commands, deterministic propagation @nogc
   det.d        the single injectable "now" (frozen per command)  @nogc
   notify.d     keyspace notifications (deferred publish)
   pubsub.d     channel/pattern registry, sink-based delivery
@@ -204,11 +208,11 @@ vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
   single-machine shared-nothing thread-per-shard model, and where the
   `CLUSTER`/`MOVED`/`ASK` surface lands.
 - **Closing the blackbox tail** — error-stats telemetry (`INFO Errorstats`/
-  `Commandstats`), an ACL engine (`ACL SETUSER`/`AUTH`/`acl_check_cmd`), and the
+  `Commandstats`), the in-progress ACL/AUTH engine (`ACL SETUSER`/`AUTH`/
+  `acl_check_cmd`; password hashing/KDF base is already in-tree), and the
   remaining semantic drift listed in [DRIFT.md](DRIFT.md).
 - **Value serialization** — a documented `DUMP`/`RESTORE`/`MIGRATE` format.
 
 ## License
 
 MIT © Marcelo Aires Caetano
-```

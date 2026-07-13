@@ -7,7 +7,7 @@ plus a hand-audit of semantic differences in commands we *do* implement.
 Regenerate the diff by re-running the extraction (see git history of this
 file) whenever the dispatch grows.
 
-**Status: 222 of 241 base commands implemented; 19 missing.** Module
+**Status: 225 of 241 base commands implemented; 16 missing.** Module
 families (RedisJSON, RediSearch, Bloom, TimeSeries — bundled in the Redis 8
 image) are out of scope entirely.
 
@@ -18,7 +18,6 @@ image) are out of scope entirely.
 | **cluster (4)** | cluster asking readonly readwrite | Excluded by owner decision — to be discussed (intersects Raft) |
 | **replication (7)** | replicaof slaveof failover psync sync replconf restore-asking | Same: replication is the Raft roadmap (`vendor/raft`), not the legacy wire protocol |
 | **serialization (3)** | dump restore migrate | Need an RDB-compatible (or documented custom) value serialization format |
-| **functions (3)** | function fcall fcall_ro | Redis Functions API; `EVAL`/`EVALSHA` (+`_RO`) cover scripting |
 | **hll debug (2)** | pfdebug pfselftest | Internal debug commands |
 
 Also missing: hash-field TTLs (`HEXPIRE`/`HPEXPIRE`/`HTTL`/..., Redis 7.4+).
@@ -27,8 +26,6 @@ Also missing: hash-field TTLs (`HEXPIRE`/`HPEXPIRE`/`HTTL`/..., Redis 7.4+).
 
 These exist but do not match Redis exactly:
 
-- **EXPIRE family**: no `NX/XX/GT/LT` flags. **ZADD**: no
-  `NX/XX/GT/LT/CH/INCR` flags (GEOADD does implement NX/XX/CH).
 - **SET**: full option set implemented (`EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET`).
 - **SRANDMEMBER/ZRANDMEMBER/HRANDFIELD**: real uniform draws (xorshift64*,
   reservoir sampling for the distinct-count form). **SPOP/RANDOMKEY** remain
@@ -48,10 +45,12 @@ These exist but do not match Redis exactly:
   deleted entries on re-delivery instead of returning nil fields; no inline
   `XADD ... MAXLEN`, no `XRANGE` exclusive `(` bounds; `XTRIM` `~` trims
   exactly; no `MINID`/`LIMIT`.
-- **Expiration**: lazy only (checked on access); no active expiry cycle, and
-  expired keys do not propagate explicit `DEL`s to the AOF (absolute
-  timestamps make replay converge, but the window Redis closes with
-  propagated deletes exists here).
+- **Expiration**: lazy expiry is always enforced on access; active expiry is
+  available as an opt-in `active-expire yes` drop-soon index swept by the 1s
+  timer. Expired keys do not propagate explicit `DEL`s to the AOF (absolute
+  timestamps make replay converge, but the window Redis closes with propagated
+  deletes exists here). With active expiry off, memory reclamation and `expired`
+  event timing remain access-driven.
 - **Lua**: system Lua 5.4, not Redis's patched 5.1. **Sandboxed**: only
   base/string/table/math are loaded (no io/os/package/debug),
   `dofile`/`loadfile`/`load`/`print` pruned, `_G` protected against global
@@ -108,8 +107,8 @@ These exist but do not match Redis exactly:
   (map), SMEMBERS/SINTER/SDIFF/SUNION (set), ZSCORE/ZINCRBY (double),
   INFO/LOLWUT (verbatim), all nils (`_`). RESP2 clients are byte-unchanged.
   Still to migrate: WITHSCORES array-of-pairs restructuring (ZRANGE family),
-  XPENDING/XINFO maps, client-side tracking (not supported). No `AUTH`
-  passwords (no `requirepass` yet).
+  XPENDING/XINFO maps, client-side tracking (not supported). No real `AUTH` /
+  ACL enforcement yet (`requirepass`, `HELLO AUTH`, `ACL SETUSER` are roadmap).
 - **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
   e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. All
   common write commands fire events — string (SET/SETNX/SETEX/GETSET/GETDEL/
@@ -123,8 +122,9 @@ These exist but do not match Redis exactly:
   emits `del` on the destination instead). Still NOT covered: `evicted`/`e`
   (maxmemory eviction), `keymiss`/`m`, `new`/`n` key events, and stream
   consumer-group events (XGROUP/XCLAIM). Events fire only on the standalone path
-  (not the Raft apply path), db is always 0, and `CONFIG SET
-  notify-keyspace-events` is not wired (config-file only).
+  (not the Raft apply path), notification channel names still use db 0 even
+  when the client selected another DB, and `CONFIG SET notify-keyspace-events`
+  is wired for standalone runtime changes.
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
   `allkeys-lfu`/`volatile-ttl` policies not implemented. Scripts honour the
@@ -137,12 +137,15 @@ These exist but do not match Redis exactly:
 - **PUBSUB NUMPAT** counts total pattern subscriptions, not unique patterns.
   Shard pub/sub is a separate namespace on the same single node.
 - **MEMORY USAGE** is a rough structural estimate, not allocator-exact.
-- **INFO** is a stub with a few fields; `SELECT` accepts only db 0 (single
-  keyspace); `SAVE`/`BGSAVE`/`LASTSAVE` are fsync-backed (no RDB files);
-  `BGREWRITEAOF` runs synchronously (single-threaded event loop).
-- **Memory model**: no small-value encodings (listpack/intset) — per-key
-  memory is higher than Redis for small containers; `OBJECT ENCODING`
-  reports our actual encodings.
+- **INFO** exposes the sections needed by the current blackbox tail (clients,
+  memory, stats, persistence, multi-DB keyspace), but is not a full Redis INFO
+  mirror yet (notably Errorstats/Commandstats are still roadmap). `SAVE`/
+  `BGSAVE`/`LASTSAVE` are fsync-backed (no RDB files); `BGREWRITEAOF` runs
+  synchronously.
+- **Memory model**: small hashes/sets/zsets use dreads' own contiguous
+  listpack/intset-style encodings and spill to the full structures past the
+  configured thresholds. The encodings are Redis-shaped for `OBJECT ENCODING`,
+  but the in-memory layout is dreads-specific.
 
 ## Raft replication (phase 1 — implemented, verified live)
 
@@ -156,23 +159,14 @@ and leader-failover with committed data surviving. The log entry is
 `[u64 clock][raw RESP command]`; the leader logs without executing (Raft only
 mutates state on commit) and every replica applies with the injected clock.
 
-**Phase-1 gaps (deliberate — static-membership-first was an explicit
-decision to avoid debugging consensus and reconfiguration at once):**
+**Remaining Raft / Redis-surface gaps:**
 
-- **No dynamic membership — no runtime join/leave.** Peers are fixed at boot
-  by `raft-peers`. Adding a 4th node to a running 3-node cluster, or formally
-  removing a node so the majority is recomputed, is NOT supported (needs joint
-  consensus / §6 single-server changes + AddServer/RemoveServer RPCs). A dead
-  node is *tolerated* (cluster runs on the majority) and an existing node can
-  *restart* and re-sync from its durable raftlog (tested), but that is "the
-  same member returning," not a new member. Cluster size is set at boot.
 - **No ReadIndex.** Leader reads are served locally; a just-partitioned leader
   could serve slightly stale data until it steps down. Followers serve their
   local applied state (Redis async-replica read semantics).
-- **`EVAL`-with-writes and `MULTI`/`EXEC` are not raft-routed yet** — they run
-  locally on the leader (not replicated through the log).
-- **`ROLE`/`WAIT`/`REPLICAOF` still report standalone values** (not raft-aware).
-- Dynamic membership IS supported now (joint consensus §6): `RAFT ADDNODE
+- **`ROLE`/`WAIT`/`REPLICAOF` still expose Redis-standalone semantics rather
+  than a full Raft-aware operational surface.**
+- Dynamic membership is supported (joint consensus §6): `RAFT ADDNODE
   id@host:port` / `REMOVENODE id` / `STATUS`, join-mode learner
   (`raft-join yes`). InstallSnapshot (§7) IS supported: `RAFT COMPACT` (and
   auto-compaction past a log threshold) collapses dead history into a snapshot
@@ -187,5 +181,5 @@ decision to avoid debugging consensus and reconfiguration at once):**
 Phase-2: **sharding** — slot ranges (CRC16/16384) each owned by a Raft group,
 which is the single-machine shared-nothing threading model (thread-per-shard).
 This is also where dynamic membership and the `CLUSTER`/`MOVED`/`ASK` command
-surface land. `DUMP`/`RESTORE`/`MIGRATE` and Redis Functions when parity work
-resumes.
+surface land. `DUMP`/`RESTORE`/`MIGRATE`, ACL/AUTH enforcement, INFO
+Errorstats/Commandstats, and the blackbox long tail remain parity work.
