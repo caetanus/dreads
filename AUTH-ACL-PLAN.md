@@ -96,9 +96,27 @@ Deny → `-NOPERM …` (Redis's exact strings: `this user has no permissions to
 run the '<cmd>' command`, `… to access one of the keys …`, `… channels …`) and
 an ACL LOG entry (§7).
 
-**Perf:** gate the whole block behind `if (c.user is gDefaultUser &&
-gDefaultUnrestricted)` (a cached bool) so the no-ACL common case is a single
-pointer compare — then benchmark SET/GET to confirm no regression.
+**Perf — minimum indirection via a per-session bypass bit + epoch (mirrors the
+WATCH epoch dreads already has):** the common case (no ACL configured, or an
+admin user) must cost ~zero, and must NOT chase the `AclUser*` on the hot path.
+
+```
+Conn:  AclUser* user;  bool aclBypass;  ulong aclEpoch;
+__gshared ulong gAclEpoch;   // bumped only on requirepass / ACL SETUSER|DELUSER (rare)
+
+// per command, in handleCommand:
+if (c.aclEpoch != gAclEpoch) refreshBypass(c);   // almost never taken
+if (!c.aclBypass) { ...enforce (unauthed → NOAUTH; restricted → the 3 checks)... }
+```
+
+`refreshBypass(c)` sets `c.aclBypass = c.authed && isUnrestricted(c.user)` and
+`c.aclEpoch = gAclEpoch`. With no ACL activity, both comparisons are on hot Conn
+fields, branch-predicted, and `aclBypass` is true → the enforcement block is
+skipped entirely. **Two predictable branches, zero pointer chase, no fan-out to
+connections on SETUSER, no stale cache** — the same `gWriteEpoch`/`c.watchEpoch`
+pattern used for WATCH. `isUnrestricted` = enabled ∧ all command bits set ∧
+allKeys ∧ allChannels. Benchmark SET/GET after wiring to confirm the gate is
+free.
 
 ## 6. requirepass ↔ default user
 
