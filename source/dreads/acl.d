@@ -1453,6 +1453,7 @@ void aclLogAdd(string reason, string ctx, scope const(char)[] obj,
         {
             e.count++;
             e.updated = nowMs;
+            e.setCinfo(cinfo); // refresh to the latest client-info (Valkey does)
             if (i != gAclLog.length - 1) // bubble to the newest slot (the end)
             {
                 auto tmp = gAclLog[i];
@@ -1925,4 +1926,28 @@ unittest // canonical propagation: encode a user, apply it back, state matches
     assert(!dst.nopass && dst.passwords.length == 1 && dst.passwords[0] == h64);
     assert(dst.root.allKeys == false && dst.root.keyPats.length == 2);
     assert(dst.root.chanPats.length == 1 && dst.root.chanPats[0] == "news");
+}
+
+// ACL LOG aggregation refreshes client-info to the latest attempt, and denial
+// metrics count every attempt. Regression for the blackbox "transaction context
+// (2)" test where an aggregated entry must show the newest cmd=exec client-info.
+unittest
+{
+    aclLogReset();
+    auto a0 = gAclDeniedCmd;
+    // two denials with the same reason/ctx/object/user but different client-info
+    aclLogAdd("command", "toplevel", "incr", "antirez", "id=0 cmd=incr", 1000);
+    aclLogAdd("command", "multi", "incr", "antirez", "id=0 cmd=exec", 2000);
+    // different ctx ⇒ NOT aggregated (ctx is part of the match key) → 2 entries
+    assert(aclLogCount() == 2);
+    // same key aggregates and refreshes cinfo + updated time + count
+    aclLogAdd("command", "multi", "incr", "antirez", "id=0 cmd=exec2", 3000);
+    assert(aclLogCount() == 2);
+    auto newest = aclLogAt(0);
+    assert(newest !is null);
+    assert(newest.count == 2, "aggregated count");
+    assert(newest.cinfo == "id=0 cmd=exec2", newest.cinfo); // refreshed to latest
+    assert(newest.updated == 3000);
+    assert(gAclDeniedCmd == a0 + 3); // every attempt counted for metrics
+    aclLogReset();
 }

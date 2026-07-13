@@ -672,9 +672,13 @@ private void aclLogViolation(ref Conn c, string reason, scope const(char)[] obj,
     ci.append("id=0 addr=? name=");
     if (c.clientName.length)
         ci.append(c.clientName);
+    // client-info reports the command the CLIENT issued, not the denied object:
+    // inside EXEC that is "exec" (the queued command is only the LOG object).
     ci.append(" cmd=");
-    ci.append(cmdName);
-    aclLogAdd(reason, c.inMulti ? "multi" : "toplevel", obj,
+    ci.append(c.inExec ? "exec" : cmdName);
+    // a denial while queuing (inMulti) OR while replaying (inExec) is a "multi"
+    // context; only a plain toplevel command is "toplevel".
+    aclLogAdd(reason, (c.inMulti || c.inExec) ? "multi" : "toplevel", obj,
             c.user !is null ? c.user.name : "default", cast(const(char)[]) ci.data, nowMs());
 }
 
@@ -722,6 +726,107 @@ private bool authenticateConn(ref Conn c, scope const(char)[] who, scope const(c
     c.user = u;
     c.authed = true;
     return true;
+}
+
+// ACL enforcement — a single `command ∈ cap_set` test (plus key/channel/db),
+// run only while ACL is in use. Returns true if the command is DENIED (having
+// emitted the error reply and recorded the ACL LOG violation). Assumes the
+// caller already checked `gAclActive && c.user !is null`. Runs at toplevel/queue
+// time AND again on EXEC replay — a user's permissions may have been revoked
+// after a command was queued, and Valkey re-checks at execution time.
+private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
+        scope const(char)[] name, ref ByteBuffer o) nothrow
+{
+    // An all-permissions, already-authed user (default/admin) can't be denied
+    // anything — skip the per-command lookup entirely.
+    if (c.authed && aclUnrestricted(c.user))
+        return false;
+    char[32] lb = void;
+    if (name.length > lb.length)
+        return false; // >32-char names aren't ACL-catalogued; dispatch handles them
+    foreach (i, ch; name)
+        lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+    auto lname = cast(const(char)[]) lb[0 .. name.length];
+    // Permission bit first: an authed user holding this command passes on a
+    // single bitset test and short-circuits everything below — the hot path for
+    // any real ACL user. `expect(..., false)`: in real traffic a client almost
+    // never issues a command it lacks, so the deny path is cold.
+    immutable cidx = aclCmdIndex(lname);
+    // per-subcommand ACL: lowercase arg[1] (e.g. CLIENT KILL → "kill")
+    char[32] sb = void;
+    const(char)[] sub;
+    if (cmd.arr.length >= 2 && cmd.arr[1].str.length <= sb.length)
+    {
+        foreach (i, ch; cmd.arr[1].str)
+            sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+        sub = cast(const(char)[]) sb[0 .. cmd.arr[1].str.length];
+    }
+    if (expect(!(c.authed && aclCanRunCmdSub(c.user, cidx, sub)), false))
+    {
+        bool alwaysOk = uname == "AUTH" || uname == "HELLO"
+            || uname == "RESET" || uname == "QUIT";
+        if (!alwaysOk)
+        {
+            if (!c.authed)
+            {
+                repError(o, "NOAUTH Authentication required.");
+                return true;
+            }
+            // object = command, or command|sub when under sub-ACL
+            static ByteBuffer ob; // TLS
+            ob.clear();
+            ob.append(lname);
+            if (sub.length && (aclIsContainer(lname) || aclCmdHasSubRule(c.user, cidx)))
+            {
+                ob.append("|");
+                ob.append(sub);
+            }
+            auto obj = cast(const(char)[]) ob.data;
+            aclLogViolation(c, "command", obj, lname);
+            static ByteBuffer eb; // TLS
+            eb.clear();
+            eb.append("NOPERM User ");
+            eb.append(c.user.name);
+            eb.append(" has no permissions to run the '");
+            eb.append(obj);
+            eb.append("' command");
+            repError(o, cast(const(char)[]) eb.data);
+            return true;
+        }
+    }
+    // key-pattern ACL: the command is allowed — now reject it if it touches a
+    // key outside the user's ~patterns (allkeys users skip).
+    auto dk = aclDeniedKey(c.user, lname, cmd.arr);
+    if (dk !is null)
+    {
+        aclLogViolation(c, "key", dk, lname);
+        repError(o, "NOPERM No permissions to access a key");
+        return true;
+    }
+    // channel-pattern ACL for pub/sub — checked before the switch AND before
+    // MULTI queuing, so an unauthorized channel is rejected at queue time.
+    if (!c.user.root.allChannels)
+    {
+        auto dch = aclCmdDeniedChannel(c.user, lname, cmd.arr);
+        if (dch !is null)
+        {
+            aclLogViolation(c, "channel", dch, lname);
+            repError(o, "NOPERM No permissions to access a channel");
+            return true;
+        }
+    }
+    // database ACL (`db=`): restrict which DBs the user may touch.
+    if (!c.user.root.allDbs)
+    {
+        auto ddb = aclDeniedDb(c.user, lname, cmd.arr, cast(int)(c.dbp - &gDbs[0]));
+        if (ddb !is null)
+        {
+            aclLogViolation(c, "database", ddb, lname);
+            repError(o, "NOPERM No permissions to access database");
+            return true;
+        }
+    }
+    return false;
 }
 
 // age-seconds as a float string ("0.001"), from a millisecond delta.
@@ -772,103 +877,8 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         // EVAL/FCALL re-checks THIS user's permissions on the writer thread, so
         // `+eval -set` can't smuggle a SET through a script. Invisible to Lua.
         scriptSetPendingUser(c.user.id);
-        // An all-permissions, already-authed user (default/admin) can't be denied
-        // anything — skip the per-command lookup entirely. Restricted users fall
-        // through to the real check.
-        if (!(c.authed && aclUnrestricted(c.user)))
-        {
-            char[32] lb = void;
-            foreach (i, ch; name)
-                lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
-            auto lname = cast(const(char)[]) lb[0 .. name.length];
-            // Permission bit first: an authed user holding this command passes on
-            // a single bitset test and short-circuits everything below — the hot
-            // path for any real ACL user. Only the miss falls to the connection
-            // commands that are allowed regardless (AUTH/HELLO/RESET/QUIT).
-            // `expect(..., false)`: in real traffic a client almost never issues a
-            // command it lacks, so the deny path is cold — hint the branch so the
-            // predictor keeps the allow path straight (varied real workloads don't
-            // train it the way a single-command benchmark does).
-            immutable cidx = aclCmdIndex(lname);
-            // per-subcommand ACL: lowercase arg[1] (e.g. CLIENT KILL → "kill")
-            char[32] sb = void;
-            const(char)[] sub;
-            if (cmd.arr.length >= 2 && cmd.arr[1].str.length <= sb.length)
-            {
-                foreach (i, ch; cmd.arr[1].str)
-                    sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
-                sub = cast(const(char)[]) sb[0 .. cmd.arr[1].str.length];
-            }
-            if (expect(!(c.authed && aclCanRunCmdSub(c.user, cidx, sub)), false))
-            {
-                bool alwaysOk = uname == "AUTH" || uname == "HELLO"
-                    || uname == "RESET" || uname == "QUIT";
-                if (!alwaysOk)
-                {
-                    if (!c.authed)
-                    {
-                        repError(o, "NOAUTH Authentication required.");
-                        return true;
-                    }
-                    // object = command, or command|sub when under sub-ACL
-                    static ByteBuffer ob; // TLS
-                    ob.clear();
-                    ob.append(lname);
-                    if (sub.length && (aclIsContainer(lname) || aclCmdHasSubRule(c.user, cidx)))
-                    {
-                        ob.append("|");
-                        ob.append(sub);
-                    }
-                    auto obj = cast(const(char)[]) ob.data;
-                    aclLogViolation(c, "command", obj, lname);
-                    static ByteBuffer eb; // TLS
-                    eb.clear();
-                    eb.append("NOPERM User ");
-                    eb.append(c.user.name);
-                    eb.append(" has no permissions to run the '");
-                    eb.append(obj);
-                    eb.append("' command");
-                    repError(o, cast(const(char)[]) eb.data);
-                    return true;
-                }
-            }
-            // key-pattern ACL: the command is allowed — now reject it if it
-            // touches a key outside the user's ~patterns (allkeys users skip).
-            auto dk = aclDeniedKey(c.user, lname, cmd.arr);
-            if (dk !is null)
-            {
-                aclLogViolation(c, "key", dk, lname);
-                repError(o, "NOPERM No permissions to access a key");
-                return true;
-            }
-            // channel-pattern ACL for pub/sub — checked HERE (before the switch
-            // AND before MULTI queuing), so an unauthorized channel is rejected
-            // at queue time, matching Valkey.
-            if (!c.user.root.allChannels)
-            {
-                auto dch = aclCmdDeniedChannel(c.user, lname, cmd.arr);
-                if (dch !is null)
-                {
-                    aclLogViolation(c, "channel", dch, lname);
-                    repError(o, "NOPERM No permissions to access a channel");
-                    return true;
-                }
-            }
-            // database ACL (`db=`): restrict which DBs the user may touch —
-            // dbid-argument commands (SELECT/MOVE/COPY/SWAPDB), whole-db commands
-            // (FLUSHALL) and keyspace commands against the connection's current db.
-            if (!c.user.root.allDbs)
-            {
-                auto ddb = aclDeniedDb(c.user, lname, cmd.arr,
-                        cast(int)(c.dbp - &gDbs[0]));
-                if (ddb !is null)
-                {
-                    aclLogViolation(c, "database", ddb, lname);
-                    repError(o, "NOPERM No permissions to access database");
-                    return true;
-                }
-            }
-        }
+        if (aclDenies(c, cmd, uname, name, o))
+            return true;
     }
 
     switch (uname)
@@ -961,6 +971,14 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 size_t qstart = qpos;
                 if (parseValue(c.multiQueue.data, qpos, arena, qcmd) != ParseStatus.ok)
                     break; // impossible: queued bytes were already parsed once
+                // re-check ACL at execution time: the user's permissions may have
+                // been revoked after this command was queued (c.inExec makes the
+                // LOG client-info report cmd=exec). A denial becomes this slot's
+                // reply in the EXEC array; skip running the command.
+                if (gAclActive && c.user !is null && qcmd.type == RType.Array
+                        && qcmd.arr.length > 0)
+                    if (aclDenies(c, qcmd, null, qcmd.arr[0].str, o))
+                        continue;
                 keep = executeCommand(c, qcmd, c.multiQueue.data[qstart .. qpos], o, arena) && keep;
             }
             return keep;

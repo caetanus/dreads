@@ -1036,11 +1036,24 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
     if (userId != 0 && arr.length > 0)
     {
         import dreads.acl : aclUserById, aclUnrestricted, aclCanRunCmd, aclCmdIndex,
-            aclKeyDenied, aclCanAccessChannel;
+            aclDeniedKey, aclCanAccessChannel, aclLogAdd;
+        import dreads.stream : nowMs;
 
         auto u = aclUserById(userId);
         if (u !is null && !aclUnrestricted(u))
         {
+            // an ACL denial inside a script is logged with the "lua" context and
+            // the calling command (eval); the object is the offending command/
+            // key/channel from the redis.call.
+            static void logDenial(string reason, const(char)[] obj,
+                    const(char)[] uname) @trusted nothrow @nogc
+            {
+                static ByteBuffer ci; // TLS
+                ci.clear();
+                ci.append("id=0 addr=? name= cmd=eval");
+                aclLogAdd(reason, "lua", obj, uname, cast(const(char)[]) ci.data, nowMs());
+            }
+
             auto nm = arr[0].str;
             char[32] lbuf = void;
             if (nm.length <= lbuf.length)
@@ -1050,6 +1063,7 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
                 auto lname = cast(const(char)[]) lbuf[0 .. nm.length];
                 if (!aclCanRunCmd(u, aclCmdIndex(lname)))
                 {
+                    logDenial("command", lname, u.name);
                     reply.clear();
                     static ByteBuffer eb; // TLS scratch for the message text
                     eb.clear();
@@ -1061,16 +1075,22 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
                     repError(reply, cast(const(char)[]) eb.data);
                     return 0;
                 }
-                if (!u.root.allKeys && aclKeyDenied(u, lname, arr))
+                if (!u.root.allKeys)
                 {
-                    reply.clear();
-                    repError(reply, "NOPERM No permissions to access a key");
-                    return 0;
+                    auto dk = aclDeniedKey(u, lname, arr);
+                    if (dk)
+                    {
+                        logDenial("key", dk, u.name);
+                        reply.clear();
+                        repError(reply, "NOPERM No permissions to access a key");
+                        return 0;
+                    }
                 }
                 if (!u.root.allChannels && arr.length >= 2
                         && (lname == "publish" || lname == "spublish")
                         && !aclCanAccessChannel(u, arr[1].str))
                 {
+                    logDenial("channel", arr[1].str, u.name);
                     reply.clear();
                     repError(reply, "NOPERM No permissions to access a channel");
                     return 0;
