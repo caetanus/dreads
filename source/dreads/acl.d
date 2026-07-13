@@ -335,6 +335,18 @@ bool aclCanAccessChannel(const(AclUser)* u, scope const(char)[] channel) @nogc n
     return false;
 }
 
+/// Snapshot the user's password hashes as isolated immutable strings, so the
+/// slow Argon2 verify can run on a worker thread without touching the registry
+/// (which the event-loop thread may mutate meanwhile). Empty when nopass.
+immutable(string)[] aclPasswordHashes(const(AclUser)* u) @trusted
+{
+    auto n = u.passwords.length;
+    auto arr = new string[n];
+    foreach (i; 0 .. n)
+        arr[i] = u.passwords[i].idup;
+    return cast(immutable(string)[]) arr;
+}
+
 /// Verify a plaintext password against this user (nopass or any stored hash).
 /// Runs Argon2 — call OFF the event loop.
 bool aclCheckPassword(const(AclUser)* u, scope const(char)[] pass) @trusted nothrow

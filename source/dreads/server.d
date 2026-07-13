@@ -523,6 +523,19 @@ private void flushPending(ref Conn c, ref ByteBuffer o) nothrow
 
 /// Transaction control plus queueing, then the executor. rawCmd holds the
 /// command's original RESP bytes for AOF logging and MULTI queueing.
+/// Runs on a vibe worker thread (via `async`): try the plaintext against each
+/// (isolated, immutable) Argon2/SHA-256 hash. Free function + immutable args so
+/// vibe schedules it off the event loop.
+private bool authVerifyJob(string pw, immutable(string)[] hashes) nothrow
+{
+    import dreads.authpw : verifyPassword;
+
+    foreach (h; hashes)
+        if (verifyPassword(pw, h))
+            return true;
+    return false;
+}
+
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
@@ -803,10 +816,34 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 repError(o, "ERR wrong number of arguments for 'auth' command");
                 return true;
             }
-            // NOTE: verifyPassword runs the slow KDF inline for now (blocks the
-            // loop); the auth worker thread is the tracked perf follow-up.
+            // Argon2 verify runs on a vibe WORKER THREAD — never inline: the KDF
+            // is ~15-30 ms and would stall the single event loop (and be a DoS
+            // vector under an AUTH flood). getResult() yields this fiber; the
+            // loop keeps serving other clients until the worker signals.
             auto u = aclUser(who);
-            if (u is null || !u.enabled || !aclCheckPassword(u, pass))
+            bool ok = false;
+            if (u !is null && u.enabled)
+            {
+                if (u.nopass)
+                    ok = true;
+                else
+                {
+                    try
+                    {
+                        import vibe.core.concurrency : async;
+                        import dreads.acl : aclPasswordHashes;
+
+                        auto pw = pass.idup; // isolate for the worker thread
+                        auto hashes = aclPasswordHashes(u);
+                        ok = async(&authVerifyJob, pw, hashes).getResult();
+                    }
+                    catch (Exception)
+                        ok = false;
+                }
+            }
+            // re-validate after yielding: the user may have been deleted/disabled
+            u = aclUser(who);
+            if (!ok || u is null || !u.enabled)
             {
                 repError(o, "WRONGPASS invalid username-password pair or user is disabled.");
                 return true;
