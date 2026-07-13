@@ -433,16 +433,23 @@ bool aclCanAccessKey(const(AclUser)* u, scope const(char)[] key, bool needRead,
     return false;
 }
 
-/// Can this user use pub/sub `channel`?
-bool aclCanAccessChannel(const(AclUser)* u, scope const(char)[] channel) @nogc nothrow @trusted
+/// Can this user use pub/sub `channel`? A plain channel (PUBLISH/SUBSCRIBE) is
+/// glob-matched against the allowed `&patterns`; a subscribe PATTERN (PSUBSCRIBE)
+/// is matched LITERALLY (a client may only subscribe to a pattern the ACL grants
+/// verbatim) — mirrors Valkey's ACLCheckChannelAgainstList.
+bool aclCanAccessChannel(const(AclUser)* u, scope const(char)[] channel,
+        bool isPattern = false) @nogc nothrow @trusted
 {
     import dreads.commands : globMatch;
 
     if (u.root.allChannels)
         return true;
     foreach (i; 0 .. u.root.chanPats.length)
-        if (globMatch(u.root.chanPats[i], channel))
+    {
+        auto pat = u.root.chanPats[i];
+        if (isPattern ? (pat == channel) : globMatch(pat, channel))
             return true;
+    }
     return false;
 }
 
@@ -839,6 +846,19 @@ unittest // reset + allkeys/allcommands + %RW flags
         assert(aclApplyRule(u, r, err), err);
     assert(aclCanAccessKey(u, "ro:1", true, false));   // read ok
     assert(!aclCanAccessKey(u, "ro:1", false, true));  // write denied
+
+    // channel access: glob for plain channels, LITERAL for subscribe patterns
+    auto cu = freshUser("cu");
+    scope (exit)
+        freeUser(cu);
+    foreach (r; ["on", "+@all", "resetchannels", "&news:*", "&chat"])
+        assert(aclApplyRule(cu, r, err), err);
+    assert(aclCanAccessChannel(cu, "news:1"));           // glob &news:*
+    assert(aclCanAccessChannel(cu, "chat"));
+    assert(!aclCanAccessChannel(cu, "secret"));
+    assert(aclCanAccessChannel(cu, "news:*", true));     // PSUBSCRIBE: literal == &news:*
+    assert(!aclCanAccessChannel(cu, "news:1", true));    // literal: "news:1" != any pattern
+    assert(!aclCanAccessChannel(cu, "chat:*", true));
 }
 
 unittest // registry: default user, get/create/del, unrestricted predicate

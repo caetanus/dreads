@@ -26,7 +26,7 @@ import vibe.core.task : Task;
 import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclApplyRule, aclDelUser, aclEachUser, aclCatNames, aclCmdIndex, aclCanRunCmd,
     aclUnrestricted, aclDescribeCommands, aclDescribeKeys, aclDescribeChannels,
-    aclEncodeCanonicalSetuser, aclApplyCanonical, gAclActive;
+    aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, gAclActive;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
@@ -578,6 +578,24 @@ private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) not
     return true;
 }
 
+// Channel ACL: a user with restricted channels (`&pattern`, not `&*`) may only
+// touch channels the ACL grants. Returns true (and writes -NOPERM) when denied.
+// PSUBSCRIBE patterns match literally; plain channels glob-match. Checked BEFORE
+// the command runs, so a rejected multi-channel SUBSCRIBE touches nothing.
+private bool aclChannelDenied(ref Conn c, scope const(RVal)[] channels, bool isPattern,
+        ref ByteBuffer o) nothrow
+{
+    if (!gAclActive || c.user is null || c.user.root.allChannels)
+        return false;
+    foreach (ref ch; channels)
+        if (!aclCanAccessChannel(c.user, ch.str, isPattern))
+        {
+            repError(o, "NOPERM No permissions to access a channel");
+            return true;
+        }
+    return false;
+}
+
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
@@ -1095,6 +1113,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'ssubscribe' command");
                 return true;
             }
+            if (aclChannelDenied(c, args, false, o))
+                return true;
             enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
@@ -1124,6 +1144,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'spublish' command");
                 return true;
             }
+            if (aclChannelDenied(c, args[0 .. 1], false, o))
+                return true;
             repInt(o, gShardPubSub.publish(args[0].str, args[1].str, "smessage"));
             return true;
         }
@@ -1286,6 +1308,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                         : "ERR wrong number of arguments for 'subscribe' command");
                 return true;
             }
+            if (aclChannelDenied(c, args, pattern, o))
+                return true;
             enterSubMode(c); // async output before any message can be delivered
             foreach (ref a; args)
             {
@@ -1342,6 +1366,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR wrong number of arguments for 'publish' command");
                 return true;
             }
+            if (aclChannelDenied(c, args[0 .. 1], false, o))
+                return true;
             repInt(o, gPubSub.publish(args[0].str, args[1].str));
             return true;
         }
