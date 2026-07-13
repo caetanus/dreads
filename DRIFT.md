@@ -1,13 +1,13 @@
 # Drift: dreads vs Redis
 
-Honest, mechanically-derived gap analysis. Method: the canonical core command
-list from the official docs repo (`redis-doc/commands.json`, 241 base
-commands / 370 including subcommands) diffed against dreads' dispatch tables,
-plus a hand-audit of semantic differences in commands we *do* implement.
-Regenerate the diff by re-running the extraction (see git history of this
-file) whenever the dispatch grows.
+Honest, mechanically-derived gap analysis. Method: the canonical base command
+set from the **Valkey** command tables (`src/commands/*.json`, 258 base
+commands; the live Valkey blackbox is the project's yardstick) diffed against
+dreads' dispatch tables (`LC_ALL=C` set-diff of case labels), plus a hand-audit
+of semantic differences in commands we *do* implement. Regenerate whenever the
+dispatch grows.
 
-**Status: 225 of 241 base commands implemented; 16 missing.** Module
+**Status: 229 of 258 base commands implemented; 29 missing.** Module
 families (RedisJSON, RediSearch, Bloom, TimeSeries — bundled in the Redis 8
 image) are out of scope entirely.
 
@@ -15,12 +15,15 @@ image) are out of scope entirely.
 
 | Family | Missing | Why |
 |---|---|---|
-| **cluster (4)** | cluster asking readonly readwrite | Excluded by owner decision — to be discussed (intersects Raft) |
-| **replication (7)** | replicaof slaveof failover psync sync replconf restore-asking | Same: replication is the Raft roadmap (`vendor/raft`), not the legacy wire protocol |
+| **hash-field TTL (11)** | hexpire hpexpire hexpireat hpexpireat httl hpttl hexpiretime hpexpiretime hpersist hgetex hsetex | Per-field hash expiry (Valkey/Redis 7.4+); new + niche, not yet built |
+| **cluster (5)** | cluster clusterscan asking readonly readwrite | Excluded by owner decision — intersects Raft/sharding |
+| **replication (7)** | replicaof slaveof failover psync sync replconf restore-asking | Replication is the Raft roadmap (`vendor/raft`), not the legacy wire protocol |
 | **serialization (3)** | dump restore migrate | Need an RDB-compatible (or documented custom) value serialization format |
 | **hll debug (2)** | pfdebug pfselftest | Internal debug commands |
+| **sentinel (1)** | sentinel | Sentinel HA is out of scope (Raft handles failover) |
 
-Also missing: hash-field TTLs (`HEXPIRE`/`HPEXPIRE`/`HTTL`/..., Redis 7.4+).
+AUTH and the full ACL command set (`ACL SETUSER|GETUSER|…`) ARE implemented and
+enforced — see the AUTH + ACL entry below.
 
 ## Semantic drift in implemented commands
 
@@ -107,8 +110,18 @@ These exist but do not match Redis exactly:
   (map), SMEMBERS/SINTER/SDIFF/SUNION (set), ZSCORE/ZINCRBY (double),
   INFO/LOLWUT (verbatim), all nils (`_`). RESP2 clients are byte-unchanged.
   Still to migrate: WITHSCORES array-of-pairs restructuring (ZRANGE family),
-  XPENDING/XINFO maps, client-side tracking (not supported). No real `AUTH` /
-  ACL enforcement yet (`requirepass`, `HELLO AUTH`, `ACL SETUSER` are roadmap).
+  XPENDING/XINFO maps, client-side tracking (not supported).
+- **AUTH + ACL**: implemented and enforced. `AUTH`/`HELLO AUTH`, `ACL
+  SETUSER|DELUSER|GETUSER|LIST|USERS|CAT|WHOAMI|GENPASS`. Passwords are Argon2id
+  (libsodium) hashed off the event loop; SHA-256 hex accepted for interop.
+  Enforcement: command (bitset), key (`~`/`%R`/`%W`, generated key-specs incl.
+  numkeys + keyword commands), channel (`&`, glob/literal), per-subcommand
+  (`+client|id`) — top-level, at MULTI queue time, and inside scripts (each
+  `redis.call` re-checked for the caller). ACL mutations replicate + persist via
+  the AOF/Raft log (canonical, already-hashed, idempotent). Gaps (roadmap):
+  `requirepass`/`aclfile` config directives, subcommand-arg validation
+  (`+get|foo`), `ACL CAT <category>` command listing, subscriber-kill on channel
+  revoke, blocked-command ACL re-check, ACL v2 selectors.
 - **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
   e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. All
   common write commands fire events — string (SET/SETNX/SETEX/GETSET/GETDEL/
@@ -181,5 +194,5 @@ mutates state on commit) and every replica applies with the injected clock.
 Phase-2: **sharding** — slot ranges (CRC16/16384) each owned by a Raft group,
 which is the single-machine shared-nothing threading model (thread-per-shard).
 This is also where dynamic membership and the `CLUSTER`/`MOVED`/`ASK` command
-surface land. `DUMP`/`RESTORE`/`MIGRATE`, ACL/AUTH enforcement, INFO
-Errorstats/Commandstats, and the blackbox long tail remain parity work.
+surface land. `DUMP`/`RESTORE`/`MIGRATE`, INFO Errorstats/Commandstats, the ACL
+niceties above, and the blackbox long tail remain parity work.

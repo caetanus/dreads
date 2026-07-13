@@ -105,7 +105,7 @@ pipelined numbers show the real per-command cost.
 
 ## Features
 
-- **225 of Redis's 241 core commands** — see [DRIFT.md](DRIFT.md) for the
+- **229 of Valkey's 258 base commands** — see [DRIFT.md](DRIFT.md) for the
   honest gap list and every semantic difference. All data types including
   **streams** with consumer groups; **GEO** (geohash-scored zsets, Redis-exact
   outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**; TTL/expiration with
@@ -127,6 +127,19 @@ pipelined numbers show the real per-command cost.
   pub/sub, subscribe-mode command gating, and **keyspace notifications**.
   Notification channel names are still db-0-shaped (`__keyspace@0__` /
   `__keyevent@0__`) while the multi-DB tail is being closed.
+- **AUTH + ACL**: real authentication and a full ACL engine. `AUTH`/`HELLO
+  AUTH`, `ACL SETUSER|DELUSER|GETUSER|LIST|USERS|CAT|WHOAMI|GENPASS` with
+  Valkey-format rule output. Passwords are **Argon2id** (libsodium, OWASP
+  memory-hard) hashed on a worker thread so the KDF never stalls the loop; a
+  bare SHA-256 hex is accepted for `aclfile`/`#hash` interop. Enforcement
+  covers **commands** (single-bitset test), **keys** (`~pattern`, `%R`/`%W`,
+  via generated key-specs incl. numkeys/keyword commands), **channels**
+  (`&pattern`, glob/literal), and **per-subcommand** rules (`+client|id`) —
+  applied at the top level, at MULTI queue time, and *inside scripts* (each
+  `redis.call` re-checks the caller, so `+eval` can't smuggle a denied
+  operation). Zero cost when ACL is unused (a single global gate) and for the
+  unrestricted default user. ACL mutations replicate + persist through the
+  AOF/Raft log in a canonical, already-hashed, idempotent form.
 - **Lua scripting** — system Lua 5.4 with a malloc-backed allocator (its GC
   never touches the D GC), running on a **dedicated thread** off the event loop:
   - `EVAL`/`EVALSHA`(`_RO`), `SCRIPT LOAD|EXISTS|FLUSH|SHOW`, and Redis
@@ -154,6 +167,9 @@ pipelined numbers show the real per-command cost.
 Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4, and
 on Linux jemalloc (linked automatically).
 
+Requirements also include libsodium (Argon2id password hashing for AUTH/ACL),
+linked automatically via the `libsodiumd` dependency.
+
 ```sh
 dub build -b release --compiler=ldc2
 ./bin/dreads                       # port 6379
@@ -161,12 +177,10 @@ dub build -b release --compiler=ldc2
 redis-cli -p 6390 PING
 ```
 
-Argon2id password hashing for the in-progress ACL/AUTH path is opt-in and links
-libsodium:
-
-```sh
-dub build -c argon2 -b release --compiler=ldc2
-```
+Each instance takes a per-port `flock` on `$XDG_RUNTIME_DIR/dreadlock-<port>.lck`
+(override with `--lockfile=<path>`) and refuses to start if a live instance
+already holds that port — `SO_REUSEPORT` is kept for instant restarts but can no
+longer silently co-bind and split traffic.
 
 Day-to-day builds go through [reggae](https://github.com/atilaneves/reggae)
 (faster incremental builds):
@@ -203,7 +217,9 @@ source/dreads/
   zset.d       skiplist with spans + score dict                 @nogc
   stream.d     stream entries, binary-searched ranges           @nogc
   obj.d        RObj tagged union + typed Keyspace (TTL-aware)   @nogc
-  commands.d   dispatch, 225 commands, deterministic propagation @nogc
+  commands.d   dispatch, 229 commands, deterministic propagation @nogc
+  acl.d        ACL model, rule parsing, command/key/channel checks @nogc
+  authpw.d     Argon2id password hashing (libsodium), off-loop
   det.d        the single injectable "now" (frozen per command)  @nogc
   notify.d     keyspace notifications (deferred publish)
   pubsub.d     channel/pattern registry, sink-based delivery
@@ -224,9 +240,9 @@ vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
   single-machine shared-nothing thread-per-shard model, and where the
   `CLUSTER`/`MOVED`/`ASK` surface lands.
 - **Closing the blackbox tail** — error-stats telemetry (`INFO Errorstats`/
-  `Commandstats`), the in-progress ACL/AUTH engine (`ACL SETUSER`/`AUTH`/
-  `acl_check_cmd`; password hashing/KDF base is already in-tree), and the
-  remaining semantic drift listed in [DRIFT.md](DRIFT.md).
+  `Commandstats`), the remaining ACL niceties (subcommand-arg validation,
+  `ACL CAT <category>` command listing, subscriber-kill on channel revoke), and
+  the remaining semantic drift listed in [DRIFT.md](DRIFT.md).
 - **Value serialization** — a documented `DUMP`/`RESTORE`/`MIGRATE` format.
 
 ## License
