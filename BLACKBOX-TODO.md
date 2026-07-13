@@ -115,21 +115,24 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
 - **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
 
 ## ACL / AUTH (2026-07-13, `auth-acl` → `master`)
-- **acl.tcl block-1 now runs to completion: 87 ok / 1 err** (was 17 at the start
+- **acl.tcl block-1 now PASSES COMPLETELY: 88 ok / 0 err** (was 17 at the start
   of the ACL push). Achieved across the session: GETUSER/LIST, subcommand +
   first-arg rules, ACL CAT/DRYRUN, canonical AOF/raft persistence, key + channel
   enforcement, ACL LOG (aggregation, contexts, metrics), `db=` database
   selectors, default-user-off auth, HELLO AUTH/SETNAME, DELUSER edges
   (default-protected + self/other-session disconnect), ACL HELP/LOAD, GETUSER
-  lossless compaction, EXEC-replay + blocked-client ACL re-check, and a global
-  connection registry (CLIENT LIST enumeration + channel kill-on-revoke). Every
-  fix has an own unit test (per `blackbox-internal-coverage`); server-layer-only
-  bits noted here.
-- **The 1 remaining acl.tcl block-1 failure is NOT ACL logic:**
-  *"blocked command gets rejected when reprocessed after permission change"* —
-  the ACL part (NOPERM on the woken BLPOP) PASSES; the remaining assertion needs
-  INFO **commandstats** (`cmdstat_blpop: … rejected_calls=1,failed_calls=0`), a
-  per-command call/rejected/failed counter subsystem dreads doesn't have.
+  lossless compaction, EXEC-replay + blocked-client ACL re-check, a global
+  connection registry (CLIENT LIST enumeration + channel kill-on-revoke +
+  CLIENT KILL), and INFO commandstats. Every fix has an own unit test (per
+  `blackbox-internal-coverage`); server-layer-only bits noted here.
+- **INFO commandstats (commit 1205560):** `# Commandstats` with per-command
+  `cmdstat_<name>:calls/usec/usec_per_call/rejected_calls/failed_calls`. Counters
+  are real (calls/failed at the executeCommand dispatch chokepoint; rejected at
+  every pre-execution ACL denial incl. the blocked-client re-check); CONFIG
+  RESETSTAT clears them. `usec` is intentionally 0 — no per-command clock read
+  (hot-path cost); blocking/pubsub/connection commands handled before the
+  dispatch chokepoint aren't call-counted. Revisit if real latency stats are
+  wanted.
 - **Connection registry (commit 702f79c):** intrusive doubly-linked list of every
   live `Conn*` (each lives on its serveClient fiber stack; single event loop ⇒ no
   locking). Powers `CLIENT LIST` (all clients), channel kill-on-revoke, and
