@@ -364,10 +364,10 @@ version (unittest) private void freeUser(AclUser* u)
 
 unittest // the scripting-ACL scenario: bob = on >123 +@scripting +set ~x*
 {
-    import dreads.authpw : initAuthPw, configureArgon;
+    import dreads.authpw : initAuthPw, configurePbkdf2;
 
     initAuthPw();
-    configureArgon(1, 8192); // fast for the test
+    configurePbkdf2(1000); // fast for the test
 
     auto bob = freshUser("bob");
     scope (exit)
@@ -390,7 +390,7 @@ unittest // the scripting-ACL scenario: bob = on >123 +@scripting +set ~x*
     assert(aclCanAccessKey(bob, "xx", true, true));
     assert(!aclCanAccessKey(bob, "yy", true, true));
 
-    configureArgon(2, 16 * 1024 * 1024);
+    configurePbkdf2(210_000);
 }
 
 unittest // reset + allkeys/allcommands + %RW flags

@@ -32,6 +32,20 @@
 			"mainSourceFile": "bench/pubsub_bench.d",
 			"targetName": "pubsub_bench",
 			"targetType": "executable"
+		},
+		{
+			"comment": "opt-in Argon2id password hashing (needs libsodium). Default builds use salted PBKDF2-HMAC-SHA256, no external dep.",
+			"name": "argon2",
+			"targetType": "executable",
+			"dependencies": {
+				"libsodiumd": "~>0.2"
+			},
+			"versions": [
+				"WithArgon2"
+			],
+			"libs": [
+				"sodium"
+			]
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
@@ -43,7 +57,6 @@
 		"draft": {
 			"path": "vendor/raft"
 		},
-		"libsodiumd": "~>0.2",
 		"vibe-core": "~>2.8"
 	},
 	"description": "a dlang redis implementation",
@@ -51,8 +64,7 @@
 		"-mcpu=x86-64-v3"
 	],
 	"libs": [
-		"lua5.4",
-		"sodium"
+		"lua5.4"
 	],
 	"libs-linux": [
 		"jemalloc"

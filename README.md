@@ -6,9 +6,11 @@
 
 <p align="center"><b>A fast, reliable, in-memory data store — written in D.</b></p>
 
-Redis-compatible, built around three commitments: zero GC in the data plane,
-arena memory, and one purpose — speed. It speaks RESP2/RESP3 and tracks
-Redis/Valkey on the supported command surface.
+Redis-compatible, built with D/dub, vibe-core fibers, and the `draft` Raft
+package. The day-to-day build uses reggae+ninja; the runtime is built around
+three commitments: zero GC in the data plane, arena memory, and one purpose —
+speed. It speaks RESP2/RESP3 and tracks Redis/Valkey on the supported command
+surface.
 
 ```
 ⟜ Ultra-light. 16 logical DBs on one event-loop thread.
@@ -143,14 +145,21 @@ pipelined numbers show the real per-command cost.
 
 ## Build & run
 
-Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4,
-libsodium, and on Linux jemalloc (linked automatically).
+Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4, and
+on Linux jemalloc (linked automatically).
 
 ```sh
 dub build -b release --compiler=ldc2
 ./bin/dreads                       # port 6379
 ./bin/dreads 6390 --appendonly     # custom port + AOF persistence
 redis-cli -p 6390 PING
+```
+
+Argon2id password hashing for the in-progress ACL/AUTH path is opt-in and links
+libsodium:
+
+```sh
+dub build -c argon2 -b release --compiler=ldc2
 ```
 
 Day-to-day builds go through [reggae](https://github.com/atilaneves/reggae)
@@ -198,7 +207,7 @@ source/dreads/
   aof.d        append-only log: write, fsync policy, replay
   replicator.d Raft integration (cross-thread queues, apply loop)
   server.d     vibe-core TCP front-end (fiber per connection)
-vendor/raft/   Raft consensus for D (git submodule)
+vendor/raft/   `draft` Raft consensus package (git submodule)
 vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
 ```
 
