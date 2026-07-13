@@ -878,6 +878,85 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             case "WHOAMI":
                 repBulk(o, c.user !is null ? c.user.name : "default");
                 return true;
+            case "DRYRUN":
+                {
+                    // ACL DRYRUN <user> <command> [args...] — run the same
+                    // command/key/channel check without executing, reply +OK or
+                    // the verbose reason (a bulk string, not an error).
+                    if (cmd.arr.length < 4)
+                    {
+                        repError(o,
+                            "ERR wrong number of arguments for 'acl|dryrun' command");
+                        return true;
+                    }
+                    auto du = aclUser(cmd.arr[2].str);
+                    static ByteBuffer de; // TLS
+                    if (du is null)
+                    {
+                        de.clear();
+                        de.append("ERR User '");
+                        de.append(cmd.arr[2].str);
+                        de.append("' not found");
+                        repError(o, cast(const(char)[]) de.data);
+                        return true;
+                    }
+                    auto targ = cmd.arr[3 .. $]; // target command + its args
+                    auto tname = targ[0].str;
+                    char[32] tlb = void;
+                    if (tname.length > tlb.length)
+                    {
+                        repError(o, "ERR Command not found");
+                        return true;
+                    }
+                    foreach (i, ch; tname)
+                        tlb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                    auto tlname = cast(const(char)[]) tlb[0 .. tname.length];
+                    immutable tci = aclCmdIndex(tlname);
+                    if (tci < 0)
+                    {
+                        de.clear();
+                        de.append("ERR Command '");
+                        de.append(tname);
+                        de.append("' not found");
+                        repError(o, cast(const(char)[]) de.data);
+                        return true;
+                    }
+                    // subcommand / first-arg
+                    char[32] dsb = void;
+                    const(char)[] dsub;
+                    if (targ.length >= 2 && targ[1].str.length <= dsb.length)
+                    {
+                        foreach (i, ch; targ[1].str)
+                            dsb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                        dsub = cast(const(char)[]) dsb[0 .. targ[1].str.length];
+                    }
+                    de.clear();
+                    if (!aclCanRunCmdSub(du, tci, dsub))
+                    {
+                        de.append("User ");
+                        de.append(du.name);
+                        de.append(" has no permissions to run the '");
+                        de.append(tlname);
+                        if (dsub.length && aclCmdHasSubRule(du, tci))
+                        {
+                            de.append("|");
+                            de.append(dsub);
+                        }
+                        de.append("' command");
+                        repBulk(o, cast(const(char)[]) de.data);
+                        return true;
+                    }
+                    if (!du.root.allKeys && aclKeyDenied(du, tlname, targ))
+                    {
+                        de.append("User ");
+                        de.append(du.name);
+                        de.append(" has no permissions to access one of the keys used as arguments");
+                        repBulk(o, cast(const(char)[]) de.data);
+                        return true;
+                    }
+                    repSimple(o, "OK");
+                    return true;
+                }
             case "GETUSER":
                 {
                     if (cmd.arr.length != 3)
@@ -1035,10 +1114,64 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     return true;
                 }
             case "CAT":
-                repArrayHeader(o, aclCatNames.length);
-                foreach (nm; aclCatNames)
-                    repBulk(o, nm);
-                return true;
+                {
+                    if (cmd.arr.length == 2) // no arg: list the categories
+                    {
+                        repArrayHeader(o, aclCatNames.length);
+                        foreach (nm; aclCatNames)
+                            repBulk(o, nm);
+                        return true;
+                    }
+                    if (cmd.arr.length == 3) // one arg: list the category's members
+                    {
+                        import dreads.aclcat : aclCatBit, gCmdCats;
+                        import dreads.aclsub : gSubCmds;
+
+                        auto cn = cmd.arr[2].str;
+                        char[32] clb = void;
+                        uint bit = 0;
+                        if (cn.length <= clb.length)
+                        {
+                            foreach (i, ch; cn)
+                                clb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                            bit = aclCatBit(clb[0 .. cn.length]);
+                        }
+                        if (bit == 0)
+                        {
+                            static ByteBuffer ce; // TLS
+                            ce.clear();
+                            ce.append("ERR Unknown category '");
+                            ce.append(cn.length > 128 ? cn[0 .. 128] : cn);
+                            ce.append("'");
+                            repError(o, cast(const(char)[]) ce.data);
+                            return true;
+                        }
+                        size_t n = 0;
+                        foreach (ref cc; gCmdCats)
+                            if (cc.cats & bit)
+                                n++;
+                        foreach (ref sc; gSubCmds)
+                            if (sc.cats & bit)
+                                n++;
+                        repArrayHeader(o, n);
+                        foreach (ref cc; gCmdCats)
+                            if (cc.cats & bit)
+                                repBulk(o, cc.name);
+                        static ByteBuffer sb; // TLS: assemble "container|sub"
+                        foreach (ref sc; gSubCmds)
+                            if (sc.cats & bit)
+                            {
+                                sb.clear();
+                                sb.append(sc.container);
+                                sb.append("|");
+                                sb.append(sc.sub);
+                                repBulk(o, cast(const(char)[]) sb.data);
+                            }
+                        return true;
+                    }
+                    repUnknownSubcommand(o, "ACL", "CAT"); // too many args
+                    return true;
+                }
             case "GENPASS":
                 {
                     import dreads.rand : nextRand;

@@ -98,6 +98,63 @@ struct AclPerm
         cmdRules.put(cast(const(char)[]) mallocDup(tok));
     }
 
+    // Engulf: adding `+memory` collapses a prior `+memory|doctor` so GETUSER
+    // shows the whole command, not stale subcommand tokens (Valkey semantics).
+    // `whole` drops every rule for the command; else only the exact cmd|sub.
+    // Order of surviving tokens is preserved (GETUSER echoes them in order).
+    void dropCmdRuleFor(scope const(char)[] cmdLower, scope const(char)[] subLower,
+            bool whole) @nogc nothrow @trusted
+    {
+        size_t w = 0;
+        foreach (r; 0 .. cmdRules.length)
+        {
+            if (cmdRuleMatches(cmdRules[r], cmdLower, subLower, whole))
+                freeSlice(cmdRules[r]);
+            else
+            {
+                cmdRules[w] = cmdRules[r];
+                w++;
+            }
+        }
+        while (cmdRules.length > w)
+            cmdRules.popBack();
+    }
+
+    // does rule token `tok` (+cmd / -cmd|sub) target this command (+ sub)?
+    private static bool cmdRuleMatches(scope const(char)[] tok, scope const(char)[] cmdLower,
+            scope const(char)[] subLower, bool whole) @nogc nothrow @safe
+    {
+        if (tok.length < 2 || (tok[0] != '+' && tok[0] != '-') || tok[1] == '@')
+            return false;
+        auto rest = tok[1 .. $];
+        size_t bar = rest.length;
+        foreach (i, ch; rest)
+            if (ch == '|')
+            {
+                bar = i;
+                break;
+            }
+        if (!eqLower(rest[0 .. bar], cmdLower))
+            return false;
+        if (whole)
+            return true; // whole-command rule engulfs every sub of this command
+        auto tsub = bar < rest.length ? rest[bar + 1 .. $] : null;
+        return eqLower(tsub, subLower);
+    }
+
+    private static bool eqLower(scope const(char)[] a, scope const(char)[] b) @nogc nothrow @safe
+    {
+        if (a.length != b.length)
+            return false;
+        foreach (i, ch; a)
+        {
+            auto x = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            if (x != b[i])
+                return false;
+        }
+        return true;
+    }
+
     // record a per-subcommand override; drop any earlier one for the same pair
     void setSubRule(int cmd, scope const(char)[] sub, bool allow) @nogc nothrow @trusted
     {
@@ -370,19 +427,80 @@ private bool applyCmdRule(AclUser* u, scope const(char)[] spec, bool allow,
     }
     if (sub.length)
     {
-        // per-subcommand override: record it, leave the base command bit alone
-        char[64] sb = void;
-        if (sub.length > sb.length)
-            return false;
+        // sub may hold a further '|'. First segment = the subcommand/first-arg.
+        size_t seg = sub.length;
         foreach (i, ch; sub)
-            sb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
-        u.root.setSubRule(idx, sb[0 .. sub.length], allow);
+            if (ch == '|')
+            {
+                seg = i;
+                break;
+            }
+        char[64] sb = void;
+        if (seg > sb.length)
+            return false;
+        foreach (i; 0 .. seg)
+            sb[i] = (sub[i] >= 'A' && sub[i] <= 'Z') ? cast(char)(sub[i] + 32) : sub[i];
+        auto slow = sb[0 .. seg];
+        if (aclIsContainer(lb[0 .. name.length]))
+        {
+            // container: the segment must be a real subcommand; a further '|'
+            // (config|get|appendonly) is an unsupported first-arg of a subcommand
+            if (!aclSubExists(lb[0 .. name.length], slow))
+            {
+                err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
+                return false;
+            }
+            if (seg < sub.length)
+            {
+                err = "ERR Error in ACL SETUSER modifier: Allowing first-arg of a"
+                    ~ " subcommand is not supported";
+                return false;
+            }
+        }
+        else
+        {
+            // non-container: `|arg` is a first-arg rule (e.g. select|0). A second
+            // '|' would be two first-args — unsupported → "Unknown command…".
+            if (seg < sub.length)
+            {
+                err = "ERR Error in ACL SETUSER modifier: Unknown command or category name in ACL";
+                return false;
+            }
+        }
+        // both subcommands and first-args are enforced via the same SubRule
+        // (aclCanRunCmdSub matches arg[1]); the rule text is echoed verbatim.
+        u.root.dropCmdRuleFor(lb[0 .. name.length], slow, false); // replace same key
+        u.root.setSubRule(idx, slow, allow);
         return true;
     }
-    // a whole-command rule supersedes any subcommand overrides for it
+    // a whole-command rule supersedes (engulfs) its subcommand overrides
+    u.root.dropCmdRuleFor(lb[0 .. name.length], null, true);
     u.root.dropSubRules(idx);
     bitSet(u.root.allowed, idx, allow);
     return true;
+}
+
+/// Is `sub` a real subcommand of container `cmd` (both lowercase)?
+bool aclSubExists(scope const(char)[] cmd, scope const(char)[] sub) @trusted nothrow @nogc
+{
+    import dreads.aclsub : gSubCmds;
+
+    foreach (ref sc; gSubCmds)
+        if (sc.container == cmd && sc.sub == sub)
+            return true;
+    return false;
+}
+
+/// Does `cmd` (lowercase) have subcommands (CONFIG, CLIENT, …)? If not, a
+/// `cmd|arg` rule is a first-arg restriction (select|0), not a subcommand.
+bool aclIsContainer(scope const(char)[] cmd) @trusted nothrow @nogc
+{
+    import dreads.aclsub : gSubCmds;
+
+    foreach (ref sc; gSubCmds)
+        if (sc.container == cmd)
+            return true;
+    return false;
 }
 
 private bool applyKeyPatWithFlags(AclUser* u, scope const(char)[] spec,
@@ -1158,6 +1276,31 @@ unittest // per-subcommand ACL: +@all -client +client|id
     assert(aclApplyRule(u, "+client", err));
     assert(aclCanRunCmd(u, ci) && !aclCmdHasSubRule(u, ci));
     assert(aclCanRunCmdSub(u, ci, "kill"));
+}
+
+unittest // subcommand catalog: validation + first-arg rules + container check
+{
+    assert(aclIsContainer("config") && aclIsContainer("client"));
+    assert(!aclIsContainer("get") && !aclIsContainer("select"));
+    assert(aclSubExists("config", "get") && aclSubExists("function", "list"));
+    assert(!aclSubExists("config", "asdf") && !aclSubExists("get", "foo"));
+
+    const(char)[] err;
+    auto u = aclGetOrCreate("subval");
+    scope (exit)
+        aclDelUser("subval");
+    assert(aclApplyRule(u, "on", err));
+    // container: valid subcommand ok; unknown sub / first-arg-of-sub rejected
+    assert(aclApplyRule(u, "+config|get", err));
+    assert(!aclApplyRule(u, "+config|asdf", err));
+    assert(!aclApplyRule(u, "+config|get|appendonly", err)); // first-arg of a sub
+    // non-container: `|arg` is a first-arg rule (select|0), enforced via SubRule
+    assert(aclApplyRule(u, "-@all", err));
+    assert(aclApplyRule(u, "+select|0", err));
+    immutable si = aclCmdIndex("select");
+    assert(aclCanRunCmdSub(u, si, "0")); // SELECT 0 ok
+    assert(!aclCanRunCmdSub(u, si, "1")); // SELECT 1 denied
+    assert(!aclApplyRule(u, "+get|k1|k2", err)); // two first-args → rejected
 }
 
 unittest // long command names (>16 chars) are catalogued and gated
