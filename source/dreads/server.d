@@ -577,20 +577,25 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         // through to the real check.
         if (!(c.authed && aclUnrestricted(c.user)))
         {
-            bool alwaysOk = uname == "AUTH" || uname == "HELLO" || uname == "RESET" || uname == "QUIT";
-            if (!alwaysOk)
+            char[32] lb = void;
+            foreach (i, ch; name)
+                lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            auto lname = cast(const(char)[]) lb[0 .. name.length];
+            // Permission bit first: an authed user holding this command passes on
+            // a single bitset test and short-circuits everything below — the hot
+            // path for any real ACL user. Only the miss falls to the connection
+            // commands that are allowed regardless (AUTH/HELLO/RESET/QUIT).
+            if (!(c.authed && aclCanRunCmd(c.user, aclCmdIndex(lname))))
             {
-                char[32] lb = void;
-                foreach (i, ch; name)
-                    lb[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
-                auto lname = cast(const(char)[]) lb[0 .. name.length];
-                if (!c.authed)
+                bool alwaysOk = uname == "AUTH" || uname == "HELLO"
+                    || uname == "RESET" || uname == "QUIT";
+                if (!alwaysOk)
                 {
-                    repError(o, "NOAUTH Authentication required.");
-                    return true;
-                }
-                if (!aclCanRunCmd(c.user, aclCmdIndex(lname)))
-                {
+                    if (!c.authed)
+                    {
+                        repError(o, "NOAUTH Authentication required.");
+                        return true;
+                    }
                     static ByteBuffer eb; // TLS
                     eb.clear();
                     eb.append("NOPERM User ");
