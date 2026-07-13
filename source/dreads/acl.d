@@ -98,29 +98,26 @@ private bool bitGet(ref const ulong[NW] bits, size_t i) @nogc nothrow @safe
 
 import dreads.dict : Dict;
 
-// name (lowercase) -> index in gCmdCats, built once at boot so the enforcement
-// hot path is an O(1) hash lookup, not a 258-command linear scan.
-private __gshared Dict!int gCmdIdx;
-
-private __gshared bool gCmdIdxBuilt;
-
-// lazy (not a module ctor — that would cycle with dreads.scripting): built on
-// the first lookup, then a single bool test on the hot path.
-private void ensureCmdIndex() @trusted nothrow
+/// Command name (lowercase) -> its index in gCmdCats, or -1.
+///
+/// A compile-time `static foreach` string switch, NOT a runtime hash table: the
+/// command names are known at build time, so LDC lowers this to a length-bucketed
+/// comparison tree that lives in the instruction stream (stays hot in i-cache).
+/// A Dict here cost ~11% on the enforcement hot path — its bucket array is touched
+/// ONLY by ACL, so it fell cold between commands and every lookup ate a data-cache
+/// miss. The switch has no cold data to miss.
+int aclCmdIndex(scope const(char)[] lower) @trusted nothrow @nogc
 {
-    if (gCmdIdxBuilt)
-        return;
-    gCmdIdxBuilt = true;
-    foreach (i, ref c; gCmdCats)
-        gCmdIdx.set(c.name, cast(int) i);
-}
-
-/// Command name (lowercase) -> its index in gCmdCats, or -1. O(1) after warmup.
-int aclCmdIndex(scope const(char)[] lower) @trusted nothrow
-{
-    ensureCmdIndex();
-    auto p = gCmdIdx.get(lower);
-    return p ? *p : -1;
+    switch (lower)
+    {
+        static foreach (i, c; gCmdCats)
+        {
+    case c.name:
+            return cast(int) i;
+        }
+    default:
+        return -1;
+    }
 }
 
 private void allowCategory(ref AclPerm p, uint catBit, bool allow) @nogc nothrow @safe
