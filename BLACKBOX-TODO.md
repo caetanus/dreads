@@ -35,25 +35,28 @@ ZRANDMEMBER WITHSCORES count-overflow guard (was a server CRASH via 9e18-draw
 loop); `blackbox/sweep.sh` restarts dreads per file (kills cross-file config
 leakage).
 
-## Progress per file (session start → sweep8, db 9, skipfile, fresh server per file)
+## Progress per file (fresh sweep 2026-07-13, sweep-27, db 9, skipfile, fresh server per file)
 
-| File | ok before | ok now | err | runs to end? |
+| File | sweep8 ok | now ok | err | first blocker (if aborts) |
 |---|---|---|---|---|
 | unit/type/incr | 32 | 32 | 0 | **PASSES** |
-| unit/type/string | 21† | 82 | 2 | yes |
-| unit/type/list | 32†‡ | 100 | 9 | yes |
-| unit/type/hash | 31† | 79 | 4 | aborts at DUMP (not implemented) |
-| unit/type/set | 90 | 115 | 2 | yes |
-| unit/type/zset | 110† | 305 | 9 | crashed at ZRANDMEMBER overflow (guard landed after sweep8) |
-| unit/expire | 30 | 62 | 4 | yes |
-| unit/keyspace | 42 | 45 | 1 | aborts: stream-cgroups COPY (syntax) |
-| unit/scan | 10 | 10 | 3 | aborts (HSCAN NOVALUES?) |
-| unit/bitops | 11† | 46 | 1 | aborts: SETBIT fuzz empty reply |
-| unit/other | 0† | 8 | 3 | aborts: CONFIG INFO `flags` field |
-| unit/sort | 0† | 45 | 10 | yes |
-| **total** | **409** | **929** | **48** | |
+| unit/type/string | 82 | 106 | 0 | **PASSES** (was 2 err) |
+| unit/type/list | 100 | 100 | 8 | aborts: tcl `can't read "cmd"` (framework var; investigate) |
+| unit/type/hash | 79 | 79 | 3 | aborts: `DUMP` unknown command |
+| unit/type/set | 115 | 115 | 4 | yes |
+| unit/type/zset | 305 | 318 | 8 | yes (ZRANDMEMBER crash guard landed) |
+| unit/expire | 62 | 62 | 3 | aborts: `CLIENT IMPORT-SOURCE` unknown subcommand |
+| unit/keyspace | 45 | 45 | 0 | aborts: stream-cgroups COPY (ERR syntax) |
+| unit/scan | 10 | 24 | 0 | yes (was aborting) |
+| unit/bitops | 46 | 49 | 2 | yes (was aborting) |
+| unit/other | 8 | 25 | 1 | aborts: CONFIG SET "Unsupported CONFIG parameter" |
+| unit/sort | 45 | 44 | 22 | yes |
+| **total** | **929** | **999** | **51** | |
 
-† aborted at first exception; ‡ plus a 600 s hang.
+Quick wins to unmask downstream tests: **CLIENT IMPORT-SOURCE** stub (expire),
+the unsupported **CONFIG parameter** in `other`, and the `list` tcl `cmd` var
+(may be a dreads reply shape the framework doesn't expect). DUMP/RESTORE (hash)
+and stream-COPY (keyspace) are the bigger blockers.
 
 ## Layer 4 — open failures (sweep7/8)
 
