@@ -156,7 +156,8 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "maxmemory-policy":
         switch (value)
         {
-        case "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random":
+        case "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random",
+            "allkeys-lfu", "volatile-lfu", "volatile-random", "volatile-ttl":
             cfg.maxmemoryPolicy = value;
             return true;
         default:
@@ -260,6 +261,17 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         else
             return false;
         return true;
+    case "rdb-version-check": // accepted no-op: RESTORE always accepts version <= ours
+        return value == "relaxed" || value == "strict";
+    case "hll-sparse-max-bytes": // accepted: HLL sparse->dense threshold (informational)
+        {
+            long v;
+            try
+                v = value.to!long;
+            catch (Exception)
+                return false;
+            return v >= 0;
+        }
     case "import-mode":
         if (value != "yes" && value != "no")
             return false;
@@ -319,7 +331,8 @@ public bool isRuntimeSettable(string lname) nothrow
         "zset-max-listpack-entries", "zset-max-ziplist-entries",
         "zset-max-listpack-value", "zset-max-ziplist-value",
         "stream-node-max-entries", "stream-node-max-bytes",
-        "proto-max-bulk-len", "client-query-buffer-limit":
+        "proto-max-bulk-len", "client-query-buffer-limit",
+        "rdb-version-check", "hll-sparse-max-bytes":
         return true;
     default:
         return false;
