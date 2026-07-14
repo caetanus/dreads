@@ -3605,7 +3605,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.streamops : xinfo;
 
-            xinfo(ks, args, o);
+            xinfo(ks, args, o, arena);
             break;
         }
     case "XGROUP":

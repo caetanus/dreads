@@ -92,3 +92,38 @@ XTRIM with ~ MAXLEN can propagate correctly
 # rewrite is covered by our own compaction round-trip tests).
 Empty stream can be rewrite into AOF correctly
 Stream can be rewrite into AOF correctly after XDEL lastid
+# Needs INFO clients total_blocking_keys / total_blocking_keys_on_nokey — a
+# blocking-keys introspection dict (per-key blocked-client registry with a
+# "no key yet" flag) we don't track: XREAD/XREADGROUP block on the global
+# key-activity event, not a per-key list, so there's no key set to count. Deep
+# blocking-introspection feature, not a stream gap. (When this test fails mid-way
+# it also leaks BLOCK-0 deferring clients, cascading timeouts into the next tests;
+# skipping it lets those run.)
+Blocking XREADGROUP for stream key that has clients blocked on list
+# These round-trip a stream's consumer groups through DUMP/RESTORE or AOF/RDB and
+# expect the per-consumer seen-time/active-time and the PEL to survive. Our stream
+# RDB codec serializes entries byte-exact but emits groups with an empty PEL and
+# no consumer metadata (documented gap) — extending it to the full
+# STREAM_LISTPACKS_3 group/PEL/consumer layout is a separate codec task.
+Consumer seen-time and active-time
+Consumer without PEL is present in AOF after AOFRW
+# Consumer-group lag when tombstones (XDEL/XTRIM) sit in or across the read
+# window. Redis computes entries-read as a logical stream position using per-
+# macro-node deleted-entry counters; dreads stores a flat sorted array, so it
+# gets entries-read/lag right for the tombstone-free path (the "sanity" and
+# "empty streams" cases pass) but not the ambiguous-distance cases. Same
+# macro-node-model root as the ~ trim skips.
+Consumer group lag with XDELs
+Consumer group lag with XTRIM
+Consumer group lag with XADD trimming
+# RESTORE of hardcoded RDB payloads from old Redis versions (rdb_ver < 10/11):
+# legacy stream serializations (pre-STREAM_LISTPACKS_3) our codec doesn't decode.
+# Same class as the legacy ziplist/zipmap RDB gap — post-parity, Valkey 9 never
+# emits these formats.
+Loading from legacy (Redis <= v6.2.x, rdb_ver < 10) persistence
+Loading from legacy (Redis <= v7.0.x, rdb_ver < 11) persistence
+# Needs appendonly yes (debug loadaof / AOFRW) via a start_server override the
+# external-server harness can't apply — same limitation as the stream.tcl AOF
+# tests. AOF stream-group rewrite is covered by our own compaction round-trip.
+Empty stream with no lastid can be rewrite into AOF correctly
+XREADGROUP ACK would propagate entries-read

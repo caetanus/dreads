@@ -10,7 +10,20 @@ import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
-import dreads.stream : FieldPair, Group, PelEntry, StreamID, nowMs;
+import dreads.stream : ConsumerInfo, FieldPair, Group, PelEntry, Stream, StreamID, nowMs;
+
+/// XINFO lag: how many entries the group hasn't read. Unknown (nil) when a
+/// tombstone sits after the cursor — the logical distance can't be counted;
+/// countAfter while entries-read is still unknown; else entries-added minus read.
+private void repGroupLag(ref ByteBuffer o, ref const Stream st, ref const Group g) @nogc nothrow
+{
+    if (g.entriesRead < 0)
+        repInt(o, cast(long) st.countAfter(g.lastDelivered));
+    else if (st.maxDeletedId > g.lastDelivered)
+        repNullBulk(o); // tombstone after the cursor: distance unknown
+    else
+        repInt(o, cast(long) st.entriesAdded - g.entriesRead);
+}
 
 private void repWrongTypeS(ref ByteBuffer o) @nogc nothrow
 {
@@ -291,7 +304,7 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
 }
 
 /// XINFO STREAM key | XINFO GROUPS key
-public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
+public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
     if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
     {
@@ -375,20 +388,63 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
                 if (!obj.stream.groups.slotLive(i))
                     continue;
                 auto g = obj.stream.groups.valAt(i);
-                repArrayHeader(o, 10);
+                repArrayHeader(o, 14); // 7 pairs
                 repBulk(o, "name");
                 repBulk(o, obj.stream.groups.keyAt(i));
                 repBulk(o, "last-delivered-id");
                 repStreamId(o, g.lastDelivered);
                 repBulk(o, "pel-count");
                 repInt(o, cast(long) g.pending.length);
+                // the group PEL: [id, delivery-time, delivery-count] per entry
+                repBulk(o, "pending");
+                repArrayHeader(o, g.pending.length);
+                foreach (ref pe; g.pending)
+                {
+                    repArrayHeader(o, 3);
+                    repStreamId(o, pe.id);
+                    repInt(o, cast(long) pe.deliveryTimeMs);
+                    repInt(o, cast(long) pe.deliveryCount);
+                }
+                // per-consumer detail (name-sorted), each with its PEL slice
+                repBulk(o, "consumers");
+                auto order = sortedConsumers(*g, arena);
+                repArrayHeader(o, order.length);
+                foreach (ci; order)
+                {
+                    auto cn = g.consumers.keyAt(ci);
+                    auto info = g.consumers.valAt(ci);
+                    size_t cpel = 0;
+                    foreach (ref pe; g.pending)
+                        if (pe.consumer == cn)
+                            cpel++;
+                    repArrayHeader(o, 10); // 5 pairs
+                    repBulk(o, "name");
+                    repBulk(o, cn);
+                    repBulk(o, "seen-time");
+                    repInt(o, cast(long) info.seenTime);
+                    repBulk(o, "active-time");
+                    repInt(o, info.activeTime == 0 ? -1 : cast(long) info.activeTime);
+                    repBulk(o, "pel-count");
+                    repInt(o, cast(long) cpel);
+                    repBulk(o, "pending");
+                    repArrayHeader(o, cpel);
+                    foreach (ref pe; g.pending)
+                    {
+                        if (pe.consumer != cn)
+                            continue;
+                        repArrayHeader(o, 3);
+                        repStreamId(o, pe.id);
+                        repInt(o, cast(long) pe.deliveryTimeMs);
+                        repInt(o, cast(long) pe.deliveryCount);
+                    }
+                }
                 repBulk(o, "entries-read");
                 if (g.entriesRead < 0)
                     repNullBulk(o);
                 else
                     repInt(o, g.entriesRead);
                 repBulk(o, "lag");
-                repInt(o, cast(long) obj.stream.countAfter(g.lastDelivered));
+                repGroupLag(o, obj.stream, *g);
             }
             return;
         }
@@ -446,11 +502,73 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
             else
                 repInt(o, g.entriesRead);
             repBulk(o, "lag");
-            repInt(o, cast(long) obj.stream.countAfter(g.lastDelivered));
+            repGroupLag(o, obj.stream, *g);
+        }
+        return;
+    }
+    if (eqICKeyword(args[0].str, "CONSUMERS"))
+    {
+        // XINFO CONSUMERS key group — consumers sorted by name (Redis rax order)
+        if (args.length != 3)
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+        auto g = obj.stream.groups.get(args[2].str);
+        if (g is null)
+        {
+            repNoGroup(o, args[2].str, args[1].str);
+            return;
+        }
+        auto order = sortedConsumers(*g, arena);
+        immutable now = nowMs();
+        repArrayHeader(o, order.length);
+        foreach (ci; order)
+        {
+            auto cn = g.consumers.keyAt(ci);
+            auto info = g.consumers.valAt(ci);
+            size_t cpel = 0;
+            foreach (ref pe; g.pending)
+                if (pe.consumer == cn)
+                    cpel++;
+            repArrayHeader(o, 8); // name, pending, idle, inactive
+            repBulk(o, "name");
+            repBulk(o, cn);
+            repBulk(o, "pending");
+            repInt(o, cast(long) cpel);
+            repBulk(o, "idle");
+            repInt(o, cast(long)(now > info.seenTime ? now - info.seenTime : 0));
+            repBulk(o, "inactive");
+            repInt(o, info.activeTime == 0 ? -1
+                    : cast(long)(now > info.activeTime ? now - info.activeTime : 0));
         }
         return;
     }
     repUnknownSubcommand(o, "XINFO", args.length ? args[0].str : "");
+}
+
+/// Live consumer slot indices of a group, sorted lexicographically by name —
+/// Redis stores consumers in a rax, so XINFO iterates them in name order.
+private size_t[] sortedConsumers(ref Group g, ref Arena arena) @nogc nothrow
+{
+    auto idx = arena.allocArray!size_t(g.consumers.length);
+    size_t n = 0;
+    foreach (i; 0 .. g.consumers.capacity)
+        if (g.consumers.slotLive(i))
+            idx[n++] = i;
+    foreach (a; 1 .. n) // insertion sort by name (consumer counts are small)
+    {
+        auto v = idx[a];
+        auto vn = g.consumers.keyAt(v);
+        size_t b = a;
+        while (b > 0 && g.consumers.keyAt(idx[b - 1]) > vn)
+        {
+            idx[b] = idx[b - 1];
+            b--;
+        }
+        idx[b] = v;
+    }
+    return idx[0 .. n];
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +722,7 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         if (eqICKeyword(sub, "CREATECONSUMER"))
         {
             repInt(o, g.consumers.exists(cname) ? 0 : 1);
-            g.ensureConsumer(cname);
+            g.ensureConsumer(cname, nowMs());
             return;
         }
         // DELCONSUMER: drop its pending entries, reply how many
@@ -712,7 +830,9 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
     }
 
     auto now = nowMs();
-    // first pass: which streams produce data?
+    // first pass: which streams produce data? XREADGROUP `>` also registers the
+    // consumer on the group even when there is nothing to deliver (so XINFO
+    // CONSUMERS lists it), bumping its seen-time.
     size_t withData = 0;
     foreach (k; 0 .. half)
     {
@@ -720,6 +840,7 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         auto g = obj.stream.groups.get(gname);
         if (rest[half + k].str == ">")
         {
+            g.ensureConsumer(cname, now);
             bool ok;
             obj.stream.nextAfter(g.lastDelivered, ok);
             if (ok)
@@ -748,7 +869,7 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
             obj.stream.nextAfter(g.lastDelivered, ok);
             if (!ok)
                 continue;
-            auto consumer = g.ensureConsumer(cname);
+            auto consumer = g.ensureConsumer(cname, now);
             // count deliverable first
             size_t n = 0;
             auto cur = g.lastDelivered;
@@ -761,6 +882,8 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
                 n++;
                 cur = id;
             }
+            if (n > 0)
+                g.markActive(cname, now); // read real data
             repArrayHeader(o, 2);
             repBulk(o, rest[k].str);
             repArrayHeader(o, n);
@@ -773,6 +896,12 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
                 if (!noack)
                     g.pelSet(id, consumer, now, 1);
             }
+            // entries-read = logical position of the advanced cursor (exact when
+            // no tombstone sits between first-entry and the cursor; the deeper
+            // tombstone-ambiguity cases — lag with XDEL/XTRIM — are a known debt).
+            if (n > 0)
+                g.entriesRead = cast(long) obj.stream.entriesAdded
+                    - cast(long) obj.stream.countAfter(g.lastDelivered);
         }
         else
         {
@@ -1056,7 +1185,7 @@ public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         return;
     }
     auto now = nowMs();
-    auto consumer = g.ensureConsumer(args[2].str);
+    auto consumer = g.ensureConsumer(args[2].str, now);
     // scan the PEL from `start`, examining up to `count` entries. Live ones are
     // claimed; ones deleted from the stream go to the deleted-ids list and are
     // evicted from the PEL. (arena copies: pelSet/pelRemove mutate the list.)
@@ -1135,7 +1264,7 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     if (justId)
         ids = ids[0 .. $ - 1];
     auto now = nowMs();
-    auto consumer = g.ensureConsumer(args[2].str);
+    auto consumer = g.ensureConsumer(args[2].str, now);
     // count claimable
     size_t n = 0;
     foreach (ref a; ids)

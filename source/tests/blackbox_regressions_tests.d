@@ -1344,4 +1344,46 @@ version (unittest)
         ks.run("XSETID", "z", "5-0", "ENTRIESADDED", "10", "MAXDELETEDID", "3-0")
             .should.equal("+OK\r\n");
     }
+
+    // Consumer-group introspection: XINFO CONSUMERS (name-sorted, idle/inactive),
+    // consumer registration on an empty `>` read, and entries-read/lag on the
+    // tombstone-free path. First caught by unit/type/stream-cgroups.
+    @("blackbox.stream_consumer_introspection")
+    unittest
+    {
+        import std.conv : to;
+        import std.string : indexOf;
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        foreach (i; 1 .. 6)
+            ks.run("XADD", "x", i.to!string ~ "-0", "d", "v");
+        ks.run("XGROUP", "CREATE", "x", "g", "0");
+
+        // fresh group (no ENTRIESREAD): entries-read nil, lag = live count
+        auto full0 = ks.run("XINFO", "STREAM", "x", "FULL");
+        full0.should.contain("entries-read");
+        full0.should.contain("lag");
+
+        // read 1 -> entries-read 1, lag 4
+        ks.run("XREADGROUP", "GROUP", "g", "Bob", "COUNT", "1", "STREAMS", "x", ">");
+        // register a second consumer even with nothing new to read for it
+        ks.run("XREADGROUP", "GROUP", "g", "Alice", "COUNT", "10", "STREAMS", "x", ">");
+
+        // XINFO CONSUMERS: both listed, sorted by name (Alice before Bob)
+        auto cons = ks.run("XINFO", "CONSUMERS", "x", "g");
+        cons.should.contain("Alice");
+        cons.should.contain("Bob");
+        cons.should.contain("idle");
+        cons.should.contain("inactive");
+        immutable ai = cast(ptrdiff_t) cons.indexOf("Alice");
+        immutable bi = cast(ptrdiff_t) cons.indexOf("Bob");
+        (ai < bi).should.equal(true); // name-sorted
+
+        // lag is 0 after the whole stream is read (tombstone-free path)
+        auto full1 = ks.run("XINFO", "STREAM", "x", "FULL");
+        full1.should.contain("lag");
+    }
 }

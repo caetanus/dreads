@@ -103,6 +103,33 @@ pipelined numbers show the real per-command cost.
   Raft thread communicate through SPSC Lamport-ring queues: atomic head/tail
   on the hot path, no mutex or syscall unless one side actually parks.
 
+## Why fibers matter
+
+dreads is not just "single-threaded like Redis". Its front-end is
+**fiber-intensive by design**: every connection, blocking wait, subscriber
+writer, pause barrier, stream read, and long-lived protocol interaction can keep
+a natural sequential control flow without becoming an OS thread and without
+turning the server into a maze of callback state machines.
+
+That matters most where Redis-like systems are event-heavy rather than purely
+request/response:
+
+- blocking commands (`BLPOP`, `BZPOPMIN`, `XREAD BLOCK`, `XREADGROUP BLOCK`, ...)
+  park a fiber and resume it when the keyspace event arrives;
+- Pub/Sub subscribers get ordered async delivery without forcing the publisher
+  to block on slow sockets;
+- Lua runs off the event loop while the main loop continues serving ordinary
+  clients;
+- `CLIENT PAUSE`, migration-style buffering, timers, and Raft commit waits all
+  compose as ordinary suspended execution instead of scattered continuation
+  state.
+
+The result is a shared-nothing-friendly model: one shard owns its keyspace on
+one event-loop thread, fibers provide massive cooperative concurrency inside
+that shard, and cross-thread work is explicit message passing. The hot data
+structures stay lock-free from the shard's point of view; concurrency is paid
+for only at the boundaries where another service or shard is involved.
+
 ## Features
 
 - **229 of Valkey's 258 base commands** — see [DRIFT.md](DRIFT.md) for the

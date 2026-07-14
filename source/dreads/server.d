@@ -2190,7 +2190,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, "ERR timeout is not an integer or out of range");
                 return true;
             }
+            immutable xrgErrPrev = gTotalErrorReplies;
+            immutable xrgOutBefore = o.length;
             xreadgroupBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
+            statBlockingReply("xreadgroup", o, xrgOutBefore, xrgErrPrev);
             return true;
         }
     case "BLMPOP":
@@ -2819,6 +2822,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             "stream-node-max-entries", "stream-node-max-bytes",
             "proto-max-bulk-len", "client-query-buffer-limit", "acllog-max-len",
             "aof-use-rdb-preamble", "rdb-version-check", "active-eviction",
+            "appendfsync",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -2865,6 +2869,9 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 break;
             case "aof-use-rdb-preamble":
                 repBulk(o, "no"); // accepted but inert — dreads' AOF is its own format
+                break;
+            case "appendfsync":
+                repBulk(o, "everysec"); // accepted but inert — dreads uses `synchronous`
                 break;
             case "rdb-version-check":
                 repBulk(o, gConfig.rdbVersionCheck);
@@ -4108,6 +4115,18 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             return;
         }
     }
+}
+
+/// Count a blocking command's final reply into INFO commandstats/errorstats —
+/// blocking serves happen in the server layer and bypass executeCommand's
+/// accounting, so a blocked XREADGROUP that wakes with -NOGROUP would otherwise
+/// not register (calls/failed_calls/total_error_replies). Mirrors that path.
+private void statBlockingReply(string lname, ref ByteBuffer o, size_t outBefore, ulong errPrev) nothrow
+{
+    immutable errored = o.length > outBefore && o.data[outBefore] == '-';
+    if (errored && gTotalErrorReplies == errPrev)
+        statErrorReply(cast(const(char)[]) o.data[outBefore .. $]);
+    statCall(aclCmdIndex(lname), errored);
 }
 
 /// XREADGROUP ... BLOCK ms ... >  : strips the BLOCK pair and retries the group

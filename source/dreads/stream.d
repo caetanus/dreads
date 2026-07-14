@@ -78,6 +78,13 @@ public struct PelEntry
     ulong deliveryCount;
 }
 
+/// Per-consumer activity clocks (XINFO CONSUMERS idle/inactive).
+public struct ConsumerInfo
+{
+    ulong seenTime; // last attempted interaction (any XREADGROUP/XCLAIM)
+    ulong activeTime; // last successful read/claim of real data; 0 = never
+}
+
 /// Consumer group: last-delivered cursor + pending entries list (sorted).
 public struct Group
 {
@@ -86,7 +93,7 @@ public struct Group
     PelEntry* pel;
     size_t plen;
     size_t pcap;
-    Dict!Unit consumers;
+    Dict!ConsumerInfo consumers;
 
     void free() @nogc nothrow
     {
@@ -102,17 +109,27 @@ public struct Group
         return pel[0 .. plen];
     }
 
-    /// Registers the consumer (if new) and returns its stable name slice.
-    const(char)[] ensureConsumer(scope const(char)[] name) @nogc nothrow
+    /// Registers the consumer (if new) and bumps its seen-time; returns the
+    /// dict-owned (stable) name slice.
+    const(char)[] ensureConsumer(scope const(char)[] name, ulong now) @nogc nothrow
     {
-        consumers.set(name, Unit());
-        // re-find to get the dict-owned slice
+        if (auto ci = consumers.get(name))
+            ci.seenTime = now;
+        else
+            consumers.set(name, ConsumerInfo(now, 0));
         foreach (i; 0 .. consumers.capacity)
         {
             if (consumers.slotLive(i) && consumers.keyAt(i) == name)
                 return consumers.keyAt(i);
         }
         return null; // unreachable
+    }
+
+    /// Marks a consumer as having read/claimed real data (active-time).
+    void markActive(scope const(char)[] name, ulong now) @nogc nothrow
+    {
+        if (auto ci = consumers.get(name))
+            ci.activeTime = now;
     }
 
     private size_t pelLowerBound(StreamID id) const @nogc nothrow
