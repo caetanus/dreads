@@ -108,11 +108,21 @@ durability gap: `dumpKey` now re-emits `HPEXPIREAT` for hash field TTLs (they
 were dropped on rewrite/snapshot). **hash 79/4 -> 81/8 (now RUNS TO COMPLETION —
 DUMP unblocked it; the 4 uniques are pre-existing HRANDFIELD/HINCRBYFLOAT, not
 RDB). list 269/6 -> 271/10 (advanced past DUMP; new blocker = CLIENT PAUSE).**
-Phase 2 (deferred): decode the compact encodings (listpack/ziplist/intset/
-quicklist + LZF) for RESTORE of hardcoded external payloads; stream DUMP.
+**Phase 2 DONE (2026-07-14):** compact-encoding decoders — intset (11),
+listpack (16/17/20), quicklist2 (18) — so real Valkey/Redis dumps import.
+**Bidirectional interop with Valkey 9.1 verified live: dreads DUMP -> Valkey
+RESTORE works for every type; Valkey DUMP -> dreads RESTORE works for every type
+(intset up to 300 elems, listpack hash/set/zset, quicklist2 list).** Own UT
+`blackbox.rdb_restore_valkey_compact` uses REAL Valkey-captured payload bytes.
+Also a live loadaof harness `blackbox/expire_loadaof_test.sh` (the USER's rule):
+every expire mechanism reloads with its ABSOLUTE deadline intact, expired keys
+stay dead across downtime, and TOUCH does NOT renew (matches Valkey — TOUCH only
+bumps last-access; sessions renew via EXPIRE/GETEX). Phase 2b (deferred): legacy
+ziplist (10/12/13) / zipmap (9) / quicklist-v1 (14) / ZSET(3 ascii) / LZF-
+compressed strings / stream DUMP — Valkey 9 doesn't emit these, needed only for
+very old dumps or compressed large values.
 
 ### Not implemented (each aborts its file)
-- RESTORE of compact-encoded external payloads (listpack/ziplist/intset) — phase 2.
 - CLIENT PAUSE (list file — the new blocker after DUMP).
 - HSCAN NOVALUES (scan file, to confirm).
 - COPY of a stream with consumer groups (keyspace).

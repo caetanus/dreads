@@ -711,6 +711,61 @@ version (unittest)
         ks.runAt(T0, "RESTORE", "x", "0", cast(string) bad).expect.to.contain("checksum");
     }
 
+    private string hexToStr(string h)
+    {
+        import std.conv : to;
+
+        auto o = new char[h.length / 2];
+        foreach (i; 0 .. o.length)
+            o[i] = cast(char) h[2 * i .. 2 * i + 2].to!ubyte(16);
+        return cast(string) o;
+    }
+
+    @("blackbox.rdb_restore_valkey_compact")
+    unittest
+    {
+        // RESTORE real Valkey 9.1 DUMP payloads (captured live): intset,
+        // listpack set/hash/zset, quicklist2 list. These are the compact encodings
+        // dreads must decode to import external Redis/Valkey dumps (phase 2).
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // intset {10,20,30}
+        ks.run("RESTORE", "iset", "0",
+            hexToStr("0b0e02000000030000000a0014001e005000cdeac7c8f30be87c"))
+            .expect.to.equal("+OK\r\n");
+        ks.run("SCARD", "iset").expect.to.equal(":3\r\n");
+        ks.run("SISMEMBER", "iset", "20").expect.to.equal(":1\r\n");
+
+        // listpack set {alpha,beta}
+        ks.run("RESTORE", "slp", "0",
+            hexToStr("141414000000020085616c70686106846265746105ff5000570d82be5bd5477b"))
+            .expect.to.equal("+OK\r\n");
+        ks.run("SISMEMBER", "slp", "alpha").expect.to.equal(":1\r\n");
+
+        // listpack hash {f1:v1, count:42}
+        ks.run("RESTORE", "hlp", "0",
+            hexToStr("1018180000000400826631038276310385636f756e74062a01ff5000a71468eb3bccba4b"))
+            .expect.to.equal("+OK\r\n");
+        ks.run("HGET", "hlp", "f1").expect.to.equal("$2\r\nv1\r\n");
+        ks.run("HGET", "hlp", "count").expect.to.equal("$2\r\n42\r\n");
+
+        // listpack zset {m1:1.5, m2:-2}
+        ks.run("RESTORE", "zlp", "0",
+            hexToStr("1117170000000400826d3203dffe02826d310383312e3504ff50002cb016337541ecc2"))
+            .expect.to.equal("+OK\r\n");
+        ks.run("ZSCORE", "zlp", "m1").expect.to.equal("$3\r\n1.5\r\n");
+        ks.run("ZSCORE", "zlp", "m2").expect.to.equal("$2\r\n-2\r\n");
+
+        // quicklist2 list [a,b,7]
+        ks.run("RESTORE", "lst", "0",
+            hexToStr("1201020f0f00000003008161028162020701ff50006bffb482e0c12468"))
+            .expect.to.equal("+OK\r\n");
+        ks.run("LRANGE", "lst", "0", "-1")
+            .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\n7\r\n");
+    }
+
     @("blackbox.hexpire_spill_and_active_reap")
     unittest
     {

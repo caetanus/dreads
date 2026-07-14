@@ -515,8 +515,22 @@ bool rdbToCommands(scope const(char)[] key, scope const(ubyte)[] body_, ref Byte
         return decodeHash(r, type, key, sink);
     case RDB_TYPE_ZSET_2:
         return decodeZsetBinary(r, key, sink);
+    case RDB_TYPE_SET_INTSET:
+        const(char)[] isb;
+        return r.loadString(isb) && decodeIntset(cast(const(ubyte)[]) isb, key, sink);
+    case RDB_TYPE_HASH_LISTPACK:
+        const(char)[] hlp;
+        return r.loadString(hlp) && decodeListpackFlat(cast(const(ubyte)[]) hlp, key, "HSET", sink);
+    case RDB_TYPE_SET_LISTPACK:
+        const(char)[] slp;
+        return r.loadString(slp) && decodeListpackFlat(cast(const(ubyte)[]) slp, key, "SADD", sink);
+    case RDB_TYPE_ZSET_LISTPACK:
+        const(char)[] zlp;
+        return r.loadString(zlp) && decodeListpackZset(cast(const(ubyte)[]) zlp, key, sink);
+    case RDB_TYPE_LIST_QUICKLIST_2:
+        return decodeQuicklist2(r, key, sink);
     default:
-        return false; // compact encodings / ZSET(3 ascii) / stream: phase 2
+        return false; // ziplist/zipmap/quicklist-v1 / ZSET(3 ascii) / LZF / stream: phase 2b
     }
 }
 
@@ -587,6 +601,298 @@ private bool decodeHash(ref RdbReader r, ubyte type, scope const(char)[] key,
         repBulk(sink, "FIELDS");
         repBulk(sink, "1");
         repBulk(sink, ttlFields[j]);
+    }
+    return true;
+}
+
+// ===========================================================================
+// Phase 2: compact-encoding decoders (import of real Valkey/Redis dumps).
+// Small collections come as a listpack (types 16/17/20), an intset (11), or a
+// quicklist of listpacks (18). We parse the packed blob into elements and emit
+// the same RPUSH/SADD/HSET/ZADD commands the plain decoders do.
+// ===========================================================================
+
+// --- listpack: <total u32 LE><numele u16 LE><entries...><0xFF> -----------
+// Forward cursor. `next` decodes one entry, advancing past its backlen; an int
+// entry is formatted into the caller's `scratch` (so the caller can hold two
+// live elements at once, needed to swap zset member/score).
+
+private size_t lpBacklenSize(size_t l) @nogc nothrow pure
+{
+    if (l < 128)
+        return 1;
+    if (l < 16384)
+        return 2;
+    if (l < 2_097_152)
+        return 3;
+    if (l < 268_435_456)
+        return 4;
+    return 5;
+}
+
+private struct LpCursor
+{
+    const(ubyte)[] lp;
+    size_t pos = 6; // skip the 6-byte header
+
+    bool atEnd() const @nogc nothrow
+    {
+        return pos >= lp.length || lp[pos] == 0xFF;
+    }
+
+    // Decode the entry at `pos` into `elem` (a blob slice for strings, or `scratch`
+    // for ints); advance past entry+backlen. Returns false on truncation.
+    bool next(ref char[24] scratch, out const(char)[] elem) @nogc nothrow @trusted
+    {
+        if (pos >= lp.length)
+            return false;
+        immutable b = lp[pos];
+        size_t entryLen; // encoding + data, excluding backlen
+        if ((b & 0x80) == 0) // 7-bit uint
+        {
+            elem = fmtLong(b & 0x7F, scratch);
+            entryLen = 1;
+        }
+        else if ((b & 0xC0) == 0x80) // 6-bit string
+        {
+            immutable slen = b & 0x3F;
+            if (pos + 1 + slen > lp.length)
+                return false;
+            elem = cast(const(char)[]) lp[pos + 1 .. pos + 1 + slen];
+            entryLen = 1 + slen;
+        }
+        else if ((b & 0xE0) == 0xC0) // 13-bit int
+        {
+            if (pos + 2 > lp.length)
+                return false;
+            int v = ((b & 0x1F) << 8) | lp[pos + 1];
+            if (v >= (1 << 12))
+                v -= (1 << 13);
+            elem = fmtLong(v, scratch);
+            entryLen = 2;
+        }
+        else if ((b & 0xF0) == 0xE0) // 12-bit string
+        {
+            if (pos + 2 > lp.length)
+                return false;
+            immutable slen = ((b & 0x0F) << 8) | lp[pos + 1];
+            if (pos + 2 + slen > lp.length)
+                return false;
+            elem = cast(const(char)[]) lp[pos + 2 .. pos + 2 + slen];
+            entryLen = 2 + slen;
+        }
+        else if (b == 0xF1) // 16-bit int
+        {
+            if (pos + 3 > lp.length)
+                return false;
+            elem = fmtLong(cast(short)(lp[pos + 1] | (lp[pos + 2] << 8)), scratch);
+            entryLen = 3;
+        }
+        else if (b == 0xF2) // 24-bit int
+        {
+            if (pos + 4 > lp.length)
+                return false;
+            int v = lp[pos + 1] | (lp[pos + 2] << 8) | (lp[pos + 3] << 16);
+            if (v >= (1 << 23))
+                v -= (1 << 24);
+            elem = fmtLong(v, scratch);
+            entryLen = 4;
+        }
+        else if (b == 0xF3) // 32-bit int
+        {
+            if (pos + 5 > lp.length)
+                return false;
+            int v = lp[pos + 1] | (lp[pos + 2] << 8) | (lp[pos + 3] << 16) | (lp[pos + 4] << 24);
+            elem = fmtLong(v, scratch);
+            entryLen = 5;
+        }
+        else if (b == 0xF4) // 64-bit int
+        {
+            if (pos + 9 > lp.length)
+                return false;
+            long v = 0;
+            foreach (i; 0 .. 8)
+                v |= (cast(long) lp[pos + 1 + i]) << (i * 8);
+            elem = fmtLong(v, scratch);
+            entryLen = 9;
+        }
+        else if (b == 0xF0) // 32-bit string
+        {
+            if (pos + 5 > lp.length)
+                return false;
+            immutable slen = lp[pos + 1] | (lp[pos + 2] << 8) | (lp[pos + 3] << 16) | (
+                cast(size_t) lp[pos + 4] << 24);
+            if (pos + 5 + slen > lp.length)
+                return false;
+            elem = cast(const(char)[]) lp[pos + 5 .. pos + 5 + slen];
+            entryLen = 5 + slen;
+        }
+        else
+            return false;
+        pos += entryLen + lpBacklenSize(entryLen);
+        return true;
+    }
+}
+
+// HASH_LISTPACK (16) -> HSET (in-order field,value). SET_LISTPACK (20) -> SADD.
+private bool decodeListpackFlat(scope const(ubyte)[] lp, scope const(char)[] key,
+    scope const(char)[] verb, ref ByteBuffer sink) @nogc nothrow
+{
+    if (lp.length < 7)
+        return false;
+    // count elements by walking (num-ele header can be 0xFFFF = unknown)
+    LpCursor c = LpCursor(lp);
+    size_t n = 0;
+    char[24] sc = void;
+    const(char)[] e;
+    while (!c.atEnd)
+    {
+        if (!c.next(sc, e))
+            return false;
+        n++;
+    }
+    if (n == 0)
+        return true;
+    repArrayHeader(sink, 2 + n);
+    repBulk(sink, verb);
+    repBulk(sink, key);
+    c = LpCursor(lp);
+    while (!c.atEnd)
+    {
+        if (!c.next(sc, e))
+            return false;
+        repBulk(sink, e);
+    }
+    return true;
+}
+
+// ZSET_LISTPACK (17): pairs (member, score) -> ZADD key score member ... (swap).
+private bool decodeListpackZset(scope const(ubyte)[] lp, scope const(char)[] key,
+    ref ByteBuffer sink) @nogc nothrow
+{
+    if (lp.length < 7)
+        return false;
+    LpCursor cnt = LpCursor(lp);
+    size_t n = 0;
+    char[24] s0 = void;
+    const(char)[] tmp;
+    while (!cnt.atEnd)
+    {
+        if (!cnt.next(s0, tmp))
+            return false;
+        n++;
+    }
+    if (n == 0)
+        return true;
+    repArrayHeader(sink, 2 + n); // n = 2*members
+    repBulk(sink, "ZADD");
+    repBulk(sink, key);
+    LpCursor c = LpCursor(lp);
+    char[24] mbuf = void, sbuf = void;
+    while (!c.atEnd)
+    {
+        const(char)[] member, score;
+        if (!c.next(mbuf, member) || c.atEnd || !c.next(sbuf, score))
+            return false;
+        repBulk(sink, score); // score first
+        repBulk(sink, member);
+    }
+    return true;
+}
+
+// SET_INTSET (11): <enc u32 LE><len u32 LE><len ints, `enc` bytes each, LE>.
+private bool decodeIntset(scope const(ubyte)[] blob, scope const(char)[] key,
+    ref ByteBuffer sink) @nogc nothrow
+{
+    if (blob.length < 8)
+        return false;
+    immutable enc = blob[0] | (blob[1] << 8) | (blob[2] << 16) | (cast(size_t) blob[3] << 24);
+    immutable len = blob[4] | (blob[5] << 8) | (blob[6] << 16) | (cast(size_t) blob[7] << 24);
+    if (enc != 2 && enc != 4 && enc != 8)
+        return false;
+    if (8 + len * enc > blob.length)
+        return false;
+    if (len == 0)
+        return true;
+    repArrayHeader(sink, 2 + len);
+    repBulk(sink, "SADD");
+    repBulk(sink, key);
+    size_t p = 8;
+    char[24] sc = void;
+    foreach (_; 0 .. len)
+    {
+        long v = 0;
+        foreach (i; 0 .. enc)
+            v |= (cast(long) blob[p + i]) << (i * 8);
+        if (enc == 2)
+            v = cast(short) v;
+        else if (enc == 4)
+            v = cast(int) v;
+        repBulk(sink, fmtLong(v, sc));
+        p += enc;
+    }
+    return true;
+}
+
+// LIST_QUICKLIST_2 (18): <numNodes> then per node <container><node-string>.
+// container 1 = PLAIN (the string is one element), 2 = PACKED (a listpack).
+private bool decodeQuicklist2(ref RdbReader r, scope const(char)[] key, ref ByteBuffer sink) @nogc nothrow
+{
+    // Two passes over the reader (save/restore pos): pass 1 counts all elements
+    // across the nodes for the RPUSH header, pass 2 streams them (repBulk copies,
+    // so a reused int scratch is safe — no element buffering needed).
+    immutable start = r.pos;
+    size_t total;
+    if (!qlWalk(r, sink, false, total))
+        return false;
+    if (total == 0)
+        return true;
+    r.pos = start;
+    repArrayHeader(sink, 2 + total);
+    repBulk(sink, "RPUSH");
+    repBulk(sink, key);
+    size_t ignore;
+    return qlWalk(r, sink, true, ignore);
+}
+
+// Walk a quicklist2 body: count elements (emit=false) or repBulk each (emit=true).
+private bool qlWalk(ref RdbReader r, ref ByteBuffer sink, bool emit, out size_t total) @nogc nothrow
+{
+    ulong nodes;
+    bool e;
+    if (!r.loadLen(nodes, e) || e)
+        return false;
+    foreach (_; 0 .. nodes)
+    {
+        ulong container;
+        bool ce;
+        if (!r.loadLen(container, ce) || ce)
+            return false;
+        const(char)[] node;
+        if (!r.loadString(node))
+            return false;
+        if (container == 1) // PLAIN: the node is one element
+        {
+            if (emit)
+                repBulk(sink, node);
+            total++;
+        }
+        else if (container == 2) // PACKED: a listpack
+        {
+            LpCursor c = LpCursor(cast(const(ubyte)[]) node);
+            char[24] sc = void;
+            const(char)[] el;
+            while (!c.atEnd)
+            {
+                if (!c.next(sc, el))
+                    return false;
+                if (emit)
+                    repBulk(sink, el);
+                total++;
+            }
+        }
+        else
+            return false;
     }
     return true;
 }
