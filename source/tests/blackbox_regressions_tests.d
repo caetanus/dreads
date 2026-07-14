@@ -1109,4 +1109,41 @@ version (unittest)
         parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "0", "5", "BOGUS"), m).should.equal(false);
         m.err.should.equal("ERR syntax error");
     }
+
+    // XREADGROUP BLOCK servability: the parking/wake is server-layer (fan-out on
+    // gKeyActivity, blackbox-only like the FIFO) — this pins the per-wake predicate
+    // the block loop consults. A `>` read on an empty group returns the nil array
+    // (=> keep blocking); a delivery advances the group cursor so the *next* `>`
+    // read is nil again; an explicit id reads the PEL (=> never blocks).
+    @("blackbox.xreadgroup_block_servability")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.run("XADD", "s", "1-1", "f", "v0"); // group starts at $ = 1-1
+        ks.run("XGROUP", "CREATE", "s", "g", "$");
+
+        // `>` with no new messages -> nil array: this is what makes the loop wait
+        ks.run("XREADGROUP", "GROUP", "g", "w1", "STREAMS", "s", ">")
+            .should.equal("*-1\r\n");
+
+        // a new entry -> `>` now delivers it (and advances the group cursor)
+        ks.run("XADD", "s", "2-1", "job", "42");
+        auto served = ks.run("XREADGROUP", "GROUP", "g", "w1", "STREAMS", "s", ">");
+        served.should.contain("2-1");
+        served.should.contain("job");
+        served.should.not.equal("*-1\r\n");
+
+        // cursor advanced: a second `>` read is nil again (would re-block)
+        ks.run("XREADGROUP", "GROUP", "g", "w1", "STREAMS", "s", ">")
+            .should.equal("*-1\r\n");
+
+        // explicit id reads the consumer's PEL (the delivered-but-unacked 2-1) —
+        // a non-nil reply, so the server layer never parks for an explicit id
+        auto hist = ks.run("XREADGROUP", "GROUP", "g", "w1", "STREAMS", "s", "0");
+        hist.should.contain("2-1");
+        hist.should.not.equal("*-1\r\n");
+    }
 }

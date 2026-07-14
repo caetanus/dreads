@@ -2150,6 +2150,49 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             xreadBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
             return true;
         }
+    case "XREADGROUP":
+        {
+            // Only the blocking form on a `>` id parks here; history reads
+            // (explicit ids from the PEL), the non-BLOCK form, and MULTI/EXEC all
+            // fall through to the normal dispatch/raft path (a single attempt).
+            import dreads.commands : parseLong;
+
+            ptrdiff_t blockAt = -1, streamsAt = -1;
+            foreach (i, ref a; args)
+            {
+                if (blockAt < 0 && eqICDebug(a.str, "BLOCK"))
+                    blockAt = cast(ptrdiff_t) i;
+                else if (streamsAt < 0 && eqICDebug(a.str, "STREAMS"))
+                    streamsAt = cast(ptrdiff_t) i;
+            }
+            // no BLOCK option (blockAt must precede STREAMS to be the keyword),
+            // malformed, or inside a transaction ⇒ normal one-shot dispatch
+            if (blockAt < 0 || streamsAt < 0 || blockAt > streamsAt
+                    || c.inMulti || c.inExec)
+                break;
+            auto after = args[streamsAt + 1 .. $];
+            if (after.length == 0 || after.length % 2 != 0)
+                break; // let dispatch surface the syntax error
+            auto half = after.length / 2;
+            bool hasGt = false;
+            foreach (ref idTok; after[half .. $])
+                if (idTok.str == ">")
+                {
+                    hasGt = true;
+                    break;
+                }
+            if (!hasGt)
+                break; // only `>` (new messages) can block; explicit ids read now
+            long blockMs;
+            if (blockAt + 1 >= cast(ptrdiff_t) args.length
+                    || !parseLong(args[blockAt + 1].str, blockMs) || blockMs < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return true;
+            }
+            xreadgroupBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
+            return true;
+        }
     case "BLMPOP":
     case "BZMPOP":
         {
@@ -4034,6 +4077,74 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             return;
         }
         if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
+        {
+            o.append(nil);
+            return;
+        }
+    }
+}
+
+/// XREADGROUP ... BLOCK ms ... >  : strips the BLOCK pair and retries the group
+/// read until a `>` delivers (or timeout). Fan-out like XREAD (all group members
+/// wake on any XADD via gKeyActivity — the group's lastDelivered cursor serializes
+/// who gets which entry, so no per-key FIFO hand-off is needed). Unlike XREAD it
+/// is a WRITE — a served pass advances the cursor and registers the PEL, so it is
+/// logged (rewritten without BLOCK, exactly what the non-blocking path logs).
+private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
+        ulong timeoutMs, ref ByteBuffer o, ref Arena arena) nothrow
+{
+    // per-call (not TLS): the fiber yields across the block while other fibers
+    // run this same function — a shared buffer would be clobbered.
+    ByteBuffer synth;
+    synth.clear();
+    // rewrite XREADGROUP without the BLOCK pair; `>` is kept verbatim (the group
+    // cursor, not a resolvable id like XREAD's `$`).
+    repArrayHeader(synth, args.length - 2 + 1);
+    repBulk(synth, "XREADGROUP");
+    foreach (i, ref a; args)
+    {
+        if (i == blockAt || i == blockAt + 1)
+            continue;
+        repBulk(synth, a.str);
+    }
+
+    ByteBuffer attempt;
+    auto ec = gKeyActivity.emitCount;
+    long remaining = cast(long) timeoutMs;
+    immutable nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREADGROUP empty reply
+    for (;;)
+    {
+        attempt.clear();
+        RVal cmd2;
+        size_t pos = 0;
+        if (parseValue(synth.data, pos, arena, cmd2) != ParseStatus.ok)
+        {
+            repError(o, "ERR internal blocking rewrite failed");
+            return;
+        }
+        // re-check ACL every pass — perms may have been revoked while blocked
+        if (gAclActive && c.user !is null && aclDenies(c, cmd2, null, "xreadgroup", o))
+            return;
+        dispatch(cmd2, *c.dbp, attempt, arena);
+        propagationOverride.clear();
+        auto rep = cast(const(char)[]) attempt.data;
+        // a real error (NOGROUP, WRONGTYPE, bad id) surfaces immediately
+        if (rep.length > 0 && rep[0] == '-')
+        {
+            o.append(attempt.data);
+            return;
+        }
+        if (rep != nil)
+        {
+            // served: a `>` delivery advanced the cursor + PEL — reply, log, wake
+            o.append(attempt.data);
+            if (gAof.enabled)
+                gAof.append(synth.data);
+            gWriteEpoch++;
+            gKeyActivity.emit();
+            return;
+        }
+        if (!waitForActivity(ec, remaining, timeoutMs))
         {
             o.append(nil);
             return;
