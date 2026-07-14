@@ -3399,18 +3399,35 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             bool autoId = args[1].str == "*";
+            bool autoSeq = false; // the `ms-*` form: explicit ms, auto sequence
+            ulong seqMs;
             StreamID id;
             if (!autoId)
             {
-                if (!parseStreamId(args[1].str, 0, id))
+                auto idarg = args[1].str;
+                if (idarg.length >= 2 && idarg[$ - 1] == '*' && idarg[$ - 2] == '-')
                 {
-                    repError(o, "ERR Invalid stream ID specified as stream command argument");
-                    break;
+                    if (!parseUlong(idarg[0 .. $ - 2], seqMs))
+                    {
+                        repError(o,
+                                "ERR Invalid stream ID specified as stream command argument");
+                        break;
+                    }
+                    autoSeq = true;
                 }
-                if (id == StreamID(0, 0))
+                else
                 {
-                    repError(o, "ERR The ID specified in XADD must be greater than 0-0");
-                    break;
+                    if (!parseStreamId(idarg, 0, id))
+                    {
+                        repError(o,
+                                "ERR Invalid stream ID specified as stream command argument");
+                        break;
+                    }
+                    if (id == StreamID(0, 0))
+                    {
+                        repError(o, "ERR The ID specified in XADD must be greater than 0-0");
+                        break;
+                    }
                 }
             }
             bool wrong;
@@ -3422,6 +3439,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             if (autoId)
                 id = obj.stream.nextId(detNow());
+            else if (autoSeq && !obj.stream.nextSeqForMs(seqMs, id))
+            {
+                repError(o,
+                        "ERR The ID specified in XADD is equal or smaller than the target stream top item");
+                break;
+            }
             auto np = (args.length - 2) / 2;
             auto pairs = arena.allocArray!FieldPair(np);
             foreach (i; 0 .. np)
@@ -3437,9 +3460,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             notifyKeyspaceEvent(NClass.stream, "xadd", args[0].str);
             repStreamId(o, id);
-            if (autoId)
+            if (autoId || autoSeq)
             {
-                // the log must carry the resolved ID, never "*"
+                // the log must carry the resolved ID, never "*" or "ms-*"
                 propagationOverride.clear();
                 repArrayHeader(propagationOverride, args.length + 1);
                 repBulk(propagationOverride, "XADD");
@@ -5312,19 +5335,19 @@ private bool parseStreamId(scope const(char)[] s, ulong seqDefault, out StreamID
             break;
         }
     }
-    long ms, seq;
+    ulong ms, seq;
     if (dash == size_t.max)
     {
-        if (!parseLong(s, ms) || ms < 0)
+        if (!parseUlong(s, ms))
             return false;
-        id = StreamID(cast(ulong) ms, seqDefault);
+        id = StreamID(ms, seqDefault);
         return true;
     }
-    if (!parseLong(s[0 .. dash], ms) || ms < 0)
+    if (!parseUlong(s[0 .. dash], ms))
         return false;
-    if (!parseLong(s[dash + 1 .. $], seq) || seq < 0)
+    if (!parseUlong(s[dash + 1 .. $], seq))
         return false;
-    id = StreamID(cast(ulong) ms, cast(ulong) seq);
+    id = StreamID(ms, seq);
     return true;
 }
 
@@ -5993,6 +6016,27 @@ public bool parseLong(scope const(char)[] s, out long v) @nogc nothrow
             return false;
         v = cast(long) acc;
     }
+    return true;
+}
+
+/// Parse an unsigned decimal in the full [0, ulong.max] range. Stream IDs are
+/// two u64 halves (ms-seq), so `18446744073709551615-18446744073709551615` is a
+/// valid id that `parseLong` (signed, capped at long.max) rejects.
+public bool parseUlong(scope const(char)[] s, out ulong v) @nogc nothrow
+{
+    if (s.length == 0)
+        return false;
+    ulong acc = 0;
+    foreach (c; s)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        immutable digit = cast(ulong)(c - '0');
+        if (acc > (ulong.max - digit) / 10)
+            return false; // overflow
+        acc = acc * 10 + digit;
+    }
+    v = acc;
     return true;
 }
 

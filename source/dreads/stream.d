@@ -233,6 +233,27 @@ public struct Stream
         return StreamID(lastId.ms, lastId.seq + 1);
     }
 
+    /// ID for XADD `ms-*` (explicit ms, auto sequence). seq=0 when ms is ahead of
+    /// lastId.ms; the next sequence when equal (fails on u64 exhaustion); fails
+    /// when ms < lastId.ms (can't produce an increasing id). Empty stream keeps
+    /// lastId=0-0, so `0-*` on a fresh stream yields 0-1.
+    bool nextSeqForMs(ulong ms, out StreamID id) @nogc nothrow
+    {
+        if (ms > lastId.ms)
+        {
+            id = StreamID(ms, 0);
+            return true;
+        }
+        if (ms == lastId.ms)
+        {
+            if (lastId.seq == ulong.max)
+                return false; // sequence exhausted for this ms
+            id = StreamID(ms, lastId.seq + 1);
+            return true;
+        }
+        return false; // ms < lastId.ms
+    }
+
     /// Appends one entry, copying the pairs. Fails unless id > lastId.
     bool add(StreamID id, scope const(FieldPair)[] src) @nogc nothrow
     {

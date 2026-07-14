@@ -124,7 +124,9 @@ version (unittest)
         // stream ranges beyond content
         ks.run("XADD", "st", "1-1", "f", "v");
         ks.run("XRANGE", "st", "999", "+").expect.to.equal("*0\r\n");
-        ks.run("XREAD", "STREAMS", "st", "18446744073709551615")[0].expect.to.equal('-');
+        // u64-max is a VALID stream id (ms-seq are two u64s), so this parses and
+        // reads nothing past it — a nil array, not a parse error (see parseUlong)
+        ks.run("XREAD", "STREAMS", "st", "18446744073709551615").expect.to.equal("*-1\r\n");
     }
 
     @("robust.bad_arity_and_types_everywhere")

@@ -5,7 +5,7 @@ module dreads.streamops;
 
 import core.stdc.stdio : snprintf;
 
-import dreads.commands : eqICKeyword, parseLong;
+import dreads.commands : eqICKeyword, parseLong, parseUlong;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj;
@@ -48,19 +48,19 @@ private bool parseId(scope const(char)[] s, ulong seqDefault, out StreamID id) @
             break;
         }
     }
-    long ms, seq;
+    ulong ms, seq;
     if (dash == size_t.max)
     {
-        if (!parseLong(s, ms) || ms < 0)
+        if (!parseUlong(s, ms))
             return false;
-        id = StreamID(cast(ulong) ms, seqDefault);
+        id = StreamID(ms, seqDefault);
         return true;
     }
-    if (!parseLong(s[0 .. dash], ms) || ms < 0)
+    if (!parseUlong(s[0 .. dash], ms))
         return false;
-    if (!parseLong(s[dash + 1 .. $], seq) || seq < 0)
+    if (!parseUlong(s[dash + 1 .. $], seq))
         return false;
-    id = StreamID(cast(ulong) ms, cast(ulong) seq);
+    id = StreamID(ms, seq);
     return true;
 }
 

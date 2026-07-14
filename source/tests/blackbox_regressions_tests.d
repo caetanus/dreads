@@ -1146,4 +1146,30 @@ version (unittest)
         hist.should.contain("2-1");
         hist.should.not.equal("*-1\r\n");
     }
+
+    // Stream ID parsing: both halves are full u64 (parseUlong, not signed
+    // parseLong) so u64-max ids are valid; and the `ms-*` form auto-generates the
+    // sequence. First caught by unit/type/stream (XADD overflow + auto-seq tests).
+    @("blackbox.stream_id_unsigned_and_autoseq")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // u64-max id parses and stores (signed parseLong would reject it)
+        ks.run("XADD", "big", "18446744073709551615-18446744073709551615", "a", "b")
+            .should.equal("$41\r\n18446744073709551615-18446744073709551615\r\n");
+        // the stream is now exhausted: a `*` add can't produce a larger id
+        ks.run("XADD", "big", "*", "c", "d").should.startWith("-ERR");
+
+        // `ms-*`: explicit ms, auto sequence. seq starts at 0 for a new ms...
+        ks.run("XADD", "s", "123-456", "item", "1").should.equal("$7\r\n123-456\r\n");
+        ks.run("XADD", "s", "123-*", "item", "2").should.equal("$7\r\n123-457\r\n"); // same ms -> +1
+        ks.run("XADD", "s", "789-*", "item", "3").should.equal("$5\r\n789-0\r\n"); // ahead ms -> 0
+        // ms below lastId can't generate an increasing id
+        ks.run("XADD", "s", "42-*", "item", "4").should.startWith("-ERR");
+        // `0-*` on a fresh stream yields 0-1 (lastId starts at 0-0)
+        ks.run("XADD", "z", "0-*", "a", "b").should.equal("$3\r\n0-1\r\n");
+    }
 }
