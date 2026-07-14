@@ -896,6 +896,35 @@ version (unittest)
         isPausedByWrite("FCALL").should.equal(false);
     }
 
+    // deny-OOM classification (Valkey CMD_DENYOOM): only allocating writes are
+    // refused over maxmemory; freeing/neutral writes run so a script can DEL to
+    // make room. First caught by unit/scripting (dirty-scripts / allow-oom).
+    @("blackbox.deny_oom_classifier")
+    unittest
+    {
+        // allocating writes are denied under OOM
+        isDenyOomCommand("SET").should.equal(true);
+        isDenyOomCommand("APPEND").should.equal(true);
+        isDenyOomCommand("LPUSH").should.equal(true);
+        isDenyOomCommand("HSET").should.equal(true);
+        isDenyOomCommand("ZADD").should.equal(true);
+        isDenyOomCommand("COPY").should.equal(true);
+        isDenyOomCommand("RESTORE").should.equal(true);
+        // freeing / neutral writes are exempt (run even under OOM)
+        isDenyOomCommand("DEL").should.equal(false);
+        isDenyOomCommand("UNLINK").should.equal(false);
+        isDenyOomCommand("GETDEL").should.equal(false);
+        isDenyOomCommand("EXPIRE").should.equal(false);
+        isDenyOomCommand("PERSIST").should.equal(false);
+        isDenyOomCommand("LPOP").should.equal(false);
+        isDenyOomCommand("SREM").should.equal(false);
+        isDenyOomCommand("ZPOPMIN").should.equal(false);
+        isDenyOomCommand("RENAME").should.equal(false);
+        // reads are never deny-oom
+        isDenyOomCommand("GET").should.equal(false);
+        isDenyOomCommand("PING").should.equal(false);
+    }
+
     // OBJECT FREQ/IDLETIME follow the maxmemory policy (LRU and LFU share one
     // counter, like Redis's obj->lru), and RESTORE FREQ/IDLETIME seed it. First
     // caught by unit/dump (OBJECT FREQ aborted the file).

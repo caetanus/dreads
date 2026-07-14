@@ -6041,6 +6041,31 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     }
 }
 
+/// True when a write may ALLOCATE and so must be refused while over maxmemory
+/// (Valkey's CMD_DENYOOM). Writes that only FREE or rearrange memory — DEL,
+/// EXPIRE, the *POP/*REM family, RENAME — are exempt and run even under OOM (so a
+/// script can DEL to make room, and a dirty script isn't stopped mid-way).
+public bool isDenyOomCommand(scope const(char)[] uname) @nogc nothrow
+{
+    if (!isWriteCommand(uname))
+        return false;
+    switch (uname)
+    {
+    case "DEL", "UNLINK", "GETDEL", "DELIFEQ", "FLUSHALL", "FLUSHDB":
+    case "RENAME", "RENAMENX":
+    case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
+    case "LPOP", "RPOP", "LREM", "LTRIM", "LMPOP":
+    case "HDEL", "HGETDEL", "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT", "HPERSIST":
+    case "SREM", "SPOP", "SMOVE":
+    case "ZREM", "ZPOPMIN", "ZPOPMAX", "ZMPOP",
+        "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX":
+    case "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM":
+        return false; // frees / neutral — allowed under OOM
+    default:
+        return true; // allocating write — denied under OOM
+    }
+}
+
 /// Commands held by a WRITE-mode CLIENT PAUSE: the write set (same classification
 /// the AOF logs by) PLUS the "may replicate" commands — PUBLISH/SPUBLISH propagate
 /// to the stream, PFCOUNT can rewrite the cached HLL cardinality. Mirrors Valkey's

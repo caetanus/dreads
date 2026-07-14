@@ -34,7 +34,7 @@ import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
-    gScriptWritesHook, propagationOverride, parseLong;
+    isDenyOomCommand, gScriptWritesHook, propagationOverride, parseLong;
 
 // A command held by a WRITE-mode CLIENT PAUSE: the may-replicate write set, plus
 // EVAL/EVALSHA/FCALL only when the script actually may write (the scripting hook
@@ -2510,7 +2510,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         // reads are served locally (leader or follower); no AOF in raft mode
     }
 
-    if (gConfig.maxmemory && isWriteCommand(uname) && !freeMemoryIfNeeded())
+    if (gConfig.maxmemory && isDenyOomCommand(uname) && !freeMemoryIfNeeded())
     {
         repError(o, "OOM command not allowed when used memory > 'maxmemory'.");
         return true;

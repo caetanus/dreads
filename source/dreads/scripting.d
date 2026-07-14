@@ -722,7 +722,7 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
 
     bool isWrite = false;
     {
-        import dreads.commands : isWriteCommand, isPausedByWrite;
+        import dreads.commands : isWriteCommand, isPausedByWrite, isDenyOomCommand;
 
         char[24] up = void;
         auto cname = arr[0].str;
@@ -762,8 +762,12 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
                 return lua_error(L);
             }
             // deny-oom write over the memory limit (legacy no-shebang scripts
-            // reach here; allow-oom/no-writes/read-only runs set gScriptAllowOom)
-            if (isWrite && !gScriptAllowOom && scriptOverMaxmemory())
+            // reach here; allow-oom/no-writes/read-only runs set gScriptAllowOom).
+            // Only ALLOCATING writes are denied, and never once the script is
+            // already dirty — Valkey doesn't stop a script mid-way (its earlier
+            // writes are committed, so refusing the rest would leave it partial).
+            if (isDenyOomCommand(uc) && !gScriptAllowOom && !gScriptWrote
+                && scriptOverMaxmemory())
             {
                 enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
                 lua_createtable(L, 0, 1);
