@@ -45,7 +45,7 @@ leakage).
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
-| unit/pause | 16 | 8 | completes (no abort); remaining = passive-expire-skip-during-pause (randomkey-loop + expires-skip), CLIENT UNBLOCK vs pause, 1 timing |
+| unit/pause | 19 | 0 | **PASSES** (1 skip N/A: deferring-client write-backpressure timing — dreads buffers server-side by design) |
 | unit/dump | 14 | 2 | OBJECT FREQ/LFU + RESTORE opts + rdb-version-check landed; remaining = MIGRATE, stream DUMP |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |

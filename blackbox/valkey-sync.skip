@@ -4,6 +4,12 @@
 #   ./runtest --host H --port P --single <file> --skipfile <this file>
 # Lines are exact test names (or /regexp). Regenerate with:
 #   grep -B40 attach_to_replication_stream tests/unit/**/*.tcl | grep 'test {'
+# N/A by design: measures the pause window via a deferring client's WRITE
+# blocking (server stops reading -> kernel backpressure). dreads' CLIENT PAUSE
+# deliberately keeps reading and buffers commands server-side (bounded, overflow
+# drops the conn), so a client's write never blocks during a pause — the pause
+# is honoured on the reply side, not by backpressure. See memory client-pause.
+Test old pause-all takes precedence over new pause-write (less restrictive)
 GETDEL propagate as DEL command to replica
 GETEX without argument does not propagate to replica
 MSETEX with past EXAT/PXAT - key stored but logically expired
