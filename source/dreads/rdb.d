@@ -46,6 +46,9 @@ enum ubyte RDB_TYPE_HASH_LISTPACK = 16;
 enum ubyte RDB_TYPE_ZSET_LISTPACK = 17;
 enum ubyte RDB_TYPE_LIST_QUICKLIST_2 = 18;
 enum ubyte RDB_TYPE_SET_LISTPACK = 20;
+enum ubyte RDB_TYPE_STREAM_LISTPACKS = 15; // rax(id->listpack) + meta + cgroups
+enum ubyte RDB_TYPE_STREAM_LISTPACKS_2 = 19; // + first_id/max_deleted_id/entries_added
+enum ubyte RDB_TYPE_STREAM_LISTPACKS_3 = 21; // + consumer active_time
 enum ubyte RDB_TYPE_HASH_2 = 22; // len + N (field, value, expiry-ms 8B); 0 = no TTL
 
 // length-encoding prefixes (top 2 bits of the first byte)
@@ -149,6 +152,104 @@ struct RdbWriter
         immutable ulong bits = *cast(ulong*)&d;
         foreach (i; 0 .. 8)
             u8(cast(ubyte)((bits >> (i * 8)) & 0xFF));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal listpack ENCODER — just enough to build stream-entry listpacks for
+// DUMP: 7-bit-uint / 64-bit-int integers, 6/12/32-bit strings, per-element
+// backlen, 6-byte header (total-bytes LE + num-elements LE), 0xFF terminator.
+// Byte layout is the external listpack spec (Valkey listpack.c, BSD-3) — a wire
+// format, not architecture. Builds into a caller-owned ByteBuffer.
+// ---------------------------------------------------------------------------
+struct LpBuilder
+{
+    private ByteBuffer* b;
+    private size_t start; // header offset within *b
+    private uint count;
+
+    void begin(ByteBuffer* buf) @nogc nothrow
+    {
+        b = buf;
+        start = b.length;
+        count = 0;
+        foreach (_; 0 .. 6)
+            b.appendByte(0); // header placeholder (4B total-bytes + 2B num-elements)
+    }
+
+    private void backlen(size_t elemLen) @nogc nothrow
+    {
+        // element length -> variable backlen, MSB group first, continuation bit set
+        // on every byte but the first (so it can be walked backwards)
+        ubyte[5] t = void;
+        size_t n;
+        if (elemLen <= 127)
+            t[0] = cast(ubyte) elemLen, n = 1;
+        else if (elemLen <= 16383)
+            t[0] = cast(ubyte)(elemLen >> 7),
+                t[1] = cast(ubyte)((elemLen & 127) | 128), n = 2;
+        else if (elemLen <= 2097151)
+            t[0] = cast(ubyte)(elemLen >> 14),
+                t[1] = cast(ubyte)(((elemLen >> 7) & 127) | 128),
+                t[2] = cast(ubyte)((elemLen & 127) | 128), n = 3;
+        else
+            t[0] = cast(ubyte)(elemLen >> 21),
+                t[1] = cast(ubyte)(((elemLen >> 14) & 127) | 128),
+                t[2] = cast(ubyte)(((elemLen >> 7) & 127) | 128),
+                t[3] = cast(ubyte)((elemLen & 127) | 128), n = 4;
+        foreach (i; 0 .. n)
+            b.appendByte(t[i]);
+    }
+
+    void appendInt(long v) @nogc nothrow
+    {
+        immutable s = b.length;
+        if (v >= 0 && v <= 127)
+            b.appendByte(cast(ubyte) v); // LP_ENCODING_7BIT_UINT
+        else
+        {
+            b.appendByte(0xF4); // LP_ENCODING_64BIT_INT
+            immutable ulong u = cast(ulong) v;
+            foreach (i; 0 .. 8)
+                b.appendByte(cast(ubyte)((u >> (i * 8)) & 0xFF));
+        }
+        backlen(b.length - s);
+        count++;
+    }
+
+    void appendStr(scope const(char)[] str) @nogc nothrow
+    {
+        immutable s = b.length;
+        if (str.length <= 63)
+            b.appendByte(cast(ubyte)(0x80 | str.length)); // 6BIT_STR
+        else if (str.length <= 4095)
+        {
+            b.appendByte(cast(ubyte)(0xE0 | (str.length >> 8))); // 12BIT_STR
+            b.appendByte(cast(ubyte)(str.length & 0xFF));
+        }
+        else
+        {
+            b.appendByte(0xF0); // 32BIT_STR
+            foreach (i; 0 .. 4)
+                b.appendByte(cast(ubyte)((str.length >> (i * 8)) & 0xFF));
+        }
+        b.append(str);
+        backlen(b.length - s);
+        count++;
+    }
+
+    void end() @nogc nothrow
+    {
+        b.appendByte(0xFF); // LP_EOF
+        immutable total = b.length - start;
+        auto d = b.data; // fetch after all appends (may have reallocated)
+        d[start] = cast(ubyte) total;
+        d[start + 1] = cast(ubyte)(total >> 8);
+        d[start + 2] = cast(ubyte)(total >> 16);
+        d[start + 3] = cast(ubyte)(total >> 24);
+        immutable nel = count > 65535 ? 65535 : count;
+        d[start + 4] = cast(ubyte) nel;
+        d[start + 5] = cast(ubyte)(nel >> 8);
     }
 }
 
@@ -333,11 +434,37 @@ bool verifyFooter(scope const(ubyte)[] payload, out const(ubyte)[] body_,
     return true;
 }
 
+// Parse a stream id "ms-seq" into its two parts (seq defaults to 0 if omitted).
+private bool parseStreamId(scope const(char)[] s, out ulong ms, out ulong seq) @nogc nothrow
+{
+    size_t i = 0;
+    if (s.length == 0)
+        return false;
+    while (i < s.length && s[i] != '-')
+    {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+        ms = ms * 10 + (s[i] - '0');
+        i++;
+    }
+    if (i < s.length) // skip '-' and read seq
+    {
+        i++;
+        while (i < s.length)
+        {
+            if (s[i] < '0' || s[i] > '9')
+                return false;
+            seq = seq * 10 + (s[i] - '0');
+            i++;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Encoder: one key's compactor commands  ->  RDB value (type + serialized).
 // The commands come from dumpKey(valueOnly): SET / RPUSH / SADD / HSET (+
-// HPEXPIREAT for field TTLs) / ZADD. Anything else (XADD — stream) => false so
-// DUMP can reply that the type is unsupported. Never touches RObj.
+// HPEXPIREAT for field TTLs) / ZADD / XADD+XSETID+XGROUP (stream). Never RObj.
 // ---------------------------------------------------------------------------
 
 /// Append the RDB value (type byte + body) for the key whose rebuild `commands`
@@ -351,7 +478,8 @@ bool commandsToRdb(scope const(ubyte)[] commands, ref Arena arena, ref ByteBuffe
         list,
         set,
         hash,
-        zset
+        zset,
+        stream
     }
 
     Kind kind = Kind.none;
@@ -361,6 +489,14 @@ bool commandsToRdb(scope const(ubyte)[] commands, ref Arena arena, ref ByteBuffe
     Vector!ulong httl; // parallel field TTLs (0 = none)
     Vector!(const(char)[]) zm; // zset members
     Vector!double zs; // parallel zset scores
+    // stream: entries in id order (parallel arrays), then groups
+    Vector!ulong stMs, stSeq; // per-entry id
+    Vector!size_t stNF; // per-entry field count
+    Vector!bool stDel; // per-entry deleted (XADD+XDEL history marker)
+    Vector!(const(char)[]) stF, stV; // flat field/value pairs across all entries
+    ulong stLastMs, stLastSeq, stMaxDelMs, stMaxDelSeq, stAdded;
+    Vector!(const(char)[]) stGName; // consumer group names
+    Vector!ulong stGMs, stGSeq; // group last-delivered id
 
     size_t pos = 0;
     RVal cmd;
@@ -427,8 +563,68 @@ bool commandsToRdb(scope const(ubyte)[] commands, ref Arena arena, ref ByteBuffe
                 zm.put(cmd.arr[i + 1].str);
             }
         }
+        else if (verb == "XADD")
+        {
+            // XADD key id field value ...
+            if (cmd.arr.length < 5 || (cmd.arr.length & 1) == 0)
+                return false;
+            ulong ms, seq;
+            if (!parseStreamId(cmd.arr[2].str, ms, seq))
+                return false;
+            kind = Kind.stream;
+            stMs.put(ms);
+            stSeq.put(seq);
+            stDel.put(false);
+            stNF.put((cmd.arr.length - 3) / 2);
+            for (size_t i = 3; i + 1 < cmd.arr.length; i += 2)
+            {
+                stF.put(cmd.arr[i].str);
+                stV.put(cmd.arr[i + 1].str);
+            }
+            stAdded++;
+            if (ms > stLastMs || (ms == stLastMs && seq >= stLastSeq))
+                stLastMs = ms, stLastSeq = seq;
+        }
+        else if (verb == "XDEL")
+        {
+            // XDEL key id — mark the matching entry deleted (history-only marker)
+            ulong ms, seq;
+            if (cmd.arr.length >= 3 && parseStreamId(cmd.arr[2].str, ms, seq))
+                foreach (j; 0 .. stMs.length)
+                    if (stMs[j] == ms && stSeq[j] == seq && !stDel[j])
+                    {
+                        stDel[j] = true;
+                        if (ms > stMaxDelMs || (ms == stMaxDelMs && seq > stMaxDelSeq))
+                            stMaxDelMs = ms, stMaxDelSeq = seq;
+                        break;
+                    }
+        }
+        else if (verb == "XSETID")
+        {
+            ulong ms, seq;
+            if (cmd.arr.length >= 3 && parseStreamId(cmd.arr[2].str, ms, seq))
+                stLastMs = ms, stLastSeq = seq;
+            if (kind == Kind.none)
+                kind = Kind.stream;
+        }
+        else if (verb == "XGROUP")
+        {
+            // XGROUP CREATE key group id [MKSTREAM]
+            if (cmd.arr.length >= 5 && cmd.arr[1].str == "CREATE")
+            {
+                ulong ms, seq;
+                if (parseStreamId(cmd.arr[4].str, ms, seq))
+                {
+                    stGName.put(cmd.arr[3].str);
+                    stGMs.put(ms);
+                    stGSeq.put(seq);
+                }
+                if (kind == Kind.none)
+                    kind = Kind.stream;
+            }
+        }
         else
-            return false; // XADD / anything else — stream deferred
+            return false; // unknown compactor verb
     }
 
     auto w = RdbWriter(&sink);
@@ -479,6 +675,75 @@ bool commandsToRdb(scope const(ubyte)[] commands, ref Arena arena, ref ByteBuffe
             w.saveBinaryDouble(zs[j]);
         }
         break;
+    case Kind.stream:
+        {
+            w.u8(RDB_TYPE_STREAM_LISTPACKS_3);
+            size_t live = 0;
+            foreach (j; 0 .. stMs.length)
+                if (!stDel[j])
+                    live++;
+            w.saveLen(live); // number of listpacks — one per live entry
+            static ByteBuffer lpbuf; // TLS scratch for a single entry's listpack
+            size_t vidx = 0; // cursor into flat stF/stV
+            ulong firstMs = 0, firstSeq = 0;
+            bool haveFirst = false;
+            foreach (j; 0 .. stMs.length)
+            {
+                immutable nf = stNF[j];
+                if (stDel[j])
+                {
+                    vidx += nf;
+                    continue;
+                }
+                if (!haveFirst)
+                    firstMs = stMs[j], firstSeq = stSeq[j], haveFirst = true;
+                // rax key = 16-byte big-endian streamID (ms 8B, seq 8B)
+                ubyte[16] idkey = void;
+                foreach (b2; 0 .. 8)
+                    idkey[b2] = cast(ubyte)((stMs[j] >> (56 - b2 * 8)) & 0xFF);
+                foreach (b2; 0 .. 8)
+                    idkey[8 + b2] = cast(ubyte)((stSeq[j] >> (56 - b2 * 8)) & 0xFF);
+                w.saveRawString(cast(const(char)[]) idkey[]);
+                // one-entry listpack: master (fields) + one SAMEFIELDS entry
+                lpbuf.clear();
+                LpBuilder lb;
+                lb.begin(&lpbuf);
+                lb.appendInt(1); // count
+                lb.appendInt(0); // deleted
+                lb.appendInt(cast(long) nf); // master field count
+                foreach (fi; 0 .. nf)
+                    lb.appendStr(stF[vidx + fi]);
+                lb.appendInt(0); // master terminator
+                lb.appendInt(2); // flags = SAMEFIELDS
+                lb.appendInt(0); // ms-diff (this IS the master)
+                lb.appendInt(0); // seq-diff
+                foreach (fi; 0 .. nf)
+                    lb.appendStr(stV[vidx + fi]);
+                lb.appendInt(cast(long)(nf + 3)); // lp_count
+                lb.end();
+                w.saveRawString(cast(const(char)[]) lpbuf.data);
+                vidx += nf;
+            }
+            w.saveLen(live); // length
+            w.saveLen(stLastMs);
+            w.saveLen(stLastSeq);
+            w.saveLen(firstMs);
+            w.saveLen(firstSeq);
+            w.saveLen(stMaxDelMs);
+            w.saveLen(stMaxDelSeq);
+            w.saveLen(stAdded);
+            w.saveLen(stGName.length); // consumer groups
+            foreach (g; 0 .. stGName.length)
+            {
+                w.saveRawString(stGName[g]);
+                w.saveLen(stGMs[g]);
+                w.saveLen(stGSeq[g]);
+                w.saveLen(0); // entries_read
+                w.saveLen(0); // global PEL (compactor does not persist it)
+                w.saveLen(0); // consumers
+            }
+            break;
+        }
     }
     return true;
 }
@@ -530,8 +795,11 @@ bool rdbToCommands(scope const(char)[] key, scope const(ubyte)[] body_, ref Byte
         return r.loadString(zlp) && decodeListpackZset(cast(const(ubyte)[]) zlp, key, sink);
     case RDB_TYPE_LIST_QUICKLIST_2:
         return decodeQuicklist2(r, key, sink);
+    case RDB_TYPE_STREAM_LISTPACKS_2:
+    case RDB_TYPE_STREAM_LISTPACKS_3:
+        return decodeStream(r, key, type == RDB_TYPE_STREAM_LISTPACKS_3, sink);
     default:
-        return false; // ziplist/zipmap/quicklist-v1 / ZSET(3 ascii) / LZF / stream: phase 2b
+        return false; // ziplist/zipmap/quicklist-v1 / ZSET(3 ascii) / LZF: phase 2b
     }
 }
 
@@ -797,6 +1065,176 @@ private bool decodeListpackZset(scope const(ubyte)[] lp, scope const(char)[] key
             return false;
         repBulk(sink, score); // score first
         repBulk(sink, member);
+    }
+    return true;
+}
+
+private bool skipBytes(ref RdbReader r, ulong n) @nogc nothrow
+{
+    foreach (_; 0 .. n)
+    {
+        ubyte b;
+        if (!r.u8(b))
+            return false;
+    }
+    return true;
+}
+
+// One stream listpack: master entry (field template) + entries -> XADD commands.
+// Layout is Valkey's t_stream.c wire format: [count, deleted, num-master-fields,
+// field..., 0], then (count+deleted) entries [flags, ms-diff, seq-diff,
+// (numfields, field...)?, value..., lp-count]. Field/value may be int-encoded, so
+// each is emitted right after it is read (before the next read reuses scratch).
+private bool decodeStreamListpack(scope const(ubyte)[] lp, scope const(char)[] key,
+    ulong mMs, ulong mSeq, ref ByteBuffer sink) @nogc nothrow
+{
+    import dreads.commands : parseLong;
+    import core.stdc.stdio : snprintf;
+
+    LpCursor c = LpCursor(lp);
+    char[24] scr = void;
+    const(char)[] e;
+    long v;
+    if (!c.next(scr, e)) return false;
+    parseLong(e, v);
+    immutable count = v;
+    if (!c.next(scr, e)) return false;
+    parseLong(e, v);
+    immutable deleted = v;
+    if (!c.next(scr, e)) return false;
+    parseLong(e, v);
+    immutable nmf = v;
+    Vector!(const(char)[]) mfields; // slices into `lp` (stable)
+    foreach (_; 0 .. nmf)
+    {
+        if (!c.next(scr, e)) return false;
+        mfields.put(e);
+    }
+    if (!c.next(scr, e)) return false; // master zero terminator
+    foreach (_; 0 .. count + deleted)
+    {
+        if (!c.next(scr, e)) return false;
+        parseLong(e, v);
+        immutable flags = v;
+        if (!c.next(scr, e)) return false;
+        parseLong(e, v);
+        immutable msd = v;
+        if (!c.next(scr, e)) return false;
+        parseLong(e, v);
+        immutable seqd = v;
+        immutable samefields = (flags & 2) != 0;
+        immutable delEntry = (flags & 1) != 0;
+        long nf = nmf;
+        if (!samefields)
+        {
+            if (!c.next(scr, e)) return false;
+            parseLong(e, v);
+            nf = v;
+        }
+        if (!delEntry)
+        {
+            repArrayHeader(sink, cast(uint)(3 + nf * 2));
+            repBulk(sink, "XADD");
+            repBulk(sink, key);
+            char[48] ib = void;
+            immutable il = snprintf(ib.ptr, ib.length, "%llu-%llu",
+                mMs + cast(ulong) msd, mSeq + cast(ulong) seqd);
+            repBulk(sink, ib[0 .. il]);
+        }
+        foreach (fi; 0 .. nf)
+        {
+            if (samefields)
+            {
+                if (!delEntry)
+                    repBulk(sink, mfields[cast(size_t) fi]);
+            }
+            else
+            {
+                if (!c.next(scr, e)) return false;
+                if (!delEntry)
+                    repBulk(sink, e); // field name (emit before value read)
+            }
+            if (!c.next(scr, e)) return false;
+            if (!delEntry)
+                repBulk(sink, e); // value
+        }
+        if (!c.next(scr, e)) return false; // lp-count (skip)
+    }
+    return true;
+}
+
+// STREAM_LISTPACKS_3 (21) -> XADD... + XSETID + XGROUP CREATE... The consumer PEL
+// and consumer records are read+skipped (groups are rebuilt via XGROUP CREATE;
+// per-consumer pending is not modelled — DRIFT, like the compactor which drops it).
+private bool decodeStream(ref RdbReader r, scope const(char)[] key, bool v3,
+    ref ByteBuffer sink) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    bool enc;
+    ulong numLp;
+    if (!r.loadLen(numLp, enc)) return false;
+    foreach (_; 0 .. numLp)
+    {
+        const(char)[] rawkey, rawlp;
+        if (!r.loadString(rawkey) || rawkey.length != 16 || !r.loadString(rawlp))
+            return false;
+        ulong mMs = 0, mSeq = 0;
+        foreach (i; 0 .. 8)
+            mMs = (mMs << 8) | cast(ubyte) rawkey[i];
+        foreach (i; 0 .. 8)
+            mSeq = (mSeq << 8) | cast(ubyte) rawkey[8 + i];
+        if (!decodeStreamListpack(cast(const(ubyte)[]) rawlp, key, mMs, mSeq, sink))
+            return false;
+    }
+    ulong length, lastMs, lastSeq, firstMs, firstSeq, mdMs, mdSeq, added;
+    if (!r.loadLen(length, enc) || !r.loadLen(lastMs, enc) || !r.loadLen(lastSeq, enc)
+        || !r.loadLen(firstMs, enc) || !r.loadLen(firstSeq, enc)
+        || !r.loadLen(mdMs, enc) || !r.loadLen(mdSeq, enc) || !r.loadLen(added, enc))
+        return false;
+    // set last-id (also covers an empty stream that still has history)
+    repArrayHeader(sink, 3);
+    repBulk(sink, "XSETID");
+    repBulk(sink, key);
+    char[48] ib = void;
+    immutable il = snprintf(ib.ptr, ib.length, "%llu-%llu", lastMs, lastSeq);
+    repBulk(sink, ib[0 .. il]);
+    ulong ng;
+    if (!r.loadLen(ng, enc)) return false;
+    foreach (_; 0 .. ng)
+    {
+        const(char)[] gname;
+        if (!r.loadString(gname)) return false;
+        ulong gMs, gSeq, eread;
+        if (!r.loadLen(gMs, enc) || !r.loadLen(gSeq, enc) || !r.loadLen(eread, enc))
+            return false;
+        ulong pelN;
+        if (!r.loadLen(pelN, enc)) return false;
+        foreach (_2; 0 .. pelN) // global PEL: id(16) + delivery-time(8) + count(varint)
+        {
+            if (!skipBytes(r, 24)) return false;
+            ulong dc;
+            if (!r.loadLen(dc, enc)) return false;
+        }
+        ulong consN;
+        if (!r.loadLen(consN, enc)) return false;
+        foreach (_2; 0 .. consN) // consumer: name + seen(8) + active(8) + pel ids(16 each)
+        {
+            const(char)[] cname;
+            if (!r.loadString(cname)) return false;
+            if (!skipBytes(r, v3 ? 16 : 8)) return false; // seen (+ active on v3)
+            ulong cpelN;
+            if (!r.loadLen(cpelN, enc)) return false;
+            if (!skipBytes(r, cpelN * 16)) return false;
+        }
+        repArrayHeader(sink, 5);
+        repBulk(sink, "XGROUP");
+        repBulk(sink, "CREATE");
+        repBulk(sink, key);
+        repBulk(sink, gname);
+        char[48] gb = void;
+        immutable gl = snprintf(gb.ptr, gb.length, "%llu-%llu", gMs, gSeq);
+        repBulk(sink, gb[0 .. gl]);
     }
     return true;
 }

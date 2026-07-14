@@ -711,6 +711,42 @@ version (unittest)
         ks.runAt(T0, "RESTORE", "x", "0", cast(string) bad).expect.to.contain("checksum");
     }
 
+    @("blackbox.rdb_stream_dump_restore")
+    unittest
+    {
+        // DUMP -> RESTORE round-trips a STREAM through the codec: entries (fields
+        // and values, incl. multi-field), the last-id, and a consumer group. The
+        // stream RDB is encoded one-listpack-per-entry (master field template +
+        // one SAMEFIELDS entry) and decoded back to XADD/XSETID/XGROUP. Verified
+        // byte-exact against Valkey 9.1 both ways (live).
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        enum ulong T0 = 1_000_000_000;
+
+        ks.runAt(T0, "XADD", "st", "5-1", "name", "alice", "age", "30");
+        ks.runAt(T0, "XADD", "st", "6-1", "name", "bob");
+        ks.runAt(T0, "XADD", "st", "7-3", "x", "y");
+        ks.runAt(T0, "XGROUP", "CREATE", "st", "g1", "0");
+
+        auto payload = extractBulk(ks.runAt(T0, "DUMP", "st"));
+        ks.runAt(T0, "DEL", "st");
+        ks.runAt(T0, "RESTORE", "st", "0", payload).expect.to.equal("+OK\r\n");
+
+        ks.runAt(T0, "XLEN", "st").expect.to.equal(":3\r\n");
+        ks.runAt(T0, "XRANGE", "st", "5-1", "5-1")
+            .expect.to.equal("*1\r\n*2\r\n$3\r\n5-1\r\n*4\r\n$4\r\nname\r\n$5\r\nalice\r\n$3\r\nage\r\n$2\r\n30\r\n");
+        // last-id preserved (a further XADD * must land after 7-3)
+        ks.runAt(T0, "XADD", "st", "7-4", "z", "w").expect.to.equal("$3\r\n7-4\r\n");
+        // the consumer group survived
+        ks.runAt(T0, "XINFO", "GROUPS", "st").expect.to.contain("g1");
+    }
+
     private string hexToStr(string h)
     {
         import std.conv : to;

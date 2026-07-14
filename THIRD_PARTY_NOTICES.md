@@ -10,8 +10,19 @@ For wire-protocol compatibility, `dreads` reproduces a number of client-facing
 **error message strings** (e.g. `ERR value is not an integer or out of range`,
 `WRONGTYPE Operation against a key holding the wrong kind of value`) verbatim
 from Valkey so that existing Redis/Valkey clients and tests observe identical
-error text. These strings are the only material derived from Valkey; no Valkey
-source code, structure, or logic was copied.
+error text.
+
+## Valkey — RDB / listpack wire format
+
+`dreads` also reproduces the **RDB serialization byte format** (DUMP/RESTORE),
+including the listpack and stream-listpack layouts, the length/type encodings,
+the CRC64-Jones footer, and protocol constants (RDB_VERSION, type bytes), so that
+DUMP payloads interoperate byte-for-byte with Redis/Valkey. This is an external
+wire specification (like a protocol RFC) reproduced for compatibility — dreads'
+own data structures and architecture are unrelated to Valkey's.
+
+These strings and format constants are the only material derived from Valkey; no
+Valkey source code, structure, or logic was copied into dreads' architecture.
 
 Valkey is distributed under the BSD 3-Clause License, which permits this use
 provided the following copyright notice, conditions, and disclaimer are
