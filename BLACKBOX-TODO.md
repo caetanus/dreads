@@ -35,28 +35,38 @@ ZRANDMEMBER WITHSCORES count-overflow guard (was a server CRASH via 9e18-draw
 loop); `blackbox/sweep.sh` restarts dreads per file (kills cross-file config
 leakage).
 
-## Progress per file (fresh sweep 2026-07-13, sweep-27, db 9, skipfile, fresh server per file)
+## Progress per file (sweep 2026-07-14, db 9, skipfile, fresh server per file)
 
-| File | sweep8 ok | now ok | err | first blocker (if aborts) |
-|---|---|---|---|---|
-| unit/type/incr | 32 | 32 | 0 | **PASSES** |
-| unit/type/string | 82 | 106 | 0 | **PASSES** (was 2 err) |
-| unit/type/list | 100 | 100 | 8 | aborts: tcl `can't read "cmd"` (framework var; investigate) |
-| unit/type/hash | 79 | 79 | 3 | aborts: `DUMP` unknown command |
-| unit/type/set | 115 | 115 | 4 | yes |
-| unit/type/zset | 305 | 318 | 8 | yes (ZRANDMEMBER crash guard landed) |
-| unit/expire | 62 | 62 | 3 | aborts: `CLIENT IMPORT-SOURCE` unknown subcommand |
-| unit/keyspace | 45 | 45 | 0 | aborts: stream-cgroups COPY (ERR syntax) |
-| unit/scan | 10 | 24 | 0 | yes (was aborting) |
-| unit/bitops | 46 | 49 | 2 | yes (was aborting) |
-| unit/other | 8 | 25 | 1 | aborts: CONFIG SET "Unsupported CONFIG parameter" |
-| unit/sort | 45 | 44 | 22 | yes |
-| **total** | **929** | **999** | **51** | |
+| File | ok | err | first blocker (if aborts) |
+|---|---|---|---|
+| unit/type/incr | 32 | 0 | **PASSES** |
+| unit/type/string | 106 | 0 | **PASSES** |
+| unit/type/zset | 322 | 0 | **PASSES** |
+| unit/scan | 24 | 0 | **PASSES** |
+| unit/bitfield | 18 | 0 | **PASSES** |
+| unit/type/list | 271 | 10 | aborts: `CLIENT PAUSE` |
+| unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
+| unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
+| unit/bitops | 49 | 2 | completes; SETBIT fuzz |
+| unit/sort | 44 | 22 | completes; BY/GET/STORE debt (biggest single-file) |
+| unit/expire | 66 | 5 | aborts: tcl `table_size` var (import-source landed) |
+| unit/keyspace | 45 | 1 | aborts: stream-cgroups COPY (ERR syntax) |
+| unit/other | 25 | 2 | aborts: CONFIG SET unsupported param |
+| **unit/hashexpire** | **226** | **26** | completes (HSETEX + edges); COPY-TTL / RDB-load / HINCRBY-on-expired follow-ups |
+| unit/dump | 5 | 2 | aborts: OBJECT FREQ (LFU freq tracking) |
+| unit/hyperloglog | 6 | 2 | aborts: PFDEBUG |
+| unit/scripting | 535 | 11 | aborts: OOM/maxmemory eviction |
 
-Quick wins to unmask downstream tests: **CLIENT IMPORT-SOURCE** stub (expire),
-the unsupported **CONFIG parameter** in `other`, and the `list` tcl `cmd` var
-(may be a dreads reply shape the framework doesn't expect). DUMP/RESTORE (hash)
-and stream-COPY (keyspace) are the bigger blockers.
+Landed 2026-07-14 (this session): HEXPIRE family + HSETEX + HGETEX; DUMP/RESTORE
+(external AOF-command<->RDB translator, both phases, bidirectional Valkey 9.1
+interop); CLIENT IMPORT-SOURCE + import-mode expiry pause; LFU/rdb-version-check/
+hll-sparse CONFIG params; INFO `keys_with_volatile_items` + `expired_fields`.
+hashexpire.tcl went 3 -> 226. No hot-path regression (SET 1.24M / GET 1.43M /
+HGET-with-field-TTL 1.19M rps @ -P16).
+
+Quick wins to unmask more: **CLIENT PAUSE/UNPAUSE** (list + unit/pause),
+**CLIENT REPLY** (pubsub), OBJECT FREQ (dump), PFDEBUG (hyperloglog), the `other`
+CONFIG param, and stream-COPY (keyspace). Sort is the biggest local debt.
 
 ## Layer 4 — open failures (sweep7/8)
 
