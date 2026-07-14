@@ -37,6 +37,13 @@ public __gshared bool gActiveExpire;
 /// INFO stats: lifetime count of keys dropped by lazy or active expiration.
 public __gshared ulong gExpiredKeys;
 
+/// Background (timer) eviction: opt-in like gActiveExpire (default off — the
+/// write path already frees on demand; the cycle only matters for the Redis
+/// contract that a key can be evicted without a subsequent write). INFO stats
+/// `evicted_keys` counts keys dropped by maxmemory pressure (write path + cycle).
+public __gshared bool gActiveEviction;
+public __gshared ulong gEvictedKeys;
+
 /// INFO stats `expired_fields`: hash fields dropped by TTL (lazy/active reap or a
 /// past-deadline HEXPIRE/HGETEX/HSETEX). The per-field analog of gExpiredKeys.
 public __gshared ulong gExpiredFields;

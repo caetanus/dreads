@@ -43,6 +43,9 @@ public struct Config
     // hot path free of index maintenance. On = bounded memory for TTL-heavy
     // workloads that never re-touch their keys, at a per-SET-EX cost.
     bool activeExpire = false;
+    // opt-in background eviction cycle (default off): evict keys over maxmemory on
+    // the timer, not only on writes. Off = write-triggered eviction only.
+    bool activeEviction = false;
     // Data-structure encoding thresholds. dreads uses a single encoding per
     // type, so these are advisory: they are accepted, stored and echoed so the
     // Redis/Valkey test suite's CONFIG SET/GET round-trips (and encoding
@@ -146,6 +149,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.activeExpire = true;
         else if (value == "no")
             cfg.activeExpire = false;
+        else
+            return false;
+        return true;
+    case "active-eviction":
+        if (value == "yes")
+            cfg.activeEviction = true;
+        else if (value == "no")
+            cfg.activeEviction = false;
         else
             return false;
         return true;
@@ -326,7 +337,7 @@ public bool isRuntimeSettable(string lname) nothrow
     switch (lname)
     {
     case "maxmemory", "maxmemory-policy", "lua-time-limit", "lua-memory-limit",
-        "active-expire", "notify-keyspace-events", "lazyfree-lazy-server-del",
+        "active-expire", "active-eviction", "notify-keyspace-events", "lazyfree-lazy-server-del",
         "appendonly", "import-mode", "replica-read-only", "slave-read-only",
         "save", "hz", "appendfsync",
         "repl-ping-replica-period", "repl-ping-slave-period",

@@ -240,11 +240,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
     }
     {
-        import dreads.obj : lruClock, gActiveExpire;
+        import dreads.obj : lruClock, gActiveExpire, gActiveEviction;
         import dreads.rand : seedRand;
         import dreads.stream : nowMs;
 
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
+        gActiveEviction = gConfig.activeEviction; // background maxmemory eviction
         lruClock = cast(uint)(nowMs() / 1000);
         seedRand(nowMs()); // shuffle the random-pick commands per boot
         {
@@ -266,7 +267,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 d.activeExpireCycle();
                 d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
             }
-            flushPendingNotify(); // deliver the "expired"/"hexpired" events the sweep queued
+            runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
+            flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
             gAof.fsyncNow();
         }, true);
     }
@@ -2929,9 +2931,10 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         if (ok)
         {
             import dreads.notify : parseNotifyFlags;
-            import dreads.obj : gActiveExpire;
+            import dreads.obj : gActiveExpire, gActiveEviction;
 
             gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
+            gActiveEviction = gConfig.activeEviction;
             cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
             repSimple(o, "OK");
         }
@@ -3082,69 +3085,116 @@ private __gshared size_t gEvictCursor;
 /// Approximate LRU eviction: sample live keys, evict the coldest, repeat.
 /// Returns false when memory stays over the limit (noeviction, or nothing
 /// evictable under volatile-lru).
+// volatile-* only touches keys with a TTL; *-random picks a sampled key blindly
+// instead of by LRU/LFU (both share obj.lruSecs, lowest = evict-first).
+private void evictionMode(out bool volatileOnly, out bool randomPick) nothrow
+{
+    auto p = gConfig.maxmemoryPolicy;
+    volatileOnly = p.length >= 9 && p[0 .. 9] == "volatile-";
+    randomPick = p.length >= 7 && p[$ - 7 .. $] == "-random";
+}
+
+// Evict one victim from `ks` per the policy: sample up to 5 live keys from a
+// rotating cursor, pick by LRU/LFU (or at random), propagate DEL, notify, count.
+// Returns false when nothing is evictable (empty, or volatile-only with no TTLs).
+private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick) nothrow
+{
+    import dreads.notify : notifyKeyspaceEvent, NClass;
+    import dreads.obj : gEvictedKeys;
+
+    auto cap = ks.d.capacity;
+    if (cap == 0 || ks.length == 0)
+        return false;
+    const(char)[] victim;
+    uint victimLru = uint.max;
+    size_t seen = 0;
+    size_t i = gEvictCursor % cap;
+    size_t scanned = 0;
+    while (seen < 5 && scanned < cap)
+    {
+        if (ks.d.slotLive(i))
+        {
+            auto obj = ks.d.valAt(i);
+            if (!volatileOnly || obj.expireAtMs != 0)
+            {
+                seen++;
+                if (randomPick)
+                {
+                    victim = ks.d.keyAt(i);
+                    break;
+                }
+                if (obj.lruSecs <= victimLru)
+                {
+                    victimLru = obj.lruSecs;
+                    victim = ks.d.keyAt(i);
+                }
+            }
+        }
+        i = (i + 1) % cap;
+        scanned++;
+    }
+    gEvictCursor = i + 1;
+    if (victim is null)
+        return false; // nothing evictable
+    if (gAof.enabled)
+    {
+        static ByteBuffer delCmd; // TLS scratch for AOF propagation
+        delCmd.clear();
+        repArrayHeader(delCmd, 2);
+        repBulk(delCmd, "DEL");
+        repBulk(delCmd, victim);
+        gAof.append(delCmd.data);
+    }
+    notifyKeyspaceEvent(NClass.evicted, "evicted", victim);
+    ks.d.del(victim);
+    gWriteEpoch++;
+    gEvictedKeys++;
+    return true;
+}
+
+// Write path: free memory synchronously before an allocating write. Operates on
+// the connection's db 0 view (gKeys); budgeted so one command can't stall.
 private bool freeMemoryIfNeeded() nothrow
 {
-    import dreads.obj : RObj;
-
     if (usedMemory() <= gConfig.maxmemory)
         return true;
     if (gConfig.maxmemoryPolicy == "noeviction")
         return false;
-    bool volatileOnly = gConfig.maxmemoryPolicy == "volatile-lru";
-    bool randomPick = gConfig.maxmemoryPolicy == "allkeys-random";
-
-    static ByteBuffer delCmd; // TLS scratch for AOF propagation
+    bool volatileOnly, randomPick;
+    evictionMode(volatileOnly, randomPick);
     foreach (_; 0 .. 128) // eviction budget per triggering command
     {
-        auto cap = gKeys.d.capacity;
-        if (cap == 0 || gKeys.length == 0)
+        if (!evictOneVictim(gKeys, volatileOnly, randomPick))
             return false;
-        // sample up to 5 live keys from a rotating cursor
-        const(char)[] victim;
-        uint victimLru = uint.max;
-        size_t seen = 0;
-        size_t i = gEvictCursor % cap;
-        size_t scanned = 0;
-        while (seen < 5 && scanned < cap)
-        {
-            if (gKeys.d.slotLive(i))
-            {
-                auto obj = gKeys.d.valAt(i);
-                if (!volatileOnly || obj.expireAtMs != 0)
-                {
-                    seen++;
-                    if (randomPick)
-                    {
-                        victim = gKeys.d.keyAt(i);
-                        break;
-                    }
-                    if (obj.lruSecs <= victimLru)
-                    {
-                        victimLru = obj.lruSecs;
-                        victim = gKeys.d.keyAt(i);
-                    }
-                }
-            }
-            i = (i + 1) % cap;
-            scanned++;
-        }
-        gEvictCursor = i + 1;
-        if (victim is null)
-            return false; // nothing evictable
-        if (gAof.enabled)
-        {
-            delCmd.clear();
-            repArrayHeader(delCmd, 2);
-            repBulk(delCmd, "DEL");
-            repBulk(delCmd, victim);
-            gAof.append(delCmd.data);
-        }
-        gKeys.d.del(victim);
-        gWriteEpoch++;
         if (usedMemory() <= gConfig.maxmemory)
             return true;
     }
     return usedMemory() <= gConfig.maxmemory;
+}
+
+// Timer path (opt-in `active-eviction`): Redis evicts on a cron too — a key can
+// be dropped without a subsequent write. Sweeps every db. CLIENT PAUSE holds it
+// back: no eviction while a pause window is open (the effect waits for unpause).
+private void runEvictionCycle() nothrow
+{
+    import dreads.obj : gActiveEviction;
+
+    if (!gActiveEviction || gConfig.maxmemory == 0
+        || gConfig.maxmemoryPolicy == "noeviction")
+        return;
+    if (gPauseUntilMs != 0 && nowMs() < gPauseUntilMs)
+        return; // eviction is skipped during a client pause
+    bool volatileOnly, randomPick;
+    evictionMode(volatileOnly, randomPick);
+    foreach (ref d; gDbs)
+    {
+        size_t budget = 0;
+        while (usedMemory() > gConfig.maxmemory && budget++ < 1024)
+            if (!evictOneVictim(d, volatileOnly, randomPick))
+                break; // nothing evictable in this db
+        if (usedMemory() <= gConfig.maxmemory)
+            break;
+    }
 }
 
 // ---------------------------------------------------------------------------

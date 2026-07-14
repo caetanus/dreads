@@ -2820,7 +2820,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
             import dreads.obj : gBlockedClients, gDbs, gExpiredKeys, gExpiredFields,
-                gPauseUntilMs, gPauseAll;
+                gEvictedKeys, gPauseUntilMs, gPauseAll;
             import dreads.stream : nowMs;
 
             static ByteBuffer ib; // TLS scratch: INFO payload
@@ -2848,8 +2848,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     gScriptCountHook !is null ? gScriptCountHook() : 0);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
-                    "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n",
-                    gExpiredKeys, gExpiredFields);
+                    "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n"
+                    ~ "evicted_keys:%llu\r\n",
+                    gExpiredKeys, gExpiredFields, gEvictedKeys);
             ib.append(b[0 .. n]);
             {
                 import dreads.acl : gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey,
