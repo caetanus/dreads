@@ -44,8 +44,9 @@ leakage).
 | unit/type/zset | 322 | 0 | **PASSES** |
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
-| unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented — re-sweep |
-| unit/pause | 13 | 4 | completes past scripts; eviction/expire-skip-during-pause, may-replicate-in-RO-script, 1 timing test |
+| unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
+| unit/pause | 15 | 6 | completes (no abort); remaining = passive-expire-skip-during-pause (randomkey-loop + expires-skip), CLIENT UNBLOCK vs pause, may-replicate msg suffix, 1 timing |
+| unit/dump | 14 | 2 | OBJECT FREQ/LFU + RESTORE opts + rdb-version-check landed; remaining = MIGRATE, stream DUMP |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
@@ -77,6 +78,18 @@ pause.tcl 2 -> 13; no hot-path regression (SET 1.26M / GET 1.37M rps @ -P16).
 Remaining unit/pause: eviction & active/passive expire skipped during a pause
 (needs a periodic-eviction cycle dreads lacks + lazy-expire deferral), may-
 replicate rejected inside RO scripts (script bridge), one deferring-client timer.
+
+Eviction/OOM (2026-07-14): deny-OOM now matches Valkey's CMD_DENYOOM (only
+allocating writes refused; DEL/EXPIRE/*POP run under OOM; a dirty script isn't
+stopped mid-way). Opt-in background eviction cycle behind `active-eviction`
+(default off; write path frees on demand) — evicts across all dbs on the 1s
+timer, counts INFO `evicted_keys`, fires the "evicted" event, and is skipped
+during a CLIENT PAUSE window. Also OBJECT FREQ/IDLETIME follow the maxmemory
+policy (LRU/LFU share obj.lruSecs; RESTORE FREQ/IDLETIME seed it), and a script's
+redis.call('publish') now reaches pub/sub via a data-plane dispatch case. The
+scripting.tcl OOM abort now blocks on INFO errorstats/commandstats (a stats gap,
+NOT eviction): errorstat_<code>:count, total_error_replies, cmdstat rejected_calls
+/failed_calls, CONFIG RESETSTAT.
 
 Quick wins to unmask more: re-sweep list.tcl (PAUSE was its blocker),
 **CLIENT REPLY** (pubsub), OBJECT FREQ (dump), PFDEBUG (hyperloglog), the `other`
