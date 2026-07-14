@@ -461,13 +461,54 @@ extern (C) private int luaSha1Hex(lua_State* L) nothrow @nogc
     return 1;
 }
 
-/// redis.acl_check_cmd(cmd, ...): dreads has no ACL layer, so every command
-/// is permitted — answer true (the script's user is effectively unrestricted).
+/// redis.acl_check_cmd(cmd, arg...): true if the CALLER's ACL user may run `cmd`
+/// with those args (command + key permissions), false if denied. An unknown
+/// command errors. Unrestricted / no-ACL callers always pass.
 extern (C) private int luaAclCheckCmd(lua_State* L) nothrow @nogc
 {
-    if (lua_gettop(L) < 1)
+    import dreads.acl : aclUserById, aclUnrestricted, aclCanRunCmd, aclCmdIndex,
+        aclDeniedKey;
+
+    immutable argc = lua_gettop(L);
+    if (argc < 1)
         return raiseErr(L, "ERR Please specify at least one argument for this redis lib call");
-    lua_pushboolean(L, 1);
+    size_t clen;
+    auto cp = lua_tolstring(L, 1, &clen);
+    char[64] lc = void;
+    int cidx = -1;
+    if (cp !is null && clen && clen <= lc.length)
+    {
+        foreach (i; 0 .. clen)
+            lc[i] = cp[i] >= 'A' && cp[i] <= 'Z' ? cast(char)(cp[i] + 32) : cp[i];
+        cidx = aclCmdIndex(cast(const(char)[]) lc[0 .. clen]);
+    }
+    if (cidx < 0)
+        return raiseErr(L, "ERR Invalid command passed to server.acl_check_cmd()");
+    auto u = aclUserById(gCtx.userId);
+    if (gCtx.userId == 0 || u is null || aclUnrestricted(u))
+    {
+        lua_pushboolean(L, 1); // no ACL in force for this caller
+        return 1;
+    }
+    bool allowed = aclCanRunCmd(u, cidx);
+    if (allowed) // command permitted — now the key patterns
+    {
+        RVal[32] argbuf = void;
+        size_t n = 0;
+        foreach (li; 1 .. argc + 1)
+        {
+            if (n >= argbuf.length)
+                break;
+            size_t sl;
+            auto sp = lua_tolstring(L, cast(int) li, &sl);
+            argbuf[n].type = RType.BulkString;
+            argbuf[n].str = sp is null ? "" : cast(string) sp[0 .. sl];
+            n++;
+        }
+        if (aclDeniedKey(u, cast(const(char)[]) lc[0 .. clen], argbuf[0 .. n]) !is null)
+            allowed = false;
+    }
+    lua_pushboolean(L, allowed ? 1 : 0);
     return 1;
 }
 
