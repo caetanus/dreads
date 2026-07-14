@@ -218,11 +218,16 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     gKeyActivity = createManualEvent();
     gPauseEvt = createManualEvent();
     {
-        import dreads.notify : gNotifyPublish, parseNotifyFlags;
+        import dreads.notify : gNotifyPublish, gPublishHook, parseNotifyFlags;
 
         cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
         gNotifyPublish = (scope const(char)[] chan, scope const(char)[] msg) nothrow{
             gPubSub.publish(chan, msg);
+        };
+        // lets a script's redis.call('publish'/'spublish') reach the pub/sub layer
+        gPublishHook = (scope const(char)[] chan, scope const(char)[] msg, bool shard) nothrow{
+            return shard ? gShardPubSub.publish(chan, msg, "smessage")
+                : gPubSub.publish(chan, msg);
         };
     }
     {

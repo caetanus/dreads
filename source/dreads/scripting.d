@@ -722,7 +722,7 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
 
     bool isWrite = false;
     {
-        import dreads.commands : isWriteCommand;
+        import dreads.commands : isWriteCommand, isPausedByWrite;
 
         char[24] up = void;
         auto cname = arr[0].str;
@@ -749,7 +749,9 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
             default:
                 break;
             }
-            if (gCtx.readOnly && isWrite)
+            // read-only scripts also bar may-replicate commands (PUBLISH/PFCOUNT):
+            // they propagate, which a no-writes/_RO script must not do.
+            if (gCtx.readOnly && isPausedByWrite(uc))
             {
                 // raise as an {err=...} object so it surfaces verbatim, the
                 // way Redis reports bridge-level refusals

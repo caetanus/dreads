@@ -14,6 +14,7 @@ public struct Config
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
     string maxmemoryPolicy = "noeviction"; // noeviction | allkeys-lru | volatile-lru
+    string rdbVersionCheck = "strict"; // strict | relaxed — RESTORE future-RDB-version policy
     long luaTimeLimitMs = 5000; // script execution budget; 0 = unlimited
     ulong luaMemoryLimit = 0; // bytes the Lua state may allocate; 0 = unlimited
     // SQLite-style durability: full = fsync per mutation (Raft-correct),
@@ -261,8 +262,11 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         else
             return false;
         return true;
-    case "rdb-version-check": // accepted no-op: RESTORE always accepts version <= ours
-        return value == "relaxed" || value == "strict";
+    case "rdb-version-check": // strict rejects a future RDB version; relaxed accepts it
+        if (value != "relaxed" && value != "strict")
+            return false;
+        cfg.rdbVersionCheck = value;
+        return true;
     case "hll-sparse-max-bytes": // accepted: HLL sparse->dense threshold (informational)
         {
             long v;
@@ -285,6 +289,8 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return value == "yes" || value == "no";
     case "save": // RDB snapshotting is not implemented; accept & ignore
         return true;
+    case "aof-use-rdb-preamble": // dreads' AOF is its own format; RDB preamble is inert
+        return value == "yes" || value == "no";
     case "hz": // background-task frequency; dreads uses a fixed timer
         try
             return value.to!int >= 0;
@@ -332,7 +338,7 @@ public bool isRuntimeSettable(string lname) nothrow
         "zset-max-listpack-value", "zset-max-ziplist-value",
         "stream-node-max-entries", "stream-node-max-bytes",
         "proto-max-bulk-len", "client-query-buffer-limit",
-        "rdb-version-check", "hll-sparse-max-bytes":
+        "rdb-version-check", "hll-sparse-max-bytes", "aof-use-rdb-preamble":
         return true;
     default:
         return false;

@@ -61,3 +61,4 @@ RESTORE expired keys with expiration time
 # coroutine.* (a library we don't load). See DRIFT.md on readonly emulation.
 Try trick readonly table on basic types metatable
 HSETEX is not replicating validation arguments
+RESTORE should not store key that are already expired, with REPLACE will propagate it as DEL or UNLINK

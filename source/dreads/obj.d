@@ -492,7 +492,9 @@ public struct Keyspace
     }
 
     /// Live object or null — lazily drops the key when its TTL has passed.
-    RObj* lookup(scope const(char)[] k) @nogc nothrow
+    // touch=false skips the LRU/LFU bump — OBJECT ENCODING/FREQ/IDLETIME must not
+    // count as an access (Redis's LOOKUP_NOTOUCH).
+    RObj* lookup(scope const(char)[] k, bool touch = true) @nogc nothrow
     {
         auto o = d.get(k);
         if (o is null)
@@ -527,7 +529,8 @@ public struct Keyspace
                 }
             }
         }
-        o.lruSecs = lruClock;
+        if (touch)
+            o.lruSecs = lruClock;
         return o;
     }
 

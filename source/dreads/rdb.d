@@ -310,13 +310,14 @@ void appendFooter(ref ByteBuffer o) @nogc nothrow
 
 /// Validate a RESTORE payload's footer: version accepted and CRC matches. On
 /// success `body_` is the value bytes (type + value, footer stripped).
-bool verifyFooter(scope const(ubyte)[] payload, out const(ubyte)[] body_) @nogc nothrow
+bool verifyFooter(scope const(ubyte)[] payload, out const(ubyte)[] body_,
+    bool strictVersion = true) @nogc nothrow
 {
     if (payload.length < 10)
         return false;
     immutable n = payload.length - 10;
     immutable ushort ver = cast(ushort)(payload[n] | (payload[n + 1] << 8));
-    if (ver > RDB_VERSION)
+    if (strictVersion && ver > RDB_VERSION) // relaxed: best-effort decode of a future dump
         return false;
     // CRC64 covers the value bytes + the 2 version bytes; 0 means "not checked".
     ulong stored = 0;

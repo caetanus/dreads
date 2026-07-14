@@ -33,6 +33,11 @@ enum NClass : uint
 
 __gshared uint gNotifyFlags = 0;
 __gshared void delegate(scope const(char)[] chan, scope const(char)[] msg) nothrow gNotifyPublish;
+// PUBLISH/SPUBLISH from the data plane (a redis.call inside a script reaches the
+// pub/sub layer through this, since dispatch can't touch the server module). The
+// server installs it pointing at gPubSub/gShardPubSub.publish; returns the number
+// of clients the message reached. `shard` selects the sharded channel space.
+__gshared long delegate(scope const(char)[] chan, scope const(char)[] msg, bool shard) nothrow gPublishHook;
 // Events are QUEUED here (length-prefixed chan,msg pairs) by notifyKeyspaceEvent,
 // which runs inside the @nogc command dispatch and so cannot publish directly.
 // The server drains this via flushPendingNotify() after the command, on the

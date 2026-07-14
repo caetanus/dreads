@@ -409,19 +409,29 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             bool replace, absttl, badOpt;
+            long freq = -1; // FREQ n -> seed the LFU counter (OBJECT FREQ reads it)
+            long idle = -1; // IDLETIME n -> seed the LRU idle (OBJECT IDLETIME reads it)
             for (size_t i = 3; i < args.length; i++)
             {
                 if (eqICKeyword(args[i].str, "REPLACE"))
                     replace = true;
                 else if (eqICKeyword(args[i].str, "ABSTTL"))
                     absttl = true;
-                else if (eqICKeyword(args[i].str, "IDLETIME") || eqICKeyword(args[i].str, "FREQ"))
+                else if (eqICKeyword(args[i].str, "IDLETIME"))
                 {
-                    if (++i >= args.length)
+                    if (++i >= args.length || !parseLong(args[i].str, idle))
                     {
                         badOpt = true;
                         break;
-                    } // value accepted, unmodelled
+                    }
+                }
+                else if (eqICKeyword(args[i].str, "FREQ"))
+                {
+                    if (++i >= args.length || !parseLong(args[i].str, freq))
+                    {
+                        badOpt = true;
+                        break;
+                    }
                 }
                 else
                 {
@@ -440,7 +450,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             const(ubyte)[] body_;
-            if (!verifyFooter(cast(const(ubyte)[]) args[2].str, body_))
+            import dreads.config : gConfig;
+
+            immutable strictVer = gConfig.rdbVersionCheck != "relaxed";
+            if (!verifyFooter(cast(const(ubyte)[]) args[2].str, body_, strictVer))
             {
                 repError(o, "ERR DUMP payload version or checksum are wrong");
                 break;
@@ -459,11 +472,25 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             applyRebuild(cmds.data, ks, arena);
             immutable ulong absMs = ttlMs == 0 ? 0
                 : (absttl ? cast(ulong) ttlMs : detNow() + cast(ulong) ttlMs);
-            if (absMs != 0)
-                if (auto ro = ks.lookup(args[0].str))
+            if (absMs != 0 || freq >= 0 || idle >= 0)
+                if (auto ro = ks.lookup(args[0].str, false))
                 {
-                    ks.retimeExpire(args[0].str, ro.expireAtMs, absMs);
-                    ro.expireAtMs = absMs;
+                    if (absMs != 0)
+                    {
+                        ks.retimeExpire(args[0].str, ro.expireAtMs, absMs);
+                        ro.expireAtMs = absMs;
+                    }
+                    // LRU and LFU share lruSecs: FREQ seeds the counter directly,
+                    // IDLETIME backdates the last-access clock so OBJECT IDLETIME
+                    // reports the requested idle seconds.
+                    if (freq >= 0)
+                        ro.lruSecs = cast(uint) freq;
+                    else if (idle >= 0)
+                    {
+                        import dreads.obj : lruClock;
+
+                        ro.lruSecs = cast(uint)(lruClock > idle ? lruClock - idle : 0);
+                    }
                 }
             // propagate: DEL key ; <rebuild commands> ; [PEXPIREAT key absMs]
             propagationOverride.clear();
@@ -4314,6 +4341,32 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             pfcount(ks, args, o);
             break;
         }
+    case "PUBLISH", "SPUBLISH":
+        {
+            // Server-layer command reachable here only via a script's redis.call
+            // (the normal client path handles it in the server before dispatch).
+            // Routes to the pub/sub layer through gPublishHook and returns the
+            // receiver count. Never a keyspace write — no propagation.
+            import dreads.notify : gPublishHook;
+
+            if (args.length != 2)
+            {
+                arityErr(o, uname[0] == 'S' ? "spublish" : "publish");
+                break;
+            }
+            immutable shard = uname[0] == 'S';
+            if (gPublishHook is null)
+                repInt(o, 0);
+            else
+            {
+                // publish() is nothrow but not @nogc (it may grow reply lists); the
+                // same control-plane @nogc cast the script round-trip uses.
+                alias PubFn = long delegate(scope const(char)[], scope const(char)[],
+                    bool) @nogc nothrow;
+                repInt(o, (cast(PubFn) gPublishHook)(args[0].str, args[1].str, shard));
+            }
+            break;
+        }
     case "PFMERGE":
         {
             import dreads.hll : pfmerge;
@@ -5646,6 +5699,13 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     }
 }
 
+/// An LFU maxmemory policy ("allkeys-lfu" / "volatile-lfu") tracks access
+/// frequency rather than recency.
+private bool isLfuPolicy(scope const(char)[] p) @nogc nothrow
+{
+    return p.length >= 3 && p[$ - 3 .. $] == "lfu";
+}
+
 /// OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ (introspection; reports OUR encodings).
 private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
@@ -5659,12 +5719,19 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
         repError(o, "ERR wrong number of arguments for 'object' command");
         return;
     }
-    auto obj = ks.lookup(args[1].str);
+    auto obj = ks.lookup(args[1].str, false); // introspection: don't count as access
     if (obj is null)
     {
         repError(o, "ERR no such key");
         return;
     }
+    import dreads.config : gConfig;
+
+    // LRU and LFU share obj.lruSecs (mutually exclusive, like Redis's obj->lru):
+    // under an LFU policy it holds the access-frequency counter, otherwise the
+    // last-access clock. IDLETIME is meaningful only under non-LFU and FREQ only
+    // under LFU.
+    immutable lfu = isLfuPolicy(gConfig.maxmemoryPolicy);
     auto sub = args[0].str;
     if (eqICKeyword(sub, "ENCODING"))
         repBulk(o, objEncoding(obj));
@@ -5674,10 +5741,18 @@ private void objectCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @n
     {
         import dreads.obj : lruClock;
 
-        repInt(o, lruClock >= obj.lruSecs ? lruClock - obj.lruSecs : 0);
+        if (lfu)
+            repError(o, "ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.");
+        else
+            repInt(o, lruClock >= obj.lruSecs ? lruClock - obj.lruSecs : 0);
     }
     else if (eqICKeyword(sub, "FREQ"))
-        repError(o, "ERR An LFU maxmemory policy is not selected, access frequency not tracked");
+    {
+        if (!lfu)
+            repError(o, "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.");
+        else
+            repInt(o, obj.lruSecs);
+    }
     else
         repUnknownSubcommand(o, "OBJECT", sub);
 }

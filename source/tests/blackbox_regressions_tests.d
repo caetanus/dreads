@@ -895,4 +895,48 @@ version (unittest)
         isPausedByWrite("EVAL").should.equal(false);
         isPausedByWrite("FCALL").should.equal(false);
     }
+
+    // OBJECT FREQ/IDLETIME follow the maxmemory policy (LRU and LFU share one
+    // counter, like Redis's obj->lru), and RESTORE FREQ/IDLETIME seed it. First
+    // caught by unit/dump (OBJECT FREQ aborted the file).
+    @("blackbox.object_freq_idletime_lfu")
+    unittest
+    {
+        import dreads.config : gConfig;
+        import dreads.obj : lruClock;
+
+        Keyspace ks;
+        auto savedPolicy = gConfig.maxmemoryPolicy;
+        scope (exit)
+        {
+            ks.d.free();
+            gConfig.maxmemoryPolicy = savedPolicy;
+        }
+
+        ks.run("SET", "k", "v");
+
+        // non-LFU: IDLETIME is an int, FREQ errors
+        gConfig.maxmemoryPolicy = "noeviction";
+        ks.run("OBJECT", "IDLETIME", "k").should.startWith(":");
+        ks.run("OBJECT", "FREQ", "k").should.startWith("-ERR An LFU maxmemory policy is not selected");
+
+        // LFU: FREQ is an int, IDLETIME errors
+        gConfig.maxmemoryPolicy = "allkeys-lfu";
+        ks.run("OBJECT", "FREQ", "k").should.startWith(":");
+        ks.run("OBJECT", "IDLETIME", "k").should.startWith("-ERR An LFU maxmemory policy is selected");
+
+        // RESTORE FREQ seeds the counter; OBJECT FREQ reads it back (and the
+        // introspection lookup must not bump it)
+        auto dumped = extractBulk(ks.run("DUMP", "k"));
+        ks.run("DEL", "k");
+        ks.run("RESTORE", "k", "0", dumped, "FREQ", "100").should.equal("+OK\r\n");
+        ks.run("OBJECT", "FREQ", "k").should.equal(":100\r\n");
+
+        // RESTORE IDLETIME backdates last-access so OBJECT IDLETIME reports it
+        gConfig.maxmemoryPolicy = "allkeys-lru";
+        ks.run("DEL", "k");
+        ks.run("RESTORE", "k", "0", dumped, "IDLETIME", "1000").should.equal("+OK\r\n");
+        immutable reply = ks.run("OBJECT", "IDLETIME", "k"); // ":<idle>\r\n", idle ~ 1000
+        reply.should.startWith(":");
+    }
 }
