@@ -114,6 +114,19 @@ both non-blocking, separate). **zset 318/8 → 322/0.** No cross-file regression
 (full sweep 999/51 → 1007/37). XREAD BLOCK deliberately stays on the broadcast
 (fan-out, not hand-off).
 
+**XREADGROUP BLOCK — DONE (2026-07-14, commit 87995e5).** It accepted the BLOCK
+keyword but never parked (validated timeout, one attempt, returned nil). Now a
+live conn reading `>` parks its fiber on the same `gKeyActivity` event as XREAD
+(fan-out — the group's `lastDelivered` cursor serializes who gets which entry, so
+no per-key FIFO hand-off). Only `>` blocks; explicit ids read the PEL and return
+at once; non-BLOCK / MULTI-EXEC fall through to one-shot dispatch. Unlike XREAD
+it's a WRITE → a served pass is logged rewritten without the BLOCK pair. Verified
+live (parks blocked_clients:1, wakes on XADD in ~1s not the 4s timeout, PEL
+registered, two workers each get a distinct entry). Own UT
+`blackbox.xreadgroup_block_servability`. Valkey's stream-cgroups blocking tests
+(line 216+) remain unreachable — that file aborts earlier on separate debts
+(`XGROUP CREATE ... ENTRIESREAD -3` validation, `XPENDING ... IDLE`).
+
 ### Hash-field TTL (HEXPIRE family) — DONE (2026-07-14)
 Implemented HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT, HPERSIST, HTTL/HPTTL/
 HEXPIRETIME/HPEXPIRETIME, HGETEX — semantics mirrored from Valkey `t_hash.c`
