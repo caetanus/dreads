@@ -60,3 +60,4 @@ RESTORE expired keys with expiration time
 # reject a write to an already-present field, and the test also indexes
 # coroutine.* (a library we don't load). See DRIFT.md on readonly emulation.
 Try trick readonly table on basic types metatable
+HSETEX is not replicating validation arguments

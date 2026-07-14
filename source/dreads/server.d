@@ -2768,7 +2768,13 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))
     {
         if (eqICDebug(args[0].str, "RESETSTAT"))
+        {
+            import dreads.obj : gExpiredKeys, gExpiredFields;
+
             resetCmdStats(); // clear INFO commandstats counters
+            gExpiredKeys = 0;
+            gExpiredFields = 0;
+        }
         repSimple(o, "OK");
         return;
     }

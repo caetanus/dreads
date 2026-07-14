@@ -13,7 +13,7 @@ import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
-import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
@@ -1493,7 +1493,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             long absMs;
-            if (!resolveExpireMs(ttlv, isSec, isRel, absMs))
+            if (ttlv < 0 || !resolveExpireMs(ttlv, isSec, isRel, absMs))
             {
                 o.append("-ERR invalid expire time in '");
                 o.append(lname);
@@ -1524,6 +1524,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 {
                     obj.hash.del(a.str); // past deadline: delete the field now
                     affected.put(idx);
+                    gExpiredFields++;
                     repInt(o, 2);
                 }
                 else
@@ -1770,7 +1771,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             long absMs;
-            if (op == 1 && !resolveExpireMs(ttlv, isSec, isRel, absMs))
+            if (op == 1 && (ttlv < 0 || !resolveExpireMs(ttlv, isSec, isRel, absMs)))
             {
                 o.append("-ERR invalid expire time in 'hgetex' command\r\n");
                 break;
@@ -1811,6 +1812,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     {
                         obj.hash.del(a.str);
                         affected.put(idx);
+                        gExpiredFields++;
                     }
                     else
                     {
@@ -1874,7 +1876,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "hsetex");
                 break;
             }
-            bool fNX, fXX, keepTTL, badOpt;
+            bool fNX, fXX, kNX, kXX, keepTTL, badOpt;
             int ttlKind = 0; // 0=none 1=EX 2=PX 3=EXAT 4=PXAT
             long ttlVal;
             size_t fi = 1;
@@ -1887,6 +1889,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     fNX = true;
                 else if (eqICKeyword(a, "FXX"))
                     fXX = true;
+                else if (eqICKeyword(a, "NX"))
+                    kNX = true; // key-level: only if the key does not exist
+                else if (eqICKeyword(a, "XX"))
+                    kXX = true; // key-level: only if the key exists
                 else if (eqICKeyword(a, "KEEPTTL"))
                     keepTTL = true;
                 else if (eqICKeyword(a, "EX") || eqICKeyword(a, "PX")
@@ -1922,6 +1928,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR FNX and FXX options at the same time are not compatible");
                 break;
             }
+            if (kNX && kXX)
+            {
+                repError(o, "ERR NX and XX options at the same time are not compatible");
+                break;
+            }
             if (keepTTL && ttlKind)
             {
                 repError(o, "ERR syntax error");
@@ -1948,7 +1959,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 immutable isSec = ttlKind == 1 || ttlKind == 3;
                 immutable isRel = ttlKind == 1 || ttlKind == 2;
                 long resolved;
-                if (!resolveExpireMs(ttlVal, isSec, isRel, resolved))
+                if (ttlVal < 0 || !resolveExpireMs(ttlVal, isSec, isRel, resolved))
                 {
                     o.append("-ERR invalid expire time in 'hsetex' command\r\n");
                     break;
@@ -1961,6 +1972,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (wrong)
             {
                 repWrongType(o);
+                break;
+            }
+            // NX (key must not exist) / XX (key must exist) — key-level condition
+            if ((kNX && obj !is null) || (kXX && obj is null))
+            {
+                repInt(o, 0);
                 break;
             }
             // FNX (no field may exist) / FXX (all fields must exist) — all-or-nothing
@@ -2001,7 +2018,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 else if (ttlKind)
                 {
                     if (pastTime)
+                    {
                         obj.hash.del(f); // past deadline: field set then immediately expired
+                        gExpiredFields++;
+                    }
                     else
                         obj.hash.setFieldTTL(f, absMs);
                 }
@@ -2011,7 +2031,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             propagationOverride.clear();
             if (pastTime)
             {
-                // fields were set then deleted — net effect is deletion
+                // fields were set with a (past) TTL then immediately expired:
+                // hset -> hexpire -> hexpired -> del, matching Valkey's sequence
+                notifyKeyspaceEvent(NClass.hash, "hexpire", args[0].str);
                 notifyKeyspaceEvent(NClass.hash, "hexpired", args[0].str);
                 repArrayHeader(propagationOverride, 2 + pairs.length / 2);
                 repBulk(propagationOverride, "HDEL");
@@ -2748,7 +2770,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
-            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys;
+            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys, gExpiredFields;
 
             static ByteBuffer ib; // TLS scratch: INFO payload
             ib.clear();
@@ -2766,7 +2788,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     gScriptCountHook !is null ? gScriptCountHook() : 0);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
-                    "# Stats\r\nexpired_keys:%llu\r\nexpired_subkeys:0\r\n", gExpiredKeys);
+                    "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n",
+                    gExpiredKeys, gExpiredFields);
             ib.append(b[0 .. n]);
             {
                 import dreads.acl : gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey,
@@ -2820,17 +2843,20 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             static void dbLine(ref ByteBuffer ib, ref char[192] b, size_t idx,
                     ref Keyspace db) @nogc nothrow
             {
-                size_t live = 0, volatileKeys = 0;
+                size_t live = 0, volatileKeys = 0, volatileItems = 0;
                 foreach (k, ref v; db)
                 {
                     live++;
                     if (v.expireAtMs != 0)
                         volatileKeys++;
+                    if (v.type == ObjType.hash && v.hash.hasFieldTTL)
+                        volatileItems++; // a hash carrying >=1 field TTL (HEXPIRE)
                 }
                 if (live == 0)
                     return;
-                auto n = snprintf(b.ptr, b.length, "db%zu:keys=%zu,expires=%zu,avg_ttl=0\r\n",
-                        idx, live, volatileKeys);
+                auto n = snprintf(b.ptr, b.length,
+                        "db%zu:keys=%zu,expires=%zu,avg_ttl=0,keys_with_volatile_items=%zu\r\n",
+                        idx, live, volatileKeys, volatileItems);
                 ib.append(b[0 .. n]);
             }
 

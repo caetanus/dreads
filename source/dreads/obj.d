@@ -37,6 +37,10 @@ public __gshared bool gActiveExpire;
 /// INFO stats: lifetime count of keys dropped by lazy or active expiration.
 public __gshared ulong gExpiredKeys;
 
+/// INFO stats `expired_fields`: hash fields dropped by TTL (lazy/active reap or a
+/// past-deadline HEXPIRE/HGETEX/HSETEX). The per-field analog of gExpiredKeys.
+public __gshared ulong gExpiredFields;
+
 /// Import mode (`CONFIG SET import-mode yes` + `CLIENT IMPORT-SOURCE ON`): a
 /// bulk-load window for migration tools. While on, expiration is PAUSED so a
 /// stream of RESTOREs with absolute TTLs (some already past) loads consistently
@@ -440,6 +444,7 @@ public struct Keyspace
                     if (n > 0)
                     {
                         reaped += n;
+                        gExpiredFields += n;
                         notifyKeyspaceEvent(NClass.hash, "hexpired", ent.key);
                     }
                     if (o.hash.length == 0)
@@ -492,8 +497,10 @@ public struct Keyspace
         // copy — no HDEL is propagated, exactly like key TTL.
         if (o.type == ObjType.hash && o.hash.hasFieldTTL && !gImportMode)
         {
-            if (o.hash.reapExpired(detNow()) > 0)
+            immutable reaped = o.hash.reapExpired(detNow());
+            if (reaped > 0)
             {
+                gExpiredFields += reaped;
                 notifyKeyspaceEvent(NClass.hash, "hexpired", k);
                 if (o.hash.length == 0)
                 {
