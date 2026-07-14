@@ -2818,6 +2818,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             "zset-max-ziplist-entries", "zset-max-ziplist-value",
             "stream-node-max-entries", "stream-node-max-bytes",
             "proto-max-bulk-len", "client-query-buffer-limit", "acllog-max-len",
+            "aof-use-rdb-preamble", "rdb-version-check", "active-eviction",
         ];
         char[64] b = void;
         size_t matches = 0;
@@ -2858,6 +2859,15 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 break;
             case "active-expire":
                 repBulk(o, gConfig.activeExpire ? "yes" : "no");
+                break;
+            case "active-eviction":
+                repBulk(o, gConfig.activeEviction ? "yes" : "no");
+                break;
+            case "aof-use-rdb-preamble":
+                repBulk(o, "no"); // accepted but inert — dreads' AOF is its own format
+                break;
+            case "rdb-version-check":
+                repBulk(o, gConfig.rdbVersionCheck);
                 break;
             case "appendfilename":
                 repBulk(o, gConfig.appendfilename);
@@ -2938,55 +2948,65 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
         }
         return;
     }
-    if (eqICDebug(args[0].str, "SET") && args.length == 3)
+    // CONFIG SET key value [key value ...] — Redis 7 accepts multiple pairs.
+    if (eqICDebug(args[0].str, "SET") && args.length >= 3 && args.length % 2 == 1)
     {
         import std.uni : toLower;
 
-        string name, value, lname;
-        try
+        // apply one directive; 0 = ok, 1 = unknown/startup-only, 2 = bad value
+        int applyOne(string lname, string value) nothrow
         {
-            name = (cast(string) args[1].str).idup;
-            value = (cast(string) args[2].str).idup;
-            lname = name.toLower;
-        }
-        catch (Exception)
-        {
-        }
-        if (lname == "acllog-max-len") // maps to the ACL LOG cap, not gConfig
-        {
-            long v;
-            if (parseLong(value, v) && v >= 0)
+            if (lname == "acllog-max-len") // maps to the ACL LOG cap, not gConfig
             {
-                gAclLogMaxLen = v; // does not retroactively trim existing entries
-                repSimple(o, "OK");
+                long v;
+                if (parseLong(value, v) && v >= 0)
+                {
+                    gAclLogMaxLen = v; // no retroactive trim of existing entries
+                    return 0;
+                }
+                return 2;
             }
-            else
-                repError(o, "ERR CONFIG SET failed - unable to set the value");
-            return;
+            if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
+                return 1;
+            bool ok = false;
+            try
+                ok = applyDirective(lname, value, gConfig);
+            catch (Exception)
+            {
+            }
+            return ok ? 0 : 2;
         }
-        if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
-        {
-            repError(o, "ERR Unsupported CONFIG parameter");
-            return;
-        }
-        bool ok = false;
-        try
-            ok = applyDirective(lname, value, gConfig);
-        catch (Exception)
-        {
-        }
-        if (ok)
-        {
-            import dreads.notify : parseNotifyFlags;
-            import dreads.obj : gActiveExpire, gActiveEviction;
 
-            gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
-            gActiveEviction = gConfig.activeEviction;
-            cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
-            repSimple(o, "OK");
+        for (size_t i = 1; i + 1 < args.length; i += 2)
+        {
+            string lname, value;
+            try
+            {
+                lname = (cast(string) args[i].str).idup.toLower;
+                value = (cast(string) args[i + 1].str).idup;
+            }
+            catch (Exception)
+            {
+            }
+            immutable rc = applyOne(lname, value);
+            if (rc == 1)
+            {
+                repError(o, "ERR Unsupported CONFIG parameter");
+                return;
+            }
+            else if (rc == 2)
+            {
+                repError(o, "ERR CONFIG SET failed - unable to set the value");
+                return;
+            }
         }
-        else
-            repError(o, "ERR CONFIG SET failed - unable to set the value");
+        import dreads.notify : parseNotifyFlags;
+        import dreads.obj : gActiveExpire, gActiveEviction;
+
+        gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
+        gActiveEviction = gConfig.activeEviction;
+        cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
+        repSimple(o, "OK");
         return;
     }
     if (eqICDebug(args[0].str, "REWRITE") || eqICDebug(args[0].str, "RESETSTAT"))

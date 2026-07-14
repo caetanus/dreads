@@ -177,7 +177,15 @@ public struct Stream
     private size_t len;
     private size_t cap;
     StreamID lastId; // survives even when all entries are gone
+    ulong entriesAdded; // total ever XADDed (monotonic; XINFO entries-added)
+    StreamID maxDeletedId; // greatest id ever XDELeted (XINFO max-deleted-entry-id)
     Dict!Group groups; // consumer groups by name
+
+    /// XINFO recorded-first-entry-id: the id of the oldest live entry, or 0-0.
+    @property StreamID recordedFirstId() const @nogc nothrow
+    {
+        return len ? entries[0].id : StreamID(0, 0);
+    }
 
     @property size_t length() const @nogc nothrow
     {
@@ -200,6 +208,8 @@ public struct Stream
         entries = null;
         len = cap = 0;
         lastId = StreamID(0, 0);
+        entriesAdded = 0;
+        maxDeletedId = StreamID(0, 0);
         groups.free();
     }
 
@@ -211,6 +221,15 @@ public struct Stream
         if (i >= len || entries[i].id != id)
             return -1;
         return dg(entries[i].pairs[0 .. entries[i].npairs]);
+    }
+
+    /// Newest live entry (XINFO last-entry); returns dg's result, or -1 if empty.
+    int getLast(scope int delegate(StreamID id, const(FieldPair)[] pairs) @nogc nothrow dg) const @nogc nothrow
+    {
+        if (len == 0)
+            return -1;
+        auto e = &entries[len - 1];
+        return dg(e.id, e.pairs[0 .. e.npairs]);
     }
 
     /// First existing entry id strictly greater than after; ok=false at end.
@@ -236,11 +255,15 @@ public struct Stream
     }
 
     /// ID for XADD *: current ms, or lastId.ms with a bumped sequence when the
-    /// clock has not advanced (or went backwards).
+    /// clock has not advanced (or went backwards). When the sequence is exhausted
+    /// at lastId.ms (e.g. a future timestamp with seq=u64max), roll over into the
+    /// next millisecond rather than overflowing the sequence.
     StreamID nextId(ulong wallMs) const @nogc nothrow
     {
         if (wallMs > lastId.ms)
             return StreamID(wallMs, 0);
+        if (lastId.seq == ulong.max)
+            return StreamID(lastId.ms + 1, 0);
         return StreamID(lastId.ms, lastId.seq + 1);
     }
 
@@ -288,6 +311,7 @@ public struct Stream
         }
         len++;
         lastId = id;
+        entriesAdded++;
         return true;
     }
 
@@ -303,6 +327,8 @@ public struct Stream
         if (i + 1 < len)
             memmove(&entries[i], &entries[i + 1], (len - i - 1) * SEntry.sizeof);
         len--;
+        if (id > maxDeletedId) // XINFO max-deleted-entry-id (XDEL only, not trim)
+            maxDeletedId = id;
         return true;
     }
 

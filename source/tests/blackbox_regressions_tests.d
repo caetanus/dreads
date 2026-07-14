@@ -1295,4 +1295,53 @@ version (unittest)
         // `+` on an empty stream -> nil
         ks.run("XREAD", "STREAMS", "empty", "+").should.equal("*-1\r\n");
     }
+
+    // Stream metadata (entries-added, max-deleted-entry-id, recorded-first-entry-id)
+    // + XSETID validation + XINFO STREAM FULL. First caught by unit/type/stream.
+    @("blackbox.stream_metadata_and_xsetid")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.run("XADD", "x", "1-0", "d", "a");
+        ks.run("XADD", "x", "2-0", "d", "b");
+        ks.run("XADD", "x", "3-0", "d", "c");
+        auto full = ks.run("XINFO", "STREAM", "x", "FULL");
+        full.should.contain("entries-added");
+        full.should.contain("recorded-first-entry-id");
+        full.should.contain("max-deleted-entry-id");
+
+        // max-deleted-entry-id tracks the greatest XDELeted id (not lowered by a
+        // later smaller delete)
+        ks.run("XDEL", "x", "2-0");
+        ks.run("XINFO", "STREAM", "x").should.contain("2-0"); // max-deleted = 2-0
+        ks.run("XDEL", "x", "1-0");
+        // recorded-first-entry-id now the oldest live entry (3-0)
+        ks.run("XINFO", "STREAM", "x").should.contain("3-0");
+
+        // XADD * after a FUTURE timestamp with exhausted seq rolls the ms, not the
+        // sequence (the wall clock is behind this id, so nextId bumps ms)
+        ks.run("DEL", "y");
+        ks.run("XADD", "y", "99999999999999-18446744073709551615", "f", "v");
+        ks.run("XADD", "y", "*", "f", "v").should.equal("$17\r\n100000000000000-0\r\n");
+
+        // XSETID validation
+        ks.run("XSETID", "ghost", "1-1").should.equal("-ERR no such key\r\n");
+        ks.run("XSETID", "x", "1-1", "0").should.startWith("-ERR syntax error"); // lone offset
+        ks.run("XSETID", "x", "1-1", "ENTRIESADDED", "-1", "MAXDELETEDID", "0-0")
+            .should.contain("must be positive");
+        // tombstone larger than the new last-id -> smaller error
+        ks.run("DEL", "z");
+        ks.run("XADD", "z", "1-0", "a", "b");
+        ks.run("XSETID", "z", "1-0", "ENTRIESADDED", "1", "MAXDELETEDID", "2-0")
+            .should.contain("smaller");
+        // entries-added below the live length -> smaller error
+        ks.run("XSETID", "z", "1-0", "ENTRIESADDED", "0", "MAXDELETEDID", "0-0")
+            .should.contain("smaller");
+        // valid XSETID with both options
+        ks.run("XSETID", "z", "5-0", "ENTRIESADDED", "10", "MAXDELETEDID", "3-0")
+            .should.equal("+OK\r\n");
+    }
 }

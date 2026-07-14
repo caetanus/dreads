@@ -68,3 +68,27 @@ RESTORE expired keys with expiration time
 Try trick readonly table on basic types metatable
 HSETEX is not replicating validation arguments
 RESTORE should not store key that are already expired, with REPLACE will propagate it as DEL or UNLINK
+# The `~` (approximate) MAXLEN/MINID trim, and LIMIT, only make sense against
+# Redis's rax-of-listpacks macro-node storage: ~N keeps entries rounded UP to the
+# next stream-node-max-entries boundary (e.g. ~444 -> 500, ~555 -> 600) and LIMIT
+# caps how many whole nodes are dropped. dreads stores a stream as a single sorted
+# array (see the small-collections design note), so it has no macro nodes to round
+# to — our ~ is an exact trim. Reproducing the block granularity would mean
+# reimplementing Redis's internal node structure, which we deliberately don't (see
+# THIRD_PARTY_NOTICES / the "build from design, not source" rule). Client-visible
+# exact MAXLEN/MINID (=) and the non-~ paths all pass.
+XADD with MAXLEN option and the '~' argument
+XADD with LIMIT delete entries no more than limit
+XTRIM with MAXLEN option basic test
+XADD with LIMIT consecutive calls
+XTRIM with ~ is limited
+XTRIM with LIMIT delete entries no more than limit
+XADD with ~ MAXLEN can propagate correctly
+XADD with ~ MINID can propagate correctly
+XTRIM with ~ MAXLEN can propagate correctly
+# These need appendonly yes (r debug loadaof), set via start_server overrides;
+# our external-server harness can't apply per-test overrides, so the DEBUG LOADAOF
+# raises "AOF is not enabled". Harness limitation, not a stream gap (AOF stream
+# rewrite is covered by our own compaction round-trip tests).
+Empty stream can be rewrite into AOF correctly
+Stream can be rewrite into AOF correctly after XDEL lastid

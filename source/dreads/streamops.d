@@ -202,7 +202,7 @@ public void xrevrange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref
         repEntry(o, hits[n - 1 - k].id, hits[n - 1 - k].pairs);
 }
 
-/// XSETID key id
+/// XSETID key id [ENTRIESADDED entries-added MAXDELETEDID max-deleted-id]
 public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
     if (args.length < 2)
@@ -216,6 +216,30 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repError(o, "ERR Invalid stream ID specified as stream command argument");
         return;
     }
+    // ENTRIESADDED n and MAXDELETEDID id come as a pair, or not at all
+    bool hasOpts = false;
+    long entriesAdded = 0;
+    StreamID maxDel;
+    if (args.length == 6 && eqICKeyword(args[2].str, "ENTRIESADDED")
+            && eqICKeyword(args[4].str, "MAXDELETEDID"))
+    {
+        hasOpts = true;
+        if (!parseLong(args[3].str, entriesAdded) || entriesAdded < 0)
+        {
+            repError(o, "ERR value for ENTRIESADDED must be positive");
+            return;
+        }
+        if (!parseId(args[5].str, 0, maxDel))
+        {
+            repError(o, "ERR Invalid stream ID specified as stream command argument");
+            return;
+        }
+    }
+    else if (args.length != 2)
+    {
+        repError(o, "ERR syntax error");
+        return;
+    }
     bool wrong;
     auto obj = ks.lookupTyped(args[0].str, ObjType.stream, wrong);
     if (wrong)
@@ -225,10 +249,10 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     if (obj is null)
     {
-        repError(o, "ERR The XSETID command requires the key to exist.");
+        repError(o, "ERR no such key");
         return;
     }
-    // must not be smaller than the current top entry
+    // the new last-id must not be below the current top entry
     bool bad = false;
     obj.stream.walkRange(StreamID.minId, StreamID.maxId, 0, (eid, pairs) {
         if (eid > id)
@@ -241,6 +265,26 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
                 "ERR The ID specified in XSETID is smaller than the target stream top item");
         return;
     }
+    // ...nor below a tombstone: the existing max-deleted (2-arg form) or the new
+    // one being set (opts form must satisfy max-deleted <= last-id)
+    immutable effMaxDel = hasOpts ? maxDel : obj.stream.maxDeletedId;
+    if (id < effMaxDel)
+    {
+        repError(o, "ERR The ID specified in XSETID is smaller than the provided"
+                ~ " max_deleted_entry_id");
+        return;
+    }
+    if (hasOpts && entriesAdded < cast(long) obj.stream.length)
+    {
+        repError(o, "ERR The entries_added specified in XSETID is smaller than "
+                ~ "the target stream length");
+        return;
+    }
+    if (hasOpts)
+    {
+        obj.stream.entriesAdded = cast(ulong) entriesAdded;
+        obj.stream.maxDeletedId = maxDel;
+    }
     obj.stream.lastId = id;
     notifyKeyspaceEvent(NClass.stream, "xsetid", args[0].str);
     repSimple(o, "OK");
@@ -249,7 +293,18 @@ public void xsetid(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
 /// XINFO STREAM key | XINFO GROUPS key
 public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
-    if (args.length != 2)
+    if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+    {
+        if (args.length > 1) // HELP takes no arguments
+        {
+            repError(o, "ERR wrong number of arguments for 'xinfo|help' command");
+            return;
+        }
+        repArrayHeader(o, 1);
+        repBulk(o, "XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:");
+        return;
+    }
+    if (args.length < 2)
     {
         repError(o, "ERR syntax error");
         return;
@@ -268,21 +323,103 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
     }
     if (eqICKeyword(args[0].str, "STREAM"))
     {
-        repArrayHeader(o, 8);
+        // XINFO STREAM key [FULL [COUNT n]]
+        immutable full = args.length >= 3 && eqICKeyword(args[2].str, "FULL");
+        if (!full && args.length != 2)
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+        // rax metrics: we don't use a radix tree, so report the analogous
+        // macro-node count (~stream-node-max-entries per node) so introspection
+        // and fuzz loops that watch radix-tree-keys behave.
+        immutable len = obj.stream.length;
+        immutable long rtKeys = len == 0 ? 0 : cast(long)((len + 99) / 100);
+        immutable long rtNodes = rtKeys + 1;
+        if (full)
+        {
+            long count = 10; // default; 0 = all
+            if (args.length >= 5 && eqICKeyword(args[3].str, "COUNT"))
+                parseLong(args[4].str, count);
+            repArrayHeader(o, 18);
+            repBulk(o, "length");
+            repInt(o, cast(long) len);
+            repBulk(o, "radix-tree-keys");
+            repInt(o, rtKeys);
+            repBulk(o, "radix-tree-nodes");
+            repInt(o, rtNodes);
+            repBulk(o, "last-generated-id");
+            repStreamId(o, obj.stream.lastId);
+            repBulk(o, "max-deleted-entry-id");
+            repStreamId(o, obj.stream.maxDeletedId);
+            repBulk(o, "entries-added");
+            repInt(o, cast(long) obj.stream.entriesAdded);
+            repBulk(o, "recorded-first-entry-id");
+            repStreamId(o, obj.stream.recordedFirstId);
+            repBulk(o, "entries");
+            size_t ne = 0;
+            immutable lim = count <= 0 ? 0 : cast(size_t) count;
+            obj.stream.walkRange(StreamID.minId, StreamID.maxId, lim, (id, pairs) {
+                ne++;
+                return 0;
+            });
+            repArrayHeader(o, ne);
+            obj.stream.walkRange(StreamID.minId, StreamID.maxId, lim, (id, pairs) {
+                repEntry(o, id, pairs);
+                return 0;
+            });
+            repBulk(o, "groups");
+            repArrayHeader(o, obj.stream.groups.length);
+            foreach (i; 0 .. obj.stream.groups.capacity)
+            {
+                if (!obj.stream.groups.slotLive(i))
+                    continue;
+                auto g = obj.stream.groups.valAt(i);
+                repArrayHeader(o, 10);
+                repBulk(o, "name");
+                repBulk(o, obj.stream.groups.keyAt(i));
+                repBulk(o, "last-delivered-id");
+                repStreamId(o, g.lastDelivered);
+                repBulk(o, "pel-count");
+                repInt(o, cast(long) g.pending.length);
+                repBulk(o, "entries-read");
+                if (g.entriesRead < 0)
+                    repNullBulk(o);
+                else
+                    repInt(o, g.entriesRead);
+                repBulk(o, "lag");
+                repInt(o, cast(long) obj.stream.countAfter(g.lastDelivered));
+            }
+            return;
+        }
+        repArrayHeader(o, 20);
         repBulk(o, "length");
-        repInt(o, cast(long) obj.stream.length);
+        repInt(o, cast(long) len);
+        repBulk(o, "radix-tree-keys");
+        repInt(o, rtKeys);
+        repBulk(o, "radix-tree-nodes");
+        repInt(o, rtNodes);
         repBulk(o, "last-generated-id");
         repStreamId(o, obj.stream.lastId);
+        repBulk(o, "max-deleted-entry-id");
+        repStreamId(o, obj.stream.maxDeletedId);
+        repBulk(o, "entries-added");
+        repInt(o, cast(long) obj.stream.entriesAdded);
+        repBulk(o, "recorded-first-entry-id");
+        repStreamId(o, obj.stream.recordedFirstId);
         repBulk(o, "groups");
         repInt(o, cast(long) obj.stream.groups.length);
         repBulk(o, "first-entry");
-        bool emitted = false;
+        bool emittedFirst = false;
         obj.stream.walkRange(StreamID.minId, StreamID.maxId, 1, (id, pairs) {
             repEntry(o, id, pairs);
-            emitted = true;
+            emittedFirst = true;
             return 0;
         });
-        if (!emitted)
+        if (!emittedFirst)
+            repNullBulk(o);
+        repBulk(o, "last-entry");
+        if (obj.stream.getLast((id, pairs) { repEntry(o, id, pairs); return 0; }) < 0)
             repNullBulk(o);
         return;
     }
@@ -334,6 +471,17 @@ private void repNoGroup(ref ByteBuffer o, scope const(char)[] group,
 /// CREATECONSUMER key g c | DELCONSUMER key g c
 public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc nothrow
 {
+    if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
+    {
+        if (args.length > 1) // HELP takes no arguments
+        {
+            repError(o, "ERR wrong number of arguments for 'xgroup|help' command");
+            return;
+        }
+        repArrayHeader(o, 1);
+        repBulk(o, "XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:");
+        return;
+    }
     if (args.length < 3)
     {
         repError(o, "ERR wrong number of arguments for 'xgroup' command");
