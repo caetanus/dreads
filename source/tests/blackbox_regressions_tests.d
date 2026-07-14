@@ -1172,4 +1172,49 @@ version (unittest)
         // `0-*` on a fresh stream yields 0-1 (lastId starts at 0-0)
         ks.run("XADD", "z", "0-*", "a", "b").should.equal("$3\r\n0-1\r\n");
     }
+
+    // Consumer-group validation/parsing debts first caught by unit/type/
+    // stream-cgroups: ENTRIESREAD validation + XINFO entries-read/lag, XPENDING
+    // IDLE + exclusive `(` bounds, XACK atomic id validation, XGROUP SETID `-`.
+    @("blackbox.stream_cgroups_parsing")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        import std.conv : to;
+
+        foreach (i; 1 .. 5)
+            ks.run("XADD", "s", "1-" ~ i.to!string, "f", "v");
+
+        // ENTRIESREAD: below -1 is rejected; 0 and a positive value are stored
+        ks.run("XGROUP", "CREATE", "s", "gneg", "$", "ENTRIESREAD", "-3")
+            .should.equal("-ERR value for ENTRIESREAD must be positive or -1\r\n");
+        ks.run("XGROUP", "CREATE", "s", "g0", "$", "ENTRIESREAD", "0").should.equal("+OK\r\n");
+        ks.run("XGROUP", "CREATE", "s", "g3", "$", "ENTRIESREAD", "3").should.equal("+OK\r\n");
+        // XINFO GROUPS carries entries-read (and a lag field)
+        auto gi = ks.run("XINFO", "GROUPS", "s");
+        gi.should.contain("entries-read");
+        gi.should.contain("lag");
+
+        // build a PEL: read all 4 into a consumer under a fresh group
+        ks.run("XGROUP", "CREATE", "s", "g", "0");
+        ks.run("XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">");
+
+        // XPENDING extended: 4 pending; IDLE far in the future filters them all out
+        ks.run("XPENDING", "s", "g", "-", "+", "10").should.startWith("*4\r\n");
+        ks.run("XPENDING", "s", "g", "IDLE", "99999999", "-", "+", "10").should.equal("*0\r\n");
+        // exclusive bounds drop the two endpoints -> 2 remain
+        ks.run("XPENDING", "s", "g", "(1-1", "(1-4", "10").should.startWith("*2\r\n");
+
+        // XACK is atomic: a bad id fails the whole command, acking nothing
+        ks.run("XACK", "s", "g", "1-1", "not-an-id")
+            .should.equal("-ERR Invalid stream ID specified as stream command argument\r\n");
+        ks.run("XACK", "s", "g", "1-1").should.equal(":1\r\n"); // 1-1 was NOT acked above
+
+        // XGROUP SETID `-` rewinds the cursor so `>` re-reads from the start
+        ks.run("XGROUP", "SETID", "s", "g", "-").should.equal("+OK\r\n");
+        ks.run("XREADGROUP", "GROUP", "g", "c2", "STREAMS", "s", ">").should.contain("1-2");
+    }
 }

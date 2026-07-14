@@ -5351,9 +5351,24 @@ private bool parseStreamId(scope const(char)[] s, ulong seqDefault, out StreamID
     return true;
 }
 
-/// XRANGE bounds: "-" and "+" specials; bare "ms" is inclusive on both ends.
+/// XRANGE bounds: "-" and "+" specials; bare "ms" is inclusive on both ends; the
+/// `(id` prefix makes the bound exclusive (start: smallest id > A; end: largest
+/// id < B — saturating at the min/max sentinels).
 private bool parseRangeId(scope const(char)[] s, bool isStart, out StreamID id) @nogc nothrow
 {
+    if (s.length > 0 && s[0] == '(')
+    {
+        StreamID base;
+        if (!parseRangeId(s[1 .. $], isStart, base))
+            return false;
+        if (isStart) // smallest id strictly greater than base
+            id = base.seq != ulong.max ? StreamID(base.ms, base.seq + 1)
+                : base.ms != ulong.max ? StreamID(base.ms + 1, 0) : StreamID(ulong.max, ulong.max);
+        else // largest id strictly less than base
+            id = base.seq != 0 ? StreamID(base.ms, base.seq - 1)
+                : base.ms != 0 ? StreamID(base.ms - 1, ulong.max) : StreamID(0, 0);
+        return true;
+    }
     if (s == "-")
     {
         id = StreamID.minId;

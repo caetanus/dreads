@@ -10,7 +10,7 @@ import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
-import dreads.stream : FieldPair, Group, StreamID, nowMs;
+import dreads.stream : FieldPair, Group, PelEntry, StreamID, nowMs;
 
 private void repWrongTypeS(ref ByteBuffer o) @nogc nothrow
 {
@@ -79,6 +79,66 @@ private bool parseRangeId(scope const(char)[] s, bool isStart, out StreamID id) 
     return parseId(s, isStart ? 0 : ulong.max, id);
 }
 
+/// Smallest id strictly greater than x (saturating at max) — for an exclusive
+/// start bound `(A`.
+private StreamID incrId(StreamID x) @nogc nothrow
+{
+    if (x.seq != ulong.max)
+        return StreamID(x.ms, x.seq + 1);
+    if (x.ms != ulong.max)
+        return StreamID(x.ms + 1, 0);
+    return StreamID(ulong.max, ulong.max); // already the maximum
+}
+
+/// Largest id strictly less than x (saturating at min) — for an exclusive end
+/// bound `(B`.
+private StreamID decrId(StreamID x) @nogc nothrow
+{
+    if (x.seq != 0)
+        return StreamID(x.ms, x.seq - 1);
+    if (x.ms != 0)
+        return StreamID(x.ms - 1, ulong.max);
+    return StreamID(0, 0); // already the minimum
+}
+
+/// Resolve a group-cursor id (XGROUP CREATE/SETID): `$` = the stream's last id,
+/// `-` = 0-0 (rewind to the start), `+` = the maximum, else an explicit id.
+private bool parseGroupCursor(scope const(char)[] s, StreamID lastId, out StreamID id) @nogc nothrow
+{
+    if (s == "$")
+    {
+        id = lastId;
+        return true;
+    }
+    if (s == "-")
+    {
+        id = StreamID.minId;
+        return true;
+    }
+    if (s == "+")
+    {
+        id = StreamID.maxId;
+        return true;
+    }
+    return parseId(s, 0, id);
+}
+
+/// parseRangeId plus the exclusive `(id` form: `(A` on a start bound becomes the
+/// smallest id > A; `(B` on an end bound becomes the largest id < B. Used by
+/// XRANGE/XREVRANGE and XPENDING.
+private bool parseRangeIdExcl(scope const(char)[] s, bool isStart, out StreamID id) @nogc nothrow
+{
+    if (s.length > 0 && s[0] == '(')
+    {
+        StreamID base;
+        if (!parseRangeId(s[1 .. $], isStart, base))
+            return false;
+        id = isStart ? incrId(base) : decrId(base);
+        return true;
+    }
+    return parseRangeId(s, isStart, id);
+}
+
 /// XREVRANGE key end start [COUNT n]
 public void xrevrange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
@@ -99,7 +159,7 @@ public void xrevrange(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref
         return;
     }
     StreamID start, end;
-    if (!parseRangeId(args[1].str, false, end) || !parseRangeId(args[2].str, true, start))
+    if (!parseRangeIdExcl(args[1].str, false, end) || !parseRangeIdExcl(args[2].str, true, start))
     {
         repError(o, "ERR Invalid stream ID specified as stream command argument");
         return;
@@ -227,7 +287,7 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
             if (!obj.stream.groups.slotLive(i))
                 continue;
             auto g = obj.stream.groups.valAt(i);
-            repArrayHeader(o, 8);
+            repArrayHeader(o, 12);
             repBulk(o, "name");
             repBulk(o, obj.stream.groups.keyAt(i));
             repBulk(o, "consumers");
@@ -236,6 +296,13 @@ public void xinfo(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
             repInt(o, cast(long) g.pending.length);
             repBulk(o, "last-delivered-id");
             repStreamId(o, g.lastDelivered);
+            repBulk(o, "entries-read");
+            if (g.entriesRead < 0)
+                repNullBulk(o); // unknown (never set via ENTRIESREAD)
+            else
+                repInt(o, g.entriesRead);
+            repBulk(o, "lag");
+            repInt(o, cast(long) obj.stream.countAfter(g.lastDelivered));
         }
         return;
     }
@@ -283,7 +350,31 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             repError(o, "ERR wrong number of arguments for 'xgroup' command");
             return;
         }
-        bool mkstream = args.length == 5 && eqICKeyword(args[4].str, "MKSTREAM");
+        // [MKSTREAM] [ENTRIESREAD n] in any order after the id
+        bool mkstream = false;
+        long entriesRead = -1; // -1 = not provided
+        for (size_t i = 4; i < args.length;)
+        {
+            if (eqICKeyword(args[i].str, "MKSTREAM"))
+            {
+                mkstream = true;
+                i++;
+            }
+            else if (eqICKeyword(args[i].str, "ENTRIESREAD") && i + 1 < args.length)
+            {
+                if (!parseLong(args[i + 1].str, entriesRead) || entriesRead < -1)
+                {
+                    repError(o, "ERR value for ENTRIESREAD must be positive or -1");
+                    return;
+                }
+                i += 2;
+            }
+            else
+            {
+                repError(o, "ERR syntax error");
+                return;
+            }
+        }
         if (obj is null && !mkstream)
         {
             repError(o,
@@ -300,15 +391,14 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             return;
         }
         StreamID at;
-        if (args[3].str == "$")
-            at = obj.stream.lastId;
-        else if (!parseId(args[3].str, 0, at))
+        if (!parseGroupCursor(args[3].str, obj.stream.lastId, at))
         {
             repError(o, "ERR Invalid stream ID specified as stream command argument");
             return;
         }
         Group g;
         g.lastDelivered = at;
+        g.entriesRead = entriesRead;
         obj.stream.groups.set(gname, g);
         repSimple(o, "OK");
         return;
@@ -333,9 +423,7 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             return;
         }
         StreamID at;
-        if (args[3].str == "$")
-            at = obj.stream.lastId;
-        else if (!parseId(args[3].str, 0, at))
+        if (!parseGroupCursor(args[3].str, obj.stream.lastId, at))
         {
             repError(o, "ERR Invalid stream ID specified as stream command argument");
             return;
@@ -587,7 +675,8 @@ public void xack(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc no
         repInt(o, 0);
         return;
     }
-    long n = 0;
+    // validate ALL ids first — a single bad id must fail the whole command
+    // without acking the ones before it (atomicity).
     foreach (ref a; args[2 .. $])
     {
         StreamID id;
@@ -596,6 +685,12 @@ public void xack(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc no
             repError(o, "ERR Invalid stream ID specified as stream command argument");
             return;
         }
+    }
+    long n = 0;
+    foreach (ref a; args[2 .. $])
+    {
+        StreamID id;
+        parseId(a.str, 0, id);
         n += g.pelRemove(id) ? 1 : 0;
     }
     repInt(o, n);
@@ -671,28 +766,53 @@ public void xpending(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
         }
         return;
     }
-    // extended form
-    if (args.length < 5)
+    // extended form: [IDLE min-idle-time] start end count [consumer]
+    size_t base = 2;
+    long minIdleFilter = 0;
+    if (args.length >= 4 && eqICKeyword(args[2].str, "IDLE"))
+    {
+        if (!parseLong(args[3].str, minIdleFilter) || minIdleFilter < 0)
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return;
+        }
+        base = 4;
+    }
+    // what remains must be start end count [consumer]
+    if (args.length != base + 3 && args.length != base + 4)
     {
         repError(o, "ERR syntax error");
         return;
     }
     StreamID start, end;
     long count;
-    if (!parseRangeId(args[2].str, true, start) || !parseRangeId(args[3].str, false, end)
-            || !parseLong(args[4].str, count) || count < 0)
+    if (!parseRangeIdExcl(args[base].str, true, start)
+            || !parseRangeIdExcl(args[base + 1].str, false, end)
+            || !parseLong(args[base + 2].str, count) || count < 0)
     {
         repError(o, "ERR syntax error");
         return;
     }
-    const(char)[] onlyConsumer = args.length == 6 ? args[5].str : null;
+    const(char)[] onlyConsumer = args.length == base + 4 ? args[base + 3].str : null;
     auto now = nowMs();
+    // a pending entry passes the filters: in [start,end], the right consumer, and
+    // idle at least min-idle-time (IDLE).
+    bool passes(ref const PelEntry pe) @nogc nothrow
+    {
+        if (pe.id < start || pe.id > end)
+            return false;
+        if (onlyConsumer !is null && pe.consumer != onlyConsumer)
+            return false;
+        immutable idle = now > pe.deliveryTimeMs ? now - pe.deliveryTimeMs : 0;
+        if (minIdleFilter > 0 && idle < cast(ulong) minIdleFilter)
+            return false;
+        return true;
+    }
+
     size_t n = 0;
     foreach (ref pe; g.pending)
     {
-        if (pe.id < start || pe.id > end)
-            continue;
-        if (onlyConsumer !is null && pe.consumer != onlyConsumer)
+        if (!passes(pe))
             continue;
         if (n == cast(size_t) count)
             break;
@@ -704,9 +824,7 @@ public void xpending(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nog
     {
         if (emitted == n)
             break;
-        if (pe.id < start || pe.id > end)
-            continue;
-        if (onlyConsumer !is null && pe.consumer != onlyConsumer)
+        if (!passes(pe))
             continue;
         repArrayHeader(o, 4);
         repStreamId(o, pe.id);

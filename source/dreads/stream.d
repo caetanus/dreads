@@ -82,6 +82,7 @@ public struct PelEntry
 public struct Group
 {
     StreamID lastDelivered;
+    long entriesRead; // XGROUP CREATE ENTRIESREAD; -1 = unknown, feeds XINFO lag
     PelEntry* pel;
     size_t plen;
     size_t pcap;
@@ -222,6 +223,16 @@ public struct Stream
             return StreamID(0, 0);
         ok = true;
         return entries[i].id;
+    }
+
+    /// Count of live entries with id strictly greater than `after` — a consumer
+    /// group's lag (how many entries it has not yet been delivered). Sorted array
+    /// ⇒ one binary search.
+    size_t countAfter(StreamID after) const @nogc nothrow
+    {
+        auto start = after.seq == ulong.max ? StreamID(after.ms + 1, 0) : StreamID(after.ms,
+                after.seq + 1);
+        return len - lowerBound(start);
     }
 
     /// ID for XADD *: current ms, or lastId.ms with a bumped sequence when the
