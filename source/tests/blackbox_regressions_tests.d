@@ -460,4 +460,37 @@ version (unittest)
         flushPendingNotify();
         sadds.expect.to.equal(1);
     }
+
+    @("blackbox.deque_fifo_and_shrink")
+    unittest
+    {
+        // emplace.Deque backs the per-key blocked-client FIFO (BLPOP family). It
+        // must keep arrival order across ring wrap AND release memory as it drains
+        // (long-running: a key that saw a burst of waiters must not keep the block).
+        import emplace.deque : Deque;
+
+        Deque!int d;
+        foreach (i; 0 .. 6)
+            d.pushBack(i);
+        d.popFront();
+        d.popFront(); // head advances; next pushes wrap the ring
+        d.pushBack(6);
+        d.pushBack(7);
+        // logical order preserved: 2 3 4 5 6 7
+        foreach (i, want; [2, 3, 4, 5, 6, 7])
+            d[i].expect.to.equal(want);
+        d.front.expect.to.equal(2);
+        d.back.expect.to.equal(7);
+
+        // FIFO drain across a grow
+        Deque!int q;
+        foreach (i; 0 .. 500)
+            q.pushBack(i);
+        foreach (i; 0 .. 500)
+        {
+            q.front.expect.to.equal(i);
+            q.popFront();
+        }
+        q.empty.expect.to.equal(true);
+    }
 }

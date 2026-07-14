@@ -60,14 +60,22 @@ and stream-COPY (keyspace) are the bigger blockers.
 
 ## Layer 4 — open failures (sweep7/8)
 
-### Blocking service order (list 9, zset ~5)
-Multiple blocked clients must be served FIFO and chained wakes must cascade
-(Linked LMOVEs, Circular BRPOPLPUSH, BLMPOP/BZMPOP "multiple blocked
-clients", BZPOPMIN re-block after expired). dreads' poll-retry model wakes
-all waiters and races them. BRPOPLPUSH with a wrong-typed *destination* must
-surface the error on wake (currently swallowed by the firstPass rule shared
-with B*MPOP). Needs a real blocked-client queue (FIFO per key) instead of
-the retry loop — design work, not a patch.
+### Blocking service order — DONE (2026-07-13, event-driven rewrite)
+The poll-retry "wake everyone and race" model was replaced with a true
+event-driven blocked-client FIFO (see the `event-driven` skill + memory
+`blocking-fifo`). Per-`(db,key)` deque of single-shot waiters; a producer wakes
+ONLY the live front of a touched key (FIFO for free — no broadcast, no gating);
+serving cascades via the next-front signal; single-shot generation stops
+double-serve (Circular BRPOPLPUSH). Timeout is the loop's own timer (finite) or a
+pure event wait (infinite) — no sleep/poll. New `emplace.Deque` (ring buffer,
+releases memory as it drains). All targets pass: Linked LMOVEs, Circular
+BRPOPLPUSH, BRPOPLPUSH/BLMPOP/BZMPOP "multiple blocked clients", wrong-dest,
+maintains-order, BZPOPMIN expire-reblock (fixed a frozen-`gClock` bug: blocking
+serves inline, so the loop refreshes the deterministic clock on each wake).
+**list 100/8 → 106/2** (2 left = LPOS RANK + the tcl `can't read "cmd"` abort,
+both non-blocking, separate). **zset 318/8 → 322/0.** No cross-file regressions
+(full sweep 999/51 → 1007/37). XREAD BLOCK deliberately stays on the broadcast
+(fan-out, not hand-off).
 
 ### Not implemented (each aborts its file)
 - DUMP/RESTORE (hash file; RDB payload + CRC — sizeable).

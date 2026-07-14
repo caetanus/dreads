@@ -37,7 +37,8 @@ import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverrid
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
-import dreads.obj : Keyspace, gDbs, NUM_DBS;
+import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType;
+import dreads.dict : Dict;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
@@ -339,6 +340,23 @@ private struct Conn
     // killing sessions on ACL DELUSER / channel revoke). Single event-loop
     // thread ⇒ no locking.
     Conn* regPrev, regNext;
+    // Blocked-client wait (BLPOP family — see the `event-driven` skill). One
+    // single-shot event per connection (reused each block) + a per-block
+    // generation so a returned/re-blocking fiber's stale deque entries
+    // self-invalidate (they carry the gen they were registered with). blockFiredKey
+    // is the key that woke it (a hint; the wake path re-verifies via lookup).
+    LocalManualEvent blockEvt;
+    bool blockEvtInit;
+    uint bwGen;
+    const(char)[] blockFiredKey;
+    // Last command name (lowercase) for CLIENT LIST's `cmd=` field. Fixed buffer:
+    // every command token fits in 32 (longest is GEORADIUSBYMEMBER_RO = 20).
+    char[32] lastCmdBuf = void;
+    ubyte lastCmdLen;
+    // CLIENT UNBLOCK: `blocked` is true while parked in a blocking command;
+    // `unblockReq` is set by another client (1 = TIMEOUT reply, 2 = -UNBLOCKED).
+    bool blocked;
+    ubyte unblockReq;
 
     @property size_t totalSubs() const @nogc nothrow
     {
@@ -368,6 +386,192 @@ private void unregisterConn(Conn* c) @nogc nothrow
     if (c.regNext !is null)
         c.regNext.regPrev = c.regPrev;
     c.regPrev = c.regNext = null;
+}
+
+// --- blocked-client FIFO registry (BLPOP family) ----------------------------
+// Per-(db,key) FIFO deque of waiting connections. A blocked call registers ONE
+// entry per key it waits on (wait-on-any: its single event joins N keys); a
+// producer wakes ONLY the live front of a touched key (FIFO for free — no race,
+// no gating). Single event-loop thread ⇒ no locking. Entries carry the
+// connection's per-block generation; a returned/re-blocking/dead connection's
+// entries mismatch and are trimmed lazily from the deque front. See the
+// `event-driven` skill. XREAD BLOCK is deliberately NOT here (fan-out).
+private struct BWEntry
+{
+    Conn* c;
+    uint gen; // the c.bwGen at register time; != c.bwGen ⇒ stale, trim
+}
+
+private struct WaiterQ
+{
+    import emplace.deque : Deque;
+
+    Deque!BWEntry q;
+
+    void push(Conn* c, uint gen) nothrow @trusted
+    {
+        q.pushBack(BWEntry(c, gen));
+    }
+
+    // Trim stale/dead entries off the front; return the live front conn or null.
+    Conn* front() nothrow @trusted
+    {
+        while (!q.empty)
+        {
+            auto e = q.front;
+            if (e.c is null || e.c.bwGen != e.gen || !connAlive(e.c))
+            {
+                q.popFront();
+                continue;
+            }
+            return e.c;
+        }
+        return null;
+    }
+
+    bool empty() nothrow @trusted
+    {
+        return front() is null;
+    }
+
+    // Drop every entry for `c` (order-preserving rotate). O(len), on conn death.
+    void removeConn(Conn* c) nothrow @trusted
+    {
+        immutable n = q.length;
+        foreach (_; 0 .. n)
+        {
+            auto e = q.front;
+            q.popFront();
+            if (e.c !is c)
+                q.pushBack(e);
+        }
+    }
+}
+
+private __gshared Dict!WaiterQ[NUM_DBS] gWaiters;
+
+// Is the connection still usable to receive a wakeup? (peer may have vanished
+// while its fiber was parked — never fire at a dead conn.)
+private bool connAlive(Conn* c) nothrow
+{
+    if (c is null)
+        return false;
+    try
+        return c.tcp.connected;
+    catch (Exception)
+        return false;
+}
+
+private WaiterQ* waitQ(int db, scope const(char)[] key, bool create) nothrow @trusted
+{
+    auto p = gWaiters[db].get(key);
+    if (p is null && create)
+    {
+        gWaiters[db].set(key, WaiterQ.init);
+        p = gWaiters[db].get(key);
+    }
+    return p;
+}
+
+// Register `c` as a waiter on each key (dedup) for a fresh block. Bumps the
+// connection's generation so any lingering entries from a previous block become
+// stale (trimmed lazily). Call once, at the start of blocking.
+private void waitRegister(int db, scope const(RVal)[] keys, Conn* c) nothrow @trusted
+{
+    c.bwGen++;
+    foreach (i, ref k; keys)
+    {
+        bool dup = false;
+        foreach (j; 0 .. i)
+            if (keys[j].str == k.str)
+            {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+        waitQ(db, k.str, true).push(c, c.bwGen);
+    }
+}
+
+// End of a block: invalidate this block's entries (stale gen ⇒ front-trimmed).
+private void waitFinish(Conn* c) nothrow
+{
+    c.bwGen++;
+}
+
+// Remove a dying connection from every waiter deque (no dangling Conn* after the
+// serveClient stack frame is freed). Called from connection teardown.
+private void waitPurgeConn(Conn* c) nothrow @trusted
+{
+    c.bwGen++;
+    static const(char)[][256] keys;
+    foreach (db; 0 .. NUM_DBS)
+    {
+        if (gWaiters[db].length == 0)
+            continue;
+        size_t n = 0;
+        foreach (key, ref _wq; gWaiters[db]) // @nogc collect (removeConn may alloc)
+        {
+            if (n == keys.length)
+                break;
+            keys[n++] = key;
+        }
+        foreach (i; 0 .. n)
+        {
+            auto p = gWaiters[db].get(keys[i]);
+            if (p !is null)
+                p.removeConn(c);
+        }
+    }
+}
+
+// Wake the live front waiter of `key` (posts the wake; the fiber resumes in loop
+// context and re-verifies via lookup). Front-trims stale/dead first.
+private void signalKey(int db, scope const(char)[] key) nothrow @trusted
+{
+    auto p = gWaiters[db].get(key);
+    if (p is null)
+        return;
+    auto c = p.front();
+    if (c is null)
+        return;
+    c.blockFiredKey = key;
+    if (c.blockEvtInit)
+        c.blockEvt.emit();
+}
+
+// After a write, wake the front of every waited key that now holds data. Guarded
+// by the blocked-client count so the no-blocker common path is free.
+private void signalReadyKeys(int db, ref Keyspace ks) nothrow @trusted
+{
+    import dreads.obj : gBlockedClients, ObjType;
+
+    if (gBlockedClients == 0 || gWaiters[db].length == 0)
+        return;
+    // collect keys first (signalKey/remove must not mutate during iteration)
+    static const(char)[][256] buf;
+    size_t n = 0;
+    foreach (key, ref _wq; gWaiters[db])
+    {
+        if (n == buf.length)
+            break;
+        buf[n++] = key;
+    }
+    foreach (i; 0 .. n)
+    {
+        auto key = buf[i];
+        auto o = ks.lookup(key);
+        if (o !is null && o.type != ObjType.str && o.containerLen > 0)
+            signalKey(db, key);
+        else
+        {
+            // no servable data and no live waiter ⇒ drop the empty deque entry
+            auto p = gWaiters[db].get(key);
+            if (p !is null && p.empty)
+                gWaiters[db].remove(key);
+        }
+    }
 }
 
 // Force-close another connection: its serveClient fiber unblocks from
@@ -598,6 +802,7 @@ private void serveClient(TCPConnection tcp) nothrow
         c.shardSub.free();
         unregisterMonitor(&c);
         unregisterConn(&c);
+        waitPurgeConn(&c); // drop any lingering block-waiter entries (no dangling &c)
         import dreads.mem : freeSlice;
 
         c.clientName.freeSlice;
@@ -992,6 +1197,14 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
+
+    // record the last command (lowercase) for CLIENT LIST's cmd= field
+    if (name.length <= c.lastCmdBuf.length)
+    {
+        foreach (i, ch; name)
+            c.lastCmdBuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+        c.lastCmdLen = cast(ubyte) name.length;
+    }
 
     // ACL enforcement — a single `command ∈ cap_set` test, only while ACL is in
     // use (gAclActive false in the default no-ACL deployment => zero cost). The
@@ -1750,9 +1963,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
             ulong timeoutMs;
-            if (!parseTimeout(args[$ - 1].str, timeoutMs))
+            if (auto terr = parseTimeout(args[$ - 1].str, timeoutMs))
             {
-                repError(o, "ERR timeout is not a float or out of range");
+                repError(o, terr);
                 return true;
             }
             blockingRetry(c, cmd.arr[0 .. $ - 1], uname == "BLMOVE" ? "LMOVE"
@@ -1797,9 +2010,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
             ulong timeoutMs;
-            if (!parseTimeout(args[0].str, timeoutMs))
+            if (auto terr = parseTimeout(args[0].str, timeoutMs))
             {
-                repError(o, "ERR timeout is not a float or out of range");
+                repError(o, terr);
                 return true;
             }
             blockingRetry(c, cmd.arr[1 .. $], uname == "BLMPOP" ? "LMPOP" : "ZMPOP",
@@ -2063,6 +2276,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             {
                 gWriteEpoch++;
                 gKeyActivity.emit();
+                signalReadyKeys(cast(int)(c.dbp - &gDbs[0]), *c.dbp);
             }
             return true;
         }
@@ -2140,7 +2354,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         if (isWriteCommand(uname) || !propagationOverride.empty)
         {
             gWriteEpoch++; // WATCH visibility
-            gKeyActivity.emit(); // wake blocked BLPOP-family clients
+            gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
+            signalReadyKeys(cast(int)(c.dbp - &gDbs[0]), *c.dbp); // wake pop-family fronts
         }
         if (gAof.enabled)
         {
@@ -2753,18 +2968,26 @@ private bool freeMemoryIfNeeded() nothrow
 // ---------------------------------------------------------------------------
 
 /// Redis timeouts are seconds as a double; 0 = block forever.
-private bool parseTimeout(scope const(char)[] s, out ulong ms) nothrow
+// Parse a blocking timeout (seconds, float). Returns null on success, else the
+// exact Redis error: negative, out of range, or not-a-float.
+private const(char)[] parseTimeout(scope const(char)[] s, out ulong ms) nothrow
 {
     import dreads.commands : parseDouble;
 
     double secs;
-    if (!parseDouble(s, secs) || secs < 0 || secs > 1e9)
-        return false;
+    if (!parseDouble(s, secs))
+        return "ERR timeout is not a float or out of range";
+    if (secs < 0)
+        return "ERR timeout is negative";
+    if (secs > 1e9) // *1000 + mstime would overflow a long long (Redis)
+        return "ERR timeout is out of range";
     ms = cast(ulong)(secs * 1000);
-    return true;
+    return null;
 }
 
 /// True while the caller should keep waiting (updates the emit count).
+// XREAD BLOCK is fan-out (all readers wake and read the same new entries — no
+// hand-off), so it stays on the global broadcast event, not the per-key FIFO.
 private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) nothrow
 {
     import core.time : MonoTime, msecs;
@@ -2773,14 +2996,84 @@ private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) 
 
     if (timeoutMs != 0 && remainingMs <= 0)
         return false;
-    gBlockedClients++; // INFO clients: parked in a blocking wait
+    gBlockedClients++;
     scope (exit)
         gBlockedClients--;
-    auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs; // forever = 1h slices
+    auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs;
     auto before = MonoTime.currTime;
     ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
     if (timeoutMs != 0)
         remainingMs -= (MonoTime.currTime - before).total!"msecs";
+    return true;
+}
+
+// Refresh the deterministic clock to wall time. Blocking commands serve INLINE
+// (not through dispatch, which freezes gClock per command), so after a wait real
+// time has passed — the lazy-expiry check must see it, or a woken client would
+// serve a key that expired while it waited (BZPOPMIN reprocessing).
+private void refreshDetClock() @nogc nothrow
+{
+    import dreads.det : gClock;
+    import dreads.stream : nowMs;
+
+    gClock = nowMs();
+}
+
+// If a CLIENT UNBLOCK targeted this connection while it was parked, emit the
+// unblock reply and return true (the caller returns). ERROR ⇒ -UNBLOCKED;
+// TIMEOUT ⇒ the command's normal nil reply.
+private bool handleUnblock(ref Conn c, ref ByteBuffer o, scope const(char)[] nilReply) nothrow
+{
+    if (c.unblockReq == 0)
+        return false;
+    immutable e = c.unblockReq;
+    c.unblockReq = 0;
+    if (e == 2)
+        repError(o, "UNBLOCKED client unblocked via CLIENT UNBLOCK");
+    else
+        o.append(nilReply);
+    return true;
+}
+
+// Lazily create the connection's single-shot wake event (reused each block).
+private void ensureBlockEvt(Conn* c) nothrow
+{
+    if (!c.blockEvtInit)
+    {
+        c.blockEvt = createManualEvent();
+        c.blockEvtInit = true;
+    }
+}
+
+// Park the blocked fiber on its own event until signalKey wakes it (or the
+// timeout fires). `ec` is snapshotted by the caller right before this call —
+// there is no yield between waitRegister and here, so no producer can interleave
+// (cooperative loop): no lost wakeup, no spurious wakeup. Returns false only on
+// timeout. The finite timeout is the event loop's OWN timer (no sleep/poll); an
+// infinite block waits the event with no timer at all.
+private bool blockWait(Conn* c, int ec, ref long remainingMs, ulong timeoutMs) nothrow
+{
+    import core.time : MonoTime, msecs;
+
+    import dreads.obj : gBlockedClients;
+
+    if (timeoutMs != 0 && remainingMs <= 0)
+        return false;
+    gBlockedClients++; // INFO clients: parked in a blocking wait
+    c.blocked = true; // eligible for CLIENT UNBLOCK while parked here
+    scope (exit)
+    {
+        gBlockedClients--;
+        c.blocked = false;
+    }
+    if (timeoutMs == 0)
+    {
+        c.blockEvt.waitUninterruptible(ec); // block forever — pure event, no timer
+        return true;
+    }
+    auto before = MonoTime.currTime;
+    c.blockEvt.waitUninterruptible(msecs(remainingMs), ec); // loop timer = the timeout
+    remainingMs -= (MonoTime.currTime - before).total!"msecs";
     return true;
 }
 
@@ -2796,17 +3089,28 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
         return;
     }
     ulong timeoutMs;
-    if (!parseTimeout(args[$ - 1].str, timeoutMs))
+    if (auto terr = parseTimeout(args[$ - 1].str, timeoutMs))
     {
-        repError(o, "ERR timeout is not a float or out of range");
+        repError(o, terr);
         return;
     }
     auto keys = args[0 .. $ - 1];
-    auto ec = gKeyActivity.emitCount;
+    immutable db = cast(int)(c.dbp - &gDbs[0]);
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
+    bool registered = false;
+    // On exit: invalidate this block's deque entries, THEN wake the next front of
+    // any still-ready key (self is now stale so the signal advances to the next
+    // waiter — this covers the served-key cascade AND the errored/timed-out case).
+    scope (exit)
+        if (registered)
+        {
+            waitFinish(&c);
+            signalReadyKeys(db, *c.dbp);
+        }
     for (;;)
     {
+        refreshDetClock(); // real time passed while parked ⇒ observe expiries
         // re-check key ACL on every pass: a blocked client whose key permission
         // was revoked while it waited must be rejected when the command is
         // reprocessed on wake (Valkey behaviour). BLPOP/BRPOP need read+write.
@@ -2844,14 +3148,28 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
                 obj.list.popBack();
             c.dbp.delIfEmpty(k.str, obj);
             logEffect(fromLeft ? "LPOP" : "RPOP", k.str);
-            return;
+            return; // scope(exit) wakes the next front if the list still has data
         }
         firstPass = false;
-        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec)
         {
             repNullArray(o);
             return;
         }
+        if (!registered)
+        {
+            ensureBlockEvt(&c);
+            waitRegister(db, keys, &c);
+            registered = true;
+        }
+        immutable ec = c.blockEvt.emitCount; // no yield since register ⇒ no lost/spurious wake
+        if (!blockWait(&c, ec, remaining, timeoutMs))
+        {
+            repNullArray(o);
+            return;
+        }
+        if (handleUnblock(c, o, gRespProto >= 3 ? "_\r\n" : "*-1\r\n"))
+            return;
     }
 }
 
@@ -2868,17 +3186,25 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
         return;
     }
     ulong timeoutMs;
-    if (!parseTimeout(args[$ - 1].str, timeoutMs))
+    if (auto terr = parseTimeout(args[$ - 1].str, timeoutMs))
     {
-        repError(o, "ERR timeout is not a float or out of range");
+        repError(o, terr);
         return;
     }
     auto keys = args[0 .. $ - 1];
-    auto ec = gKeyActivity.emitCount;
+    immutable db = cast(int)(c.dbp - &gDbs[0]);
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
+    bool registered = false;
+    scope (exit)
+        if (registered)
+        {
+            waitFinish(&c);
+            signalReadyKeys(db, *c.dbp);
+        }
     for (;;)
     {
+        refreshDetClock();
         // re-check key ACL on every pass (see blockingPop) — perms may have been
         // revoked while blocked. BZPOPMIN/MAX need read+write.
         if (gAclActive && c.user !is null && !c.user.root.allKeys)
@@ -2918,15 +3244,49 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
             obj.zset.remove(victim);
             c.dbp.delIfEmpty(k.str, obj);
             logEffect(popMax ? "ZPOPMAX" : "ZPOPMIN", k.str);
-            return;
+            return; // scope(exit) wakes the next front if the zset still has data
         }
         firstPass = false;
-        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec)
         {
             repNullArray(o);
             return;
         }
+        if (!registered)
+        {
+            ensureBlockEvt(&c);
+            waitRegister(db, keys, &c);
+            registered = true;
+        }
+        immutable ec = c.blockEvt.emitCount;
+        if (!blockWait(&c, ec, remaining, timeoutMs))
+        {
+            repNullArray(o);
+            return;
+        }
+        if (handleUnblock(c, o, gRespProto >= 3 ? "_\r\n" : "*-1\r\n"))
+            return;
     }
+}
+
+// Classify the blocking source keys: 1 = some key has servable data (right type
+// + non-empty), -1 = none has data but some key is wrong-typed, 0 = all empty.
+// Blocking commands only SERVE (dispatch) when the source has data; an empty
+// source blocks regardless of the destination type (matching Redis) — so a
+// wrong-typed dest never surfaces until there's something to move.
+private int blockSourceState(ref Conn c, const(RVal)[] keys, ObjType t) nothrow
+{
+    bool wrongSeen = false;
+    foreach (ref k; keys)
+    {
+        bool wrong;
+        auto o = c.dbp.lookupTyped(k.str, t, wrong);
+        if (wrong)
+            wrongSeen = true;
+        else if (o !is null && o.containerLen > 0)
+            return 1;
+    }
+    return wrongSeen ? -1 : 0;
 }
 
 /// Generic retry loop: rewrites the blocking command into its non-blocking
@@ -2937,8 +3297,11 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
         string nilReply, ulong timeoutMs, ref ByteBuffer o, ref Arena arena,
         bool skipFirst = false) nothrow
 {
-    static ByteBuffer synth; // TLS: rebuilt command bytes
-    static ByteBuffer attempt; // TLS: attempt reply staging
+    // NOT static: a blocked fiber yields while OTHER fibers run blockingRetry, and
+    // a shared TLS buffer would be overwritten with another client's command — the
+    // woken fiber would then re-parse someone else's rewritten command. Per-call.
+    ByteBuffer synth; // rebuilt command bytes (must survive across the block's yields)
+    ByteBuffer attempt; // dispatch reply staging
     synth.clear();
     auto argTokens = skipFirst ? parts[1 .. $] : parts[1 .. $];
     repArrayHeader(synth, 1 + argTokens.length);
@@ -2946,14 +3309,41 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
     foreach (ref p; argTokens)
         repBulk(synth, p.str);
 
-    auto ec = gKeyActivity.emitCount;
+    // the blocking key set: LMOVE/RPOPLPUSH block on the source (argTokens[0]);
+    // LMPOP/ZMPOP block on the `numkeys` keys after the count (argTokens[1..1+N]).
+    const(RVal)[] blockKeys;
+    if (verb == "LMOVE" || verb == "RPOPLPUSH")
+    {
+        if (argTokens.length >= 1)
+            blockKeys = argTokens[0 .. 1];
+    }
+    else
+    {
+        long nk;
+        if (argTokens.length >= 2 && parseLong(argTokens[0].str, nk) && nk > 0
+                && 1 + nk <= argTokens.length)
+            blockKeys = argTokens[1 .. 1 + cast(size_t) nk];
+    }
+
+    import dreads.obj : ObjType;
+
+    immutable srcType = verb == "ZMPOP" ? ObjType.zset : ObjType.list;
+    immutable db = cast(int)(c.dbp - &gDbs[0]);
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
+    bool registered = false;
+    scope (exit)
+        if (registered)
+        {
+            waitFinish(&c);
+            signalReadyKeys(db, *c.dbp);
+        }
     // the rewritten command replies through the connection's protocol, so the
     // "nothing to serve" sentinel is `_` under RESP3
     auto nil = gRespProto >= 3 ? "_\r\n" : nilReply;
     for (;;)
     {
+        refreshDetClock();
         attempt.clear();
         RVal cmd2;
         size_t pos = 0;
@@ -2966,35 +3356,62 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
         // (the woken command is reprocessed, so it must be re-validated).
         if (gAclActive && c.user !is null && aclDenies(c, cmd2, null, verb, o))
             return;
-        dispatch(cmd2, *c.dbp, attempt, arena);
-        propagationOverride.clear();
-        auto rep = cast(const(char)[]) attempt.data;
-        if (rep.length > 0 && rep[0] == '-')
+        // Dispatch on the FIRST attempt (to validate args / surface a wrong-typed
+        // source) and whenever the source has data. An empty source blocks.
+        immutable st = blockSourceState(c, blockKeys, srcType);
+        if (firstPass || st == 1)
         {
-            // surface errors only before blocking; once blocked, a key that
-            // turned wrong-typed must not wake (or fail) the client
-            if (firstPass)
+            dispatch(cmd2, *c.dbp, attempt, arena);
+            propagationOverride.clear();
+            auto rep = cast(const(char)[]) attempt.data;
+            if (rep.length > 0 && rep[0] == '-')
+            {
+                // Surface real errors; but a WRONGTYPE with an EMPTY source is a
+                // destination error we shouldn't raise yet — an empty source must
+                // block regardless of the dest type (Redis). Surface a WRONGTYPE
+                // only when the source has data (dst error, source intact via
+                // lmove's dst-first check) or the source itself is wrong-typed on
+                // the first attempt. Non-WRONGTYPE errors (bad numkeys/syntax) are
+                // validation and always surface.
+                immutable isWrongType = rep.length >= 10 && rep[1 .. 10] == "WRONGTYPE";
+                if (!isWrongType || st == 1 || (firstPass && st == -1))
+                {
+                    o.append(attempt.data);
+                    return;
+                }
+                rep = nil; // WRONGTYPE dst on an empty source ⇒ keep waiting
+            }
+            if (rep != nil)
             {
                 o.append(attempt.data);
+                if (gAof.enabled)
+                    gAof.append(synth.data);
+                gWriteEpoch++;
+                gKeyActivity.emit();
                 return;
             }
-            rep = nil; // treat as "not ready", keep waiting
-        }
-        if (rep != nil)
-        {
-            o.append(attempt.data);
-            if (gAof.enabled)
-                gAof.append(synth.data);
-            gWriteEpoch++;
-            gKeyActivity.emit();
-            return;
         }
         firstPass = false;
-        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec)
         {
             o.append(nil);
             return;
         }
+        if (!registered)
+        {
+            ensureBlockEvt(&c);
+            if (blockKeys.length)
+                waitRegister(db, blockKeys, &c);
+            registered = true;
+        }
+        immutable ec = c.blockEvt.emitCount;
+        if (!blockWait(&c, ec, remaining, timeoutMs))
+        {
+            o.append(nil);
+            return;
+        }
+        if (handleUnblock(c, o, nil))
+            return;
     }
 }
 
@@ -3151,13 +3568,15 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
 {
     import core.stdc.stdio : snprintf;
 
+    auto lastCmd = c.lastCmdLen ? cast(const(char)[]) c.lastCmdBuf[0 .. c.lastCmdLen] : "NULL";
     char[224] b = void;
     auto n = snprintf(b.ptr, b.length,
             "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
-            ~ " multi=%d cmd=client|list user=%.*s resp=%d\n",
+            ~ " multi=%d cmd=%.*s user=%.*s resp=%d\n",
             c.id, cast(int) c.clientName.length, c.clientName.ptr,
             cast(int)(c.dbp - &gDbs[0]), cast(int) c.sub.subCount, 0,
             cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
+            cast(int) lastCmd.length, lastCmd.ptr,
             cast(int)(c.user !is null ? c.user.name.length : 7),
             c.user !is null ? c.user.name.ptr : "default".ptr, c.resp3 ? 3 : 2);
     if (n > 0)
@@ -3212,6 +3631,46 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     }
     else if (eqICDebug(sub, "KILL"))
         return clientKill(c, args[1 .. $], o);
+    else if (eqICDebug(sub, "UNBLOCK"))
+    {
+        // CLIENT UNBLOCK <id> [TIMEOUT|ERROR] — wake a client parked in a
+        // blocking command: TIMEOUT (default) replies as if it timed out, ERROR
+        // replies -UNBLOCKED. :1 if it was blocked and got unblocked, else :0.
+        if (args.length < 2 || args.length > 3)
+        {
+            repError(o, "ERR wrong number of arguments for 'client|unblock' command");
+            return true;
+        }
+        long id;
+        if (!parseLong(args[1].str, id) || id < 0)
+        {
+            repError(o, "ERR value is not an integer or out of range");
+            return true;
+        }
+        ubyte mode = 1; // TIMEOUT
+        if (args.length == 3)
+        {
+            if (eqICDebug(args[2].str, "ERROR"))
+                mode = 2;
+            else if (!eqICDebug(args[2].str, "TIMEOUT"))
+            {
+                repError(o, "ERR syntax error");
+                return true;
+            }
+        }
+        long unblocked = 0;
+        for (auto p = gConnHead; p !is null; p = p.regNext)
+            if (p.id == cast(ulong) id && p !is &c && p.blocked)
+            {
+                p.unblockReq = mode;
+                if (p.blockEvtInit)
+                    p.blockEvt.emit(); // wake it; the block loop honours unblockReq
+                unblocked = 1;
+                break;
+            }
+        repInt(o, unblocked);
+        return true;
+    }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
