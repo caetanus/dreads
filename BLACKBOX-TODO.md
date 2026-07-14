@@ -94,10 +94,29 @@ per-field DEL on lazy reap (absolute deadline is already replicated). Events
 `blackbox.hexpire_*` (6 tests). No tcl suite here (this Valkey checkout's hash.tcl
 predates the feature); validated by unit + live smoke + source parity.
 
+### DUMP / RESTORE — DONE phase 1 (2026-07-14)
+DUMP/RESTORE/CRC64 landed as an **external AOF-command <-> RDB translator**
+(`dreads/rdb.d`) — NOT a first-class serializer. It speaks only RESP commands
+(the compactor's `dumpKey` output) and RDB bytes, never touches RObj. DUMP =
+`dumpKey(valueOnly)` -> `commandsToRdb` -> version-80 + CRC64-Jones footer.
+RESTORE = `verifyFooter` -> `rdbToCommands` -> re-dispatch (DEL + rebuild cmds +
+PEXPIREAT logged; no RESTORE in the log). Encoder emits PLAIN types
+(0/1/2/4/5 + 22 hash-with-field-TTL); the decoder handles those. Field TTLs
+round-trip (HASH_2). REPLACE/ABSTTL/BUSYKEY/checksum-reject all correct. Own UT
+`blackbox.rdb_dump_restore_roundtrip` + codec UTs in rdb.d. Also fixed a
+durability gap: `dumpKey` now re-emits `HPEXPIREAT` for hash field TTLs (they
+were dropped on rewrite/snapshot). **hash 79/4 -> 81/8 (now RUNS TO COMPLETION —
+DUMP unblocked it; the 4 uniques are pre-existing HRANDFIELD/HINCRBYFLOAT, not
+RDB). list 269/6 -> 271/10 (advanced past DUMP; new blocker = CLIENT PAUSE).**
+Phase 2 (deferred): decode the compact encodings (listpack/ziplist/intset/
+quicklist + LZF) for RESTORE of hardcoded external payloads; stream DUMP.
+
 ### Not implemented (each aborts its file)
-- DUMP/RESTORE (hash file; RDB payload + CRC — sizeable).
+- RESTORE of compact-encoded external payloads (listpack/ziplist/intset) — phase 2.
+- CLIENT PAUSE (list file — the new blocker after DUMP).
 - HSCAN NOVALUES (scan file, to confirm).
 - COPY of a stream with consumer groups (keyspace).
+- Stream DUMP/RESTORE (deferred with the RDB phase 2).
 
 ### Scripting (effects replication LANDED — leftovers)
 Effects replication is in (EVAL never logged; each redis.call write logged

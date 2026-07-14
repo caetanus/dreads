@@ -647,6 +647,70 @@ version (unittest)
         ks.run("HTTL", "h", "FIELDS", "2", "f", "g").expect.to.equal("*2\r\n:-1\r\n:100\r\n");
     }
 
+    // Extract a RESP bulk-string payload ($<len>\r\n<bytes>\r\n) by length — the
+    // DUMP payload is binary and may contain \r\n, so never split on the delimiter.
+    private string extractBulk(string reply)
+    {
+        assert(reply.length > 0 && reply[0] == '$', "not a bulk reply");
+        size_t i = 1, len = 0;
+        while (reply[i] != '\r')
+        {
+            len = len * 10 + (reply[i] - '0');
+            i++;
+        }
+        i += 2; // skip \r\n
+        return reply[i .. i + len];
+    }
+
+    @("blackbox.rdb_dump_restore_roundtrip")
+    unittest
+    {
+        // DUMP -> RESTORE round-trips every value type through the AOF-command <->
+        // RDB translator (the compactor feeds DUMP; RESTORE decodes to commands and
+        // dispatches). Field TTLs survive as HASH_2.
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        enum ulong T0 = 1_000_000_000;
+
+        ks.runAt(T0, "SET", "str", "hello");
+        ks.runAt(T0, "RPUSH", "l", "a", "b", "c");
+        ks.runAt(T0, "SADD", "s", "x", "y", "z");
+        ks.runAt(T0, "HSET", "h", "f1", "v1", "f2", "v2");
+        ks.runAt(T0, "HEXPIRE", "h", "500", "FIELDS", "1", "f1"); // -> HASH_2
+        ks.runAt(T0, "ZADD", "z", "1.5", "m1", "2.5", "m2");
+
+        foreach (k; ["str", "l", "s", "h", "z"])
+        {
+            auto payload = extractBulk(ks.runAt(T0, "DUMP", k));
+            ks.runAt(T0, "DEL", k);
+            ks.runAt(T0, "RESTORE", k, "0", payload).expect.to.equal("+OK\r\n");
+        }
+
+        // contents survived
+        ks.runAt(T0, "GET", "str").expect.to.equal("$5\r\nhello\r\n");
+        ks.runAt(T0, "LRANGE", "l", "0", "-1")
+            .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        ks.runAt(T0, "SCARD", "s").expect.to.equal(":3\r\n");
+        ks.runAt(T0, "HGET", "h", "f2").expect.to.equal("$2\r\nv2\r\n");
+        ks.runAt(T0, "HTTL", "h", "FIELDS", "1", "f1").expect.to.equal("*1\r\n:500\r\n"); // TTL survived
+        ks.runAt(T0, "ZSCORE", "z", "m2").expect.to.equal("$3\r\n2.5\r\n");
+
+        // BUSYKEY without REPLACE, ok with REPLACE
+        auto p = extractBulk(ks.runAt(T0, "DUMP", "str"));
+        ks.runAt(T0, "RESTORE", "str", "0", p).expect.to.contain("BUSYKEY");
+        ks.runAt(T0, "RESTORE", "str", "0", p, "REPLACE").expect.to.equal("+OK\r\n");
+        // corrupted payload rejected
+        auto bad = p.dup;
+        bad[$ - 1] = cast(char)(bad[$ - 1] ^ 0xFF);
+        ks.runAt(T0, "RESTORE", "x", "0", cast(string) bad).expect.to.contain("checksum");
+    }
+
     @("blackbox.hexpire_spill_and_active_reap")
     unittest
     {

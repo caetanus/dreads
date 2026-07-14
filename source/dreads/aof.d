@@ -115,22 +115,32 @@ public struct Aof
 /// and the Raft snapshot.
 public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
 {
-    import dreads.commands : fmtDouble;
-    import dreads.obj : ObjType;
-    import dreads.dict : StrVal;
-    import dreads.stream : StreamID, nowMs;
+    import dreads.stream : nowMs;
 
-    enum CHUNK = 128;
     auto now = nowMs();
     foreach (i; 0 .. ks.d.capacity)
     {
         if (!ks.d.slotLive(i))
             continue;
-        auto key = ks.d.keyAt(i);
         auto obj = ks.d.valAt(i);
         if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
             continue; // expired keys stay dead
+        dumpKey(buf, ks.d.keyAt(i), obj, false);
+    }
+}
 
+/// Emit the canonical rebuild commands for ONE key's value. `valueOnly` (DUMP
+/// payload) omits the key-level PEXPIREAT — RESTORE carries the TTL as an
+/// argument; otherwise a trailing PEXPIREAT preserves it (AOF rewrite / raft
+/// snapshot). Hash field TTLs (HEXPIRE) are always re-emitted as HPEXPIREAT, so
+/// they survive compaction and translate into the RDB hash-with-expiry form.
+public void dumpKey(ref ByteBuffer buf, scope const(char)[] key, RObj* obj, bool valueOnly) @nogc nothrow
+{
+    import dreads.commands : fmtDouble;
+    import dreads.obj : ObjType;
+    import dreads.stream : StreamID;
+
+    enum CHUNK = 128;
         final switch (obj.type)
         {
         case ObjType.str:
@@ -160,6 +170,7 @@ public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
             }
         case ObjType.hash:
             emitDictChunks(buf, "HSET", key, obj, true);
+            emitHashFieldTTLs(buf, key, obj);
             break;
         case ObjType.set:
             emitDictChunks(buf, "SADD", key, obj, false);
@@ -252,15 +263,39 @@ public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
                 break;
             }
         }
-        if (obj.expireAtMs != 0)
-        {
-            repArrayHeader(buf, 3);
-            repBulk(buf, "PEXPIREAT");
-            repBulk(buf, key);
-            char[24] eb = void;
-            auto elen = snprintf(eb.ptr, eb.length, "%llu", obj.expireAtMs);
-            repBulk(buf, eb[0 .. elen]);
-        }
+    if (!valueOnly && obj.expireAtMs != 0)
+    {
+        repArrayHeader(buf, 3);
+        repBulk(buf, "PEXPIREAT");
+        repBulk(buf, key);
+        char[24] eb = void;
+        auto elen = snprintf(eb.ptr, eb.length, "%llu", obj.expireAtMs);
+        repBulk(buf, eb[0 .. elen]);
+    }
+}
+
+/// Re-emit a hash's field TTLs (HEXPIRE) as one HPEXPIREAT per TTL'd field, so
+/// they survive AOF rewrite / raft snapshot and carry into the RDB translation.
+private void emitHashFieldTTLs(ref ByteBuffer buf, scope const(char)[] key, RObj* obj) @nogc nothrow
+{
+    if (!obj.hash.hasFieldTTL)
+        return;
+    foreach (slot; 0 .. obj.hash.capacity)
+    {
+        if (!obj.hash.slotLive(slot))
+            continue;
+        auto field = obj.hash.keyAt(slot);
+        immutable ttl = obj.hash.getFieldTTL(field);
+        if (ttl == 0)
+            continue;
+        repArrayHeader(buf, 6);
+        repBulk(buf, "HPEXPIREAT");
+        repBulk(buf, key);
+        char[24] tb = void;
+        repBulk(buf, tb[0 .. snprintf(tb.ptr, tb.length, "%llu", ttl)]);
+        repBulk(buf, "FIELDS");
+        repBulk(buf, "1");
+        repBulk(buf, field);
     }
 }
 
@@ -306,7 +341,7 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) 
 
 /// One SADD/HSET per chunk of a dict-backed container.
 private void emitDictChunks(ref ByteBuffer buf, scope const(char)[] verb,
-        scope const(char)[] key, RObj* obj, bool withValues) nothrow
+        scope const(char)[] key, RObj* obj, bool withValues) @nogc nothrow
 {
     enum CHUNK = 128;
     // count live entries

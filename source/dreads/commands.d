@@ -18,6 +18,8 @@ import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
 import emplace.vector : Vector;
+import dreads.aof : dumpKey;
+import dreads.rdb : commandsToRdb, rdbToCommands, appendFooter, verifyFooter;
 
 /// When a command's effect must reach the AOF (and later the Raft log) in a
 /// different form than the client sent it — time- or randomness-dependent
@@ -364,6 +366,120 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             else
                 repInt(o, 0);
+            break;
+        }
+    case "DUMP":
+        {
+            // DUMP key -> the RDB serialization of the value (via the compactor's
+            // rebuild commands), or nil when the key is missing.
+            if (args.length != 1)
+            {
+                arityErr(o, "dump");
+                break;
+            }
+            auto obj = ks.lookup(args[0].str);
+            if (obj is null)
+            {
+                repNullBulk(o);
+                break;
+            }
+            ByteBuffer cmds, payload;
+            dumpKey(cmds, args[0].str, obj, true); // value-only rebuild commands
+            if (!commandsToRdb(cmds.data, arena, payload))
+            {
+                repError(o, "ERR DUMP is not supported for this value type");
+                break;
+            }
+            appendFooter(payload);
+            repBulk(o, cast(const(char)[]) payload.data);
+            break;
+        }
+    case "RESTORE":
+        {
+            // RESTORE key ttl serialized-value [REPLACE|ABSTTL|IDLETIME n|FREQ n]
+            if (args.length < 3)
+            {
+                arityErr(o, "restore");
+                break;
+            }
+            long ttlMs;
+            if (!parseLong(args[1].str, ttlMs) || ttlMs < 0)
+            {
+                repError(o, "ERR Invalid TTL value, must be >= 0");
+                break;
+            }
+            bool replace, absttl, badOpt;
+            for (size_t i = 3; i < args.length; i++)
+            {
+                if (eqICKeyword(args[i].str, "REPLACE"))
+                    replace = true;
+                else if (eqICKeyword(args[i].str, "ABSTTL"))
+                    absttl = true;
+                else if (eqICKeyword(args[i].str, "IDLETIME") || eqICKeyword(args[i].str, "FREQ"))
+                {
+                    if (++i >= args.length)
+                    {
+                        badOpt = true;
+                        break;
+                    } // value accepted, unmodelled
+                }
+                else
+                {
+                    badOpt = true;
+                    break;
+                }
+            }
+            if (badOpt)
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            if (!replace && ks.lookup(args[0].str) !is null)
+            {
+                repError(o, "BUSYKEY Target key name already exists.");
+                break;
+            }
+            const(ubyte)[] body_;
+            if (!verifyFooter(cast(const(ubyte)[]) args[2].str, body_))
+            {
+                repError(o, "ERR DUMP payload version or checksum are wrong");
+                break;
+            }
+            ByteBuffer cmds;
+            if (!rdbToCommands(args[0].str, body_, cmds))
+            {
+                repError(o, "ERR Bad data format");
+                break;
+            }
+            // Rebuild the key from primitives (the "vice-versa"): drop any old
+            // value, apply the decoded commands, set the key TTL. The AOF log gets
+            // DEL + rebuild commands + PEXPIREAT — deterministic, no RESTORE in the
+            // log (see [[aof-is-ours]]).
+            ks.del(args[0].str);
+            applyRebuild(cmds.data, ks, arena);
+            immutable ulong absMs = ttlMs == 0 ? 0
+                : (absttl ? cast(ulong) ttlMs : detNow() + cast(ulong) ttlMs);
+            if (absMs != 0)
+                if (auto ro = ks.lookup(args[0].str))
+                {
+                    ks.retimeExpire(args[0].str, ro.expireAtMs, absMs);
+                    ro.expireAtMs = absMs;
+                }
+            // propagate: DEL key ; <rebuild commands> ; [PEXPIREAT key absMs]
+            propagationOverride.clear();
+            repArrayHeader(propagationOverride, 2);
+            repBulk(propagationOverride, "DEL");
+            repBulk(propagationOverride, args[0].str);
+            propagationOverride.append(cmds.data);
+            if (absMs != 0)
+            {
+                repArrayHeader(propagationOverride, 3);
+                repBulk(propagationOverride, "PEXPIREAT");
+                repBulk(propagationOverride, args[0].str);
+                char[24] pb = void;
+                repBulk(propagationOverride, pb[0 .. snprintf(pb.ptr, pb.length, "%llu", absMs)]);
+            }
+            repSimple(o, "OK");
             break;
         }
 
@@ -5375,6 +5491,26 @@ private void propagateSet(scope const(char)[] key, scope const(char)[] val, ulon
     }
 }
 
+/// Apply a stream of rebuild commands (RESTORE's decoded RDB) against the
+/// keyspace, discarding replies. Re-enters `dispatch` per command — single event
+/// loop, no yield, so recursion is safe. Sub-command propagation overrides are
+/// dropped; RESTORE logs its own canonical DEL+rebuild+PEXPIREAT.
+private void applyRebuild(scope const(ubyte)[] cmds, ref Keyspace ks, ref Arena arena) @nogc nothrow
+{
+    immutable now = detNow();
+    size_t p = 0;
+    RVal sub;
+    ByteBuffer scratch;
+    while (p < cmds.length)
+    {
+        if (parseValue(cmds, p, arena, sub) != ParseStatus.ok)
+            break;
+        scratch.clear();
+        dispatch(sub, ks, scratch, arena, now);
+    }
+    propagationOverride.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Small parsing / reply utilities
 // ---------------------------------------------------------------------------
@@ -5564,7 +5700,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     {
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
     case "SETEX", "PSETEX", "GETDEL", "DELIFEQ", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
-    case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY":
+    case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY", "RESTORE":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
