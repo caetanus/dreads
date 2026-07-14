@@ -169,8 +169,13 @@ public struct RObj
         case ObjType.hash:
             foreach (i; 0 .. hash.capacity)
             {
-                if (hash.slotLive(i))
-                    c.hash.set(hash.keyAt(i), hash.valAt(i).dup());
+                if (!hash.slotLive(i))
+                    continue;
+                auto f = hash.keyAt(i);
+                c.hash.set(f, hash.valAt(i).dup());
+                immutable ttl = (cast() hash).getFieldTTL(f); // set() cleared it; restore
+                if (ttl != 0)
+                    c.hash.setFieldTTL(f, ttl);
             }
             break;
         case ObjType.set:

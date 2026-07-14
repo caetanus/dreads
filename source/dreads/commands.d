@@ -13,7 +13,7 @@ import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
-import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields;
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
@@ -1480,7 +1480,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             long nf;
-            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            if (fi + 2 > args.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            if (!parseLong(args[fi + 1].str, nf))
             {
                 repError(o, "ERR value is not an integer or out of range");
                 break;
@@ -1512,6 +1518,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
             Vector!size_t affected; // fields set (HPEXPIREAT) or deleted (HDEL) — for propagation
             repArrayHeader(o, fields.length);
+            // import mode pauses the delete: a past field TTL is stored, not reaped
+            immutable bool effPast = pastTime && !gImportMode;
             foreach (idx, ref a; fields)
             {
                 auto exist = obj is null ? null : obj.hash.get(a.str);
@@ -1520,7 +1528,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     repInt(o, -2); // no such field / key
                     continue;
                 }
-                if (pastTime)
+                // NX/XX/GT/LT are checked FIRST, even for a past deadline: a failed
+                // condition means "don't touch" (0), never delete. No TTL = +inf.
+                immutable ulong cur = obj.hash.getFieldTTL(a.str);
+                if ((fNX && cur != 0) || (fXX && cur == 0)
+                    || (fGT && (cur == 0 || newAt <= cur))
+                    || (fLT && cur != 0 && newAt >= cur))
+                {
+                    repInt(o, 0); // condition not met
+                    continue;
+                }
+                if (effPast)
                 {
                     obj.hash.del(a.str); // past deadline: delete the field now
                     affected.put(idx);
@@ -1529,15 +1547,6 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 }
                 else
                 {
-                    // a field with no TTL counts as +infinity for GT/LT (like key EXPIRE)
-                    immutable ulong cur = obj.hash.getFieldTTL(a.str);
-                    if ((fNX && cur != 0) || (fXX && cur == 0)
-                        || (fGT && (cur == 0 || newAt <= cur))
-                        || (fLT && cur != 0 && newAt >= cur))
-                    {
-                        repInt(o, 0); // condition not met
-                        continue;
-                    }
                     obj.hash.setFieldTTL(a.str, newAt);
                     affected.put(idx);
                     repInt(o, 1);
@@ -1546,7 +1555,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             if (affected.length > 0)
             {
                 propagationOverride.clear();
-                if (pastTime)
+                if (effPast)
                 {
                     // canonical: HDEL key field... (replicas delete the expired fields)
                     notifyKeyspaceEvent(NClass.hash, "hexpired", args[0].str);
@@ -1758,7 +1767,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         "ERR Mandatory keyword FIELDS is missing or not at the right position");
                 break;
             }
-            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            if (fi + 2 > args.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            if (!parseLong(args[fi + 1].str, nf))
             {
                 repError(o, "ERR value is not an integer or out of range");
                 break;
@@ -1784,7 +1799,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             immutable now = detNow();
-            immutable bool pastTime = op == 1 && absMs <= cast(long) now;
+            // import mode pauses the delete (a past field TTL is stored, not reaped)
+            immutable bool pastTime = op == 1 && absMs <= cast(long) now && !gImportMode;
             immutable ulong newAt = (op == 1 && absMs > 0) ? cast(ulong) absMs : 1;
             // reply: the field values (HMGET-shaped), reaped fields already gone
             repArrayHeader(o, fields.length);
@@ -1939,7 +1955,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             long nf;
-            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            if (fi + 2 > args.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            if (!parseLong(args[fi + 1].str, nf))
             {
                 repError(o, "ERR value is not an integer or out of range");
                 break;
@@ -1964,7 +1986,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     o.append("-ERR invalid expire time in 'hsetex' command\r\n");
                     break;
                 }
-                pastTime = resolved <= cast(long) now;
+                pastTime = resolved <= cast(long) now && !gImportMode;
                 absMs = resolved <= 0 ? 1 : cast(ulong) resolved;
             }
             bool wrong;
