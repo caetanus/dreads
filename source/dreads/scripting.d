@@ -32,11 +32,58 @@ shared static this()
     gLuaLock = new Mutex;
     // dispatch reaches Redis Functions (and the script-cache count for INFO)
     // through these hooks (no import cycle)
-    import dreads.commands : gFcallHook, gFunctionHook, gScriptCountHook;
+    import dreads.commands : gFcallHook, gFunctionHook, gScriptCountHook,
+        gScriptWritesHook;
 
     gFunctionHook = &functionCommand;
     gFcallHook = &fcallCommand;
     gScriptCountHook = &cachedScriptCount;
+    gScriptWritesHook = &scriptWrites; // WRITE-pause: hold writing scripts only
+}
+
+/// WRITE-mode CLIENT PAUSE hook: does this EVAL/EVALSHA/FCALL invocation possibly
+/// write? A no-writes shebang (EVAL/EVALSHA) or a function registered `no-writes`
+/// (FCALL) is read-only and passes the barrier; a legacy or unflagged script may
+/// write and is held. arg[1] is the inline body (EVAL), sha (EVALSHA) or function
+/// name (FCALL). Runs on the event-loop thread; only briefly locks for lookups.
+private bool scriptWrites(scope const(char)[] uname, const ref RVal cmd) @nogc nothrow
+{
+    if (cmd.type != RType.Array || cmd.arr.length < 2)
+        return true; // malformed — be safe (it will error on run anyway)
+    auto a1 = cmd.arr[1].str;
+    if (uname == "EVAL")
+        return bodyMayWrite(a1);
+    if (uname == "EVALSHA")
+    {
+        auto body_ = cachedScript(a1); // takes its own lock
+        return body_ is null ? true : bodyMayWrite(body_); // uncached => NOSCRIPT later
+    }
+    // FCALL: the registry stores 'R' (no-writes) or 'W' as the last meta byte.
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    auto meta = gFns.get(a1);
+    if (meta is null)
+        return true; // unknown function => let it through the gate to error
+    auto raw = meta.rawView();
+    return raw.length == 0 || raw[$ - 1] != 'R';
+}
+
+/// A shebang script is read-only only when its first line carries `no-writes`;
+/// a legacy (no-shebang) script may always write.
+private bool bodyMayWrite(scope const(char)[] body_) @nogc nothrow
+{
+    if (body_.length < 2 || body_[0] != '#' || body_[1] != '!')
+        return true; // legacy script — may write
+    size_t e = 0;
+    while (e < body_.length && body_[e] != '\n')
+        e++;
+    auto line = body_[0 .. e]; // the shebang line
+    if (line.length >= 9)
+        foreach (i; 0 .. line.length - 8)
+            if (line[i .. i + 9] == "no-writes")
+                return false;
+    return true;
 }
 
 /// Per-invocation math.random seed. dreads replicates script EFFECTS, not the
@@ -2060,7 +2107,14 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
                 repError(o, "ERR failed to initialize Lua");
                 return;
             }
-            if (luaL_loadbuffer(gL, args[1].str.ptr, args[1].str.length, "@user_script") != LUA_OK)
+            // Strip + validate the optional `#!lua` shebang before compiling, exactly
+            // as EVAL does. We CACHE the original body (with shebang) so EVALSHA
+            // re-parses it identically; only the compile check sees the stripped body.
+            const(char)[] body_ = args[1].str;
+            bool nw, ao, hs;
+            if (!parseEvalShebang(body_, o, nw, ao, hs))
+                return; // parseEvalShebang wrote the error reply
+            if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
             {
                 luaErrToResp(o, "ERR Error compiling script: ");
                 lua_settop(gL, 0);

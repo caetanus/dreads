@@ -33,7 +33,18 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
 import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
-import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverride, parseLong;
+import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
+    gScriptWritesHook, propagationOverride, parseLong;
+
+// A command held by a WRITE-mode CLIENT PAUSE: the may-replicate write set, plus
+// EVAL/EVALSHA/FCALL only when the script actually may write (the scripting hook
+// reads the shebang / function flags; read-only scripts pass the barrier).
+private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @nogc nothrow
+{
+    if (uname == "EVAL" || uname == "EVALSHA" || uname == "FCALL")
+        return gScriptWritesHook !is null && gScriptWritesHook(uname, cmd);
+    return isPausedByWrite(uname);
+}
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
@@ -342,6 +353,7 @@ private struct Conn
     bool pauseBlocked; // parked on the pause barrier => counted in gBlockedClients
     // MULTI state: queued raw commands, back to back
     bool inMulti;
+    bool multiHasWrite; // a queued command writes => EXEC is held by a WRITE pause
     size_t multiCount;
     ByteBuffer multiQueue;
     // WATCH state: conservative — any write since WATCH aborts EXEC
@@ -1335,16 +1347,29 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     // CLIENT PAUSE barrier — before ACL/dispatch/AOF. A matching command (ALL, or a
     // write in WRITE mode) is buffered raw and replayed when the window lifts; CLIENT
     // is exempt so UNPAUSE always lands. Never executed nor logged while barriered.
-    if (gPauseUntilMs != 0 && uname != "CLIENT" && c.id != gPauseIssuer)
+    // MULTI queuing is NOT barriered (commands still return QUEUED under a pause);
+    // the transaction is instead held as a unit at EXEC iff it queued a write.
+    // A pause is rare — keep it off the branch predictor's hot path (expect false).
+    if (expect(gPauseUntilMs != 0, false) && uname != "CLIENT" && c.id != gPauseIssuer)
     {
         if (nowMs() >= gPauseUntilMs)
             gPauseUntilMs = 0; // window elapsed — run normally
-        else if (gPauseAll || isWriteCommand(uname))
+        else
         {
-            c.pausedBuf.append(rawCmd);
-            if (c.pausedBuf.length > gConfig.clientQueryBufferLimit)
-                return false; // guard: a client flooding the barrier is disconnected
-            return true; // barriered
+            bool barrier;
+            if (uname == "EXEC")
+                barrier = gPauseAll || c.multiHasWrite; // hold the whole txn
+            else if (c.inMulti)
+                barrier = false; // let MULTI/queued commands reach the queue
+            else
+                barrier = gPauseAll || heldByWritePause(uname, cmd);
+            if (barrier)
+            {
+                c.pausedBuf.append(rawCmd);
+                if (c.pausedBuf.length > gConfig.clientQueryBufferLimit)
+                    return false; // guard: a client flooding the barrier is disconnected
+                return true; // barriered
+            }
         }
     }
 
@@ -1388,6 +1413,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         {
             c.inMulti = true;
             c.multiCount = 0;
+            c.multiHasWrite = false;
             c.multiQueue.clear();
             repSimple(o, "OK");
         }
@@ -1398,6 +1424,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         else
         {
             c.inMulti = false;
+            c.multiHasWrite = false;
             c.multiQueue.clear();
             c.watching = false;
             repSimple(o, "OK");
@@ -1430,6 +1457,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 return true;
             }
             c.inMulti = false;
+            c.multiHasWrite = false;
             scope (exit)
             {
                 c.multiQueue.clear();
@@ -1958,6 +1986,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     case "RESET":
         {
             c.inMulti = false;
+            c.multiHasWrite = false;
             c.multiQueue.clear();
             c.watching = false;
             gPubSub.dropAll(&c.sub);
@@ -1975,6 +2004,8 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     {
         c.multiQueue.append(rawCmd);
         c.multiCount++;
+        if (heldByWritePause(uname, cmd)) // remember so EXEC can be held by a WRITE pause
+            c.multiHasWrite = true;
         repSimple(o, "QUEUED");
         return true;
     }

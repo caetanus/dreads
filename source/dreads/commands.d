@@ -5966,6 +5966,32 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     }
 }
 
+/// Commands held by a WRITE-mode CLIENT PAUSE: the write set (same classification
+/// the AOF logs by) PLUS the "may replicate" commands — PUBLISH/SPUBLISH propagate
+/// to the stream, PFCOUNT can rewrite the cached HLL cardinality. Mirrors Valkey's
+/// WRITE-pause mask of CMD_WRITE | CMD_MAY_REPLICATE. Scripts (EVAL/EVALSHA/FCALL)
+/// are NOT decided here — their write-ness depends on the shebang / function flags,
+/// so the caller consults `gScriptWritesHook`; the _RO variants are always reads.
+/// EXEC is decided from the queued transaction's contents (Conn.multiHasWrite).
+public bool isPausedByWrite(scope const(char)[] uname) @nogc nothrow
+{
+    if (isWriteCommand(uname))
+        return true;
+    switch (uname)
+    {
+    case "PUBLISH", "SPUBLISH", "PFCOUNT":
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Set by the scripting module: true if this EVAL/EVALSHA/FCALL invocation may
+/// write (a legacy script, or one whose shebang / registered function lacks the
+/// no-writes flag). Lets a WRITE-mode CLIENT PAUSE hold writing scripts while
+/// letting read-only ones through. Null until scripting initializes.
+public __gshared bool function(scope const(char)[] uname, const ref RVal cmd) @nogc nothrow gScriptWritesHook;
+
 /// Redis-style glob: * matches any run, ? matches one char.
 public bool globMatch(scope const(char)[] pat, scope const(char)[] s) @nogc nothrow
 {
