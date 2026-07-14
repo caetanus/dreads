@@ -46,7 +46,7 @@ leakage).
 | unit/bitfield | 18 | 0 | **PASSES** |
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
 | unit/pause | 19 | 0 | **PASSES** (1 skip N/A: deferring-client write-backpressure timing — dreads buffers server-side by design) |
-| unit/dump | 14 | 2 | OBJECT FREQ/LFU + RESTORE opts + rdb-version-check landed; remaining = MIGRATE, stream DUMP |
+| unit/dump | 14 | 4 | completes (no abort); **stream DUMP/RESTORE landed** (byte-exact Valkey 9.1 both ways); remaining = MIGRATE command, RESTORE shared-NACK corruption reject |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
