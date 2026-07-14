@@ -42,6 +42,8 @@ leakage).
 | unit/type/incr | 32 | 0 | **PASSES** |
 | unit/type/string | 106 | 0 | **PASSES** |
 | unit/type/zset | 322 | 0 | **PASSES** |
+| unit/type/stream | 71 | 0 | **PASSES** (skips N/A: `~` approx trim = Redis macro-node granularity; 2 DEBUG LOADAOF need appendonly override) |
+| unit/type/stream-cgroups | 53 | 0 | **PASSES** (skips: total_blocking_keys introspection, DUMP/RESTORE+AOF consumer metadata = Raft-replicated by design, legacy-RDB load, lag-with-tombstones) |
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
@@ -126,6 +128,32 @@ registered, two workers each get a distinct entry). Own UT
 `blackbox.xreadgroup_block_servability`. Valkey's stream-cgroups blocking tests
 (line 216+) remain unreachable — that file aborts earlier on separate debts
 (`XGROUP CREATE ... ENTRIESREAD -3` validation, `XPENDING ... IDLE`).
+
+### Streams — DONE (2026-07-14): stream.tcl 71/0, stream-cgroups 53/0
+Both files went from aborting at test 5/10 to fully passing. Landed, roughly in
+dependency order: u64 stream ids (parseUlong, not signed) + `ms-*` auto-seq;
+XGROUP CREATE ENTRIESREAD validation + XINFO entries-read/lag; XPENDING IDLE +
+exclusive `(` bounds; XACK atomic id validation; XGROUP SETID/CREATE `-`/`+`
+cursors; inline XADD/XTRIM trim (MAXLEN/MINID/`=`/LIMIT/NOMKSTREAM); XRANGE/
+XREVRANGE exclusive `(` edges; PEL history reports deleted entries (#5570); XREAD
+`+` last-element + ignore mid-block type change; stream metadata (entries-added,
+max-deleted-entry-id, recorded-first-entry-id) + XINFO STREAM [FULL]; XSETID with
+ENTRIESADDED/MAXDELETEDID; nextId ms-rollover on seq exhaustion; CONFIG SET
+multi-pair + CONFIG GET of SET-only params; SWAPDB/MOVE/XAUTOCLAIM are writes
+(unblock blocked XREADGROUP); XCLAIM/XAUTOCLAIM evict deleted entries; XREADGROUP
+BLOCK (event-driven, see blocking section); consumer introspection (XINFO
+CONSUMERS, seen/active-time, name-sorted, entries-read/lag tombstone-free path);
+blocked-command commandstats.
+
+**Deliberate skips (N/A or by-design, in valkey-sync.skip):** `~` approximate trim
+and lag-with-tombstones depend on Redis's rax macro-node granularity, which dreads
+(flat sorted array) doesn't model; DUMP/RESTORE+AOF of consumer-group PEL/consumer
+metadata is redundant with Raft replication (the follower rebuilds the PEL from the
+log — low-priority to cover the full STREAM_LISTPACKS_3 group layout anyway, see
+the `rdb-pel-from-raft` memory); `total_blocking_keys` introspection needs a
+per-key blocked-client registry we don't keep (XREAD/XREADGROUP block on the global
+event); legacy-RDB (rdb_ver<10/11) loading; and DEBUG LOADAOF/AOFRW need a per-test
+appendonly override the external harness can't apply. No SET/GET hot-path change.
 
 ### Hash-field TTL (HEXPIRE family) — DONE (2026-07-14)
 Implemented HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT, HPERSIST, HTTL/HPTTL/
