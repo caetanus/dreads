@@ -1217,4 +1217,57 @@ version (unittest)
         ks.run("XGROUP", "SETID", "s", "g", "-").should.equal("+OK\r\n");
         ks.run("XREADGROUP", "GROUP", "g", "c2", "STREAMS", "s", ">").should.contain("1-2");
     }
+
+    // XADD/XTRIM inline trimming (MAXLEN/MINID/NOMKSTREAM/LIMIT) + exclusive
+    // XRANGE bound edge cases. First caught by unit/type/stream (aborted at the
+    // MAXLEN tests). The ~ approximation is exact here (we don't emulate Redis's
+    // macro-node granularity) — see the skip note in valkey-sync.skip.
+    @("blackbox.stream_trim_and_exclusive")
+    unittest
+    {
+        import std.conv : to;
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // XADD MAXLEN trims oldest-first to the newest N after the add
+        foreach (i; 1 .. 6)
+            ks.run("XADD", "s", "MAXLEN", "3", i.to!string ~ "-1", "f", "v");
+        ks.run("XLEN", "s").should.equal(":3\r\n");
+        ks.run("XRANGE", "s", "-", "+").should.contain("3-1"); // 1-1/2-1 dropped
+        ks.run("XRANGE", "s", "-", "+").should.not.contain("1-1");
+
+        // XADD MINID 4 drops entries with id < 4-0 (3-1), keeping 4-1,5-1 + new 5-2
+        ks.run("XADD", "s", "MINID", "4", "5-2", "f", "v");
+        ks.run("XLEN", "s").should.equal(":3\r\n");
+
+        // NOMKSTREAM: no key -> nil, key not created
+        ks.run("XADD", "ghost", "NOMKSTREAM", "*", "f", "v").should.equal("$-1\r\n");
+        ks.run("EXISTS", "ghost").should.equal(":0\r\n");
+
+        // XTRIM MINID (own command, not just XADD)
+        ks.run("DEL", "t");
+        foreach (i; 1 .. 6)
+            ks.run("XADD", "t", i.to!string ~ "-0", "f", "v");
+        ks.run("XTRIM", "t", "MINID", "3").should.equal(":2\r\n"); // 1-0,2-0 dropped
+        ks.run("XLEN", "t").should.equal(":3\r\n");
+
+        // LIMIT without ~ is an error
+        ks.run("XTRIM", "t", "MAXLEN", "1", "LIMIT", "1")
+            .should.startWith("-ERR syntax error");
+
+        // exclusive XRANGE edge cases: `(` on the specials, or off the ends, error
+        ks.run("DEL", "v");
+        ks.run("XADD", "v", "1-0", "f", "v");
+        ks.run("XRANGE", "v", "(-", "+").should.startWith("-ERR");
+        ks.run("XRANGE", "v", "-", "(+").should.startWith("-ERR");
+        ks.run("XRANGE", "v", "-", "(0-0").should.startWith("-ERR"); // nothing below 0-0
+        ks.run("XRANGE", "v",
+            "(18446744073709551615-18446744073709551615", "+").should.startWith("-ERR");
+        // valid exclusive bound works
+        ks.run("XADD", "v", "2-0", "f", "v");
+        ks.run("XRANGE", "v", "(1-0", "+").should.contain("2-0");
+        ks.run("XRANGE", "v", "(1-0", "+").should.not.contain("1-0");
+    }
 }

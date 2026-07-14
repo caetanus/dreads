@@ -130,9 +130,16 @@ private bool parseRangeIdExcl(scope const(char)[] s, bool isStart, out StreamID 
 {
     if (s.length > 0 && s[0] == '(')
     {
-        StreamID base;
-        if (!parseRangeId(s[1 .. $], isStart, base))
+        auto inner = s[1 .. $];
+        if (inner == "-" || inner == "+") // the specials can't be made exclusive
             return false;
+        StreamID base;
+        if (!parseId(inner, isStart ? 0 : ulong.max, base))
+            return false;
+        if (isStart && base == StreamID(ulong.max, ulong.max))
+            return false; // nothing above the maximum id
+        if (!isStart && base == StreamID(0, 0))
+            return false; // nothing below 0-0
         id = isStart ? incrId(base) : decrId(base);
         return true;
     }
@@ -623,12 +630,13 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         {
             StreamID after;
             parseId(spec, 0, after);
-            // this consumer's pending entries with id > after, still existing
+            // history: this consumer's pending entries with id > after. Entries
+            // deleted from the stream (XDEL/trim) still appear — with a nil field
+            // list — so the client can see which pending ids are now gone (#5570).
             size_t n = 0;
             foreach (ref pe; g.pending)
             {
-                if (pe.id > after && pe.consumer == cname
-                        && obj.stream.getEntry(pe.id, (pairs) => 0) == 0)
+                if (pe.id > after && pe.consumer == cname)
                 {
                     n++;
                     if (count && n == cast(size_t) count)
@@ -646,8 +654,13 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
                 if (pe.id > after && pe.consumer == cname)
                 {
                     auto id = pe.id;
-                    if (obj.stream.getEntry(id, (pairs) { repEntry(o, id, pairs); return 0; }) == 0)
-                        emitted++;
+                    if (obj.stream.getEntry(id, (pairs) { repEntry(o, id, pairs); return 0; }) < 0)
+                    {
+                        repArrayHeader(o, 2); // gone from the stream: [id, nil]
+                        repStreamId(o, id);
+                        repNullArray(o);
+                    }
+                    emitted++;
                 }
             }
         }

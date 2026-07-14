@@ -15,7 +15,7 @@ import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, NClass;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode;
 import dreads.resp;
-import dreads.stream : FieldPair, StreamID;
+import dreads.stream : FieldPair, Stream, StreamID;
 import dreads.det : detNow = now;
 import emplace.vector : Vector;
 import dreads.aof : dumpKey;
@@ -3393,18 +3393,48 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // --- streams ---
     case "XADD":
         {
-            if (args.length < 4 || (args.length - 2) % 2 != 0)
+            // XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] thr [LIMIT n]] <id|*> f v ...
+            if (args.length < 4)
             {
                 arityErr(o, "xadd");
                 break;
             }
-            bool autoId = args[1].str == "*";
+            bool nomkstream = false;
+            TrimSpec trim;
+            size_t p = 1; // walks past leading options to the id token
+            bool optErr = false;
+            while (p < args.length)
+            {
+                auto tok = args[p].str;
+                if (eqICKeyword(tok, "NOMKSTREAM"))
+                    nomkstream = true, p++;
+                else if (eqICKeyword(tok, "MAXLEN") || eqICKeyword(tok, "MINID"))
+                {
+                    if (auto e = parseTrimSpec(args, p, trim))
+                    {
+                        repError(o, e);
+                        optErr = true;
+                        break;
+                    }
+                }
+                else
+                    break; // args[p] is the id
+            }
+            if (optErr)
+                break;
+            // remaining must be: id + >=1 balanced field/value pair
+            if (p >= args.length || (args.length - p) < 3 || (args.length - p - 1) % 2 != 0)
+            {
+                arityErr(o, "xadd");
+                break;
+            }
+            auto idarg = args[p].str;
+            bool autoId = idarg == "*";
             bool autoSeq = false; // the `ms-*` form: explicit ms, auto sequence
             ulong seqMs;
             StreamID id;
             if (!autoId)
             {
-                auto idarg = args[1].str;
                 if (idarg.length >= 2 && idarg[$ - 1] == '*' && idarg[$ - 2] == '-')
                 {
                     if (!parseUlong(idarg[0 .. $ - 2], seqMs))
@@ -3431,10 +3461,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 }
             }
             bool wrong;
-            auto obj = ks.getOrCreate(args[0].str, ObjType.stream, wrong);
+            // NOMKSTREAM: a missing key is left untouched (nil reply), not created
+            auto obj = nomkstream ? ks.lookupTyped(args[0].str, ObjType.stream, wrong)
+                : ks.getOrCreate(args[0].str, ObjType.stream, wrong);
             if (wrong)
             {
                 repWrongType(o);
+                break;
+            }
+            if (obj is null)
+            {
+                repNullBulk(o); // NOMKSTREAM and the key does not exist
                 break;
             }
             if (autoId)
@@ -3445,12 +3482,12 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         "ERR The ID specified in XADD is equal or smaller than the target stream top item");
                 break;
             }
-            auto np = (args.length - 2) / 2;
+            auto np = (args.length - p - 1) / 2;
             auto pairs = arena.allocArray!FieldPair(np);
-            foreach (i; 0 .. np)
+            foreach (j; 0 .. np)
             {
-                pairs[i].field = args[2 + i * 2].str;
-                pairs[i].value = args[3 + i * 2].str;
+                pairs[j].field = args[p + 1 + j * 2].str;
+                pairs[j].value = args[p + 2 + j * 2].str;
             }
             if (!obj.stream.add(id, pairs))
             {
@@ -3458,20 +3495,27 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         "ERR The ID specified in XADD is equal or smaller than the target stream top item");
                 break;
             }
+            applyTrim(obj.stream, trim); // optional MAXLEN/MINID after the add
             notifyKeyspaceEvent(NClass.stream, "xadd", args[0].str);
             repStreamId(o, id);
             if (autoId || autoSeq)
             {
-                // the log must carry the resolved ID, never "*" or "ms-*"
+                // the log must carry the resolved ID (never "*"/"ms-*"); keep the
+                // NOMKSTREAM / trim options verbatim (our trim is deterministic).
                 propagationOverride.clear();
                 repArrayHeader(propagationOverride, args.length + 1);
                 repBulk(propagationOverride, "XADD");
-                repBulk(propagationOverride, args[0].str);
-                char[48] b = void;
-                auto blen = snprintf(b.ptr, b.length, "%llu-%llu", id.ms, id.seq);
-                repBulk(propagationOverride, b[0 .. blen]);
-                foreach (ref a; args[2 .. $])
-                    repBulk(propagationOverride, a.str);
+                foreach (idx, ref a; args)
+                {
+                    if (idx == p)
+                    {
+                        char[48] b = void;
+                        auto blen = snprintf(b.ptr, b.length, "%llu-%llu", id.ms, id.seq);
+                        repBulk(propagationOverride, b[0 .. blen]);
+                    }
+                    else
+                        repBulk(propagationOverride, a.str);
+                }
             }
             break;
         }
@@ -3644,22 +3688,23 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "XTRIM":
         {
-            // XTRIM key MAXLEN [~|=] n   (the ~ approximation flag is accepted, exact trim applied)
-            if (args.length < 3 || args.length > 4 || !eqICKeyword(args[1].str, "MAXLEN"))
+            // XTRIM key MAXLEN|MINID [~|=] threshold [LIMIT n]
+            if (args.length < 3 || !(eqICKeyword(args[1].str, "MAXLEN")
+                    || eqICKeyword(args[1].str, "MINID")))
             {
                 repError(o, "ERR syntax error");
                 break;
             }
-            auto nArg = args[$ - 1].str;
-            if (args.length == 4 && args[2].str != "~" && args[2].str != "=")
+            TrimSpec trim;
+            size_t p = 1;
+            if (auto e = parseTrimSpec(args, p, trim))
             {
-                repError(o, "ERR syntax error");
+                repError(o, e);
                 break;
             }
-            long maxlen;
-            if (!parseLong(nArg, maxlen) || maxlen < 0)
+            if (p != args.length) // trailing garbage after the trim clause
             {
-                repError(o, "ERR value is not an integer or out of range");
+                repError(o, "ERR syntax error");
                 break;
             }
             bool wrong;
@@ -3669,7 +3714,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            auto trimmed = obj is null ? 0 : cast(long) obj.stream.trimMaxLen(cast(size_t) maxlen);
+            auto trimmed = obj is null ? 0 : cast(long) applyTrim(obj.stream, trim);
             if (trimmed > 0)
                 notifyKeyspaceEvent(NClass.stream, "xtrim", args[0].str);
             repInt(o, trimmed);
@@ -5323,6 +5368,76 @@ private void setUnion(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @no
 // Stream helpers
 // ---------------------------------------------------------------------------
 
+enum TrimKind : ubyte
+{
+    none,
+    maxlen,
+    minid
+}
+
+/// A parsed `MAXLEN|MINID [~|=] threshold [LIMIT n]` trim clause, shared by XADD
+/// and XTRIM. `approx` (the ~ form) has no effect on our exact array trim beyond
+/// permitting LIMIT.
+struct TrimSpec
+{
+    TrimKind kind;
+    size_t maxlen; // for MAXLEN
+    StreamID minid; // for MINID
+    bool approx; // ~ vs =
+    size_t limit; // LIMIT n (0 = unlimited)
+}
+
+/// Parse a trim clause beginning at args[i] (which is MAXLEN or MINID), advancing
+/// i past the tokens consumed. Returns the exact client-facing error, or null.
+private string parseTrimSpec(const(RVal)[] args, ref size_t i, out TrimSpec ts) @nogc nothrow
+{
+    immutable isMaxlen = eqICKeyword(args[i].str, "MAXLEN");
+    ts.kind = isMaxlen ? TrimKind.maxlen : TrimKind.minid;
+    i++;
+    if (i < args.length && (args[i].str == "~" || args[i].str == "="))
+    {
+        ts.approx = args[i].str == "~";
+        i++;
+    }
+    if (i >= args.length)
+        return "ERR syntax error";
+    if (isMaxlen)
+    {
+        long ml;
+        if (!parseLong(args[i].str, ml) || ml < 0)
+            return "ERR value is not an integer or out of range";
+        ts.maxlen = cast(size_t) ml;
+    }
+    else if (!parseStreamId(args[i].str, 0, ts.minid))
+        return "ERR Invalid stream ID specified as stream command argument";
+    i++;
+    if (i + 1 < args.length && eqICKeyword(args[i].str, "LIMIT"))
+    {
+        if (!ts.approx)
+            return "ERR syntax error, LIMIT cannot be used without the special ~ option";
+        long lim;
+        if (!parseLong(args[i + 1].str, lim) || lim < 0)
+            return "ERR value is not an integer or out of range";
+        ts.limit = cast(size_t) lim;
+        i += 2;
+    }
+    return null;
+}
+
+/// Apply a parsed trim clause to a stream; returns the number of entries dropped.
+private size_t applyTrim(ref Stream st, const ref TrimSpec ts) @nogc nothrow
+{
+    final switch (ts.kind)
+    {
+    case TrimKind.none:
+        return 0;
+    case TrimKind.maxlen:
+        return st.trimMaxLen(ts.maxlen, ts.limit);
+    case TrimKind.minid:
+        return st.trimMinId(ts.minid, ts.limit);
+    }
+}
+
 /// "ms" or "ms-seq"; a bare "ms" gets seqDefault.
 private bool parseStreamId(scope const(char)[] s, ulong seqDefault, out StreamID id) @nogc nothrow
 {
@@ -5358,15 +5473,26 @@ private bool parseRangeId(scope const(char)[] s, bool isStart, out StreamID id) 
 {
     if (s.length > 0 && s[0] == '(')
     {
+        auto inner = s[1 .. $];
+        if (inner == "-" || inner == "+") // the specials can't be made exclusive
+            return false;
         StreamID base;
-        if (!parseRangeId(s[1 .. $], isStart, base))
+        if (!parseStreamId(inner, isStart ? 0 : ulong.max, base))
             return false;
         if (isStart) // smallest id strictly greater than base
+        {
+            if (base == StreamID(ulong.max, ulong.max))
+                return false; // nothing above the maximum id
             id = base.seq != ulong.max ? StreamID(base.ms, base.seq + 1)
-                : base.ms != ulong.max ? StreamID(base.ms + 1, 0) : StreamID(ulong.max, ulong.max);
+                : StreamID(base.ms + 1, 0);
+        }
         else // largest id strictly less than base
+        {
+            if (base == StreamID(0, 0))
+                return false; // nothing below 0-0
             id = base.seq != 0 ? StreamID(base.ms, base.seq - 1)
-                : base.ms != 0 ? StreamID(base.ms - 1, ulong.max) : StreamID(0, 0);
+                : StreamID(base.ms - 1, ulong.max);
+        }
         return true;
     }
     if (s == "-")

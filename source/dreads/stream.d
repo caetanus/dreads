@@ -306,14 +306,36 @@ public struct Stream
         return true;
     }
 
-    /// XTRIM MAXLEN: keeps only the newest maxlen entries; returns dropped count.
-    size_t trimMaxLen(size_t maxlen) @nogc nothrow
+    /// XTRIM MAXLEN: keeps only the newest maxlen entries. `limit` (0 = unlimited)
+    /// caps how many are dropped in one call (the ~ ... LIMIT form). Returns the
+    /// dropped count.
+    size_t trimMaxLen(size_t maxlen, size_t limit = 0) @nogc nothrow
     {
-        import core.stdc.string : memmove;
-
         if (len <= maxlen)
             return 0;
         auto drop = len - maxlen;
+        if (limit && drop > limit)
+            drop = limit;
+        return dropOldest(drop);
+    }
+
+    /// XTRIM MINID: drops entries with id < minid (oldest first). `limit`
+    /// (0 = unlimited) caps how many are dropped. Returns the dropped count.
+    size_t trimMinId(StreamID minid, size_t limit = 0) @nogc nothrow
+    {
+        auto drop = lowerBound(minid); // entries with id strictly below minid
+        if (limit && drop > limit)
+            drop = limit;
+        return dropOldest(drop);
+    }
+
+    /// Drop the `drop` oldest entries, compacting the array. Shared by the trims.
+    private size_t dropOldest(size_t drop) @nogc nothrow
+    {
+        import core.stdc.string : memmove;
+
+        if (drop == 0)
+            return 0;
         foreach (i; 0 .. drop)
             freeEntry(i);
         if (drop < len)
