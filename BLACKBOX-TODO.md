@@ -45,7 +45,7 @@ leakage).
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
-| unit/pause | 15 | 6 | completes (no abort); remaining = passive-expire-skip-during-pause (randomkey-loop + expires-skip), CLIENT UNBLOCK vs pause, may-replicate msg suffix, 1 timing |
+| unit/pause | 16 | 8 | completes (no abort); remaining = passive-expire-skip-during-pause (randomkey-loop + expires-skip), CLIENT UNBLOCK vs pause, 1 timing |
 | unit/dump | 14 | 2 | OBJECT FREQ/LFU + RESTORE opts + rdb-version-check landed; remaining = MIGRATE, stream DUMP |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
@@ -57,7 +57,7 @@ leakage).
 | **unit/hashexpire** | **226** | **26** | completes (HSETEX + edges); COPY-TTL / RDB-load / HINCRBY-on-expired follow-ups |
 | unit/dump | 5 | 2 | aborts: OBJECT FREQ (LFU freq tracking) |
 | unit/hyperloglog | 6 | 2 | aborts: PFDEBUG |
-| unit/scripting | 535 | 11 | aborts: OOM/maxmemory eviction |
+| unit/scripting | 548 | 0 | **PASSES** (errorstats/commandstats + Valkey error format + acl_check_cmd) |
 
 Landed 2026-07-14 (this session): HEXPIRE family + HSETEX + HGETEX; DUMP/RESTORE
 (external AOF-command<->RDB translator, both phases, bidirectional Valkey 9.1
