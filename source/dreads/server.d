@@ -4055,6 +4055,7 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
     static ByteBuffer attempt; // TLS
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
+    bool firstPass = true;
     for (;;)
     {
         attempt.clear();
@@ -4071,11 +4072,16 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
         dispatch(cmd2, *c.dbp, attempt, arena);
         auto rep = cast(const(char)[]) attempt.data;
         auto nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
-        if (rep != nil)
+        // A WRONGTYPE that appears only AFTER blocking means the key changed type
+        // while we waited (XADD then DEL then LPUSH): keep waiting, don't wake with
+        // an error. On the first attempt a wrong-typed key is a real error.
+        immutable isWrongType = rep.length >= 10 && rep[1 .. 10] == "WRONGTYPE";
+        if (rep != nil && !(isWrongType && !firstPass))
         {
             o.append(attempt.data);
             return;
         }
+        firstPass = false;
         if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
         {
             o.append(nil);

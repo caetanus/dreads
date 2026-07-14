@@ -5658,15 +5658,25 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     auto half = rest.length / 2;
 
-    // resolve the exclusive start id per stream and count streams with data
-    bool startFor(size_t k, out StreamID start, out const(RObj)* obj) @nogc nothrow
+    // resolve the exclusive start id per stream and count streams with data.
+    // `lastOnly` (the `+` selector) asks for just the final entry.
+    bool startFor(size_t k, out StreamID start, out const(RObj)* obj, out bool lastOnly) @nogc nothrow
     {
+        lastOnly = false;
         bool wrong;
         obj = ks.lookupTyped(rest[k].str, ObjType.stream, wrong);
         if (wrong || obj is null)
             return false; // wrong type surfaces below; missing stream has no data
-        StreamID after;
         auto spec = rest[half + k].str;
+        if (spec == "+")
+        {
+            if (obj.stream.length == 0)
+                return false;
+            start = obj.stream.lastId; // inclusive: the last entry itself
+            lastOnly = true;
+            return true;
+        }
+        StreamID after;
         if (spec == "$")
             after = obj.stream.lastId;
         else if (!parseStreamId(spec, 0, after))
@@ -5682,7 +5692,7 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     {
         auto spec = rest[half + k].str;
         StreamID ignored;
-        if (spec != "$" && !parseStreamId(spec, 0, ignored))
+        if (spec != "$" && spec != "+" && !parseStreamId(spec, 0, ignored))
         {
             repError(o, "ERR Invalid stream ID specified as stream command argument");
             return;
@@ -5701,7 +5711,8 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     {
         StreamID start;
         const(RObj)* obj;
-        if (!startFor(k, start, obj))
+        bool lastOnly;
+        if (!startFor(k, start, obj, lastOnly))
             continue;
         size_t n = 0;
         obj.stream.walkRange(start, StreamID.maxId, 1, (id, pairs) { n++; return 0; });
@@ -5718,16 +5729,18 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     {
         StreamID start;
         const(RObj)* obj;
-        if (!startFor(k, start, obj))
+        bool lastOnly;
+        if (!startFor(k, start, obj, lastOnly))
             continue;
+        immutable effLimit = lastOnly ? 1 : limit; // `+` returns only the last entry
         size_t n = 0;
-        obj.stream.walkRange(start, StreamID.maxId, limit, (id, pairs) { n++; return 0; });
+        obj.stream.walkRange(start, StreamID.maxId, effLimit, (id, pairs) { n++; return 0; });
         if (n == 0)
             continue;
         repArrayHeader(o, 2);
         repBulk(o, rest[k].str);
         repArrayHeader(o, n);
-        obj.stream.walkRange(start, StreamID.maxId, limit, (id, pairs) {
+        obj.stream.walkRange(start, StreamID.maxId, effLimit, (id, pairs) {
             repEntry(o, id, pairs);
             return 0;
         });

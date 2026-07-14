@@ -1270,4 +1270,29 @@ version (unittest)
         ks.run("XRANGE", "v", "(1-0", "+").should.contain("2-0");
         ks.run("XRANGE", "v", "(1-0", "+").should.not.contain("1-0");
     }
+
+    // XREAD `+` (last-element selector) returns only the final entry, ignoring
+    // COUNT; and a blocked XREAD ignores a mid-wait type change on its key
+    // (server-layer, blackbox-only) — here we pin the `+` dispatch semantics.
+    @("blackbox.xread_last_element")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.run("XADD", "s", "1-0", "k1", "v1");
+        ks.run("XADD", "s", "2-0", "k2", "v2");
+        ks.run("XADD", "s", "3-0", "k3", "v3");
+        // `+` -> just the last entry
+        auto r = ks.run("XREAD", "STREAMS", "s", "+");
+        r.should.contain("3-0");
+        r.should.contain("k3");
+        r.should.not.contain("1-0");
+        r.should.not.contain("2-0");
+        // COUNT is ignored for `+` (still one entry)
+        ks.run("XREAD", "COUNT", "5", "STREAMS", "s", "+").should.contain("*1\r\n"); // one entry
+        // `+` on an empty stream -> nil
+        ks.run("XREAD", "STREAMS", "empty", "+").should.equal("*-1\r\n");
+    }
 }
