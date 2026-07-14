@@ -5653,7 +5653,7 @@ private void xread(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     if (rest.length == 0 || rest.length % 2 != 0)
     {
         repError(o,
-                "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.");
+                "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
         return;
     }
     auto half = rest.length / 2;
@@ -6808,7 +6808,7 @@ unittest // streams: XREAD
     // COUNT limits per stream
     assert(run(ks, "XREAD", "COUNT", "1", "STREAMS", "s1", "0")[0 .. 4] == "*1\r\n");
     assert(run(ks, "XREAD", "STREAMS", "s1") ==
-            "-ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.\r\n");
+            "-ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.\r\n");
     assert(run(ks, "XREAD", "s1", "0") == "-ERR syntax error\r\n");
 }
 

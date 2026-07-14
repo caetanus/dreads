@@ -683,7 +683,7 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
     if (rest.length == 0 || rest.length % 2 != 0)
     {
         repError(o,
-                "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID or '>' must be specified.");
+                "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.");
         return;
     }
     auto half = rest.length / 2;
@@ -1022,7 +1022,9 @@ public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
     {
         if (eqICKeyword(args[i].str, "COUNT") && i + 1 < args.length)
         {
-            if (!parseLong(args[i + 1].str, count) || count < 1)
+            // Redis scans up to count*10 pending entries, so a count near LONG_MAX
+            // would overflow — reject it (test: "out of range count").
+            if (!parseLong(args[i + 1].str, count) || count < 1 || count > long.max / 10)
             {
                 repError(o, "ERR COUNT must be > 0");
                 return;
@@ -1055,25 +1057,30 @@ public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
     }
     auto now = nowMs();
     auto consumer = g.ensureConsumer(args[2].str);
-    // collect claimable ids (arena copies: pelSet mutates the list)
+    // scan the PEL from `start`, examining up to `count` entries. Live ones are
+    // claimed; ones deleted from the stream go to the deleted-ids list and are
+    // evicted from the PEL. (arena copies: pelSet/pelRemove mutate the list.)
     auto claimable = arena.allocArray!StreamID(g.pending.length);
-    size_t n = 0;
+    auto deleted = arena.allocArray!StreamID(g.pending.length);
+    size_t n = 0, nd = 0, attempts = 0;
     StreamID nextCursor = StreamID(0, 0);
     foreach (ref pe; g.pending)
     {
         if (pe.id < start)
             continue;
-        if (n == cast(size_t) count)
+        if (attempts >= cast(size_t) count)
         {
-            nextCursor = pe.id;
+            nextCursor = pe.id; // more to scan next round
             break;
         }
         auto idle = now > pe.deliveryTimeMs ? now - pe.deliveryTimeMs : 0;
         if (idle < cast(ulong) minIdle)
             continue;
+        attempts++;
         if (obj.stream.getEntry(pe.id, (pairs) => 0) < 0)
-            continue; // deleted entries are skipped
-        claimable[n++] = pe.id;
+            deleted[nd++] = pe.id; // gone from the stream
+        else
+            claimable[n++] = pe.id;
     }
     repArrayHeader(o, 3);
     repStreamId(o, nextCursor);
@@ -1088,7 +1095,12 @@ public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         else
             obj.stream.getEntry(id, (pairs) { repEntry(o, id, pairs); return 0; });
     }
-    repArrayHeader(o, 0); // deleted-and-acked ids: we skip instead
+    repArrayHeader(o, nd); // ids that were deleted from the stream
+    foreach (id; deleted[0 .. nd])
+    {
+        repStreamId(o, id);
+        g.pelRemove(id); // evict the tombstone from the PEL
+    }
 }
 
 /// XCLAIM key group consumer min-idle-time id [id ...] [JUSTID]
@@ -1156,7 +1168,10 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         if (idle < cast(ulong) minIdle)
             continue;
         if (obj.stream.getEntry(id, (pairs) => 0) < 0)
+        {
+            g.pelRemove(id); // deleted from the stream: evict from the PEL, don't claim
             continue;
+        }
         auto dc = g.pending[pi].deliveryCount + (justId ? 0 : 1);
         g.pelSet(id, consumer, now, dc);
         if (justId)
