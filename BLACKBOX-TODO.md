@@ -157,8 +157,9 @@ appendonly override the external harness can't apply. No SET/GET hot-path change
 
 ### Hash-field TTL (HEXPIRE family) — DONE (2026-07-14)
 Implemented HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT, HPERSIST, HTTL/HPTTL/
-HEXPIRETIME/HPEXPIRETIME, HGETEX — semantics mirrored from Valkey `t_hash.c`
-(codes -2/-1/0/1/2; NX/XX/GT/LT; HSET drops a field's TTL). Storage is a
+HEXPIRETIME/HPEXPIRETIME, HGETEX — behavior derived from the blackbox tests +
+command docs (the client contract: reply codes -2/-1/0/1/2, the NX/XX/GT/LT
+condition flags, HSET dropping a field's TTL), NOT from Valkey source. Storage is a
 lazily-allocated per-hash side-map `SmallHash.fieldTTL` (field→absMs, own field
 names, survives listpack↔hashtable spill); a small hash with any field TTL reports
 `listpackex`. Expiry mirrors key TTL exactly: **lazy** reap in `Keyspace.lookup`
