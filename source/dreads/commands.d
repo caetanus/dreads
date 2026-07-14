@@ -6328,6 +6328,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "SET", "SETNX", "GETSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY", "MSET":
     case "SETEX", "PSETEX", "GETDEL", "DELIFEQ", "SETRANGE", "INCRBYFLOAT", "MSETNX", "MSETEX":
     case "DEL", "UNLINK", "FLUSHALL", "FLUSHDB", "RENAME", "RENAMENX", "COPY", "RESTORE":
+    case "SWAPDB", "MOVE":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
@@ -6337,7 +6338,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":
     case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
-    case "XADD", "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM":
+    case "XADD", "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM", "XAUTOCLAIM":
     case "GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER":
     case "SETBIT", "BITOP", "BITFIELD":
     case "LMPOP", "SORT", "PFADD", "PFMERGE":
@@ -6358,14 +6359,14 @@ public bool isDenyOomCommand(scope const(char)[] uname) @nogc nothrow
     switch (uname)
     {
     case "DEL", "UNLINK", "GETDEL", "DELIFEQ", "FLUSHALL", "FLUSHDB":
-    case "RENAME", "RENAMENX":
+    case "RENAME", "RENAMENX", "SWAPDB", "MOVE":
     case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
     case "LPOP", "RPOP", "LREM", "LTRIM", "LMPOP":
     case "HDEL", "HGETDEL", "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT", "HPERSIST":
     case "SREM", "SPOP", "SMOVE":
     case "ZREM", "ZPOPMIN", "ZPOPMAX", "ZMPOP",
         "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX":
-    case "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM":
+    case "XDEL", "XTRIM", "XSETID", "XGROUP", "XREADGROUP", "XACK", "XCLAIM", "XAUTOCLAIM":
         return false; // frees / neutral — allowed under OOM
     default:
         return true; // allocating write — denied under OOM
