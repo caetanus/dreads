@@ -3892,16 +3892,21 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
                 return true;
             }
         }
+        // A CLIENT PAUSE holds blocked clients in place — unblocking one would let
+        // it proceed past the barrier, so CLIENT UNBLOCK is a no-op (returns 0)
+        // while a window is open; it works again after UNPAUSE.
+        immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
         long unblocked = 0;
-        for (auto p = gConnHead; p !is null; p = p.regNext)
-            if (p.id == cast(ulong) id && p !is &c && p.blocked)
-            {
-                p.unblockReq = mode;
-                if (p.blockEvtInit)
-                    p.blockEvt.emit(); // wake it; the block loop honours unblockReq
-                unblocked = 1;
-                break;
-            }
+        if (!paused)
+            for (auto p = gConnHead; p !is null; p = p.regNext)
+                if (p.id == cast(ulong) id && p !is &c && p.blocked)
+                {
+                    p.unblockReq = mode;
+                    if (p.blockEvtInit)
+                        p.blockEvt.emit(); // wake it; the block loop honours unblockReq
+                    unblocked = 1;
+                    break;
+                }
         repInt(o, unblocked);
         return true;
     }
