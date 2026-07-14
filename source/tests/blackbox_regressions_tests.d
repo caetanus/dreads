@@ -766,6 +766,43 @@ version (unittest)
             .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\n7\r\n");
     }
 
+    @("blackbox.hsetex_flags")
+    unittest
+    {
+        // HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|KEEPTTL] FIELDS n field value...
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        enum ulong T0 = 1_000_000_000;
+
+        // set value + TTL atomically
+        ks.runAt(T0, "HSETEX", "h", "EX", "100", "FIELDS", "2", "f1", "v1", "f2", "v2")
+            .expect.to.equal(":1\r\n");
+        ks.runAt(T0, "HGET", "h", "f1").expect.to.equal("$2\r\nv1\r\n");
+        ks.runAt(T0, "HTTL", "h", "FIELDS", "1", "f1").expect.to.equal("*1\r\n:100\r\n");
+
+        // FNX fails when any field exists; FXX succeeds when all exist
+        ks.runAt(T0, "HSETEX", "h", "FNX", "EX", "50", "FIELDS", "1", "f1", "x")
+            .expect.to.equal(":0\r\n");
+        ks.runAt(T0, "HSETEX", "h", "FXX", "EX", "50", "FIELDS", "1", "f1", "vNEW")
+            .expect.to.equal(":1\r\n");
+        ks.runAt(T0, "HGET", "h", "f1").expect.to.equal("$4\r\nvNEW\r\n");
+
+        // KEEPTTL changes the value but keeps the field's TTL
+        ks.runAt(T0, "HSETEX", "h", "KEEPTTL", "FIELDS", "1", "f1", "vKeep")
+            .expect.to.equal(":1\r\n");
+        ks.runAt(T0, "HTTL", "h", "FIELDS", "1", "f1").expect.to.equal("*1\r\n:50\r\n");
+
+        // no TTL flag => field becomes persistent (clears any TTL)
+        ks.runAt(T0, "HSETEX", "h", "FIELDS", "1", "f2", "vP").expect.to.equal(":1\r\n");
+        ks.runAt(T0, "HTTL", "h", "FIELDS", "1", "f2").expect.to.equal("*1\r\n:-1\r\n");
+    }
+
     @("blackbox.import_mode_pauses_expiry")
     unittest
     {

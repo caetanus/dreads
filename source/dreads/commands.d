@@ -1866,6 +1866,193 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
+    case "HSETEX":
+        {
+            // HSETEX key [FNX|FXX] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL] FIELDS n field value...
+            if (args.length < 5)
+            {
+                arityErr(o, "hsetex");
+                break;
+            }
+            bool fNX, fXX, keepTTL, badOpt;
+            int ttlKind = 0; // 0=none 1=EX 2=PX 3=EXAT 4=PXAT
+            long ttlVal;
+            size_t fi = 1;
+            for (; fi < args.length; fi++)
+            {
+                auto a = args[fi].str;
+                if (eqICKeyword(a, "FIELDS"))
+                    break;
+                else if (eqICKeyword(a, "FNX"))
+                    fNX = true;
+                else if (eqICKeyword(a, "FXX"))
+                    fXX = true;
+                else if (eqICKeyword(a, "KEEPTTL"))
+                    keepTTL = true;
+                else if (eqICKeyword(a, "EX") || eqICKeyword(a, "PX")
+                    || eqICKeyword(a, "EXAT") || eqICKeyword(a, "PXAT"))
+                {
+                    if (fi + 1 >= args.length || !parseLong(args[fi + 1].str, ttlVal))
+                    {
+                        repError(o, "ERR value is not an integer or out of range");
+                        badOpt = true;
+                        break;
+                    }
+                    ttlKind = eqICKeyword(a, "EX") ? 1 : eqICKeyword(a, "PX") ? 2
+                        : eqICKeyword(a, "EXAT") ? 3 : 4;
+                    fi++;
+                }
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    badOpt = true;
+                    break;
+                }
+            }
+            if (badOpt)
+                break;
+            if (fi >= args.length || !eqICKeyword(args[fi].str, "FIELDS"))
+            {
+                repError(o,
+                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                break;
+            }
+            if (fNX && fXX)
+            {
+                repError(o, "ERR FNX and FXX options at the same time are not compatible");
+                break;
+            }
+            if (keepTTL && ttlKind)
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            long nf;
+            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            auto pairs = args[fi + 2 .. $];
+            if (nf <= 0 || cast(size_t)(nf * 2) != pairs.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            immutable now = detNow();
+            ulong absMs = 0;
+            bool pastTime = false;
+            if (ttlKind)
+            {
+                immutable isSec = ttlKind == 1 || ttlKind == 3;
+                immutable isRel = ttlKind == 1 || ttlKind == 2;
+                long resolved;
+                if (!resolveExpireMs(ttlVal, isSec, isRel, resolved))
+                {
+                    o.append("-ERR invalid expire time in 'hsetex' command\r\n");
+                    break;
+                }
+                pastTime = resolved <= cast(long) now;
+                absMs = resolved <= 0 ? 1 : cast(ulong) resolved;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            // FNX (no field may exist) / FXX (all fields must exist) — all-or-nothing
+            if (fNX || fXX)
+            {
+                bool condFail = false;
+                for (size_t i = 0; i < pairs.length; i += 2)
+                {
+                    immutable exists = obj !is null && obj.hash.get(pairs[i].str) !is null;
+                    if ((fNX && exists) || (fXX && !exists))
+                    {
+                        condFail = true;
+                        break;
+                    }
+                }
+                if (condFail)
+                {
+                    repInt(o, 0);
+                    break;
+                }
+            }
+            if (obj is null)
+            {
+                bool w2;
+                obj = ks.getOrCreate(args[0].str, ObjType.hash, w2);
+            }
+            // apply value + TTL to each field
+            for (size_t i = 0; i < pairs.length; i += 2)
+            {
+                auto f = pairs[i].str;
+                immutable ulong saved = keepTTL ? obj.hash.getFieldTTL(f) : 0;
+                obj.hash.set(f, StrVal.of(pairs[i + 1].str)); // set() clears any field TTL
+                if (keepTTL)
+                {
+                    if (saved != 0)
+                        obj.hash.setFieldTTL(f, saved);
+                }
+                else if (ttlKind)
+                {
+                    if (pastTime)
+                        obj.hash.del(f); // past deadline: field set then immediately expired
+                    else
+                        obj.hash.setFieldTTL(f, absMs);
+                }
+            }
+            notifyKeyspaceEvent(NClass.hash, "hset", args[0].str);
+            // propagate deterministically: HSET values + HPEXPIREAT per TTL'd field
+            propagationOverride.clear();
+            if (pastTime)
+            {
+                // fields were set then deleted — net effect is deletion
+                notifyKeyspaceEvent(NClass.hash, "hexpired", args[0].str);
+                repArrayHeader(propagationOverride, 2 + pairs.length / 2);
+                repBulk(propagationOverride, "HDEL");
+                repBulk(propagationOverride, args[0].str);
+                for (size_t i = 0; i < pairs.length; i += 2)
+                    repBulk(propagationOverride, pairs[i].str);
+            }
+            else
+            {
+                repArrayHeader(propagationOverride, 2 + pairs.length);
+                repBulk(propagationOverride, "HSET");
+                repBulk(propagationOverride, args[0].str);
+                for (size_t i = 0; i < pairs.length; i += 2)
+                {
+                    repBulk(propagationOverride, pairs[i].str);
+                    repBulk(propagationOverride, pairs[i + 1].str);
+                }
+                for (size_t i = 0; i < pairs.length; i += 2)
+                {
+                    immutable ttl = obj.hash.getFieldTTL(pairs[i].str);
+                    if (ttl == 0)
+                        continue;
+                    repArrayHeader(propagationOverride, 6);
+                    repBulk(propagationOverride, "HPEXPIREAT");
+                    repBulk(propagationOverride, args[0].str);
+                    char[24] tb = void;
+                    repBulk(propagationOverride, tb[0 .. snprintf(tb.ptr, tb.length, "%llu", ttl)]);
+                    repBulk(propagationOverride, "FIELDS");
+                    repBulk(propagationOverride, "1");
+                    repBulk(propagationOverride, pairs[i].str);
+                }
+                if (ttlKind || keepTTL)
+                    notifyKeyspaceEvent(NClass.hash, "hexpire", args[0].str);
+            }
+            if (obj.hash.length == 0)
+                ks.delIfEmpty(args[0].str, obj);
+            else
+                ks.retimeSubExpire(args[0].str, ObjType.hash, obj.hash.minFieldTTL());
+            repInt(o, 1);
+            break;
+        }
     case "HLEN":
         {
             if (args.length != 1)
@@ -5705,7 +5892,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
     case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT", "HGETDEL":
-    case "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT", "HPERSIST":
+    case "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT", "HPERSIST", "HSETEX":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":
