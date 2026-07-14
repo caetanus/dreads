@@ -37,7 +37,8 @@ import dreads.commands : dispatch, globMatch, isWriteCommand, propagationOverrid
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
-import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType;
+import dreads.stream : nowMs;
+import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
 import dreads.dict : Dict;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
@@ -103,6 +104,21 @@ public void resetCmdStats() @nogc nothrow
 }
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
+
+// CLIENT PAUSE barrier: while `gPauseUntilMs` is in the future, commands that match
+// the mode (ALL, or WRITE-only) are NOT executed — each connection's fiber buffers
+// their raw bytes in `Conn.pausedBuf` (barriered) and REPLAYS them once the window
+// lifts (timeout or CLIENT UNPAUSE). Transient connection state: never AOF-logged,
+// never replicated (raft handles failover; this is for online migration windows).
+// gPauseUntilMs / gPauseAll / gPauseIssuer live in dreads.obj (so INFO can read
+// them without a module cycle); imported publicly here for the rest of server.d.
+public import dreads.obj : gPauseUntilMs, gPauseAll, gPauseIssuer;
+private __gshared LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE / timeout
+// Backstop re-check interval for a quiet barriered fiber: CLIENT UNPAUSE wakes it
+// via gPauseEvt at once, but this caps the wait so a client that resumes flooding
+// after going idle is drained into pausedBuf (and trips the overflow guard) within
+// this bound rather than sitting in the kernel until the window's own timeout.
+private enum ulong PAUSE_POLL_MS = 100;
 
 private extern (C) int flock(int fd, int operation) nothrow @nogc;
 private __gshared int gPortLockFd = -1;
@@ -189,6 +205,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
     }
     gKeyActivity = createManualEvent();
+    gPauseEvt = createManualEvent();
     {
         import dreads.notify : gNotifyPublish, parseNotifyFlags;
 
@@ -318,6 +335,11 @@ private struct Conn
     AclUser* user;
     bool authed;
     bool importSource; // CLIENT IMPORT-SOURCE ON: a migration/sync feeder (flags=I)
+    // CLIENT PAUSE: raw bytes of commands barriered during a pause window, replayed
+    // in order once it lifts. Owned by this fiber, so a disconnect frees it cleanly.
+    ByteBuffer pausedBuf;
+    ByteBuffer pauseReplayBuf; // scratch: the batch being re-injected on unbarrier
+    bool pauseBlocked; // parked on the pause barrier => counted in gBlockedClients
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     size_t multiCount;
@@ -806,6 +828,8 @@ private void serveClient(TCPConnection tcp) nothrow
         c.shardSub.free();
         unregisterMonitor(&c);
         unregisterConn(&c);
+        if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
+            gBlockedClients--;
         waitPurgeConn(&c); // drop any lingering block-waiter entries (no dangling &c)
         import dreads.mem : freeSlice;
 
@@ -816,64 +840,162 @@ private void serveClient(TCPConnection tcp) nothrow
         tcp.tcpNoDelay = true; // small RESP replies must not wait on Nagle
         c.wlock = new TaskMutex;
         bool keep = true;
-        while (keep && tcp.connected)
-        {
-            if (!tcp.waitForData())
-                break;
-            auto space = inb.freeSpace(READ_CHUNK);
-            auto n = tcp.read(space, IOMode.once);
-            if (n == 0)
-                break;
-            inb.grow(n);
 
-            size_t pos = 0;
-            while (keep)
+        // Write the accumulated reply buffer (shares the one ordered path with
+        // pub/sub messages so a subscribe confirmation never trails a later message).
+        void flushOut()
+        {
+            if (outb.empty)
+                return;
+            if (c.subMode)
+            {
+                auto m = rcFromBytes(outb.data);
+                if (c.oq.push(m))
+                    c.oqEvt.emit();
+                rcRelease(m);
+            }
+            else
+            {
+                c.wlock.lock();
+                scope (exit)
+                    c.wlock.unlock();
+                tcp.write(outb.data);
+            }
+            outb.clear();
+        }
+
+        // Drop this connection's pause-park accounting (see gBlockedClients).
+        void pauseUnblock()
+        {
+            if (c.pauseBlocked)
+            {
+                c.pauseBlocked = false;
+                gBlockedClients--;
+            }
+        }
+
+        // Replay commands barriered during a CLIENT PAUSE by re-injecting them into
+        // the NORMAL command pipeline (handleCommand's own gate). We do NOT clear the
+        // pause here: each held command is re-evaluated by the gate, so if a pause is
+        // still in force — a *stacked* one, or the window simply not expired yet — it
+        // is re-buffered for the next round; only genuinely-lifted commands execute.
+        // Stacked pauses thus reorganize themselves with no manual end-time juggling.
+        // Snapshot-then-clear so the re-buffering (which appends to pausedBuf) can't
+        // race the cursor walking it.
+        void replayPaused()
+        {
+            pauseUnblock();
+            // per-connection scratch (handleCommand may yield to other fibers mid-
+            // replay, so this must not be shared TLS)
+            c.pauseReplayBuf.clear();
+            c.pauseReplayBuf.append(c.pausedBuf.data);
+            c.pausedBuf.clear();
+            auto buf = c.pauseReplayBuf.data;
+            size_t p = 0;
+            while (keep && p < buf.length)
             {
                 RVal cmd;
-                size_t cmdStart = pos;
-                auto st = parseValue(inb.data, pos, arena, cmd);
-                if (st == ParseStatus.incomplete)
+                immutable start = p;
+                if (parseValue(buf, p, arena, cmd) != ParseStatus.ok)
                     break;
-                if (st == ParseStatus.protocolError)
-                {
-                    repError(outb, "ERR Protocol error");
-                    keep = false;
-                    break;
-                }
                 if (cmd.type == RType.Array && cmd.arr.length == 0)
-                    continue; // blank inline line — Redis ignores it silently
-                gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
-                keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                    continue;
+                gRespProto = c.resp3 ? 3 : 2;
+                keep = handleCommand(c, cmd, buf[start .. p], outb, arena);
                 if (gNotifyFlags)
-                    flushPendingNotify(); // publish keyspace events the command queued
+                    flushPendingNotify();
                 arena.reset();
             }
-            inb.consume(pos);
-            // Reap the chunk's trailing run of pipelined writes (their replies
-            // come last, in order) before flushing the batch to the client.
             if (c.pendingCount > 0)
                 flushPending(c, outb);
             gAof.flush();
+            flushOut();
+        }
 
-            if (!outb.empty)
+        while (keep && tcp.connected)
+        {
+            import core.time : msecs;
+            import vibe.core.net : WaitForDataStatus;
+
+            // No separate "park": the socket keeps draining even under a pause, so
+            // a flooding client hits the overflow guard in handleCommand (a bounded
+            // server-side buffer) instead of piling up in the kernel.
+            //
+            // Quiet-and-barriered special case: while THIS connection holds commands
+            // barriered by an active window and the socket is momentarily idle, wait
+            // on the pause event instead of the socket, so CLIENT UNPAUSE (which
+            // emits it) wakes us AT ONCE to replay — "unpause replays, then resumes".
+            // A short cap bounds the wait so a client that resumes flooding is drained
+            // into the server-side buffer (and trips the overflow guard) promptly, and
+            // so the window's own timeout still fires. On any wake we loop back: replay
+            // if the window has lifted, otherwise drain whatever just arrived.
+            if (gPauseUntilMs != 0 && c.pausedBuf.length && !tcp.dataAvailableForRead)
             {
-                if (c.subMode)
+                immutable now = nowMs();
+                if (now < gPauseUntilMs)
                 {
-                    // Share the one ordered output path with pub/sub messages so
-                    // a subscribe confirmation can never trail a later message.
-                    auto m = rcFromBytes(outb.data);
-                    if (c.oq.push(m))
-                        c.oqEvt.emit();
-                    rcRelease(m); // push retained; drop our creating reference
+                    if (!c.pauseBlocked) // count this parked client as blocked (once)
+                    {
+                        c.pauseBlocked = true;
+                        gBlockedClients++;
+                    }
+                    immutable rem = gPauseUntilMs - now;
+                    immutable cap = rem < PAUSE_POLL_MS ? rem : PAUSE_POLL_MS;
+                    immutable ec = gPauseEvt.emitCount;
+                    gPauseEvt.waitUninterruptible(msecs(cap), ec);
                 }
-                else
+                if (c.pausedBuf.length && (gPauseUntilMs == 0 || nowMs() >= gPauseUntilMs))
+                    replayPaused();
+                continue;
+            }
+
+            immutable ws = tcp.waitForDataEx();
+            if (ws == WaitForDataStatus.noMoreData)
+                break; // peer disconnected
+
+            // Unbarrier BEFORE handling anything freshly arrived: the held commands
+            // arrived earlier, so once the window has lifted (CLIENT UNPAUSE zeroed
+            // it) they must replay ahead of this chunk to preserve arrival order.
+            if (c.pausedBuf.length && (gPauseUntilMs == 0 || nowMs() >= gPauseUntilMs))
+                replayPaused();
+
+            if (ws == WaitForDataStatus.dataAvailable)
+            {
+                auto space = inb.freeSpace(READ_CHUNK);
+                auto n = tcp.read(space, IOMode.once);
+                if (n == 0)
+                    break;
+                inb.grow(n);
+
+                size_t pos = 0;
+                while (keep)
                 {
-                    c.wlock.lock();
-                    scope (exit)
-                        c.wlock.unlock();
-                    tcp.write(outb.data);
+                    RVal cmd;
+                    size_t cmdStart = pos;
+                    auto st = parseValue(inb.data, pos, arena, cmd);
+                    if (st == ParseStatus.incomplete)
+                        break;
+                    if (st == ParseStatus.protocolError)
+                    {
+                        repError(outb, "ERR Protocol error");
+                        keep = false;
+                        break;
+                    }
+                    if (cmd.type == RType.Array && cmd.arr.length == 0)
+                        continue; // blank inline line — Redis ignores it silently
+                    gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
+                    keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                    if (gNotifyFlags)
+                        flushPendingNotify(); // publish keyspace events the command queued
+                    arena.reset();
                 }
-                outb.clear();
+                inb.consume(pos);
+                // Reap the chunk's trailing run of pipelined writes (their replies
+                // come last, in order) before flushing the batch to the client.
+                if (c.pendingCount > 0)
+                    flushPending(c, outb);
+                gAof.flush();
+                flushOut();
             }
         }
     }
@@ -1208,6 +1330,22 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         foreach (i, ch; name)
             c.lastCmdBuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
         c.lastCmdLen = cast(ubyte) name.length;
+    }
+
+    // CLIENT PAUSE barrier — before ACL/dispatch/AOF. A matching command (ALL, or a
+    // write in WRITE mode) is buffered raw and replayed when the window lifts; CLIENT
+    // is exempt so UNPAUSE always lands. Never executed nor logged while barriered.
+    if (gPauseUntilMs != 0 && uname != "CLIENT" && c.id != gPauseIssuer)
+    {
+        if (nowMs() >= gPauseUntilMs)
+            gPauseUntilMs = 0; // window elapsed — run normally
+        else if (gPauseAll || isWriteCommand(uname))
+        {
+            c.pausedBuf.append(rawCmd);
+            if (c.pausedBuf.length > gConfig.clientQueryBufferLimit)
+                return false; // guard: a client flooding the barrier is disconnected
+            return true; // barriered
+        }
     }
 
     // ACL enforcement — a single `command ∈ cap_set` test, only while ACL is in
@@ -3703,6 +3841,52 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         }
         else
             repError(o, "ERR syntax error");
+    }
+    else if (eqICDebug(sub, "PAUSE") && (args.length == 2 || args.length == 3))
+    {
+        import dreads.stream : nowMs;
+
+        long ms;
+        if (!parseLong(args[1].str, ms) || ms < 0)
+            repError(o, "ERR timeout is not an integer or out of range");
+        else
+        {
+            bool all = true; // default ALL (matches Valkey)
+            bool badMode;
+            if (args.length == 3)
+            {
+                if (eqICDebug(args[2].str, "WRITE"))
+                    all = false;
+                else if (eqICDebug(args[2].str, "ALL"))
+                    all = true;
+                else
+                    badMode = true;
+            }
+            if (badMode)
+                repError(o, "ERR CLIENT PAUSE mode must be WRITE or ALL");
+            else
+            {
+                // Stacking (Valkey pauseClientsByClient): keep the HIGHER end-time
+                // and the MOST RESTRICTIVE action. A new WRITE pause can't downgrade
+                // an ALL pause still in force, and a shorter timeout can't cut a
+                // longer one — the two overlap as the strictest of both.
+                immutable now = nowMs();
+                immutable active = gPauseUntilMs > now;
+                immutable newEnd = now + cast(ulong) ms;
+                gPauseAll = all || (active && gPauseAll); // ALL wins while it lasts
+                if (!active || newEnd > gPauseUntilMs)
+                    gPauseUntilMs = newEnd; // never shorten a running window
+                gPauseIssuer = c.id; // the pauser's own connection is exempt
+                gPauseEvt.emit(); // re-arm any fiber parked on a prior window
+                repSimple(o, "OK");
+            }
+        }
+    }
+    else if (eqICDebug(sub, "UNPAUSE") && args.length == 1)
+    {
+        gPauseUntilMs = 0; // lift the barrier
+        gPauseEvt.emit(); // wake parked fibers to replay their held commands
+        repSimple(o, "OK");
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))

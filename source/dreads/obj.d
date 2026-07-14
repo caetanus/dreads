@@ -48,7 +48,17 @@ public __gshared ulong gExpiredFields;
 public __gshared bool gImportMode;
 
 /// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
+/// Also counts clients parked by a CLIENT PAUSE barrier (Valkey counts postponed
+/// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
 public __gshared long gBlockedClients;
+
+/// CLIENT PAUSE state (server layer owns the barrier/replay; kept here so INFO in
+/// the data plane can read it without a module cycle). `gPauseUntilMs` is the
+/// absolute deadline (0 = not paused); `gPauseAll` true = pause ALL, false = WRITE
+/// only. Stacking keeps the higher end-time and the most restrictive action.
+public __gshared ulong gPauseUntilMs;
+public __gshared bool gPauseAll = true;
+public __gshared ulong gPauseIssuer; // conn id that set the pause (exempt from it)
 
 /// The logical databases (Redis SELECT 0..15). The *current* db is per-client
 /// (`Conn.db`); the connection dispatches against `gDbs[conn.db]`, SELECT just

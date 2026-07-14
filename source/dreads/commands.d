@@ -2792,14 +2792,25 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
-            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys, gExpiredFields;
+            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys, gExpiredFields,
+                gPauseUntilMs, gPauseAll;
+            import dreads.stream : nowMs;
 
             static ByteBuffer ib; // TLS scratch: INFO payload
             ib.clear();
             char[192] b = void;
             ib.append("# Server\r\nredis_version:7.4.0\r\nserver_name:dreads\r\n");
-            auto n = snprintf(b.ptr, b.length, "# Clients\r\nblocked_clients:%lld\r\n",
-                    gBlockedClients);
+            // CLIENT PAUSE visibility: reason/actions/remaining-ms (Valkey INFO
+            // clients). paused_actions reflects the current (stacked) restriction.
+            immutable now = nowMs();
+            immutable paused = gPauseUntilMs > now;
+            immutable reason = paused ? "client_pause" : "none";
+            immutable actions = !paused ? "none" : (gPauseAll ? "all" : "write");
+            immutable long premain = paused ? cast(long)(gPauseUntilMs - now) : 0;
+            auto n = snprintf(b.ptr, b.length,
+                    "# Clients\r\nblocked_clients:%lld\r\npaused_reason:%s\r\n"
+                    ~ "paused_actions:%s\r\npaused_timeout_milliseconds:%lld\r\n",
+                    gBlockedClients, reason.ptr, actions.ptr, premain);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
                     "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
