@@ -2849,11 +2849,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             ib.append(b[0 .. n]);
             {
                 import dreads.stats : gTotalErrorReplies;
+                import dreads.server : migrateCachedCount;
 
                 n = snprintf(b.ptr, b.length,
                         "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n"
-                        ~ "evicted_keys:%llu\r\ntotal_error_replies:%llu\r\n",
-                        gExpiredKeys, gExpiredFields, gEvictedKeys, gTotalErrorReplies);
+                        ~ "evicted_keys:%llu\r\ntotal_error_replies:%llu\r\nmigrate_cached_sockets:%zu\r\n",
+                        gExpiredKeys, gExpiredFields, gEvictedKeys, gTotalErrorReplies,
+                        migrateCachedCount());
                 ib.append(b[0 .. n]);
             }
             {
@@ -5713,6 +5715,96 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
     case ObjType.stream:
         return "stream";
     }
+}
+
+/// Build the DUMP payload (RDB value + version + CRC64 footer) for `key` into
+/// `payload`. Returns false if the key is missing or its type can't be
+/// serialized. Shared by the DUMP command and MIGRATE (option 2: DUMP->RESTORE).
+public bool dumpKeyPayload(ref Keyspace ks, scope const(char)[] key, ref Arena arena,
+    ref ByteBuffer payload) @nogc nothrow
+{
+    auto obj = ks.lookup(key, false); // introspection: don't count as access
+    if (obj is null)
+        return false;
+    static ByteBuffer cmds; // TLS scratch: the value-only rebuild commands
+    cmds.clear();
+    dumpKey(cmds, key, obj, true);
+    payload.clear();
+    if (!commandsToRdb(cmds.data, arena, payload))
+        return false;
+    appendFooter(payload);
+    return true;
+}
+
+/// Parsed form of a MIGRATE command line. `err` is null on success, else the
+/// exact client-facing error string.
+public struct MigrateArgs
+{
+    const(char)[] host;
+    long port, destdb, timeout;
+    bool copy, replace, hasAuth;
+    const(char)[] authUser, authPw;
+    const(char)[] singleKey; // single-key form (empty when KEYS is used)
+    const(RVal)[] keyList; // multi-key form (empty when single-key)
+    string err;
+}
+
+/// Parse `MIGRATE host port key destdb timeout [COPY] [REPLACE]
+/// [AUTH pw | AUTH2 user pw] [KEYS k...]`. Pure: no I/O, no keyspace access —
+/// the DUMP/RESTORE round-trip is the server layer's job. Returns false with
+/// `.err` set to the exact client-facing error on any malformed input.
+public bool parseMigrateArgs(const(RVal)[] arr, out MigrateArgs m) @nogc nothrow
+{
+    if (arr.length < 6)
+    {
+        m.err = "ERR wrong number of arguments for 'migrate' command";
+        return false;
+    }
+    m.host = arr[1].str;
+    if (!parseLong(arr[2].str, m.port) || !parseLong(arr[4].str, m.destdb)
+        || !parseLong(arr[5].str, m.timeout))
+    {
+        m.err = "ERR value is not an integer or out of range";
+        return false;
+    }
+    for (size_t i = 6; i < arr.length;)
+    {
+        auto opt = arr[i].str;
+        if (eqICKeyword(opt, "COPY"))
+            m.copy = true, i++;
+        else if (eqICKeyword(opt, "REPLACE"))
+            m.replace = true, i++;
+        else if (eqICKeyword(opt, "AUTH") && i + 1 < arr.length)
+            m.hasAuth = true, m.authPw = arr[i + 1].str, i += 2;
+        else if (eqICKeyword(opt, "AUTH2") && i + 2 < arr.length)
+            m.hasAuth = true, m.authUser = arr[i + 1].str, m.authPw = arr[i + 2].str, i += 3;
+        else if (eqICKeyword(opt, "KEYS"))
+        {
+            m.keyList = arr[i + 1 .. $];
+            break;
+        }
+        else
+        {
+            m.err = "ERR syntax error";
+            return false;
+        }
+    }
+    m.singleKey = arr[3].str;
+    if (m.keyList.length == 0)
+    {
+        if (m.singleKey.length == 0)
+        {
+            m.err = "ERR wrong number of arguments for 'migrate' command";
+            return false;
+        }
+    }
+    else if (m.singleKey.length != 0)
+    {
+        m.err = "ERR When using MIGRATE KEYS option, the key argument"
+            ~ " must be set to the empty string";
+        return false;
+    }
+    return true;
 }
 
 /// An LFU maxmemory policy ("allkeys-lfu" / "volatile-lfu") tracks access

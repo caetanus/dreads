@@ -1027,4 +1027,86 @@ version (unittest)
         immutable reply = ks.run("OBJECT", "IDLETIME", "k"); // ":<idle>\r\n", idle ~ 1000
         reply.should.startWith(":");
     }
+
+    // MIGRATE argument parsing (option 2: DUMP here -> RESTORE onto the target
+    // over a cached socket). The socket round-trip is server-layer and validated
+    // live against Valkey (dump.tcl MIGRATE tests are external:skip); this pins
+    // the pure arg parser: host/port/destdb/timeout + COPY/REPLACE/AUTH/AUTH2/KEYS
+    // and the single-key vs KEYS-form validation.
+    @("blackbox.migrate_arg_parsing")
+    unittest
+    {
+        static RVal[] cmd(const(char)[][] parts...)
+        {
+            auto a = new RVal[parts.length];
+            foreach (i, p; parts)
+            {
+                a[i].type = RType.BulkString;
+                a[i].str = p;
+            }
+            return a;
+        }
+
+        MigrateArgs m;
+
+        // basic single-key form
+        parseMigrateArgs(cmd("MIGRATE", "127.0.0.1", "6380", "k", "0", "1000"), m)
+            .should.equal(true);
+        m.host.should.equal("127.0.0.1");
+        m.port.should.equal(6380);
+        m.destdb.should.equal(0);
+        m.timeout.should.equal(1000);
+        m.singleKey.should.equal("k");
+        m.copy.should.equal(false);
+        m.replace.should.equal(false);
+        m.hasAuth.should.equal(false);
+        m.keyList.length.should.equal(0);
+
+        // COPY + REPLACE flags
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "2", "5", "COPY", "REPLACE"), m)
+            .should.equal(true);
+        m.copy.should.equal(true);
+        m.replace.should.equal(true);
+        m.destdb.should.equal(2);
+
+        // AUTH pw / AUTH2 user pw
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "0", "5", "AUTH", "secret"), m)
+            .should.equal(true);
+        m.hasAuth.should.equal(true);
+        m.authUser.length.should.equal(0);
+        m.authPw.should.equal("secret");
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "0", "5", "AUTH2", "u", "p"), m)
+            .should.equal(true);
+        m.authUser.should.equal("u");
+        m.authPw.should.equal("p");
+
+        // KEYS form: key argument must be the empty string, all keys collected
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "", "0", "5", "KEYS", "a", "b", "c"), m)
+            .should.equal(true);
+        m.keyList.length.should.equal(3);
+        m.keyList[0].str.should.equal("a");
+        m.keyList[2].str.should.equal("c");
+        m.singleKey.length.should.equal(0);
+
+        // KEYS with a non-empty key argument is an error
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "notempty", "0", "5", "KEYS", "a"), m)
+            .should.equal(false);
+        m.err.should.startWith("ERR When using MIGRATE KEYS option");
+
+        // empty single key (no KEYS) -> wrong number of args
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "", "0", "5"), m).should.equal(false);
+        m.err.should.startWith("ERR wrong number of arguments");
+
+        // too few args
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "0"), m).should.equal(false);
+        m.err.should.startWith("ERR wrong number of arguments");
+
+        // non-integer port / destdb / timeout
+        parseMigrateArgs(cmd("MIGRATE", "h", "notaport", "k", "0", "5"), m).should.equal(false);
+        m.err.should.startWith("ERR value is not an integer");
+
+        // unknown option -> syntax error
+        parseMigrateArgs(cmd("MIGRATE", "h", "1", "k", "0", "5", "BOGUS"), m).should.equal(false);
+        m.err.should.equal("ERR syntax error");
+    }
 }

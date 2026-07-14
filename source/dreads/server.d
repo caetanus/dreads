@@ -18,7 +18,7 @@ import core.stdc.stdlib : malloc, cfree = free;
 import core.time : seconds;
 
 import vibe.core.core : runEventLoop, runTask, setTimer;
-import vibe.core.net : TCPConnection, listenTCP, TCPListenOptions;
+import vibe.core.net : TCPConnection, connectTCP, listenTCP, TCPListenOptions;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 import vibe.core.task : Task;
@@ -239,6 +239,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                     d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
                 }
             runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
+            releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
             flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
             gAof.fsyncNow();
         }, true);
@@ -2450,6 +2451,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             scriptCommand(args, o);
             return true;
         }
+    case "MIGRATE":
+        {
+            migrateCommand(c, cmd.arr, o);
+            return true;
+        }
     default:
         break;
     }
@@ -3194,6 +3200,309 @@ private void runEvictionCycle() nothrow
         if (usedMemory() <= gConfig.maxmemory)
             break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// MIGRATE — option 2: DUMP the key(s) here, RESTORE them onto the target over a
+// cached outbound socket, then DEL locally (unless COPY). The socket is cached
+// per host:port and released after idle (INFO migrate_cached_sockets), matching
+// Redis. This is server-layer (owns an outbound TCPConnection), not data-plane.
+// ---------------------------------------------------------------------------
+private struct MigrateSock
+{
+    TCPConnection conn;
+    char[128] hp = void; // "host:port" cache key (inline, no allocation)
+    size_t hplen;
+    ulong lastUsed; // nowMs of last use — for idle release
+    bool alive;
+}
+
+private __gshared MigrateSock[8] gMigrateCache;
+private enum ulong MIGRATE_IDLE_MS = 10_000; // release a cached socket after 10s idle
+
+public size_t migrateCachedCount() @nogc nothrow
+{
+    size_t n = 0;
+    foreach (ref m; gMigrateCache)
+        if (m.alive)
+            n++;
+    return n;
+}
+
+// Close cached sockets idle longer than MIGRATE_IDLE_MS (called from the 1s timer).
+private void releaseIdleMigrateConns() nothrow
+{
+    immutable now = nowMs();
+    foreach (ref m; gMigrateCache)
+        if (m.alive && now - m.lastUsed >= MIGRATE_IDLE_MS)
+        {
+            try
+                m.conn.close();
+            catch (Exception)
+            {
+            }
+            m.alive = false;
+            m.hplen = 0;
+        }
+}
+
+// Read one RESP simple-status/error line ("+OK", "-ERR ...") into `line`.
+private bool migrateReadLine(ref TCPConnection conn, ref char[512] line, out size_t n) nothrow
+{
+    import vibe.core.stream : IOMode;
+
+    n = 0;
+    try
+        while (n < line.length)
+        {
+            ubyte[1] ch;
+            if (conn.read(ch[], IOMode.all) != 1)
+                return false;
+            if (ch[0] == '\n')
+            {
+                if (n > 0 && line[n - 1] == '\r')
+                    n--; // strip CRLF
+                return true;
+            }
+            line[n++] = cast(char) ch[0];
+        }
+    catch (Exception)
+        return false;
+    return false;
+}
+
+// Send one command as a RESP array of bulk strings.
+private bool migrateSend(ref TCPConnection conn, scope const(const(char)[])[] parts) nothrow
+{
+    static ByteBuffer wb; // TLS
+    wb.clear();
+    repArrayHeader(wb, cast(uint) parts.length);
+    foreach (p; parts)
+        repBulk(wb, p);
+    try
+    {
+        conn.write(cast(const(ubyte)[]) wb.data);
+        return true;
+    }
+    catch (Exception)
+        return false;
+}
+
+private void migrateCommand(ref Conn c, const(RVal)[] arr, ref ByteBuffer o) nothrow
+{
+    import dreads.commands : dumpKeyPayload, MigrateArgs, parseMigrateArgs;
+    import dreads.mem : ByteBuffer, Arena;
+
+    // MIGRATE host port key destdb timeout [COPY] [REPLACE] [AUTH pw|AUTH2 u p] [KEYS k...]
+    MigrateArgs ma;
+    if (!parseMigrateArgs(arr, ma))
+    {
+        repError(o, ma.err);
+        return;
+    }
+    auto host = ma.host;
+    immutable port = ma.port, destdb = ma.destdb;
+    immutable copy = ma.copy, replace = ma.replace, hasAuth = ma.hasAuth;
+    auto authUser = ma.authUser, authPw = ma.authPw;
+    auto keyList = ma.keyList;
+    const(char)[] singleKey = ma.singleKey;
+
+    // collect the keys that actually exist locally (Redis skips missing ones)
+    static const(char)[][256] keybuf;
+    size_t nk = 0;
+    void consider(scope const(char)[] k) @nogc nothrow
+    {
+        if (nk < keybuf.length && c.dbp.lookup(k, false) !is null)
+            keybuf[nk++] = k;
+    }
+
+    if (keyList.length)
+        foreach (ref k; keyList)
+            consider(k.str);
+    else
+        consider(singleKey);
+
+    if (nk == 0)
+    {
+        repSimple(o, "NOKEY");
+        return;
+    }
+
+    // get / open the cached outbound socket for host:port
+    static ByteBuffer hpbuf; // TLS
+    hpbuf.clear();
+    hpbuf.append(host);
+    hpbuf.appendByte(':');
+    {
+        char[8] pb = void;
+        import core.stdc.stdio : snprintf;
+
+        auto pl = snprintf(pb.ptr, pb.length, "%lld", port);
+        hpbuf.append(pb[0 .. pl]);
+    }
+    auto hpkey = cast(const(char)[]) hpbuf.data;
+    MigrateSock* slot;
+    foreach (ref m; gMigrateCache)
+        if (m.alive && m.hp[0 .. m.hplen] == hpkey)
+        {
+            slot = &m;
+            break;
+        }
+    if (slot is null)
+    {
+        // find a free slot (or fail gracefully if the small cache is full)
+        foreach (ref m; gMigrateCache)
+            if (!m.alive)
+            {
+                slot = &m;
+                break;
+            }
+        if (slot is null)
+            slot = &gMigrateCache[0]; // reuse slot 0 (close the old one below)
+        if (slot.alive)
+        {
+            try
+                slot.conn.close();
+            catch (Exception)
+            {
+            }
+        }
+        try
+        {
+            slot.conn = connectTCP(host.idup, cast(ushort) port);
+            slot.conn.tcpNoDelay = true;
+        }
+        catch (Exception)
+        {
+            slot.alive = false;
+            repError(o, "IOERR error or timeout connecting to the client");
+            return;
+        }
+        slot.hplen = hpkey.length <= slot.hp.length ? hpkey.length : slot.hp.length;
+        slot.hp[0 .. slot.hplen] = hpkey[0 .. slot.hplen];
+        slot.alive = true;
+    }
+    slot.lastUsed = nowMs();
+
+    char[512] line = void;
+    size_t ln;
+    bool fail(string msg) nothrow
+    {
+        // a broken socket must not be reused
+        try
+            slot.conn.close();
+        catch (Exception)
+        {
+        }
+        slot.alive = false;
+        slot.hplen = 0;
+        repError(o, msg);
+        return false;
+    }
+
+    // AUTH (optional), then SELECT the destination db
+    if (hasAuth)
+    {
+        immutable okAuth = authUser.length
+            ? migrateSend(slot.conn, ["AUTH", authUser, authPw])
+            : migrateSend(slot.conn, ["AUTH", authPw]);
+        if (!okAuth || !migrateReadLine(slot.conn, line, ln))
+        {
+            fail("IOERR error or timeout writing to target instance");
+            return;
+        }
+        if (ln == 0 || line[0] != '+')
+        {
+            fail(cast(string)("ERR Target instance replied with error: " ~ (ln > 1
+                    ? line[1 .. ln].idup : "auth failed")));
+            return;
+        }
+    }
+    {
+        char[24] db = void;
+        import core.stdc.stdio : snprintf;
+
+        auto dl = snprintf(db.ptr, db.length, "%lld", destdb);
+        if (!migrateSend(slot.conn, ["SELECT", db[0 .. dl]])
+            || !migrateReadLine(slot.conn, line, ln) || ln == 0 || line[0] != '+')
+        {
+            fail("IOERR error or timeout reading from target instance");
+            return;
+        }
+    }
+
+    // DUMP + RESTORE each key (pipeline the RESTOREs, then read replies)
+    Arena arena;
+    static ByteBuffer payload; // TLS: the DUMP payload for one key
+    foreach (ki; 0 .. nk)
+    {
+        auto k = keybuf[ki];
+        if (!dumpKeyPayload(*c.dbp, k, arena, payload))
+        {
+            fail("ERR DUMP is not supported for this value type");
+            return;
+        }
+        // remaining TTL in ms (0 = no expiry) — RESTORE re-arms it
+        auto obj = c.dbp.lookup(k, false);
+        long ttl = 0;
+        if (obj !is null && obj.expireAtMs != 0)
+        {
+            immutable now = nowMs();
+            ttl = obj.expireAtMs > now ? cast(long)(obj.expireAtMs - now) : 1;
+        }
+        char[24] tb = void;
+        import core.stdc.stdio : snprintf;
+
+        auto tl = snprintf(tb.ptr, tb.length, "%lld", ttl);
+        immutable ok = replace
+            ? migrateSend(slot.conn, ["RESTORE", k, tb[0 .. tl],
+                    cast(const(char)[]) payload.data, "REPLACE"])
+            : migrateSend(slot.conn, ["RESTORE", k, tb[0 .. tl],
+                    cast(const(char)[]) payload.data]);
+        if (!ok)
+        {
+            fail("IOERR error or timeout writing to target instance");
+            return;
+        }
+        arena.reset();
+    }
+    // read the RESTORE replies in order; any error aborts (nothing deleted)
+    foreach (ki; 0 .. nk)
+    {
+        if (!migrateReadLine(slot.conn, line, ln))
+        {
+            fail("IOERR error or timeout reading from target instance");
+            return;
+        }
+        if (ln == 0 || line[0] != '+')
+        {
+            // surface the target's error (e.g. BUSYKEY without REPLACE)
+            repError(o, ln > 1 ? cast(string) line[1 .. ln].idup
+                    : "ERR Target instance replied with error");
+            return;
+        }
+    }
+
+    // success: delete the migrated keys locally unless COPY, and log the DELs
+    if (!copy)
+    {
+        static ByteBuffer delCmd; // TLS
+        foreach (ki; 0 .. nk)
+        {
+            auto k = keybuf[ki];
+            c.dbp.del(k);
+            gWriteEpoch++;
+            if (gAof.enabled)
+            {
+                delCmd.clear();
+                repArrayHeader(delCmd, 2);
+                repBulk(delCmd, "DEL");
+                repBulk(delCmd, k);
+                gAof.append(delCmd.data);
+            }
+        }
+    }
+    repSimple(o, "OK");
 }
 
 // ---------------------------------------------------------------------------
