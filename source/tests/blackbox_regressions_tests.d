@@ -766,6 +766,35 @@ version (unittest)
             .expect.to.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\n7\r\n");
     }
 
+    @("blackbox.import_mode_pauses_expiry")
+    unittest
+    {
+        // CLIENT IMPORT-SOURCE / import-mode: a bulk-load window where expiry is
+        // paused so a stream of RESTOREs with absolute (possibly past) TTLs loads
+        // consistently instead of racing the expiry cycle.
+        import dreads.obj : gImportMode;
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gImportMode = false;
+            gClock = 0;
+        }
+        enum ulong T0 = 1_000_000_000;
+
+        ks.runAt(T0, "SET", "k", "v");
+        ks.runAt(T0, "PEXPIRE", "k", "10"); // deadline T0+10
+
+        gImportMode = true; // import window: past-deadline key stays live
+        ks.runAt(T0 + 100, "GET", "k").expect.to.equal("$1\r\nv\r\n");
+        ks.runAt(T0 + 100, "EXISTS", "k").expect.to.equal(":1\r\n");
+
+        gImportMode = false; // window closed: lazy expiry resumes
+        ks.runAt(T0 + 100, "GET", "k").expect.to.equal("$-1\r\n");
+    }
+
     @("blackbox.hexpire_spill_and_active_reap")
     unittest
     {

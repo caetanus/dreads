@@ -317,6 +317,7 @@ private struct Conn
     // AUTH). Enforcement is `command in c.user's cap_set` (see dreads.acl).
     AclUser* user;
     bool authed;
+    bool importSource; // CLIENT IMPORT-SOURCE ON: a migration/sync feeder (flags=I)
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     size_t multiCount;
@@ -3575,10 +3576,11 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
     char[224] b = void;
     auto n = snprintf(b.ptr, b.length,
             "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
-            ~ " multi=%d cmd=%.*s user=%.*s resp=%d\n",
+            ~ " multi=%d flags=%s cmd=%.*s user=%.*s resp=%d\n",
             c.id, cast(int) c.clientName.length, c.clientName.ptr,
             cast(int)(c.dbp - &gDbs[0]), cast(int) c.sub.subCount, 0,
             cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
+            c.importSource ? "I".ptr : "N".ptr,
             cast(int) lastCmd.length, lastCmd.ptr,
             cast(int)(c.user !is null ? c.user.name.length : 7),
             c.user !is null ? c.user.name.ptr : "default".ptr, c.resp3 ? 3 : 2);
@@ -3673,6 +3675,28 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
             }
         repInt(o, unblocked);
         return true;
+    }
+    else if (eqICDebug(sub, "IMPORT-SOURCE") && args.length == 2)
+    {
+        import dreads.obj : gImportMode;
+
+        if (eqICDebug(args[1].str, "ON"))
+        {
+            if (!gImportMode)
+                repError(o, "ERR Server is not in import mode");
+            else
+            {
+                c.importSource = true;
+                repSimple(o, "OK");
+            }
+        }
+        else if (eqICDebug(args[1].str, "OFF"))
+        {
+            c.importSource = false;
+            repSimple(o, "OK");
+        }
+        else
+            repError(o, "ERR syntax error");
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))

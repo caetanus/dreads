@@ -260,10 +260,15 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         else
             return false;
         return true;
-        // accepted no-ops: dreads is never a replica and has no import mode,
-        // but the test suite flips these in start_server overrides.
     case "import-mode":
-        return value == "yes" || value == "no";
+        if (value != "yes" && value != "no")
+            return false;
+        import dreads.obj : gImportMode;
+
+        gImportMode = value == "yes"; // pauses expiry while a bulk import runs
+        return true;
+        // accepted no-ops: dreads is never a replica, so replica flags are inert
+        // but the test suite flips them in start_server overrides.
     case "replica-read-only", "slave-read-only":
         return value == "yes" || value == "no";
     case "save": // RDB snapshotting is not implemented; accept & ignore

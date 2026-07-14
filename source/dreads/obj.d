@@ -37,6 +37,12 @@ public __gshared bool gActiveExpire;
 /// INFO stats: lifetime count of keys dropped by lazy or active expiration.
 public __gshared ulong gExpiredKeys;
 
+/// Import mode (`CONFIG SET import-mode yes` + `CLIENT IMPORT-SOURCE ON`): a
+/// bulk-load window for migration tools. While on, expiration is PAUSED so a
+/// stream of RESTOREs with absolute TTLs (some already past) loads consistently
+/// instead of racing the expiry cycle. Turned off, normal expiry resumes.
+public __gshared bool gImportMode;
+
 /// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
 public __gshared long gBlockedClients;
 
@@ -312,8 +318,8 @@ public struct Keyspace
     /// bypassed disarm) self-heals here instead of resurrecting a key.
     size_t activeExpireCycle() @nogc nothrow
     {
-        if (!gActiveExpire || expires.empty)
-            return 0;
+        if (!gActiveExpire || gImportMode || expires.empty)
+            return 0; // import mode pauses active expiry (bulk-load window)
         immutable now = detNow();
         size_t dropped = 0;
         // removeRight is a consuming range: it drains every deadline <= now in one
@@ -414,8 +420,8 @@ public struct Keyspace
     /// the container's *live* registration still equals it.
     size_t activeSubExpireCycle() @nogc nothrow
     {
-        if (!gActiveExpire || subExpires.empty)
-            return 0;
+        if (!gActiveExpire || gImportMode || subExpires.empty)
+            return 0; // import mode pauses active expiry
         immutable now = detNow();
         size_t reaped = 0;
         foreach (e; subExpires.removeRight(now))
@@ -471,7 +477,7 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return null;
-        if (o.expired())
+        if (o.expired() && !gImportMode) // import mode: bulk-load window, no expiry
         {
             disarmExpire(k, o.expireAtMs);
             disarmSubExpire(k);
@@ -484,7 +490,7 @@ public struct Keyspace
         // (the per-field analog of the key-level check above). The absolute field
         // deadlines are replicated via HPEXPIREAT, so every node reaps off its own
         // copy — no HDEL is propagated, exactly like key TTL.
-        if (o.type == ObjType.hash && o.hash.hasFieldTTL)
+        if (o.type == ObjType.hash && o.hash.hasFieldTTL && !gImportMode)
         {
             if (o.hash.reapExpired(detNow()) > 0)
             {
