@@ -229,11 +229,15 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
-            foreach (ref d; gDbs) // drop-soon sweep across every database
-            {
-                d.activeExpireCycle();
-                d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
-            }
+            // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
+            // is a propagated DEL) is held until the window lifts, like eviction.
+            immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
+            if (!paused)
+                foreach (ref d; gDbs) // drop-soon sweep across every database
+                {
+                    d.activeExpireCycle();
+                    d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
+                }
             runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
             flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
             gAof.fsyncNow();

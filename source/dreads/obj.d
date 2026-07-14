@@ -508,6 +508,12 @@ public struct Keyspace
             return null;
         if (o.expired() && !gImportMode) // import mode: bulk-load window, no expiry
         {
+            // A CLIENT PAUSE holds the expiry DEL (a replicated write): the key
+            // reads as logically expired (null) but is NOT deleted/counted until
+            // the window lifts and a later access reaps it. gPauseUntilMs is
+            // runtime-only (never logged), so raft replay is unaffected.
+            if (gPauseUntilMs != 0 && detNow() < gPauseUntilMs)
+                return null;
             disarmExpire(k, o.expireAtMs);
             disarmSubExpire(k);
             d.del(k);

@@ -3667,14 +3667,20 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "RANDOMKEY":
         {
-            // deterministic "random": the first live, unexpired slot
+            import dreads.obj : gPauseUntilMs;
+
+            // deterministic "random": the first live, unexpired slot. Under a
+            // CLIENT PAUSE, expiry is held, so a logically-expired key is still
+            // present and RANDOMKEY returns it (and can't spin looking for a live
+            // one — the Valkey "infinite loop during pause" guard).
             auto now = detNow();
+            immutable paused = gPauseUntilMs != 0 && now < gPauseUntilMs;
             foreach (i; 0 .. ks.d.capacity)
             {
                 if (!ks.d.slotLive(i))
                     continue;
                 auto obj = ks.d.valAt(i);
-                if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                if (!paused && obj.expireAtMs != 0 && now >= obj.expireAtMs)
                     continue;
                 repBulk(o, ks.d.keyAt(i));
                 return true;
