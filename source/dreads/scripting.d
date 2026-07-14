@@ -114,6 +114,12 @@ public __gshared bool gScriptAllowOom;
 /// same one-script-at-a-time __gshared reasoning as gScriptAllowOom.
 public __gshared bool gScriptReadOnly;
 
+/// Source id of the running script (its sha, or a function name) — appended to a
+/// client-facing script error as ` script: <src>, on @user_script:1.`, the way
+/// Valkey tags where the error came from. Set per run on the Lua worker.
+private __gshared char[64] gScriptSource;
+private __gshared size_t gScriptSourceLen;
+
 /// True when the server is over its maxmemory limit (a read-only check; script
 /// writes don't run the eviction cycle — see DRIFT.md on approximate LRU).
 private bool scriptOverMaxmemory() nothrow @nogc
@@ -1681,7 +1687,23 @@ private void luaToResp(lua_State* L, int idx, ref ByteBuffer o, int depth = 0) n
             {
                 size_t len;
                 auto p = lua_tolstring(L, -1, &len);
-                repError(o, p[0 .. len]);
+                auto msg = p[0 .. len];
+                // a returned {err=...} without a CODE gets the default ERR
+                // (redis.error_reply("") -> "ERR"); a coded one surfaces verbatim
+                if (!startsWithCode(msg))
+                {
+                    static ByteBuffer eb; // TLS scratch
+                    eb.clear();
+                    eb.append("ERR");
+                    if (msg.length)
+                    {
+                        eb.appendByte(' ');
+                        eb.append(msg);
+                    }
+                    repError(o, cast(const(char)[]) eb.data);
+                }
+                else
+                    repError(o, msg);
                 lua_settop(L, lua_gettop(L) - 1);
                 break;
             }
@@ -1909,6 +1931,8 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         if (gScripts.get(sha[]) is null)
             gScripts.set(sha[], StrVal.ofRaw(body_)); // EVAL populates the cache too
     }
+    gScriptSource[0 .. 40] = sha[]; // tag client-facing errors with this source
+    gScriptSourceLen = 40;
 
     // optional `#!lua [flags=...]` shebang: validate + strip before compiling,
     // and honour no-writes (the other flags are accepted for compatibility)
@@ -2024,7 +2048,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
             gInScript = false;
         if (lua_pcall(gL, 0, 1, 0) != LUA_OK)
         {
-            luaErrToResp(o, "ERR Error running script: ");
+            luaErrToResp(o, "ERR ", true); // client-facing: tag with ` script: <src>`
             return;
         }
     }
@@ -2034,34 +2058,57 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
 /// -<prefix><lua error message>, CRLF-sanitized. A {err=...} error object
 /// (a failing redis.call raised inside the script) surfaces VERBATIM, like
 /// Redis: the caller sees the original command error, not a wrapper.
-private void luaErrToResp(ref ByteBuffer o, scope const(char)[] prefix) nothrow
+private void luaErrToResp(ref ByteBuffer o, scope const(char)[] prefix,
+    bool withSource = false) nothrow
 {
     size_t len;
+    o.appendByte('-');
+    bool wrote = false;
     if (lua_type(gL, -1) == LUA_TTABLE)
     {
         lua_pushlstring(gL, "err".ptr, 3);
-        if (lua_rawget(gL, -2) == LUA_TSTRING)
+        immutable isStr = lua_rawget(gL, -2) == LUA_TSTRING;
+        if (isStr)
         {
             auto ep = lua_tolstring(gL, -1, &len);
-            o.appendByte('-');
-            foreach (c; ep[0 .. len])
+            auto msg = ep[0 .. len];
+            // a value already carrying a CODE ("WRONGTYPE ...", "MY_ERR x")
+            // surfaces verbatim; a bare/empty message gets the default ERR code
+            if (!startsWithCode(msg))
+                o.append("ERR ");
+            foreach (c; msg)
                 o.appendByte(c == '\r' || c == '\n' ? ' ' : c);
-            o.append("\r\n");
-            lua_settop(gL, lua_gettop(gL) - 1);
-            return;
+            wrote = true;
         }
         lua_settop(gL, lua_gettop(gL) - 1);
+        if (!isStr) // error({}) or an error object without an 'err' string
+        {
+            o.append("ERR unknown error");
+            wrote = true;
+        }
     }
-    auto p = lua_tolstring(gL, -1, &len);
-    o.appendByte('-');
-    // an error already carrying a CODE (our raiseErr strings: "ERR ...",
-    // "WRONGTYPE ...") surfaces verbatim; a raw Lua error gets the wrapper
-    if (p !is null && !startsWithCode(p[0 .. len]))
-        o.append(prefix);
-    if (p !is null)
+    else
     {
-        foreach (c; p[0 .. len])
-            o.appendByte(c == '\r' || c == '\n' ? ' ' : c);
+        auto p = lua_tolstring(gL, -1, &len);
+        if (p !is null && len)
+        {
+            // an error already carrying a CODE surfaces verbatim; a raw Lua error
+            // (e.g. `error('msg')` -> "user_script:1: msg") gets the prefix
+            if (!startsWithCode(p[0 .. len]))
+                o.append(prefix);
+            foreach (c; p[0 .. len])
+                o.appendByte(c == '\r' || c == '\n' ? ' ' : c);
+            wrote = true;
+        }
+    }
+    if (!wrote)
+        o.append("ERR unknown error");
+    // tag where a client-facing script error came from (Valkey's ` script: ...`)
+    if (withSource && gScriptSourceLen)
+    {
+        o.append(" script: ");
+        o.append(gScriptSource[0 .. gScriptSourceLen]);
+        o.append(", on @user_script:1.");
     }
     o.append("\r\n");
 }
@@ -2069,8 +2116,11 @@ private void luaErrToResp(ref ByteBuffer o, scope const(char)[] prefix) nothrow
 /// True when the message opens with an uppercase CODE followed by a space.
 private bool startsWithCode(scope const(char)[] m) nothrow @nogc
 {
+    // the code is the first word if it is UPPERCASE (letters/digits/_) and
+    // followed by a space, e.g. "WRONGTYPE ...", "MY_ERR_CODE custom msg"
     size_t i = 0;
-    while (i < m.length && m[i] >= 'A' && m[i] <= 'Z')
+    while (i < m.length && ((m[i] >= 'A' && m[i] <= 'Z') || m[i] == '_'
+            || (m[i] >= '0' && m[i] <= '9')))
         i++;
     return i > 0 && i < m.length && m[i] == ' ';
 }
@@ -2933,7 +2983,9 @@ unittest // return type conversions
     assert(evalRun(ks, "return {1, 'two', 3}") == "*3\r\n:1\r\n$3\r\ntwo\r\n:3\r\n");
     assert(evalRun(ks, "return {1, nil, 3}") == "*1\r\n:1\r\n"); // stops at nil
     assert(evalRun(ks, "return redis.status_reply('GOOD')") == "+GOOD\r\n");
-    assert(evalRun(ks, "return redis.error_reply('bad thing')") == "-bad thing\r\n");
+    // a returned error without a CODE gets the default ERR prefix (Valkey 7)
+    assert(evalRun(ks, "return redis.error_reply('bad thing')") == "-ERR bad thing\r\n");
+    assert(evalRun(ks, "return redis.error_reply('WRONGTYPE nope')") == "-WRONGTYPE nope\r\n");
     assert(evalRun(ks, "return {KEYS[1], ARGV[1]}", "1", "k1", "a1") == "*2\r\n$2\r\nk1\r\n$2\r\na1\r\n");
 }
 
@@ -2995,10 +3047,14 @@ unittest // errors
     Keyspace ks;
     scope (exit)
         ks.d.free();
+    import std.algorithm : canFind;
+
     auto compile = evalRun(ks, "this is not lua");
     assert(compile[0 .. 28] == "-ERR Error compiling script:");
+    // a runtime error surfaces as `-ERR <lua msg> script: <src>` (Valkey-style)
     auto runtime = evalRun(ks, "error('boom')");
-    assert(runtime[0 .. 26] == "-ERR Error running script:");
+    assert(runtime[0 .. 5] == "-ERR " && runtime.canFind("boom")
+            && runtime.canFind(" script: "), runtime);
 }
 
 unittest // sandbox: _G protection, pruned globals, recursion guard
