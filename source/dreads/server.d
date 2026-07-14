@@ -229,8 +229,11 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         setTimer(1.seconds, delegate() @trusted nothrow {
             lruClock = cast(uint)(nowMs() / 1000);
             foreach (ref d; gDbs) // drop-soon sweep across every database
+            {
                 d.activeExpireCycle();
-            flushPendingNotify(); // deliver the "expired" events the sweep queued
+                d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
+            }
+            flushPendingNotify(); // deliver the "expired"/"hexpired" events the sweep queued
             gAof.fsyncNow();
         }, true);
     }

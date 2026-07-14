@@ -38,6 +38,21 @@ version (unittest)
         return (cast(string) o.data).idup;
     }
 
+    // Like `run`, but freezes the command clock at `atMs` (the dispatch applyTime,
+    // as a replayed raft entry would) — deterministic time for TTL tests.
+    private string runAt(ref Keyspace ks, ulong atMs, string[] cmdArgs...)
+    {
+        Arena arena;
+        ByteBuffer o;
+        RVal v;
+        size_t pos = 0;
+        propagationOverride.clear();
+        auto encoded = cmdArgs.respCmd;
+        parseValue(cast(const(ubyte)[]) encoded, pos, arena, v).expect.to.equal(ParseStatus.ok);
+        v.dispatch(ks, o, arena, atMs);
+        return (cast(string) o.data).idup;
+    }
+
     @("blackbox.help_replies")
     unittest
     {
@@ -492,5 +507,182 @@ version (unittest)
             q.popFront();
         }
         q.empty.expect.to.equal(true);
+    }
+
+    @("blackbox.hexpire_httl_codes")
+    unittest
+    {
+        // HEXPIRE family (Valkey 7.4): per-field reply codes and the four TTL
+        // read commands. Codes: -2 no field, -1 no TTL, 1 set, value for reads.
+        enum ulong T0 = 1_000_000_000; // frozen now, 1e9 ms
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.runAt(T0, "HSET", "h", "f1", "v1", "f2", "v2", "f3", "v3");
+        // set TTL on f1,f2 (100s); nope is missing
+        ks.runAt(T0, "HEXPIRE", "h", "100", "FIELDS", "2", "f1", "f2")
+            .expect.to.equal("*2\r\n:1\r\n:1\r\n");
+        ks.runAt(T0, "HEXPIRE", "h", "100", "FIELDS", "1", "nope")
+            .expect.to.equal("*1\r\n:-2\r\n");
+        // reads: f1 has 100s, f3 has none (-1), nope missing (-2)
+        ks.runAt(T0, "HTTL", "h", "FIELDS", "3", "f1", "f3", "nope")
+            .expect.to.equal("*3\r\n:100\r\n:-1\r\n:-2\r\n");
+        ks.runAt(T0, "HPTTL", "h", "FIELDS", "1", "f1").expect.to.equal("*1\r\n:100000\r\n");
+        // absolute: now(1e9ms)+100000ms = 1_000_100_000ms -> 1_000_100 s
+        ks.runAt(T0, "HEXPIRETIME", "h", "FIELDS", "1", "f1").expect.to.equal("*1\r\n:1000100\r\n");
+        ks.runAt(T0, "HPEXPIRETIME", "h", "FIELDS", "1", "f1")
+            .expect.to.equal("*1\r\n:1000100000\r\n");
+        // propagation is canonical HPEXPIREAT with the absolute ms
+        ks.runAt(T0, "HEXPIRE", "h", "100", "FIELDS", "1", "f1");
+        (cast(string) propagationOverride.data).idup.expect.to.equal(
+            "*6\r\n$10\r\nHPEXPIREAT\r\n$1\r\nh\r\n$10\r\n1000100000\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n");
+    }
+
+    @("blackbox.hexpire_lazy_reap_and_past")
+    unittest
+    {
+        // A field whose deadline passed is invisible (lazy reap on access), and a
+        // past-time HEXPIRE deletes the field now (code 2) and propagates HDEL.
+        enum ulong T0 = 1_000_000_000;
+        enum ulong T1 = 1_000_200_000; // 200s later
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.runAt(T0, "HSET", "h", "f1", "v1", "f2", "v2");
+        ks.runAt(T0, "HEXPIRE", "h", "100", "FIELDS", "1", "f1");
+        ks.runAt(T1, "HGET", "h", "f1").expect.to.equal("$-1\r\n"); // reaped, invisible
+        ks.runAt(T1, "HGET", "h", "f2").expect.to.equal("$2\r\nv2\r\n"); // survives
+        ks.runAt(T1, "HLEN", "h").expect.to.equal(":1\r\n");
+
+        // past-time set: code 2, field deleted, propagation is HDEL
+        ks.runAt(T0, "HSET", "h2", "a", "1", "b", "2");
+        ks.runAt(T0, "HPEXPIREAT", "h2", "1", "FIELDS", "1", "a").expect.to.equal("*1\r\n:2\r\n");
+        (cast(string) propagationOverride.data).idup.expect.to.equal(
+            "*3\r\n$4\r\nHDEL\r\n$2\r\nh2\r\n$1\r\na\r\n");
+        ks.runAt(T0, "HGET", "h2", "a").expect.to.equal("$-1\r\n");
+    }
+
+    @("blackbox.hexpire_conditions_and_persist")
+    unittest
+    {
+        // NX/XX/GT/LT per-field conditions (a field with no TTL is +infinity for
+        // GT/LT, like key EXPIRE) and HPERSIST codes (-2/-1/1).
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        gClock = 1_000_000_000;
+
+        ks.run("HSET", "h", "f", "1");
+        ks.run("HEXPIRE", "h", "100", "NX", "FIELDS", "1", "f").expect.to.equal("*1\r\n:1\r\n");
+        ks.run("HEXPIRE", "h", "200", "NX", "FIELDS", "1", "f").expect.to.equal("*1\r\n:0\r\n");
+        ks.run("HEXPIRE", "h", "200", "GT", "FIELDS", "1", "f").expect.to.equal("*1\r\n:1\r\n");
+        ks.run("HEXPIRE", "h", "100", "GT", "FIELDS", "1", "f").expect.to.equal("*1\r\n:0\r\n");
+        ks.run("HEXPIRE", "h", "50", "LT", "FIELDS", "1", "f").expect.to.equal("*1\r\n:1\r\n");
+        ks.run("HEXPIRE", "h", "999", "XX", "FIELDS", "1", "f").expect.to.equal("*1\r\n:1\r\n");
+        // incompatible flags
+        ks.run("HEXPIRE", "h", "1", "NX", "GT", "FIELDS", "1", "f").expect.to.contain("not compatible");
+
+        // HPERSIST: f has TTL (->1), g has none (->-1), nope missing (->-2)
+        ks.run("HSET", "h", "g", "2");
+        ks.run("HPERSIST", "h", "FIELDS", "3", "f", "g", "nope")
+            .expect.to.equal("*3\r\n:1\r\n:-1\r\n:-2\r\n");
+        ks.run("HTTL", "h", "FIELDS", "1", "f").expect.to.equal("*1\r\n:-1\r\n"); // gone
+    }
+
+    @("blackbox.hexpire_hset_clears_and_encoding")
+    unittest
+    {
+        // A plain HSET overwrite discards the field's TTL (Valkey: EXPIRY_NONE),
+        // and a small hash carrying any field TTL reports "listpackex".
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        gClock = 1_000_000_000;
+
+        ks.run("HSET", "h", "f", "1");
+        ks.run("OBJECT", "ENCODING", "h").expect.to.equal("$8\r\nlistpack\r\n");
+        ks.run("HEXPIRE", "h", "100", "FIELDS", "1", "f");
+        ks.run("OBJECT", "ENCODING", "h").expect.to.equal("$10\r\nlistpackex\r\n");
+        ks.run("HSET", "h", "f", "2"); // overwrite drops the TTL
+        ks.run("HTTL", "h", "FIELDS", "1", "f").expect.to.equal("*1\r\n:-1\r\n");
+    }
+
+    @("blackbox.hgetex_ttl_ops")
+    unittest
+    {
+        // HGETEX returns the values (HMGET-shaped) and applies its TTL op as a
+        // side effect: EX sets, PERSIST clears, no-op leaves the TTL untouched.
+        import dreads.det : gClock;
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+        }
+        gClock = 1_000_000_000;
+
+        ks.run("HSET", "h", "f", "v1", "g", "v2");
+        ks.run("HGETEX", "h", "EX", "100", "FIELDS", "2", "f", "g")
+            .expect.to.equal("*2\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+        ks.run("HTTL", "h", "FIELDS", "2", "f", "g").expect.to.equal("*2\r\n:100\r\n:100\r\n");
+        ks.run("HGETEX", "h", "PERSIST", "FIELDS", "1", "f")
+            .expect.to.equal("*1\r\n$2\r\nv1\r\n");
+        // f persisted, g untouched by the plain (no-op) read below
+        ks.run("HGETEX", "h", "FIELDS", "1", "g").expect.to.equal("*1\r\n$2\r\nv2\r\n");
+        ks.run("HTTL", "h", "FIELDS", "2", "f", "g").expect.to.equal("*2\r\n:-1\r\n:100\r\n");
+    }
+
+    @("blackbox.hexpire_spill_and_active_reap")
+    unittest
+    {
+        // Field TTLs survive the small->large (listpack->hashtable) spill (they
+        // key by field name, not slot), and the active cycle reaps due fields of
+        // an untouched hash via the tagged secondary index.
+        import dreads.det : gClock;
+        import dreads.obj : gActiveExpire;
+        import std.conv : to;
+
+        enum ulong T0 = 1_000_000_000;
+        enum ulong T1 = 1_000_200_000; // 200s later
+
+        Keyspace ks;
+        scope (exit)
+        {
+            ks.d.free();
+            gClock = 0;
+            gActiveExpire = false;
+        }
+        gActiveExpire = true; // arm the secondary index
+
+        // one TTL'd field (500s), then push past 128 entries to force the spill
+        ks.runAt(T0, "HSET", "big", "keep", "v");
+        ks.runAt(T0, "HEXPIRE", "big", "500", "FIELDS", "1", "keep");
+        foreach (i; 0 .. 200)
+            ks.runAt(T0, "HSET", "big", "x" ~ i.to!string, "y");
+        ks.runAt(T0, "OBJECT", "ENCODING", "big").expect.to.equal("$9\r\nhashtable\r\n");
+        ks.runAt(T0, "HTTL", "big", "FIELDS", "1", "keep").expect.to.equal("*1\r\n:500\r\n"); // survived spill
+
+        // active reap of an untouched hash: f (100s) is due at T1, g survives
+        ks.runAt(T0, "HSET", "h", "f", "1", "g", "2");
+        ks.runAt(T0, "HEXPIRE", "h", "100", "FIELDS", "1", "f");
+        gClock = T1; // advance for the (non-dispatch) active cycle
+        ks.activeSubExpireCycle();
+        ks.runAt(T1, "HGET", "h", "f").expect.to.equal("$-1\r\n"); // reaped by the cycle
+        ks.runAt(T1, "HGET", "h", "g").expect.to.equal("$1\r\n2\r\n"); // survives
     }
 }

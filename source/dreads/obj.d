@@ -53,6 +53,8 @@ public struct RObj
     ulong expireAtMs; // 0 = no expiry; absolute epoch ms otherwise
     uint lruSecs; // last access, in lruClock units
     uint expireSlot; // active expiry: this key's index in its deadline bucket (O(1) removal within it)
+    ulong subExpireAt; // secondary index: the container's currently-registered nearest internal deadline (0 = none)
+    uint subExpireSlot; // this container's index in its sub-expiry bucket (O(1) removal)
     union
     {
         StrVal str;
@@ -219,6 +221,22 @@ public struct Keyspace
     private alias ExpBucket = Vector!(const(char)[]);
     private Map!(ulong, ExpBucket) expires;
 
+    /// The secondary "sub-expiry" index: container-INTERNAL TTLs (hash fields
+    /// today, zset members later). Distinct from `expires`, which keys a whole
+    /// key. An entry is tagged by TYPE and names the container by key, registered
+    /// at its *nearest* internal deadline; firing it hands the container back to
+    /// itself to reap its own expired members (one entry per container, not per
+    /// field — the per-field deadlines live inside the container). This keeps the
+    /// hot common case (plain key TTL) on the fast `expires` path untouched.
+    private struct SubEnt
+    {
+        ObjType type;
+        const(char)[] key; // non-owning slice into Dict-owned key memory
+    }
+
+    private alias SubBucket = Vector!SubEnt;
+    private Map!(ulong, SubBucket) subExpires;
+
     @disable this(this);
 
     ~this() @nogc nothrow
@@ -319,11 +337,132 @@ public struct Keyspace
         return dropped;
     }
 
+    // ----- secondary index: container-internal (hash-field) active expiry -----
+
+    /// Register container `k` (of type `t`) at its nearest internal deadline `at`.
+    /// One entry per container; the object remembers its bucket slot for O(1)
+    /// removal (mirrors `armExpire`). No-op when active expiry is off.
+    void armSubExpire(scope const(char)[] k, ObjType t, ulong at) @nogc nothrow
+    {
+        if (!gActiveExpire || at == 0)
+            return;
+        auto o = d.get(k);
+        if (o is null)
+            return;
+        auto sk = d.storedKey(k); // stable Dict-owned key bytes — no dup
+        auto bucket = subExpires.getOrPut(at, SubBucket.init);
+        o.subExpireSlot = cast(uint) bucket.length;
+        o.subExpireAt = at;
+        bucket.put(SubEnt(t, sk));
+    }
+
+    /// Remove `k`'s entry from the sub-expiry index (uses its remembered deadline
+    /// and slot; O(log n) tree lookup + O(1) swap-pop). No-op if not indexed.
+    void disarmSubExpire(scope const(char)[] k) @nogc nothrow
+    {
+        if (!gActiveExpire)
+            return;
+        auto o = d.get(k);
+        if (o is null)
+            return;
+        immutable at = o.subExpireAt;
+        if (at == 0)
+            return;
+        auto bucket = subExpires.get(at);
+        if (bucket is null)
+        {
+            o.subExpireAt = 0;
+            return;
+        }
+        immutable slot = o.subExpireSlot;
+        if (slot >= bucket.length || (*bucket)[slot].key != k)
+        {
+            o.subExpireAt = 0;
+            return;
+        }
+        immutable last = bucket.length - 1;
+        if (slot != last)
+        {
+            auto moved = (*bucket)[last];
+            (*bucket)[slot] = moved;
+            if (auto mo = d.get(moved.key)) // relocated container learns its new slot
+                mo.subExpireSlot = cast(uint) slot;
+        }
+        bucket.popBack();
+        if (bucket.length == 0)
+            subExpires.remove(at);
+        o.subExpireAt = 0;
+    }
+
+    /// Re-register `k` at a new nearest internal deadline `newAt` (0 = none left).
+    /// Used after a HEXPIRE/HPERSIST changes a hash's minimum field deadline.
+    void retimeSubExpire(scope const(char)[] k, ObjType t, ulong newAt) @nogc nothrow
+    {
+        if (!gActiveExpire)
+            return;
+        auto o = d.get(k);
+        if (o is null || o.subExpireAt == newAt)
+            return;
+        disarmSubExpire(k);
+        armSubExpire(k, t, newAt);
+    }
+
+    /// Active sub-expiry: for every container whose nearest internal deadline has
+    /// passed, hand it back to itself to reap its own expired members, then
+    /// re-register at its new nearest deadline (or drop the key if it emptied).
+    /// Same self-heal rule as `activeExpireCycle`: a bucket entry only fires when
+    /// the container's *live* registration still equals it.
+    size_t activeSubExpireCycle() @nogc nothrow
+    {
+        if (!gActiveExpire || subExpires.empty)
+            return 0;
+        immutable now = detNow();
+        size_t reaped = 0;
+        foreach (e; subExpires.removeRight(now))
+        {
+            foreach (j; 0 .. e.value.length)
+            {
+                auto ent = e.value[j];
+                auto o = d.get(ent.key);
+                if (o is null || o.subExpireAt != e.key)
+                    continue; // stale/relocated entry self-heals
+                o.subExpireAt = 0; // this registration is now consumed
+                final switch (ent.type)
+                {
+                case ObjType.hash:
+                    immutable n = o.hash.reapExpired(now);
+                    if (n > 0)
+                    {
+                        reaped += n;
+                        notifyKeyspaceEvent(NClass.hash, "hexpired", ent.key);
+                    }
+                    if (o.hash.length == 0)
+                    {
+                        disarmExpire(ent.key, o.expireAtMs);
+                        d.del(ent.key);
+                        notifyKeyspaceEvent(NClass.generic, "del", ent.key);
+                    }
+                    else if (immutable nextAt = o.hash.minFieldTTL()) // re-register at the new nearest
+                        armSubExpire(ent.key, ObjType.hash, nextAt);
+                    break;
+                case ObjType.str:
+                case ObjType.list:
+                case ObjType.set:
+                case ObjType.zset:
+                case ObjType.stream:
+                    break; // only hashes carry internal TTLs today
+                }
+            }
+        }
+        return reaped;
+    }
+
     private void freeExpiresIndex() @nogc nothrow
     {
         // buckets hold non-owning slices into Dict key memory — only the tree
         // and its bucket arrays need releasing
         expires.clear();
+        subExpires.clear();
     }
 
     /// Live object or null — lazily drops the key when its TTL has passed.
@@ -335,10 +474,30 @@ public struct Keyspace
         if (o.expired())
         {
             disarmExpire(k, o.expireAtMs);
+            disarmSubExpire(k);
             d.del(k);
             notifyKeyspaceEvent(NClass.expired, "expired", k);
             gExpiredKeys++;
             return null;
+        }
+        // Lazy field expiry: reap any expired hash fields before the key is used
+        // (the per-field analog of the key-level check above). The absolute field
+        // deadlines are replicated via HPEXPIREAT, so every node reaps off its own
+        // copy — no HDEL is propagated, exactly like key TTL.
+        if (o.type == ObjType.hash && o.hash.hasFieldTTL)
+        {
+            if (o.hash.reapExpired(detNow()) > 0)
+            {
+                notifyKeyspaceEvent(NClass.hash, "hexpired", k);
+                if (o.hash.length == 0)
+                {
+                    disarmExpire(k, o.expireAtMs);
+                    disarmSubExpire(k);
+                    d.del(k);
+                    notifyKeyspaceEvent(NClass.generic, "del", k);
+                    return null;
+                }
+            }
         }
         o.lruSecs = lruClock;
         return o;
@@ -394,6 +553,7 @@ public struct Keyspace
         if (o is null)
             return false;
         disarmExpire(k, o.expireAtMs); // drop its pending drop-soon entry
+        disarmSubExpire(k); // and any sub-expiry (hash field) registration
         return d.del(k);
     }
 
@@ -410,13 +570,24 @@ public struct Keyspace
         if (src is null)
             return false;
         immutable ttl = src.expireAtMs;
+        // a hash's field-TTL registration must move with it (its bucket entry
+        // points at `from`'s key bytes, which d.steal frees)
+        immutable bool subHash = src.type == ObjType.hash && src.hash.hasFieldTTL;
+        immutable subAt = subHash ? src.hash.minFieldTTL() : 0;
         disarmExpire(from, ttl);
-        if (auto dst = lookup(to)) // overwriting a live destination drops its TTL entry
+        disarmSubExpire(from);
+        if (auto dst = lookup(to)) // overwriting a live destination drops its TTL entries
+        {
             disarmExpire(to, dst.expireAtMs);
+            disarmSubExpire(to);
+        }
         RObj obj;
         d.steal(from, obj);
+        obj.subExpireAt = 0; // stale slot from the old registration; re-armed below
         d.set(to, obj);
         armExpire(to, ttl);
+        if (subAt != 0)
+            armSubExpire(to, ObjType.hash, subAt);
         return true;
     }
 
@@ -427,6 +598,7 @@ public struct Keyspace
         if (o.type != ObjType.str && o.type != ObjType.stream && o.containerLen == 0)
         {
             disarmExpire(k, o.expireAtMs);
+            disarmSubExpire(k);
             d.del(k);
             notifyKeyspaceEvent(NClass.generic, "del", k); // emptied container is removed
         }

@@ -9,6 +9,7 @@ module dreads.smallhash;
 // ~this (union field).
 
 import dreads.dict : Dict, StrVal;
+import emplace.vector : Vector;
 
 struct SmallHash
 {
@@ -28,10 +29,28 @@ struct SmallHash
     private size_t count, cap;
     private Dict!StrVal large;
 
-    /// hash has no intset tier: small = listpack, large = hashtable.
+    // Per-field TTL side-map (HEXPIRE family). NULL until the first field TTL is
+    // set — a hash without field expiry pays nothing (one null pointer). Keyed by
+    // field name -> absolute deadline (ms); the Dict owns its own copies of the
+    // field names, so it survives blob realloc / small->large spill (which key by
+    // name too). See [[keyspace]] field-TTL design: this is the per-hash analog of
+    // RObj.expireAtMs; the *active* reap is driven by a separate tagged index.
+    private Dict!(ulong)* fieldTTL;
+    // A cached LOWER BOUND on the field deadlines — the O(1) fast path for lazy
+    // reap: when `minDeadline > now` nothing can be due, so a hot read skips the
+    // O(n) scan entirely. Kept exact by `setFieldTTL`; a `clearFieldTTL` that drops
+    // the current min leaves it stale-small (still a valid lower bound), and the
+    // next scan self-heals it via `minFieldTTL`. 0 = no field TTLs.
+    private ulong minDeadline;
+
+    /// hash has no intset tier: small = listpack, large = hashtable. A small hash
+    /// that carries any field TTL reports "listpackex" (Valkey's listpack-with-
+    /// expiry encoding), matching OBJECT ENCODING after HEXPIRE.
     const(char)[] encoding() const @nogc nothrow
     {
-        return big ? "hashtable" : "listpack";
+        if (big)
+            return "hashtable";
+        return hasFieldTTL ? "listpackex" : "listpack";
     }
 
     private const(char)[] fieldAt(size_t i) const @nogc nothrow @trusted
@@ -91,6 +110,10 @@ struct SmallHash
     /// the field is new. Mirrors `Dict!StrVal.set`.
     bool set(scope const(char)[] k, StrVal v) @nogc nothrow
     {
+        // HSET-family write drops any TTL the field had (Valkey: entryUpdate with
+        // EXPIRY_NONE). No-op for a new field or a hash with no field TTLs.
+        if (fieldTTL !is null)
+            fieldTTL.remove(k);
         if (big)
             return large.set(k, v);
         foreach (i; 0 .. count)
@@ -118,6 +141,8 @@ struct SmallHash
 
     bool remove(scope const(char)[] k) @nogc nothrow @trusted
     {
+        if (fieldTTL !is null)
+            fieldTTL.remove(k); // drop the field's TTL entry, if any
         if (big)
             return large.remove(k);
         import core.stdc.string : memmove;
@@ -144,6 +169,83 @@ struct SmallHash
     }
 
     alias del = remove;
+
+    // ----- field TTL (HEXPIRE family) -----
+
+    /// Does any field carry a TTL? Cheap guard for the lazy-reap fast path.
+    bool hasFieldTTL() const @nogc nothrow
+    {
+        return fieldTTL !is null && fieldTTL.length > 0;
+    }
+
+    /// Set (or update) `field`'s absolute deadline (ms). The caller guarantees the
+    /// field exists. Lazily allocates the side-map on first use.
+    void setFieldTTL(scope const(char)[] field, ulong at) @nogc nothrow @trusted
+    {
+        if (fieldTTL is null)
+        {
+            import core.stdc.stdlib : calloc;
+
+            fieldTTL = cast(Dict!(ulong)*) calloc(1, (Dict!(ulong)).sizeof);
+            assert(fieldTTL !is null, "out of memory");
+        }
+        fieldTTL.set(field, at); // Dict owns a stable copy of the field name
+        if (minDeadline == 0 || at < minDeadline)
+            minDeadline = at; // keep the fast-path bound exact on set
+    }
+
+    /// `field`'s absolute deadline (ms), or 0 when it has no TTL.
+    ulong getFieldTTL(scope const(char)[] field) const @nogc nothrow @trusted
+    {
+        if (fieldTTL is null)
+            return 0;
+        auto p = (cast() *fieldTTL).get(field);
+        return p is null ? 0 : *p;
+    }
+
+    /// Drop `field`'s TTL (HPERSIST). Returns true when a TTL was actually removed.
+    bool clearFieldTTL(scope const(char)[] field) @nogc nothrow
+    {
+        if (fieldTTL is null)
+            return false;
+        return fieldTTL.remove(field);
+    }
+
+    /// The smallest field deadline in the hash (0 = no field TTLs). Drives the
+    /// active index: a hash registers itself at its *nearest* field deadline.
+    ulong minFieldTTL() const @nogc nothrow @trusted
+    {
+        if (fieldTTL is null)
+            return 0;
+        ulong m = 0;
+        (cast() *fieldTTL).opApply((const(char)[] _f, ref ulong at) @nogc nothrow {
+            if (m == 0 || at < m)
+                m = at;
+            return 0;
+        });
+        return m;
+    }
+
+    /// Lazy reap: remove every field whose deadline is <= `nowMs` (field and value
+    /// gone, TTL entry gone). Returns how many fields were reaped. The @nogc analog
+    /// of key-level lazy expiry in `Keyspace.lookup`.
+    size_t reapExpired(ulong nowMs) @nogc nothrow @trusted
+    {
+        if (fieldTTL is null || fieldTTL.length == 0 || minDeadline > nowMs)
+            return 0; // O(1) fast path: nothing can be due yet
+        // Collect the due field names first (slices into the side-map's own stable
+        // key memory), then mutate — never delete while iterating the Dict.
+        Vector!(const(char)[]) due;
+        fieldTTL.opApply((const(char)[] f, ref ulong at) @nogc nothrow {
+            if (at <= nowMs)
+                due.put(f);
+            return 0;
+        });
+        foreach (f; due[])
+            remove(f); // removes field+value AND its TTL entry (remove() clears it)
+        minDeadline = minFieldTTL(); // refresh the bound (self-heals a stale-small min)
+        return due.length;
+    }
 
     // ----- iteration -----
 
@@ -172,6 +274,12 @@ struct SmallHash
         }
         foreach (i; 0 .. count)
             c.append(fieldAt(i), vals[i].dup());
+        // clone the field-TTL side-map (keyed by name, independent of tier)
+        if (fieldTTL !is null)
+            (cast() *fieldTTL).opApply((const(char)[] f, ref ulong at) @nogc nothrow {
+                c.setFieldTTL(f, at);
+                return 0;
+            });
         return c;
     }
 
@@ -182,6 +290,9 @@ struct SmallHash
         else
             foreach (i; 0 .. count)
                 vals[i].free();
+        if (fieldTTL !is null)
+            fieldTTL.clear(); // drop every field TTL; keep the map alloc for reuse
+        minDeadline = 0;
         count = blen = 0;
         big = false;
     }
@@ -191,6 +302,12 @@ struct SmallHash
         import core.stdc.stdlib : cfree = free;
 
         clear();
+        if (fieldTTL !is null)
+        {
+            fieldTTL.free();
+            cfree(fieldTTL);
+            fieldTTL = null;
+        }
         if (blob !is null)
         {
             cfree(blob);

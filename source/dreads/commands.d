@@ -17,6 +17,7 @@ import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS;
 import dreads.resp;
 import dreads.stream : FieldPair, StreamID;
 import dreads.det : detNow = now;
+import emplace.vector : Vector;
 
 /// When a command's effect must reach the AOF (and later the Raft log) in a
 /// different form than the client sent it — time- or randomness-dependent
@@ -1297,6 +1298,455 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (obj.hash.length == 0)
                     notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
                 ks.delIfEmpty(args[0].str, obj);
+            }
+            break;
+        }
+    case "HEXPIRE":
+    case "HPEXPIRE":
+    case "HEXPIREAT":
+    case "HPEXPIREAT":
+        {
+            // H*EXPIRE key ttl [NX|XX|GT|LT] FIELDS numfields field [field ...]
+            immutable lname = name.length == 7 ? "hexpire" : name.length == 8
+                ? "hpexpire" : name.length == 9 ? "hexpireat" : "hpexpireat";
+            immutable isSec = name[1] == 'E'; // HEXPIRE/HEXPIREAT are seconds
+            immutable isRel = name.length <= 8; // HEXPIRE/HPEXPIRE are relative
+            if (args.length < 5)
+            {
+                arityErr(o, lname);
+                break;
+            }
+            long ttlv;
+            if (!parseLong(args[1].str, ttlv))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            bool fNX, fXX, fGT, fLT, badOpt;
+            size_t fi = 2;
+            for (; fi < args.length; fi++)
+            {
+                if (eqICKeyword(args[fi].str, "FIELDS"))
+                    break;
+                else if (eqICKeyword(args[fi].str, "NX"))
+                    fNX = true;
+                else if (eqICKeyword(args[fi].str, "XX"))
+                    fXX = true;
+                else if (eqICKeyword(args[fi].str, "GT"))
+                    fGT = true;
+                else if (eqICKeyword(args[fi].str, "LT"))
+                    fLT = true;
+                else
+                {
+                    o.append("-ERR Unsupported option ");
+                    o.append(args[fi].str.length > 128 ? args[fi].str[0 .. 128] : args[fi].str);
+                    o.append("\r\n");
+                    badOpt = true;
+                    break;
+                }
+            }
+            if (badOpt)
+                break;
+            if (fi >= args.length || !eqICKeyword(args[fi].str, "FIELDS"))
+            {
+                repError(o,
+                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                break;
+            }
+            if (fNX && (fXX || fGT || fLT))
+            {
+                repError(o, "ERR NX and XX, GT or LT options at the same time are not compatible");
+                break;
+            }
+            if (fGT && fLT)
+            {
+                repError(o, "ERR GT and LT options at the same time are not compatible");
+                break;
+            }
+            long nf;
+            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            auto fields = args[fi + 2 .. $];
+            if (nf <= 0 || cast(size_t) nf != fields.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            long absMs;
+            if (!resolveExpireMs(ttlv, isSec, isRel, absMs))
+            {
+                o.append("-ERR invalid expire time in '");
+                o.append(lname);
+                o.append("' command\r\n");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            immutable now = detNow();
+            immutable bool pastTime = absMs <= cast(long) now;
+            immutable ulong newAt = absMs <= 0 ? 1 : cast(ulong) absMs;
+            Vector!size_t affected; // fields set (HPEXPIREAT) or deleted (HDEL) — for propagation
+            repArrayHeader(o, fields.length);
+            foreach (idx, ref a; fields)
+            {
+                auto exist = obj is null ? null : obj.hash.get(a.str);
+                if (exist is null)
+                {
+                    repInt(o, -2); // no such field / key
+                    continue;
+                }
+                if (pastTime)
+                {
+                    obj.hash.del(a.str); // past deadline: delete the field now
+                    affected.put(idx);
+                    repInt(o, 2);
+                }
+                else
+                {
+                    // a field with no TTL counts as +infinity for GT/LT (like key EXPIRE)
+                    immutable ulong cur = obj.hash.getFieldTTL(a.str);
+                    if ((fNX && cur != 0) || (fXX && cur == 0)
+                        || (fGT && (cur == 0 || newAt <= cur))
+                        || (fLT && cur != 0 && newAt >= cur))
+                    {
+                        repInt(o, 0); // condition not met
+                        continue;
+                    }
+                    obj.hash.setFieldTTL(a.str, newAt);
+                    affected.put(idx);
+                    repInt(o, 1);
+                }
+            }
+            if (affected.length > 0)
+            {
+                propagationOverride.clear();
+                if (pastTime)
+                {
+                    // canonical: HDEL key field... (replicas delete the expired fields)
+                    notifyKeyspaceEvent(NClass.hash, "hexpired", args[0].str);
+                    repArrayHeader(propagationOverride, 2 + affected.length);
+                    repBulk(propagationOverride, "HDEL");
+                    repBulk(propagationOverride, args[0].str);
+                    foreach (ai; affected[])
+                        repBulk(propagationOverride, fields[ai].str);
+                }
+                else
+                {
+                    // canonical: HPEXPIREAT key absMs FIELDS n field... (absolute, deterministic)
+                    notifyKeyspaceEvent(NClass.hash, "hexpire", args[0].str);
+                    repArrayHeader(propagationOverride, 5 + affected.length);
+                    repBulk(propagationOverride, "HPEXPIREAT");
+                    repBulk(propagationOverride, args[0].str);
+                    char[24] wb = void;
+                    repBulk(propagationOverride, wb[0 .. snprintf(wb.ptr, wb.length, "%llu", newAt)]);
+                    repBulk(propagationOverride, "FIELDS");
+                    char[24] cb = void;
+                    repBulk(propagationOverride,
+                            cb[0 .. snprintf(cb.ptr, cb.length, "%llu", cast(ulong) affected.length)]);
+                    foreach (ai; affected[])
+                        repBulk(propagationOverride, fields[ai].str);
+                }
+                if (obj.hash.length == 0)
+                    ks.delIfEmpty(args[0].str, obj);
+                else
+                    ks.retimeSubExpire(args[0].str, ObjType.hash, obj.hash.minFieldTTL());
+            }
+            break;
+        }
+    case "HTTL":
+    case "HPTTL":
+    case "HEXPIRETIME":
+    case "HPEXPIRETIME":
+        {
+            // H* key FIELDS numfields field... — remaining TTL / absolute expiry per field
+            immutable lname = name.length == 4 ? "httl" : name.length == 5
+                ? "hpttl" : name.length == 11 ? "hexpiretime" : "hpexpiretime";
+            immutable isSec = name[1] != 'P'; // HTTL/HEXPIRETIME are seconds
+            immutable bool relative = name.length <= 5; // HTTL/HPTTL are relative
+            if (args.length < 4)
+            {
+                arityErr(o, lname);
+                break;
+            }
+            long nf;
+            if (!eqICKeyword(args[1].str, "FIELDS"))
+            {
+                repError(o,
+                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                break;
+            }
+            if (!parseLong(args[2].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            auto fields = args[3 .. $];
+            if (nf <= 0 || cast(size_t) nf != fields.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            immutable now = detNow();
+            repArrayHeader(o, fields.length);
+            foreach (ref a; fields)
+            {
+                auto exist = obj is null ? null : obj.hash.get(a.str);
+                if (exist is null)
+                {
+                    repInt(o, -2); // no such field / key
+                    continue;
+                }
+                immutable ulong at = obj.hash.getFieldTTL(a.str);
+                if (at == 0)
+                {
+                    repInt(o, -1); // field exists, no TTL
+                    continue;
+                }
+                long result = relative ? cast(long)(at - now) : cast(long) at;
+                if (result < 0)
+                    result = 0;
+                repInt(o, isSec ? (result + 500) / 1000 : result);
+            }
+            break;
+        }
+    case "HPERSIST":
+        {
+            // HPERSIST key FIELDS numfields field...
+            if (args.length < 4)
+            {
+                arityErr(o, "hpersist");
+                break;
+            }
+            long nf;
+            if (!eqICKeyword(args[1].str, "FIELDS"))
+            {
+                repError(o,
+                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                break;
+            }
+            if (!parseLong(args[2].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            auto fields = args[3 .. $];
+            if (nf <= 0 || cast(size_t) nf != fields.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            Vector!size_t affected;
+            repArrayHeader(o, fields.length);
+            foreach (idx, ref a; fields)
+            {
+                auto exist = obj is null ? null : obj.hash.get(a.str);
+                if (exist is null)
+                {
+                    repInt(o, -2); // no such field / key
+                    continue;
+                }
+                if (obj.hash.clearFieldTTL(a.str))
+                {
+                    affected.put(idx);
+                    repInt(o, 1); // TTL removed
+                }
+                else
+                    repInt(o, -1); // field exists, had no TTL
+            }
+            if (affected.length > 0)
+            {
+                notifyKeyspaceEvent(NClass.hash, "hpersist", args[0].str);
+                ks.retimeSubExpire(args[0].str, ObjType.hash, obj.hash.minFieldTTL());
+                propagationOverride.clear();
+                repArrayHeader(propagationOverride, 4 + affected.length);
+                repBulk(propagationOverride, "HPERSIST");
+                repBulk(propagationOverride, args[0].str);
+                repBulk(propagationOverride, "FIELDS");
+                char[24] cb = void;
+                repBulk(propagationOverride,
+                        cb[0 .. snprintf(cb.ptr, cb.length, "%llu", cast(ulong) affected.length)]);
+                foreach (ai; affected[])
+                    repBulk(propagationOverride, fields[ai].str);
+            }
+            break;
+        }
+    case "HGETEX":
+        {
+            // HGETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST] FIELDS numfields field...
+            if (args.length < 4)
+            {
+                arityErr(o, "hgetex");
+                break;
+            }
+            int op = 0; // 0=none, 1=set-ttl, 2=persist
+            bool isSec, isRel;
+            long ttlv;
+            size_t fi = 1;
+            if (!eqICKeyword(args[1].str, "FIELDS"))
+            {
+                auto opt = args[1].str;
+                if (eqICKeyword(opt, "PERSIST"))
+                {
+                    op = 2;
+                    fi = 2;
+                }
+                else if (eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX")
+                    || eqICKeyword(opt, "EXAT") || eqICKeyword(opt, "PXAT"))
+                {
+                    if (args.length < 3 || !parseLong(args[2].str, ttlv))
+                    {
+                        repError(o, "ERR value is not an integer or out of range");
+                        break;
+                    }
+                    op = 1;
+                    isSec = eqICKeyword(opt, "EX") || eqICKeyword(opt, "EXAT");
+                    isRel = eqICKeyword(opt, "EX") || eqICKeyword(opt, "PX");
+                    fi = 3;
+                }
+                else
+                {
+                    repError(o, "ERR syntax error");
+                    break;
+                }
+            }
+            long nf;
+            if (fi >= args.length || !eqICKeyword(args[fi].str, "FIELDS"))
+            {
+                repError(o,
+                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                break;
+            }
+            if (fi + 2 > args.length || !parseLong(args[fi + 1].str, nf))
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            auto fields = args[fi + 2 .. $];
+            if (nf <= 0 || cast(size_t) nf != fields.length)
+            {
+                repError(o,
+                        "ERR numfields should be greater than 0 and match the provided number of fields");
+                break;
+            }
+            long absMs;
+            if (op == 1 && !resolveExpireMs(ttlv, isSec, isRel, absMs))
+            {
+                o.append("-ERR invalid expire time in 'hgetex' command\r\n");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            immutable now = detNow();
+            immutable bool pastTime = op == 1 && absMs <= cast(long) now;
+            immutable ulong newAt = (op == 1 && absMs > 0) ? cast(ulong) absMs : 1;
+            // reply: the field values (HMGET-shaped), reaped fields already gone
+            repArrayHeader(o, fields.length);
+            foreach (ref a; fields)
+            {
+                auto f = obj is null ? null : obj.hash.get(a.str);
+                if (f is null)
+                    repNullBulk(o);
+                else
+                    repStrVal(o, *f);
+            }
+            if (op != 0 && obj !is null)
+            {
+                Vector!size_t affected;
+                foreach (idx, ref a; fields)
+                {
+                    if (obj.hash.get(a.str) is null)
+                        continue;
+                    if (op == 2)
+                    {
+                        if (obj.hash.clearFieldTTL(a.str))
+                            affected.put(idx);
+                    }
+                    else if (pastTime)
+                    {
+                        obj.hash.del(a.str);
+                        affected.put(idx);
+                    }
+                    else
+                    {
+                        obj.hash.setFieldTTL(a.str, newAt);
+                        affected.put(idx);
+                    }
+                }
+                if (affected.length > 0)
+                {
+                    propagationOverride.clear();
+                    if (op == 2)
+                    {
+                        notifyKeyspaceEvent(NClass.hash, "hpersist", args[0].str);
+                        repArrayHeader(propagationOverride, 4 + affected.length);
+                        repBulk(propagationOverride, "HPERSIST");
+                        repBulk(propagationOverride, args[0].str);
+                        repBulk(propagationOverride, "FIELDS");
+                        char[24] cb = void;
+                        repBulk(propagationOverride,
+                                cb[0 .. snprintf(cb.ptr, cb.length, "%llu", cast(ulong) affected.length)]);
+                        foreach (ai; affected[])
+                            repBulk(propagationOverride, fields[ai].str);
+                    }
+                    else if (pastTime)
+                    {
+                        notifyKeyspaceEvent(NClass.hash, "hexpired", args[0].str);
+                        repArrayHeader(propagationOverride, 2 + affected.length);
+                        repBulk(propagationOverride, "HDEL");
+                        repBulk(propagationOverride, args[0].str);
+                        foreach (ai; affected[])
+                            repBulk(propagationOverride, fields[ai].str);
+                    }
+                    else
+                    {
+                        notifyKeyspaceEvent(NClass.hash, "hexpire", args[0].str);
+                        repArrayHeader(propagationOverride, 4 + affected.length);
+                        repBulk(propagationOverride, "HPEXPIREAT");
+                        repBulk(propagationOverride, args[0].str);
+                        char[24] wb = void;
+                        repBulk(propagationOverride, wb[0 .. snprintf(wb.ptr, wb.length, "%llu", newAt)]);
+                        repBulk(propagationOverride, "FIELDS");
+                        char[24] cb = void;
+                        repBulk(propagationOverride,
+                                cb[0 .. snprintf(cb.ptr, cb.length, "%llu", cast(ulong) affected.length)]);
+                        foreach (ai; affected[])
+                            repBulk(propagationOverride, fields[ai].str);
+                    }
+                    if (obj.hash.length == 0)
+                        ks.delIfEmpty(args[0].str, obj);
+                    else
+                        ks.retimeSubExpire(args[0].str, ObjType.hash, obj.hash.minFieldTTL());
+                }
             }
             break;
         }
@@ -5119,6 +5569,7 @@ public bool isWriteCommand(scope const(char)[] uname) @nogc nothrow
     case "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LPUSHX", "RPUSHX":
     case "LTRIM", "LINSERT", "LMOVE", "RPOPLPUSH":
     case "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX", "HINCRBYFLOAT", "HGETDEL":
+    case "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT", "HPERSIST":
     case "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE":
     case "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZMPOP":
     case "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZRANGESTORE":

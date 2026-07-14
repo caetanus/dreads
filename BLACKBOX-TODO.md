@@ -77,6 +77,23 @@ both non-blocking, separate). **zset 318/8 → 322/0.** No cross-file regression
 (full sweep 999/51 → 1007/37). XREAD BLOCK deliberately stays on the broadcast
 (fan-out, not hand-off).
 
+### Hash-field TTL (HEXPIRE family) — DONE (2026-07-14)
+Implemented HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT, HPERSIST, HTTL/HPTTL/
+HEXPIRETIME/HPEXPIRETIME, HGETEX — semantics mirrored from Valkey `t_hash.c`
+(codes -2/-1/0/1/2; NX/XX/GT/LT; HSET drops a field's TTL). Storage is a
+lazily-allocated per-hash side-map `SmallHash.fieldTTL` (field→absMs, own field
+names, survives listpack↔hashtable spill); a small hash with any field TTL reports
+`listpackex`. Expiry mirrors key TTL exactly: **lazy** reap in `Keyspace.lookup`
+(the per-field analog of the key-expired check) and **active** reap via a NEW
+tagged secondary index `subExpires: deadline→[{type,key}]` — one entry per
+container at its nearest field deadline, dispatched by type (hash now, zset-member
+later), reusing arm/disarm/retime/cycle. Propagation is canonical + deterministic:
+`HPEXPIREAT` (set) / `HDEL` (past-time or reap), like EXPIRE→PEXPIREAT/DEL — no
+per-field DEL on lazy reap (absolute deadline is already replicated). Events
+`hexpire`/`hpersist`/`hexpired` (NClass.hash), once per command. Own UT:
+`blackbox.hexpire_*` (6 tests). No tcl suite here (this Valkey checkout's hash.tcl
+predates the feature); validated by unit + live smoke + source parity.
+
 ### Not implemented (each aborts its file)
 - DUMP/RESTORE (hash file; RDB payload + CRC — sizeable).
 - HSCAN NOVALUES (scan file, to confirm).
