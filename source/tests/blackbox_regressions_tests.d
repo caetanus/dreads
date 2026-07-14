@@ -925,6 +925,29 @@ version (unittest)
         isDenyOomCommand("PING").should.equal(false);
     }
 
+    // INFO errorstats: statErrorReply extracts the error code (first token, capped
+    // at 32 chars, default ERR) and bumps total_error_replies. The pipeline wiring
+    // is server-layer (blackbox-only); this pins the code extraction.
+    @("blackbox.errorstats_code_extraction")
+    unittest
+    {
+        import dreads.stats : gErrorStats, gTotalErrorReplies, statErrorReply,
+            resetErrorStats;
+
+        resetErrorStats();
+        statErrorReply("-WRONGTYPE Operation against a key holding the wrong kind");
+        statErrorReply("-ERR bad");
+        statErrorReply("ERR no leading dash"); // caller passed the bare message
+        statErrorReply("-OOM command not allowed");
+        gTotalErrorReplies.should.equal(4);
+        (*gErrorStats.get("WRONGTYPE")).should.equal(1);
+        (*gErrorStats.get("ERR")).should.equal(2);
+        (*gErrorStats.get("OOM")).should.equal(1);
+        resetErrorStats();
+        gTotalErrorReplies.should.equal(0);
+        assert(gErrorStats.get("OOM") is null);
+    }
+
     // OBJECT FREQ/IDLETIME follow the maxmemory policy (LRU and LFU share one
     // counter, like Redis's obj->lru), and RESTORE FREQ/IDLETIME seed it. First
     // caught by unit/dump (OBJECT FREQ aborted the file).

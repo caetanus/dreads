@@ -2847,11 +2847,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             n = snprintf(b.ptr, b.length, "number_of_cached_scripts:%zu\r\n",
                     gScriptCountHook !is null ? gScriptCountHook() : 0);
             ib.append(b[0 .. n]);
-            n = snprintf(b.ptr, b.length,
-                    "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n"
-                    ~ "evicted_keys:%llu\r\n",
-                    gExpiredKeys, gExpiredFields, gEvictedKeys);
-            ib.append(b[0 .. n]);
+            {
+                import dreads.stats : gTotalErrorReplies;
+
+                n = snprintf(b.ptr, b.length,
+                        "# Stats\r\nexpired_keys:%llu\r\nexpired_fields:%llu\r\nexpired_subkeys:0\r\n"
+                        ~ "evicted_keys:%llu\r\ntotal_error_replies:%llu\r\n",
+                        gExpiredKeys, gExpiredFields, gEvictedKeys, gTotalErrorReplies);
+                ib.append(b[0 .. n]);
+            }
             {
                 import dreads.acl : gAclDeniedAuth, gAclDeniedCmd, gAclDeniedKey,
                     gAclDeniedChannel;
@@ -2882,7 +2886,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             // is not tracked (no per-command clock — see BLACKBOX-TODO.md), so it
             // is reported as 0. Only commands with activity are listed.
             {
-                import dreads.server : gCmdStats;
+                import dreads.stats : gCmdStats;
                 import dreads.aclcat : gCmdCats;
 
                 ib.append("# Commandstats\r\n");
@@ -2896,6 +2900,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                                 s.calls, s.usec, s.rejected, s.failed);
                         ib.append(b[0 .. n]);
                     }
+            }
+            {
+                import dreads.stats : appendErrorstats;
+
+                appendErrorstats(ib); // # Errorstats\r\nerrorstat_<code>:count=N
             }
             ib.append("# Keyspace\r\n");
             // raw dict count, like Redis/DBSIZE: a logically-expired key that

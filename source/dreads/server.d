@@ -35,6 +35,8 @@ import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
     isDenyOomCommand, gScriptWritesHook, propagationOverride, parseLong;
+import dreads.stats : gTotalErrorReplies, statErrorReply, resetErrorStats,
+    gCmdStats, CmdStat, statCall, statRejected, resetCmdStats;
 
 // A command held by a WRITE-mode CLIENT PAUSE: the may-replicate write set, plus
 // EVAL/EVALSHA/FCALL only when the script actually may write (the scripting hook
@@ -78,41 +80,6 @@ private __gshared ulong gClientIds;
 private __gshared Conn*[64] gMonitors;
 private __gshared size_t gMonitorCount;
 
-// Per-command statistics for INFO commandstats (indexed by aclCmdIndex). Counters
-// only — calls/rejected/failed are cheap increments on the command path. We do
-// NOT read a per-command clock (usec stays 0) to keep the hot path clean; see
-// BLACKBOX-TODO.md. `rejected` = rejected before execution (ACL denials);
-// `failed` = executed but returned an error.
-struct CmdStat
-{
-    ulong calls, usec, rejected, failed;
-}
-
-public __gshared CmdStat[gCmdCats.length] gCmdStats;
-
-// A command rejected before execution (ACL denial). idx = aclCmdIndex(name).
-void statRejected(int idx) @nogc nothrow
-{
-    if (idx >= 0 && idx < cast(int) gCmdStats.length)
-        gCmdStats[idx].rejected++;
-}
-
-// A command that executed; `failed` if its reply was an error.
-void statCall(int idx, bool failed) @nogc nothrow
-{
-    if (idx >= 0 && idx < cast(int) gCmdStats.length)
-    {
-        gCmdStats[idx].calls++;
-        if (failed)
-            gCmdStats[idx].failed++;
-    }
-}
-
-public void resetCmdStats() @nogc nothrow
-{
-    foreach (ref s; gCmdStats)
-        s = CmdStat.init;
-}
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
 
@@ -2450,8 +2417,22 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             import dreads.scripting : gScriptWrote;
 
             gScriptWrote = false;
+            immutable evalPrev = gTotalErrorReplies;
+            immutable evalOut = o.length;
             evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
             propagationOverride.clear();
+            // commandstats/errorstats for the EVAL itself: a Lua-level error is a
+            // real leaf error; an error propagated from a redis.call already
+            // bumped the counter (during the round-trip), so don't re-count it.
+            immutable evalErrored = o.length > evalOut && o.data[evalOut] == '-';
+            if (evalErrored && gTotalErrorReplies == evalPrev)
+                statErrorReply(cast(const(char)[]) o.data[evalOut .. $]);
+            {
+                char[16] lc = void;
+                foreach (i, ch; name)
+                    lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+                statCall(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]), evalErrored);
+            }
             if (gScriptWrote)
             {
                 gWriteEpoch++;
@@ -2514,12 +2495,25 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
 
     if (gConfig.maxmemory && isDenyOomCommand(uname) && !freeMemoryIfNeeded())
     {
-        repError(o, "OOM command not allowed when used memory > 'maxmemory'.");
+        // refused before running: a rejected_call (not a call) + a leaf OOM error
+        char[16] lc = void;
+        foreach (i, ch; name)
+            lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+        statRejected(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]));
+        enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
+        statErrorReply(oom);
+        repError(o, oom);
         return true;
     }
+    immutable errPrev = gTotalErrorReplies; // leaf-vs-propagated guard (see stats.d)
     auto outBefore = o.length;
     auto keep = dispatch(cmd, *c.dbp, o, arena);
     immutable errored = o.length > outBefore && o.data[outBefore] == '-';
+    // errorstats/total: only a REAL leaf error (a nested command — e.g. a script's
+    // redis.call — that failed already bumped the counter during dispatch, so the
+    // outer command must not re-count its propagated error).
+    if (errored && gTotalErrorReplies == errPrev)
+        statErrorReply(cast(const(char)[]) o.data[outBefore .. $]);
     // INFO commandstats: count the executed data command (name.length <= 16 here,
     // guaranteed by the nbuf check above). Blocking/pubsub/connection commands
     // handled before this point are not counted — see BLACKBOX-TODO.md.
@@ -2949,6 +2943,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             import dreads.obj : gExpiredKeys, gExpiredFields;
 
             resetCmdStats(); // clear INFO commandstats counters
+            resetErrorStats(); // clear errorstats + total_error_replies
             gExpiredKeys = 0;
             gExpiredFields = 0;
         }

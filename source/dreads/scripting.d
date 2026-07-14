@@ -103,8 +103,16 @@ private ulong nextScriptRandSeed() nothrow @nogc
 
 /// Deny-oom policy for the script in flight (THREAD-LOCAL, like gPoolMode): the
 /// bridge lets writes through only when this is true. Set per run in
-/// evalCommand/fcallCommand and read by luaRedisCall on the same thread.
-private bool gScriptAllowOom;
+/// evalCommand/fcallCommand; read by the deny-OOM gate in executeScriptCommand,
+/// which runs on the MAIN thread (a redis.call round-trips there). __gshared and
+/// safe because exactly one script runs at a time and the round-trip's cross-
+/// thread event orders the write-before-read.
+public __gshared bool gScriptAllowOom;
+
+/// The current script is read-only (EVAL_RO/EVALSHA_RO or a no-writes shebang /
+/// function). Read by the RO-write gate in executeScriptCommand (main thread),
+/// same one-script-at-a-time __gshared reasoning as gScriptAllowOom.
+public __gshared bool gScriptReadOnly;
 
 /// True when the server is over its maxmemory limit (a read-only check; script
 /// writes don't run the eviction cycle — see DRIFT.md on approximate LRU).
@@ -749,32 +757,12 @@ private int redisCallImpl(lua_State* L, bool raise) nothrow @nogc
             default:
                 break;
             }
-            // read-only scripts also bar may-replicate commands (PUBLISH/PFCOUNT):
-            // they propagate, which a no-writes/_RO script must not do.
-            if (gCtx.readOnly && isPausedByWrite(uc))
-            {
-                // raise as an {err=...} object so it surfaces verbatim, the
-                // way Redis reports bridge-level refusals
-                enum ro = "ERR Write commands are not allowed from read-only scripts.";
-                lua_createtable(L, 0, 1);
-                lua_pushlstring(L, ro.ptr, ro.length);
-                lua_setfield(L, -2, "err");
-                return lua_error(L);
-            }
-            // deny-oom write over the memory limit (legacy no-shebang scripts
-            // reach here; allow-oom/no-writes/read-only runs set gScriptAllowOom).
-            // Only ALLOCATING writes are denied, and never once the script is
-            // already dirty — Valkey doesn't stop a script mid-way (its earlier
-            // writes are committed, so refusing the rest would leave it partial).
-            if (isDenyOomCommand(uc) && !gScriptAllowOom && !gScriptWrote
-                && scriptOverMaxmemory())
-            {
-                enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
-                lua_createtable(L, 0, 1);
-                lua_pushlstring(L, oom.ptr, oom.length);
-                lua_setfield(L, -2, "err");
-                return lua_error(L);
-            }
+            // The RO-write refusal (a write / may-replicate command from a
+            // read-only script) is enforced at the pipeline top too — see the gate
+            // in executeScriptCommand — so it is counted like any command.
+            // deny-OOM is enforced at the pipeline top (executeScriptCommand, on
+            // the main thread) so the refusal is counted there like any command —
+            // see the gate + statRejected in executeScriptCommand.
             // SELECT inside a script switches the db for the rest of THIS script
             // (subsequent redis.call target the new db) without touching the
             // caller's connection db. Update the bridge's db before the command
@@ -1161,6 +1149,61 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
         gRespProto = savedProto;
 
     reply.clear();
+
+    // Pipeline-top stats + deny-OOM for the sub-command, on the MAIN thread (a
+    // redis.call round-trips here), so both are counted like any top-level command
+    // and the errorstat HashMap is never touched from the Lua worker.
+    import dreads.stats : statCall, statRejected, statErrorReply, gTotalErrorReplies;
+    import dreads.acl : aclCmdIndex;
+    import dreads.commands : isDenyOomCommand, isPausedByWrite;
+
+    int cidx = -1;
+    {
+        char[16] up = void, lo = void;
+        auto nm = arr.length ? arr[0].str : null;
+        if (nm.length && nm.length <= up.length)
+        {
+            foreach (i, ch; nm)
+            {
+                up[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+                lo[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+            }
+            cidx = aclCmdIndex(cast(const(char)[]) lo[0 .. nm.length]);
+            auto ucName = cast(const(char)[]) up[0 .. nm.length];
+            // RO-write: a read-only script (EVAL_RO / no-writes) can't run a write
+            // or a may-replicate command (PUBLISH/PFCOUNT). Covers reads too, so it
+            // sits before the isWrite-gated deny-OOM check.
+            if (gScriptReadOnly && isPausedByWrite(ucName))
+            {
+                enum ro = "ERR Write commands are not allowed from read-only scripts.";
+                repError(reply, ro);
+                statRejected(cidx);
+                statErrorReply(ro);
+                return 0;
+            }
+            if (isWrite && isDenyOomCommand(ucName)
+                && !gScriptAllowOom && !gScriptWrote && scriptOverMaxmemory())
+            {
+                enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
+                repError(reply, oom);
+                statRejected(cidx); // refused before running
+                statErrorReply(oom);
+                return 0;
+            }
+        }
+    }
+    // Count the executed sub-command (a leaf: its error, if any, is the real one).
+    immutable subPrev = gTotalErrorReplies;
+    scope (exit)
+        if (cidx >= 0)
+        {
+            auto rd = reply.data;
+            immutable errored = rd.length > 0 && rd[0] == '-';
+            if (errored && gTotalErrorReplies == subPrev)
+                statErrorReply(cast(const(char)[]) rd);
+            statCall(cidx, errored);
+        }
+
     if (!isWrite)
     {
         dispatch(cmd, ks, reply, arena, clock);
@@ -1913,6 +1956,7 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
 
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    gScriptReadOnly = readOnly; // pipeline-top RO-write gate reads this on main
     bindBridgeContext(&ks); // sets ks/viaPool/db/clock for inline or pool mode
     gScriptResp = 2; // redis.setresp default per script
     gScriptWrote = false; // per-EVAL: the server signals WATCH/blocked wakes
@@ -2791,6 +2835,7 @@ public void fcallCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
 
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;
+    gScriptReadOnly = readOnly; // pipeline-top RO-write gate reads this on main
     bindBridgeContext(&ks);
     gScriptResp = 2;
     gScriptWrote = false;
