@@ -870,4 +870,29 @@ version (unittest)
         ks.runAt(T1, "HGET", "h", "f").expect.to.equal("$-1\r\n"); // reaped by the cycle
         ks.runAt(T1, "HGET", "h", "g").expect.to.equal("$1\r\n2\r\n"); // survives
     }
+
+    // CLIENT PAUSE write surface: the classifier the WRITE-mode barrier consults.
+    // The socket/fiber buffering + replay is server-layer (stays blackbox-only —
+    // see BLACKBOX-TODO.md); this pins the pure predicate, Valkey's WRITE-pause
+    // mask CMD_WRITE | CMD_MAY_REPLICATE.
+    @("blackbox.pause_write_surface_classifier")
+    unittest
+    {
+        // plain writes are held
+        isPausedByWrite("SET").should.equal(true);
+        isPausedByWrite("HSET").should.equal(true);
+        isPausedByWrite("ZADD").should.equal(true);
+        // may-replicate: propagate / rewrite a cache, so a WRITE pause holds them
+        isPausedByWrite("PUBLISH").should.equal(true);
+        isPausedByWrite("SPUBLISH").should.equal(true);
+        isPausedByWrite("PFCOUNT").should.equal(true);
+        // pure reads pass the barrier
+        isPausedByWrite("GET").should.equal(false);
+        isPausedByWrite("HGET").should.equal(false);
+        isPausedByWrite("PING").should.equal(false);
+        // scripts are NOT decided here — write-ness depends on shebang / function
+        // flags, resolved separately via gScriptWritesHook
+        isPausedByWrite("EVAL").should.equal(false);
+        isPausedByWrite("FCALL").should.equal(false);
+    }
 }

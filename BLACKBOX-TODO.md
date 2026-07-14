@@ -44,7 +44,8 @@ leakage).
 | unit/type/zset | 322 | 0 | **PASSES** |
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
-| unit/type/list | 271 | 10 | aborts: `CLIENT PAUSE` |
+| unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented — re-sweep |
+| unit/pause | 13 | 4 | completes past scripts; eviction/expire-skip-during-pause, may-replicate-in-RO-script, 1 timing test |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
@@ -64,7 +65,20 @@ hll-sparse CONFIG params; INFO `keys_with_volatile_items` + `expired_fields`.
 hashexpire.tcl went 3 -> 226. No hot-path regression (SET 1.24M / GET 1.43M /
 HGET-with-field-TTL 1.19M rps @ -P16).
 
-Quick wins to unmask more: **CLIENT PAUSE/UNPAUSE** (list + unit/pause),
+CLIENT PAUSE/UNPAUSE landed (2026-07-14): buffer-and-replay via the normal
+pipeline (no fiber park — the socket keeps draining into a bounded per-conn
+buffer, so a flood trips the client-query-buffer-limit and the conn is dropped;
+verified the cut point tracks the configured limit). WRITE vs ALL, issuer
+exempt, stacking (max end + most restrictive), INFO paused_* fields,
+blocked_clients accounting, and the WRITE "write surface" (PUBLISH/SPUBLISH/
+PFCOUNT + EVAL/EVALSHA/FCALL gated by shebang/function no-writes flags,
+EXEC-with-writes as a unit). Also fixed SCRIPT LOAD to strip the `#!lua` shebang.
+pause.tcl 2 -> 13; no hot-path regression (SET 1.26M / GET 1.37M rps @ -P16).
+Remaining unit/pause: eviction & active/passive expire skipped during a pause
+(needs a periodic-eviction cycle dreads lacks + lazy-expire deferral), may-
+replicate rejected inside RO scripts (script bridge), one deferring-client timer.
+
+Quick wins to unmask more: re-sweep list.tcl (PAUSE was its blocker),
 **CLIENT REPLY** (pubsub), OBJECT FREQ (dump), PFDEBUG (hyperloglog), the `other`
 CONFIG param, and stream-COPY (keyspace). Sort is the biggest local debt.
 
