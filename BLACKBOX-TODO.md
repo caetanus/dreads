@@ -46,7 +46,7 @@ leakage).
 | unit/bitfield | 18 | 0 | **PASSES** |
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
 | unit/pause | 19 | 0 | **PASSES** (1 skip N/A: deferring-client write-backpressure timing — dreads buffers server-side by design) |
-| unit/dump | 14 | 4 | completes (no abort); **stream DUMP/RESTORE landed** (byte-exact Valkey 9.1 both ways); remaining = MIGRATE command, RESTORE shared-NACK corruption reject |
+| unit/dump | 15 | 1 | **MIGRATE landed** (DUMP->RESTORE over cached socket; 14 two-instance tests are external:skip, verified live vs valkey 9.1; the runnable cached-connection-release test passes); stream DUMP/RESTORE byte-exact both ways; only remaining fail = RESTORE shared-NACK corruption reject (expects "Bad data format", we say "checksum are wrong") |
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
@@ -159,11 +159,22 @@ ziplist (10/12/13) / zipmap (9) / quicklist-v1 (14) / ZSET(3 ascii) / LZF-
 compressed strings / stream DUMP — Valkey 9 doesn't emit these, needed only for
 very old dumps or compressed large values.
 
+**MIGRATE DONE (2026-07-14, commit 6852d20):** option 2 — DUMP each existing key
+here, RESTORE it onto the target over a **cached outbound socket** (per host:port,
+released after 10s idle from the 1s timer; INFO `migrate_cached_sockets`), then
+DEL locally unless COPY (logged). Reuses `dumpKeyPayload`, so it interoperates
+byte-for-byte with real Redis/Valkey, not just dreads<->dreads. Flags COPY/REPLACE
+/AUTH/AUTH2/KEYS; missing keys skipped, NOKEY when none; RESTORE errors surfaced
+verbatim; broken socket closed not reused. Arg parsing extracted to pure
+`parseMigrateArgs` with own UT `blackbox.migrate_arg_parsing`. The 14 two-instance
+dump.tcl MIGRATE tests are external:skip (harness won't spawn dreads as the second
+node); verified live vs valkey 9.1 (basic/copy+ttl/replace/BUSYKEY/NOKEY/multi-key
+/socket-caching). The runnable cached-connection-release test passes.
+
 ### Not implemented (each aborts its file)
-- CLIENT PAUSE (list file — the new blocker after DUMP).
 - HSCAN NOVALUES (scan file, to confirm).
 - COPY of a stream with consumer groups (keyspace).
-- Stream DUMP/RESTORE (deferred with the RDB phase 2).
+(CLIENT PAUSE and stream DUMP/RESTORE — both DONE this session, see above.)
 
 ### Scripting (effects replication LANDED — leftovers)
 Effects replication is in (EVAL never logged; each redis.call write logged
