@@ -12,7 +12,7 @@ import core.stdc.string : memcpy;
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
-import dreads.notify : notifyKeyspaceEvent, NClass;
+import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode;
 import dreads.resp;
 import dreads.stream : FieldPair, Stream, StreamID;
@@ -3746,13 +3746,36 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case "RANDOMKEY":
         {
             import dreads.obj : gPauseUntilMs;
+            import dreads.rand : randBelow;
 
-            // deterministic "random": the first live, unexpired slot. Under a
-            // CLIENT PAUSE, expiry is held, so a logically-expired key is still
-            // present and RANDOMKEY returns it (and can't spin looking for a live
-            // one — the Valkey "infinite loop during pause" guard).
+            // Uniformly random live, unexpired slot via rejection sampling (like
+            // SRANDMEMBER/HRANDFIELD). Under a CLIENT PAUSE, expiry is held, so a
+            // logically-expired key is still present and eligible (the Valkey
+            // "no infinite loop during pause" guard — we never spin skipping it).
             auto now = detNow();
             immutable paused = gPauseUntilMs != 0 && now < gPauseUntilMs;
+            if (ks.d.length == 0)
+            {
+                repNullBulk(o);
+                break;
+            }
+            enum maxTries = 100;
+            foreach (_; 0 .. maxTries)
+            {
+                immutable cap = ks.d.capacity;
+                if (cap == 0)
+                    break;
+                immutable i = randBelow(cap);
+                if (!ks.d.slotLive(i))
+                    continue;
+                auto obj = ks.d.valAt(i);
+                if (!paused && obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                    continue; // expired: skip (a later access / active cycle reaps it)
+                repBulk(o, ks.d.keyAt(i));
+                return true;
+            }
+            // Fallback (all sampled slots were empty/expired): linear scan so we
+            // still return a key when a live unexpired one exists.
             foreach (i; 0 .. ks.d.capacity)
             {
                 if (!ks.d.slotLive(i))
@@ -3855,13 +3878,30 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case "MOVE":
         {
-            if (args.length != 2)
+            // MOVE key db [REPLACE] — REPLACE overwrites an existing destination key
+            // (and adopts the source's TTL, or clears it if the source has none).
+            if (args.length < 2)
             {
                 arityErr(o, "move");
                 break;
             }
+            bool replace = false;
+            // Anything past `key db` other than a lone REPLACE is a syntax error
+            // (extra tokens included), NOT an arity error.
+            if (args.length > 3 || (args.length == 3 && !eqICKeyword(args[2].str, "REPLACE")))
+            {
+                repError(o, "ERR syntax error");
+                break;
+            }
+            if (args.length == 3)
+                replace = true;
             long dst;
-            if (!parseLong(args[1].str, dst) || dst < 0 || dst >= NUM_DBS)
+            if (!parseLong(args[1].str, dst)) // not an integer at all
+            {
+                repError(o, "ERR value is not an integer or out of range");
+                break;
+            }
+            if (dst < 0 || dst >= NUM_DBS)
             {
                 repError(o, "ERR DB index is out of range");
                 break;
@@ -3879,26 +3919,46 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 break;
             }
             auto src = ks.lookup(args[0].str);
-            if (src is null || gDbs[cast(size_t) dst].exists(args[0].str))
+            immutable dstExists = gDbs[cast(size_t) dst].exists(args[0].str);
+            if (src is null || (dstExists && !replace))
             {
-                repInt(o, 0); // no such key, or the destination already has it
+                repInt(o, 0); // no such key, or the destination already has it (no REPLACE)
                 break;
             }
             immutable ttl = src.expireAtMs;
+            if (dstExists) // REPLACE: drop the old destination (and its expire index)
+            {
+                gDbs[cast(size_t) dst].disarmExpire(args[0].str,
+                        gDbs[cast(size_t) dst].lookup(args[0].str).expireAtMs);
+                gDbs[cast(size_t) dst].d.del(args[0].str);
+            }
             ks.disarmExpire(args[0].str, ttl);
             RObj obj;
             ks.d.steal(args[0].str, obj);
             gDbs[cast(size_t) dst].d.set(args[0].str, obj);
             gDbs[cast(size_t) dst].armExpire(args[0].str, ttl);
+            // move_from on the source db, move_to on the destination db.
+            notifyKeyspaceEventDb(curIdx, NClass.generic, "move_from", args[0].str);
+            notifyKeyspaceEventDb(cast(int) dst, NClass.generic, "move_to", args[0].str);
             repInt(o, 1);
             break;
         }
     case "SWAPDB":
         {
-            long a, b;
-            if (args.length != 2 || !parseLong(args[0].str, a) || !parseLong(args[1].str, b))
+            if (args.length != 2)
             {
-                repError(o, "ERR invalid first DB index or second DB index");
+                arityErr(o, "swapdb");
+                break;
+            }
+            long a, b;
+            if (!parseLong(args[0].str, a)) // report which index is malformed
+            {
+                repError(o, "ERR invalid first DB index");
+                break;
+            }
+            if (!parseLong(args[1].str, b))
+            {
+                repError(o, "ERR invalid second DB index");
                 break;
             }
             if (a < 0 || a >= NUM_DBS || b < 0 || b >= NUM_DBS)

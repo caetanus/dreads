@@ -209,11 +209,7 @@ public struct RObj
             });
             break;
         case ObjType.stream:
-            stream.walkRange(StreamID.minId, StreamID.maxId, 0, (id, pairs) {
-                c.stream.add(id, pairs);
-                return 0;
-            });
-            c.stream.lastId = stream.lastId; // survives an empty stream
+            c.stream = stream.dup(); // deep copy: entries + metadata + groups/PEL
             break;
         }
         return c;

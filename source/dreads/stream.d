@@ -104,6 +104,33 @@ public struct Group
         consumers.free();
     }
 
+    /// Independent deep copy — cursor, entries-read, consumers, and the PEL, with
+    /// every copied PEL entry's `consumer` slice re-pointed into the COPY's own
+    /// consumers dict (dict keys are stable). The result owns nothing of `this`,
+    /// so it outlives the source group (COPY/MOVE then DEL of the source key).
+    Group dup() const @nogc nothrow @trusted
+    {
+        auto src = cast(Group*)&this;
+        Group g;
+        g.lastDelivered = lastDelivered;
+        g.entriesRead = entriesRead;
+        foreach (ci; 0 .. src.consumers.capacity) // consumers first
+            if (src.consumers.slotLive(ci))
+                g.consumers.set(src.consumers.keyAt(ci), *src.consumers.valAt(ci));
+        foreach (pe; src.pending) // then the PEL, pointing into the copy's dict
+        {
+            const(char)[] stable;
+            foreach (ci; 0 .. g.consumers.capacity)
+                if (g.consumers.slotLive(ci) && g.consumers.keyAt(ci) == pe.consumer)
+                {
+                    stable = g.consumers.keyAt(ci);
+                    break;
+                }
+            g.pelSet(pe.id, stable, pe.deliveryTimeMs, pe.deliveryCount);
+        }
+        return g;
+    }
+
     @property const(PelEntry)[] pending() const @nogc nothrow
     {
         return pel[0 .. plen];
@@ -228,6 +255,26 @@ public struct Stream
         entriesAdded = 0;
         maxDeletedId = StreamID(0, 0);
         groups.free();
+    }
+
+    /// Independent deep copy — entries, id/counter metadata, and every consumer
+    /// group (each via `Group.dup`). Used by `RObj.deepDup` for COPY/MOVE. The
+    /// result shares no memory with `this`.
+    Stream dup() const @nogc nothrow @trusted
+    {
+        auto src = cast(Stream*)&this;
+        Stream s;
+        src.walkRange(StreamID.minId, StreamID.maxId, 0, (id, pairs) {
+            s.add(id, pairs);
+            return 0;
+        });
+        s.lastId = lastId; // survives an empty stream
+        s.entriesAdded = entriesAdded;
+        s.maxDeletedId = maxDeletedId;
+        foreach (gi; 0 .. src.groups.capacity)
+            if (src.groups.slotLive(gi))
+                s.groups.set(src.groups.keyAt(gi), src.groups.valAt(gi).dup());
+        return s;
     }
 
     /// Fetches one entry's fields; returns dg's result, or -1 when absent.

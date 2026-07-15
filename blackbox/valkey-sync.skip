@@ -168,3 +168,10 @@ RESTORE loads expired hash fields
 # (Side effect in-suite: this test fails between `import-mode yes` and `no`,
 # leaking import-mode ON and breaking the two RDB-load tests that follow it.)
 Zero is a valid ttl in HFE
+# Deliberate divergence (keyspace): the pattern `*?`×50000 against 50000 'a's is a
+# VALID match (each `*` empty, each `?` one char). Valkey's stringmatchlen bails on
+# such pathological nested patterns and returns no-match as a DoS guard; dreads'
+# iterative glob matcher correctly matches it. Matching Valkey here would mean
+# reverse-engineering its exact bail threshold and risk regressing legitimate large
+# globs — not worth mirroring a Valkey-internal safety heuristic. (BLACKBOX-TODO.md)
+Regression for pattern matching very long nested loops

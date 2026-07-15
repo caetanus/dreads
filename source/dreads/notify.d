@@ -105,6 +105,28 @@ void notifyKeyspaceEvent(uint klass, scope const(char)[] event, scope const(char
         queuePair("__keyevent@0__:", event, key);
 }
 
+/// Like notifyKeyspaceEvent but targets a SPECIFIC db's channels — needed by the
+/// cross-db commands (MOVE fires `move_from` on the source db and `move_to` on the
+/// destination db). Formats `__keyspace@<db>__:` / `__keyevent@<db>__:` @nogc.
+void notifyKeyspaceEventDb(int db, uint klass, scope const(char)[] event,
+        scope const(char)[] key) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    immutable f = gNotifyFlags;
+    if (!(f & klass))
+        return;
+    char[24] ksbuf = void, kebuf = void;
+    immutable kn = snprintf(ksbuf.ptr, ksbuf.length, "__keyspace@%d__:", db);
+    immutable en = snprintf(kebuf.ptr, kebuf.length, "__keyevent@%d__:", db);
+    if (kn <= 0 || en <= 0)
+        return;
+    if (f & NClass.keyspace)
+        queuePair(ksbuf[0 .. kn], key, event);
+    if (f & NClass.keyevent)
+        queuePair(kebuf[0 .. en], event, key);
+}
+
 /// Publish and clear everything queued since the last flush. Called by the server
 /// after each command, on the non-@nogc side (gNotifyPublish -> gPubSub.publish).
 void flushPendingNotify() nothrow
