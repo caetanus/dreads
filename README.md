@@ -83,6 +83,26 @@ Peak best-of runs are higher (for example GET 2.34M vs 1.73M and SET 1.33M vs
 Unpipelined throughput is round-trip bound on both sides (~95-100k rps); the
 pipelined numbers show the real per-command cost.
 
+### Pub/Sub: publish cost is independent of pattern count
+
+Redis/Valkey match a published channel against pattern subscribers by walking the
+*whole* pattern list and running the glob matcher on each — **O(P)** per publish.
+dreads indexes patterns by their anchor (`A*` / `*B` / `A*B`) so a publish is
+**O(len(channel)), independent of P** (see [PUBSUB.md](PUBSUB.md); the design is
+our own). `bench/pubsub_bench.d` drives `PubSub.publish` directly:
+
+| Pattern subscribers `P` | dreads (ns/pub) | naive glob-all (ns/pub) | speedup |
+|---:|---:|---:|---:|
+| 100 | 400 | 805 | 2.0× |
+| 1,000 | 399 | 7,301 | 18× |
+| 10,000 | 418 | 74,846 | 179× |
+| 100,000 | 520 | 842,303 | **1621×** |
+
+The header-indexed matcher stays flat (~400–520 ns/pub) as `P` grows four orders
+of magnitude, while the naive scan grows linearly. Fan-out delivery to exact
+subscribers is sub-linear too: 228 ns/pub at 1 subscriber, 307 ns/pub at 64.
+Reproduce with `dub run --config=pubsub-bench --compiler=ldc2 --build=release`.
+
 ## How it's fast
 
 - **Zero-GC data plane.** The RESP parser, every data structure, command
