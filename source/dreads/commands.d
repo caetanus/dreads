@@ -689,13 +689,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "getex");
                 break;
             }
-            bool wrong;
-            auto obj = ks.lookupTyped(args[0].str, ObjType.str, wrong);
-            if (wrong)
-            {
-                repWrongType(o);
-                break;
-            }
+            // Validate the options (syntax + integer expire arg) BEFORE the key type
+            // check: `getex wrongtypekey exat -abcd` reports the bad-arg error, not
+            // WRONGTYPE (the arg is parsed regardless of what the key holds).
             long absMs = -1;
             bool doPersist;
             if (args.length == 2 && eqICKeyword(args[1].str, "PERSIST"))
@@ -726,6 +722,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else if (args.length != 1)
             {
                 repError(o, "ERR syntax error");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.str, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
                 break;
             }
             if (obj is null)
