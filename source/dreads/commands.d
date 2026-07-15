@@ -5941,6 +5941,8 @@ public const(char)[] objEncoding(const RObj* obj) @nogc nothrow
                 lpBytes += entry;
             }
             auto fill = gConfig.listMaxListpackSize;
+            if (fill == 0)
+                fill = 1; // Valkey treats a 0 count-limit as 1
             bool small;
             if (fill >= 0)
             {
