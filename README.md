@@ -171,9 +171,21 @@ for only at the boundaries where another service or shard is involved.
   emitted through a proto-aware reply oracle, and pub/sub confirmations/messages
   are framed as Push under RESP3. RESP2 clients are byte-unchanged.
 - **Pub/Sub**: `SUBSCRIBE`/`PSUBSCRIBE` (glob) / `PUBLISH`/`PUBSUB`, shard
-  pub/sub, subscribe-mode command gating, and **keyspace notifications**.
-  Notification channel names are still db-0-shaped (`__keyspace@0__` /
-  `__keyevent@0__`) while the multi-DB tail is being closed.
+  pub/sub, subscribe-mode command gating (a RESP3 subscriber may run any command;
+  a RESP2 one is limited to the pub/sub verbs + `PING`/`QUIT`/`RESET`/`HELLO`),
+  and **keyspace notifications**. Notification channel names are still db-0-shaped
+  (`__keyspace@0__` / `__keyevent@0__`) while the multi-DB tail is being closed.
+- **Client-side caching (`CLIENT TRACKING`)**: server-assisted invalidation over
+  a connection registry of `Weak` handles (a cross-fiber delivery `lock()`s the
+  target, so it can't dangle). Default and **`BCAST`** modes (per-prefix message
+  grouping), `REDIRECT` to another connection, `OPTIN`/`OPTOUT` + `CLIENT
+  CACHING`, `NOLOOP`, and `TRACKINGINFO`/`GETREDIR`. Invalidations are framed by
+  the target's protocol (a RESP3 client gets an `invalidate` **push**, a RESP2
+  redirection target a `message __redis__:invalidate`), spooled per command and
+  flushed at the command boundary so a client's own-key push trails its reply;
+  key expiry and eviction invalidate too, and a dead redirection target yields a
+  `tracking-redir-broken` push. `tracking.tcl` passes 29/0 (skips: rax-memory
+  accounting, in-script command tracking, BCAST prefix-collision error strings).
 - **AUTH + ACL**: real authentication and a full ACL engine. `AUTH`/`HELLO
   AUTH`, `ACL SETUSER|DELUSER|GETUSER|LIST|USERS|CAT|WHOAMI|GENPASS` with
   Valkey-format rule output. Passwords are **Argon2id** (libsodium, OWASP
