@@ -92,6 +92,20 @@ private __gshared LocalManualEvent gKeyActivity;
 // them without a module cycle); imported publicly here for the rest of server.d.
 public import dreads.obj : gPauseUntilMs, gPauseAll, gPauseIssuer;
 private __gshared LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE / timeout
+// Replay re-entrancy guard (the CLIENT PAUSE heisenbug). replayPaused() drains a
+// connection's held commands through the normal pipeline, and that path does IO
+// (flushOut / gAof.flush) which yields — another connection's fiber can land a
+// fresh CLIENT PAUSE mid-drain. If that pause took effect while we're still
+// replaying, the remaining held commands would re-barrier against a window that
+// only exists because of the yield, and the emit/park ordering can strand a fiber.
+// Fix: clear the (already-lifted) window BEFORE the drain, and while `gReplaying`
+// is set DEFER any incoming CLIENT PAUSE into gPausePending* — applied AFTER the
+// drain finishes, so it never interleaves with the very commands it must follow.
+private __gshared bool gReplaying;         // a replayPaused() drain is in progress
+private __gshared bool gPausePending;      // a CLIENT PAUSE arrived mid-replay
+private __gshared ulong gPausePendingEnd;  // its (already absolute) deadline
+private __gshared bool gPausePendingAll;   // its ALL(true)/WRITE(false) mode
+private __gshared ulong gPausePendingIssuer; // its issuer conn id (exempt)
 // Backstop re-check interval for a quiet barriered fiber: CLIENT UNPAUSE wakes it
 // via gPauseEvt at once, but this caps the wait so a client that resumes flooding
 // after going idle is drained into pausedBuf (and trips the overflow guard) within
@@ -479,6 +493,30 @@ private bool connAlive(Conn* c) nothrow
         return false;
 }
 
+// Non-consuming EOF probe for a parked blocked fiber. `tcp.connected` stays true
+// after the peer's FIN until we actually read the EOF, so it can't tell a live
+// idle client from a vanished one. waitForDataEx with a zero timeout returns the
+// socket's current read state WITHOUT consuming: noMoreData ⇒ the peer closed
+// (the event loop already processed the FD's EOF while we yielded); timeout ⇒
+// alive but idle; dataAvailable ⇒ alive with buffered input (a pipelined command
+// left for the serve loop to handle after the block ends — NOT consumed here).
+private bool peerGone(Conn* c) nothrow
+{
+    import core.time : Duration;
+    import vibe.core.net : WaitForDataStatus;
+
+    if (c is null)
+        return true;
+    try
+    {
+        if (!c.tcp.connected)
+            return true;
+        return c.tcp.waitForDataEx(Duration.zero) == WaitForDataStatus.noMoreData;
+    }
+    catch (Exception)
+        return true;
+}
+
 private WaiterQ* waitQ(int db, scope const(char)[] key, bool create) nothrow @trusted
 {
     auto p = gWaiters[db].get(key);
@@ -556,6 +594,22 @@ private void signalKey(int db, scope const(char)[] key) nothrow @trusted
     c.blockFiredKey = key;
     if (c.blockEvtInit)
         c.blockEvt.emit();
+}
+
+// FIFO fairness gate. True when `key` already has a live blocked waiter ahead of
+// `c` — so `c` must NOT serve the key inline, but queue behind. This is what makes
+// a pipelined `LPUSH k v` + `BLPOP k 0` on one connection hand the value to the
+// client that blocked FIRST: fibers are cooperative, so the earlier waiter's fiber
+// hasn't resumed between the two pipelined commands, and without this gate the
+// second command would steal the value it just pushed. The woken front waiter, by
+// contrast, IS the front (or the deque is empty), so it serves normally.
+private bool keyHeldByOther(int db, scope const(char)[] key, Conn* c) nothrow @trusted
+{
+    auto p = gWaiters[db].get(key);
+    if (p is null)
+        return false;
+    auto f = p.front(); // trims stale/dead, returns live front or null
+    return f !is null && f !is c;
 }
 
 // After a write, wake the front of every waited key that now holds data. Guarded
@@ -876,6 +930,16 @@ private void serveClient(TCPConnection tcp) nothrow
         void replayPaused()
         {
             pauseUnblock();
+            // The window that barriered these commands has already lifted (this is
+            // only ever called when gPauseUntilMs is 0 or elapsed). Clear it HARD
+            // before the drain so the held commands run through a clean gate — and
+            // set gReplaying so any CLIENT PAUSE that lands during the drain's IO
+            // yields is DEFERRED (gPausePending) rather than re-barriering the very
+            // commands it must follow. The deferred pause is applied after the drain.
+            gPauseUntilMs = 0;
+            immutable outerReplay = !gReplaying; // nested replays shouldn't own the guard
+            if (outerReplay)
+                gReplaying = true;
             // per-connection scratch (handleCommand may yield to other fibers mid-
             // replay, so this must not be shared TLS)
             c.pauseReplayBuf.clear();
@@ -901,6 +965,20 @@ private void serveClient(TCPConnection tcp) nothrow
                 flushPending(c, outb);
             gAof.flush();
             flushOut();
+            if (outerReplay)
+            {
+                gReplaying = false;
+                // Apply a CLIENT PAUSE that arrived mid-drain, now that the held
+                // commands have all run ahead of it (arrival order preserved).
+                if (gPausePending)
+                {
+                    gPausePending = false;
+                    gPauseUntilMs = gPausePendingEnd;
+                    gPauseAll = gPausePendingAll;
+                    gPauseIssuer = gPausePendingIssuer;
+                    gPauseEvt.emit();
+                }
+            }
         }
 
         while (keep && tcp.connected)
@@ -1017,6 +1095,39 @@ private bool isDeferrableWrite(ref Conn c, const ref RVal cmd) nothrow
     foreach (i, ch; name)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     return isWriteCommand(cast(string) nbuf[0 .. name.length]) && gReplicator.isLeader;
+}
+
+// Flush a connection's accumulated reply buffer to the socket BEFORE its fiber
+// parks in a blocking command. The serve loop only flushes `outb` after the whole
+// pipeline batch, but a parked block never returns to that flush — so replies to
+// commands that PRECEDED the block in the same pipeline (e.g. the `:1` from the
+// LPUSH in `LPUSH k v` + `BLPOP k 0`) would sit unsent while the client waits
+// forever to read them. Send them now, then keep waiting on an empty buffer.
+private void flushBeforeBlock(ref Conn c, ref ByteBuffer o) nothrow
+{
+    if (o.empty)
+        return;
+    try
+    {
+        if (c.subMode)
+        {
+            auto m = rcFromBytes(o.data);
+            if (c.oq.push(m))
+                c.oqEvt.emit();
+            rcRelease(m);
+        }
+        else
+        {
+            c.wlock.lock();
+            scope (exit)
+                c.wlock.unlock();
+            c.tcp.write(o.data);
+        }
+        o.clear();
+    }
+    catch (Exception)
+    {
+    }
 }
 
 // Reap every in-flight pipelined write, appending its reply in order (so the
@@ -3679,20 +3790,38 @@ private void ensureBlockEvt(Conn* c) nothrow
     }
 }
 
-// Park the blocked fiber on its own event until signalKey wakes it (or the
-// timeout fires). `ec` is snapshotted by the caller right before this call —
-// there is no yield between waitRegister and here, so no producer can interleave
-// (cooperative loop): no lost wakeup, no spurious wakeup. Returns false only on
-// timeout. The finite timeout is the event loop's OWN timer (no sleep/poll); an
-// infinite block waits the event with no timer at all.
-private bool blockWait(Conn* c, int ec, ref long remainingMs, ulong timeoutMs) nothrow
+// Outcome of a blocking wait: the caller re-checks its keys on `ready`, replies
+// nil on `timedOut`, and silently returns (peer gone) on `disconnected`.
+private enum BlockWake : ubyte
+{
+    ready,
+    timedOut,
+    disconnected
+}
+
+// A parked blocked fiber isn't reading its socket, so a peer that vanishes while
+// the fiber waits would never be noticed (the serve loop only sees EOF at
+// waitForData). So the wait POLLS at a bounded interval and checks the connection
+// each tick — a dead peer wakes the fiber, which returns `disconnected` and runs
+// its own scope(exit) cleanup (decrementing gBlockedClients, unregistering). This
+// is what stops a client that BLPOPs with an infinite timeout and then disconnects
+// from leaking the blocked-client count forever.
+private enum ulong BLOCK_POLL_MS = 100;
+
+// Park the blocked fiber on its own event until signalKey wakes it, the timeout
+// fires, or the peer disconnects. `ec` is snapshotted by the caller right before
+// this call — there is no yield between waitRegister and here, so no producer can
+// interleave (cooperative loop): no lost wakeup. Between polls the blocked-client
+// count is held (the ++/-- brackets the WHOLE wait, not each poll tick), so a
+// concurrent INFO never samples a transient dip.
+private BlockWake blockWait(Conn* c, int ec, ref long remainingMs, ulong timeoutMs) nothrow
 {
     import core.time : MonoTime, msecs;
 
     import dreads.obj : gBlockedClients;
 
     if (timeoutMs != 0 && remainingMs <= 0)
-        return false;
+        return BlockWake.timedOut;
     gBlockedClients++; // INFO clients: parked in a blocking wait
     c.blocked = true; // eligible for CLIENT UNBLOCK while parked here
     scope (exit)
@@ -3700,15 +3829,30 @@ private bool blockWait(Conn* c, int ec, ref long remainingMs, ulong timeoutMs) n
         gBlockedClients--;
         c.blocked = false;
     }
-    if (timeoutMs == 0)
+    // Decrement the caller's `remainingMs` by ACTUAL elapsed per tick — never
+    // recompute it from the original timeoutMs, or a re-block (caller re-enters
+    // after a spurious wake) would reset the countdown (the BZPOPMIN
+    // "reprocessing" contract: the timeout must survive across re-blocks).
+    for (;;)
     {
-        c.blockEvt.waitUninterruptible(ec); // block forever — pure event, no timer
-        return true;
+        // slice = the poll tick, capped by any remaining finite timeout
+        long slice = cast(long) BLOCK_POLL_MS;
+        if (timeoutMs != 0 && remainingMs < slice)
+            slice = remainingMs;
+        immutable before = MonoTime.currTime;
+        immutable n = c.blockEvt.waitUninterruptible(msecs(slice), ec);
+        if (timeoutMs != 0)
+            remainingMs -= (MonoTime.currTime - before).total!"msecs";
+        if (n != ec) // genuine signal (emit count advanced) or CLIENT UNBLOCK
+            return BlockWake.ready;
+        if (c.unblockReq != 0)
+            return BlockWake.ready;
+        if (peerGone(c)) // peer vanished while we were parked (EOF probe)
+            return BlockWake.disconnected;
+        if (timeoutMs != 0 && remainingMs <= 0)
+            return BlockWake.timedOut;
+        // else: poll tick elapsed with no event — loop and wait again
     }
-    auto before = MonoTime.currTime;
-    c.blockEvt.waitUninterruptible(msecs(remainingMs), ec); // loop timer = the timeout
-    remainingMs -= (MonoTime.currTime - before).total!"msecs";
-    return true;
 }
 
 /// BLPOP / BRPOP: keys..., timeout. Reply *2 [key, value] or nil array.
@@ -3773,6 +3917,8 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
             }
             if (obj is null || obj.list.length == 0)
                 continue;
+            if (keyHeldByOther(db, k.str, &c))
+                continue; // FIFO: an earlier-blocked client serves this key first
             repArrayHeader(o, 2);
             repBulk(o, k.str);
             repBulk(o, fromLeft ? obj.list.front : obj.list.back);
@@ -3796,11 +3942,17 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
             waitRegister(db, keys, &c);
             registered = true;
         }
+        flushBeforeBlock(c, o); // send replies to earlier pipelined cmds before parking
         immutable ec = c.blockEvt.emitCount; // no yield since register ⇒ no lost/spurious wake
-        if (!blockWait(&c, ec, remaining, timeoutMs))
+        final switch (blockWait(&c, ec, remaining, timeoutMs))
         {
+        case BlockWake.timedOut:
             repNullArray(o);
             return;
+        case BlockWake.disconnected:
+            return; // peer gone; scope(exit) unregisters + drops the blocked count
+        case BlockWake.ready:
+            break;
         }
         if (handleUnblock(c, o, gRespProto >= 3 ? "_\r\n" : "*-1\r\n"))
             return;
@@ -3866,6 +4018,8 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
             }
             if (obj is null || obj.zset.length == 0)
                 continue;
+            if (keyHeldByOther(db, k.str, &c))
+                continue; // FIFO: an earlier-blocked client serves this key first
             const(char)[] victim;
             repArrayHeader(o, 3);
             repBulk(o, k.str);
@@ -3892,11 +4046,17 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
             waitRegister(db, keys, &c);
             registered = true;
         }
+        flushBeforeBlock(c, o); // send replies to earlier pipelined cmds before parking
         immutable ec = c.blockEvt.emitCount;
-        if (!blockWait(&c, ec, remaining, timeoutMs))
+        final switch (blockWait(&c, ec, remaining, timeoutMs))
         {
+        case BlockWake.timedOut:
             repNullArray(o);
             return;
+        case BlockWake.disconnected:
+            return; // peer gone; scope(exit) unregisters + drops the blocked count
+        case BlockWake.ready:
+            break;
         }
         if (handleUnblock(c, o, gRespProto >= 3 ? "_\r\n" : "*-1\r\n"))
             return;
@@ -3993,7 +4153,13 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
         // Dispatch on the FIRST attempt (to validate args / surface a wrong-typed
         // source) and whenever the source has data. An empty source blocks.
         immutable st = blockSourceState(c, blockKeys, srcType);
-        if (firstPass || st == 1)
+        // FIFO fairness (single-source BLMOVE/BRPOPLPUSH): if an earlier-blocked
+        // client is queued ahead on the source, don't let this one steal the value
+        // inline — queue behind it (see keyHeldByOther / blockingPop). Multi-key
+        // BLMPOP/BZMPOP is left to dispatch's own first-with-data pick.
+        immutable srcHeld = blockKeys.length == 1
+            && keyHeldByOther(db, blockKeys[0].str, &c);
+        if ((firstPass || st == 1) && !srcHeld)
         {
             dispatch(cmd2, *c.dbp, attempt, arena);
             propagationOverride.clear();
@@ -4038,11 +4204,17 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
                 waitRegister(db, blockKeys, &c);
             registered = true;
         }
+        flushBeforeBlock(c, o); // send replies to earlier pipelined cmds before parking
         immutable ec = c.blockEvt.emitCount;
-        if (!blockWait(&c, ec, remaining, timeoutMs))
+        final switch (blockWait(&c, ec, remaining, timeoutMs))
         {
+        case BlockWake.timedOut:
             o.append(nil);
             return;
+        case BlockWake.disconnected:
+            return; // peer gone; scope(exit) unregisters + drops the blocked count
+        case BlockWake.ready:
+            break;
         }
         if (handleUnblock(c, o, nil))
             return;
@@ -4451,18 +4623,32 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
                 repError(o, "ERR CLIENT PAUSE mode must be WRITE or ALL");
             else
             {
-                // Stacking (Valkey pauseClientsByClient): keep the HIGHER end-time
-                // and the MOST RESTRICTIVE action. A new WRITE pause can't downgrade
-                // an ALL pause still in force, and a shorter timeout can't cut a
-                // longer one — the two overlap as the strictest of both.
                 immutable now = nowMs();
-                immutable active = gPauseUntilMs > now;
                 immutable newEnd = now + cast(ulong) ms;
-                gPauseAll = all || (active && gPauseAll); // ALL wins while it lasts
-                if (!active || newEnd > gPauseUntilMs)
-                    gPauseUntilMs = newEnd; // never shorten a running window
-                gPauseIssuer = c.id; // the pauser's own connection is exempt
-                gPauseEvt.emit(); // re-arm any fiber parked on a prior window
+                if (gReplaying)
+                {
+                    // A drain is in progress on some connection's fiber (we got here
+                    // via its IO yield). Defer: stacking against whatever is already
+                    // pending, applied when the drain finishes (see replayPaused).
+                    gPausePendingAll = all || (gPausePending && gPausePendingAll);
+                    if (!gPausePending || newEnd > gPausePendingEnd)
+                        gPausePendingEnd = newEnd;
+                    gPausePendingIssuer = c.id;
+                    gPausePending = true;
+                }
+                else
+                {
+                    // Stacking (Valkey pauseClientsByClient): keep the HIGHER end-time
+                    // and the MOST RESTRICTIVE action. A new WRITE pause can't
+                    // downgrade an ALL pause still in force, and a shorter timeout
+                    // can't cut a longer one — the two overlap as the strictest.
+                    immutable active = gPauseUntilMs > now;
+                    gPauseAll = all || (active && gPauseAll); // ALL wins while it lasts
+                    if (!active || newEnd > gPauseUntilMs)
+                        gPauseUntilMs = newEnd; // never shorten a running window
+                    gPauseIssuer = c.id; // the pauser's own connection is exempt
+                    gPauseEvt.emit(); // re-arm any fiber parked on a prior window
+                }
                 repSimple(o, "OK");
             }
         }

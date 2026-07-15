@@ -6,6 +6,31 @@
 > clean single run (271/10, completed) but reproduced on the 1st fuzz run (hang,
 > 200s timeout, right after "List of various encodings - sanitize dump"). One pass
 > is not proof; the blocking/unblock paths especially need repeated runs.
+>
+> **RESOLVED (2026-07-15) — the list "hang" was THREE stacked server-layer bugs in
+> the blocking path, all found by fuzzing `unit/type/list` in a loop (20/20 clean
+> after the fix; only the 2 known encoding failures remain). Repro harness kept at
+> `blackbox/fair_hammer.py` (OUR scenario, not copied from tcl):**
+> 1. **Fairness steal.** Fibers are cooperative, so in a pipelined `LPUSH k v` +
+>    `BLPOP k 0` the earlier-blocked client's fiber hasn't resumed between the two
+>    commands — the pipeline's own BLPOP would pop the value it just pushed. Fix:
+>    `keyHeldByOther` gate — a blocking pop won't serve a key inline while a live
+>    waiter sits ahead of it in that key's FIFO deque.
+> 2. **Disconnect leak.** A fiber parked in an INFINITE block (`BLPOP k 0`) never
+>    reads its socket, so `tcp.connected` stays true after the peer's FIN and its
+>    `scope(exit)` (which drops `blocked_clients`) never runs → the count leaked and
+>    every later `wait_for_blocked_clients_count N` (== check) timed out, cascading
+>    the whole file. Fix: `blockWait` now POLLS (100ms) and probes EOF without
+>    consuming via `waitForDataEx(Duration.zero)` → `noMoreData` wakes the fiber to
+>    clean up. (`tcp.connected` alone can't detect a half-open peer.)
+> 3. **Unflushed pipeline reply.** The serve loop flushes `outb` only AFTER the whole
+>    pipeline batch; a block parks the fiber INSIDE `handleCommand` and never returns
+>    to that flush, so the `:1` from the pipelined LPUSH sat unsent and the client
+>    waited forever to read it. Fix: `flushBeforeBlock` writes `outb` to the socket
+>    before parking. Also fixed the blocking timeout resetting across a re-block
+>    (BZPOPMIN/BLPOP "reprocessing" — must count down the ORIGINAL timeout) and the
+>    CLIENT PAUSE replay re-entrancy (defer a pause arriving mid-replay).
+>    These are server-layer (real fibers/sockets) ⇒ blackbox-only per convention.
 
 Failures found running the **Valkey test suite** against a live dreads in
 external mode (`./runtest --host … --port … --single <file>`), on **db 9**
@@ -53,7 +78,7 @@ leakage).
 | unit/type/stream-cgroups | 53 | 0 | **PASSES** (skips: total_blocking_keys introspection, DUMP/RESTORE+AOF consumer metadata = Raft-replicated by design, legacy-RDB load, lag-with-tombstones) |
 | unit/scan | 24 | 0 | **PASSES** |
 | unit/bitfield | 18 | 0 | **PASSES** |
-| unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
+| unit/type/list | ~283 | 2 | blocking-path bugs FIXED (fairness/disconnect/flush — see top note); 20/20 fuzz clean. 2 remaining = listpack↔quicklist encoding conversion (LSET-boundary), a separate encoding debt |
 | unit/pause | 19 | 0 | **PASSES** (1 skip N/A: deferring-client write-backpressure timing — dreads buffers server-side by design) |
 | unit/dump | 15 | 1 | **MIGRATE landed** (DUMP->RESTORE over cached socket; 14 two-instance tests are external:skip, verified live vs valkey 9.1; the runnable cached-connection-release test passes); stream DUMP/RESTORE byte-exact both ways; only remaining fail = RESTORE shared-NACK corruption reject (expects "Bad data format", we say "checksum are wrong") |
 | unit/type/hash | 85 | 0 | **PASSES** (HINCRBYFLOAT long-double repr + NaN/Inf + value-update spill; HRANDFIELD uniform via rejection sampling) |
