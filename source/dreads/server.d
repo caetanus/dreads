@@ -2931,29 +2931,15 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
     }
     if (eqICDebug(args[0].str, "GET") && args.length >= 2)
     {
-        // (name, value) pairs for every known directive matching the pattern
-        static immutable names = [
-            "port", "appendonly", "appendfilename", "dir", "maxmemory",
-            "maxmemory-policy", "lua-time-limit", "lua-memory-limit", "active-expire",
-            "notify-keyspace-events", "lazyfree-lazy-server-del",
-            "hash-max-listpack-entries", "hash-max-listpack-value",
-            "hash-max-ziplist-entries", "hash-max-ziplist-value",
-            "list-max-listpack-size", "list-max-ziplist-size", "list-compress-depth",
-            "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
-            "zset-max-listpack-entries", "zset-max-listpack-value",
-            "zset-max-ziplist-entries", "zset-max-ziplist-value",
-            "stream-node-max-entries", "stream-node-max-bytes",
-            "proto-max-bulk-len", "client-query-buffer-limit", "acllog-max-len",
-            "aof-use-rdb-preamble", "rdb-version-check", "active-eviction",
-            "appendfsync",
-        ];
+        // Iterate the SAME canonical registry CONFIG INFO uses, so the two commands
+        // return the same directives in the same order (name, value) pairs.
         char[64] b = void;
         size_t matches = 0;
-        foreach (nm; names)
+        foreach (ref m; gCfgMeta)
         {
             foreach (ref pat; args[1 .. $])
             {
-                if (globMatch(pat.str, nm))
+                if (globMatch(pat.str, m.name))
                 {
                     matches++;
                     break;
@@ -2961,12 +2947,12 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             }
         }
         repMapHeader(o, matches); // CONFIG GET is a map -> %N in RESP3
-        foreach (nm; names)
+        foreach (ref m; gCfgMeta)
         {
             bool hit = false;
             foreach (ref pat; args[1 .. $])
             {
-                if (globMatch(pat.str, nm))
+                if (globMatch(pat.str, m.name))
                 {
                     hit = true;
                     break;
@@ -2974,6 +2960,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             }
             if (!hit)
                 continue;
+            immutable nm = m.name;
             repBulk(o, nm);
             switch (nm)
             {
@@ -3071,6 +3058,27 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             case "acllog-max-len":
                 auto n = snprintf(b.ptr, b.length, "%lld", gAclLogMaxLen);
                 repBulk(o, b[0 .. n]);
+                break;
+            // Metadata-carried directives (no gConfig backing) — report stable
+            // Redis-shaped values so CONFIG GET matches CONFIG INFO's directive set.
+            case "activerehashing":
+                repBulk(o, "yes"); // dreads rehashes incrementally, always on
+                break;
+            case "maxclients":
+                repBulk(o, "10000");
+                break;
+            case "databases":
+                auto n = snprintf(b.ptr, b.length, "%d", cast(int) NUM_DBS);
+                repBulk(o, b[0 .. n]);
+                break;
+            case "repl-diskless-load":
+                repBulk(o, "disabled");
+                break;
+            case "dbfilename":
+                repBulk(o, "dump.rdb");
+                break;
+            case "save", "requirepass", "replicaof", "slaveof":
+                repBulk(o, ""); // no scheduled RDB save / no auth / no legacy replicaof
                 break;
             default:
                 repBulk(o, ""); // known name with no value formatter
@@ -3179,37 +3187,54 @@ private struct CfgMeta
     string aliasName; // the paired name for aliased directives ("" = none)
 }
 
+// Single canonical, ORDERED config registry. BOTH `CONFIG GET` and `CONFIG INFO`
+// iterate this one list, so the two commands always return the same directives in
+// the same order (the "CONFIG INFO ordering is consistent across calls" contract).
+// The `-ziplist-` names are the legacy aliases of the `-listpack-` ones (carried
+// as plain numeric entries — CONFIG GET maps them to the same gConfig field).
 private static immutable CfgMeta[] gCfgMeta = [
     {"appendonly", "bool"},
+    {"appendfsync", "enum", ["always", "everysec", "no"]},
+    {"appendfilename", "string"},
+    {"aof-use-rdb-preamble", "bool"},
+    {"acllog-max-len", "numeric", null, true, 0, long.max},
     {"active-expire", "bool"},
+    {"active-eviction", "bool"},
     {"activerehashing", "bool"},
     {"lazyfree-lazy-server-del", "bool"},
     {"port", "numeric", null, true, 0, 65_535},
     {"maxclients", "numeric", null, true, 1, long.max},
     {"maxmemory", "numeric", null, true, 0, long.max},
+    {"maxmemory-policy", "enum", [
+        "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random",
+        "volatile-random", "volatile-ttl"
+    ]},
     {"proto-max-bulk-len", "numeric", null, true, 0, long.max},
     {"client-query-buffer-limit", "numeric", null, true, 0, long.max},
+    {"lua-time-limit", "numeric", null, true, 0, long.max},
+    {"lua-memory-limit", "numeric", null, true, 0, long.max},
     {"hash-max-listpack-entries", "numeric", null, true, 0, long.max},
     {"hash-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"hash-max-ziplist-entries", "numeric", null, true, 0, long.max},
+    {"hash-max-ziplist-value", "numeric", null, true, 0, long.max},
     {"list-max-listpack-size", "numeric", null, true, long.min, long.max},
+    {"list-max-ziplist-size", "numeric", null, true, long.min, long.max},
     {"list-compress-depth", "numeric", null, true, 0, long.max},
     {"set-max-intset-entries", "numeric", null, true, 0, long.max},
     {"set-max-listpack-entries", "numeric", null, true, 0, long.max},
     {"set-max-listpack-value", "numeric", null, true, 0, long.max},
     {"zset-max-listpack-entries", "numeric", null, true, 0, long.max},
     {"zset-max-listpack-value", "numeric", null, true, 0, long.max},
+    {"zset-max-ziplist-entries", "numeric", null, true, 0, long.max},
+    {"zset-max-ziplist-value", "numeric", null, true, 0, long.max},
     {"stream-node-max-entries", "numeric", null, true, 0, long.max},
+    {"stream-node-max-bytes", "numeric", null, true, 0, long.max},
     {"dir", "string"},
-    {"appendfilename", "string"},
     {"dbfilename", "string"},
-    {"maxmemory-policy", "enum", [
-        "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random",
-        "volatile-random", "volatile-ttl"
-    ]},
+    {"rdb-version-check", "enum", ["strict", "relaxed"]},
     {"repl-diskless-load", "enum", ["disabled", "on-empty-db", "swapdb"]},
     {"save", "special"},
     {"notify-keyspace-events", "special"},
-    // directives carried only for their metadata (flags / aliasing)
     {"databases", "numeric", null, true, 1, 65_535, ["immutable"]},
     {"requirepass", "string", null, false, 0, 0, ["sensitive"]},
     {"replicaof", "string", null, false, 0, 0, null, "slaveof"},

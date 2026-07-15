@@ -175,3 +175,8 @@ Zero is a valid ttl in HFE
 # reverse-engineering its exact bail threshold and risk regressing legitimate large
 # globs — not worth mirroring a Valkey-internal safety heuristic. (BLACKBOX-TODO.md)
 Regression for pattern matching very long nested loops
+# Needs CLIENT TRACKING (client-side caching / RESP3 invalidation push) — a real
+# feature dreads doesn't implement; a no-op stub would silently mislead a client
+# relying on invalidation, so we skip rather than fake it. The test only uses
+# `client tracking on` as one piece of state for RESET to clear (BLACKBOX-TODO.md).
+RESET clears client state
