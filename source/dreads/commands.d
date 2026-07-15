@@ -29,6 +29,12 @@ import dreads.rdb : commandsToRdb, rdbToCommands, appendFooter, verifyFooter;
 /// thread, and the test runner gets one buffer per thread.
 public ByteBuffer propagationOverride;
 
+/// Set by a write command that turned out to be a NO-OP (changed nothing) so the
+/// executor skips the dirty bump, the WATCH/blocked-client wake, and AOF logging —
+/// a no-op SETBIT/BITFIELD SET must not increment `rdb_changes_since_last_save`
+/// nor propagate. Reset before each dispatch; defaults false (writes dirty).
+public __gshared bool gWriteNoOp;
+
 /// True while a script is running. Script effects replicate by replay, so
 /// commands whose output order is only incidentally stable (SORT BY nosort
 /// on a set) must pick the deterministic path when they see this.

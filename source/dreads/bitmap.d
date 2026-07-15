@@ -7,7 +7,7 @@ module dreads.bitmap;
 import core.bitop : popcnt;
 import core.stdc.string : memcpy, memset;
 
-import dreads.commands : eqICKeyword, normalizeRange, parseLong;
+import dreads.commands : eqICKeyword, normalizeRange, parseLong, gWriteNoOp;
 import dreads.mem : Arena, ByteBuffer, freeSlice, mallocDup;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
@@ -86,7 +86,22 @@ public void setbit(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         return;
     }
     bool wrong;
-    auto bytes = ensureBytes(ks, args[0].str, cast(size_t)(off >> 3) + 1, wrong);
+    immutable neededLen = cast(size_t)(off >> 3) + 1;
+    // Capture the current length BEFORE we possibly grow the string: SETBIT only
+    // dirties (rdb_changes / WATCH / propagation) when it changes the bit OR extends
+    // the string (a new key or a higher offset both extend). See gWriteNoOp.
+    size_t oldLen = 0;
+    {
+        auto cur = ks.lookupTyped(args[0].str, ObjType.str, wrong);
+        if (wrong)
+        {
+            repWrongTypeB(o);
+            return;
+        }
+        if (cur !is null)
+            oldLen = cur.str.len();
+    }
+    auto bytes = ensureBytes(ks, args[0].str, neededLen, wrong);
     if (wrong)
     {
         repWrongTypeB(o);
@@ -94,11 +109,14 @@ public void setbit(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     }
     auto mask = cast(ubyte)(1 << (7 - (off & 7)));
     auto old = (bytes[cast(size_t)(off >> 3)] & mask) ? 1 : 0;
-    if (args[2].str[0] == '1')
+    immutable newBit = args[2].str[0] == '1' ? 1 : 0;
+    if (newBit)
         bytes[cast(size_t)(off >> 3)] |= mask;
     else
         bytes[cast(size_t)(off >> 3)] &= ~cast(int) mask;
     repInt(o, old);
+    if (old == newBit && neededLen <= oldLen)
+        gWriteNoOp = true; // bit unchanged and no length growth
 }
 
 /// GETBIT key offset
@@ -560,14 +578,29 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     bool wrong;
     char[] bytes;
     char[24] sb = void; // scratch for an int-encoded read value; must outlive the pass
+    bool anyChange = false; // dirty only if a SET changed a field, an INCRBY ran, or grew
     if (mutates)
     {
-        bytes = ensureBytes(ks, args[0].str, cast(size_t)((maxBit + 7) / 8), wrong);
+        immutable neededLen = cast(size_t)((maxBit + 7) / 8);
+        size_t oldLen0 = 0; // pre-growth length: a new key or a higher offset extends
+        {
+            auto cur0 = ks.lookupTyped(args[0].str, ObjType.str, wrong);
+            if (wrong)
+            {
+                repWrongTypeB(o);
+                return;
+            }
+            if (cur0 !is null)
+                oldLen0 = cur0.str.len();
+        }
+        bytes = ensureBytes(ks, args[0].str, neededLen, wrong);
         if (wrong)
         {
             repWrongTypeB(o);
             return;
         }
+        if (neededLen > oldLen0)
+            anyChange = true;
     }
     else
     {
@@ -685,6 +718,11 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         }
         else
             toWrite = width == 64 ? cast(ulong) result : cast(ulong) result & ((1UL << width) - 1);
+        // dirty tracking: INCRBY always counts; SET only when the field changes
+        if (!isSet)
+            anyChange = true;
+        else if (toWrite != (width == 64 ? raw : raw & ((1UL << width) - 1)))
+            anyChange = true;
         writeField(bytes, off, width, toWrite);
         // GET-style reply: SET returns the OLD value, INCRBY the new one
         if (isSet)
@@ -696,4 +734,6 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         }
         i += 4;
     }
+    if (!anyChange)
+        gWriteNoOp = true; // no field changed / all-GET ⇒ not dirty, don't propagate
 }

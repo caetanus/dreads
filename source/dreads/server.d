@@ -34,7 +34,7 @@ import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
-    isDenyOomCommand, gScriptWritesHook, propagationOverride, parseLong;
+    isDenyOomCommand, gScriptWritesHook, propagationOverride, parseLong, gWriteNoOp;
 import dreads.stats : gTotalErrorReplies, statErrorReply, resetErrorStats,
     gCmdStats, CmdStat, statCall, statRejected, resetCmdStats;
 
@@ -2682,6 +2682,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     }
     immutable errPrev = gTotalErrorReplies; // leaf-vs-propagated guard (see stats.d)
     auto outBefore = o.length;
+    gWriteNoOp = false; // a write command may flag itself a no-op (SETBIT/BITFIELD)
     auto keep = dispatch(cmd, *c.dbp, o, arena);
     immutable errored = o.length > outBefore && o.data[outBefore] == '-';
     // errorstats/total: only a REAL leaf error (a nested command — e.g. a script's
@@ -2698,7 +2699,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
         statCall(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]), errored);
     }
-    if (o.length > outBefore && o.data[outBefore] != '-')
+    // A write that flagged itself a no-op (no data changed) neither dirties, wakes,
+    // nor propagates — matches Redis's dirty-delta model (SETBIT/BITFIELD SET only
+    // count when the bit/field actually changed).
+    if (o.length > outBefore && o.data[outBefore] != '-' && !gWriteNoOp)
     {
         if (isWriteCommand(uname) || !propagationOverride.empty)
         {
