@@ -3185,11 +3185,22 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
     size_t seen = 0;
     size_t i = gEvictCursor % cap;
     size_t scanned = 0;
+    import dreads.det : detNow = now;
+
     while (seen < 5 && scanned < cap)
     {
         if (ks.d.slotLive(i))
         {
             auto obj = ks.d.valAt(i);
+            // An already-expired key sampled during the eviction scan is reaped
+            // for free — clean the dead before evicting the living (no live data
+            // lost). lookup() does the disarm+del+notify+expired-count.
+            if (obj.expireAtMs != 0 && detNow() >= obj.expireAtMs)
+            {
+                cast(void) ks.lookup(ks.d.keyAt(i));
+                gEvictCursor = i + 1;
+                return true;
+            }
             if (!volatileOnly || obj.expireAtMs != 0)
             {
                 seen++;
@@ -3235,6 +3246,9 @@ private bool freeMemoryIfNeeded() nothrow
         return true;
     if (gConfig.maxmemoryPolicy == "noeviction")
         return false;
+    // The OOM gate runs before dispatch sets the per-command clock, so refresh it
+    // here — evictOneVictim reaps expired keys it samples (against detNow()).
+    refreshDetClock();
     bool volatileOnly, randomPick;
     evictionMode(volatileOnly, randomPick);
     foreach (_; 0 .. 128) // eviction budget per triggering command
