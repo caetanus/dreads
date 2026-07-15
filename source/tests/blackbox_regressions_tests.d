@@ -1386,4 +1386,65 @@ version (unittest)
         auto full1 = ks.run("XINFO", "STREAM", "x", "FULL");
         full1.should.contain("lag");
     }
+
+    // SORT debts first caught by unit/sort: BY-nosort keeps native list/zset
+    // order (DESC reverses it, STORE doesn't force alpha for list/zset), equal
+    // BY-weights sub-sort lexicographically by value, and a GET pattern ending in
+    // a bare `->` is a literal key, not a hash-field read.
+    @("blackbox.sort_by_nosort_tie_and_arrow")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // zset BY nosort keeps score order; DESC reverses it
+        ks.run("ZADD", "z", "1", "a", "5", "b", "2", "c", "10", "d", "3", "e");
+        ks.run("SORT", "z", "BY", "nosort", "ASC")
+            .should.equal("*5\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\ne\r\n$1\r\nb\r\n$1\r\nd\r\n");
+        ks.run("SORT", "z", "BY", "nosort", "DESC")
+            .should.equal("*5\r\n$1\r\nd\r\n$1\r\nb\r\n$1\r\ne\r\n$1\r\nc\r\n$1\r\na\r\n");
+
+        // list BY nosort + STORE keeps native (insertion) order, not alpha
+        ks.run("RPUSH", "l", "5", "3", "4", "1", "2");
+        ks.run("SORT", "l", "BY", "nosort", "STORE", "ldst").should.equal(":5\r\n");
+        ks.run("LRANGE", "ldst", "0", "-1")
+            .should.equal("*5\r\n$1\r\n5\r\n$1\r\n3\r\n$1\r\n4\r\n$1\r\n1\r\n$1\r\n2\r\n");
+
+        // equal BY weights -> sub-sort lexicographically by the element value
+        ks.run("SADD", "s", "b", "a", "c");
+        ks.run("SET", "w_a", "100");
+        ks.run("SET", "w_b", "100");
+        ks.run("SET", "w_c", "100");
+        ks.run("SORT", "s", "BY", "w_*")
+            .should.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+        // GET pattern ending in a bare `->` is a literal key (no hash split)
+        ks.run("RPUSH", "ml", "a");
+        ks.run("SET", "x:a->", "100");
+        ks.run("SORT", "ml", "BY", "nosort", "GET", "x:*->")
+            .should.equal("*1\r\n$3\r\n100\r\n");
+    }
+
+    // COMMAND GETKEYS: SORT source + STORE dst (last STORE wins); SORT_RO source
+    // only; the default is the first argument. First caught by unit/sort.
+    @("blackbox.command_getkeys")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        ks.run("COMMAND", "GETKEYS", "SORT", "abc", "STORE", "def")
+            .should.equal("*2\r\n$3\r\nabc\r\n$3\r\ndef\r\n");
+        // last STORE wins
+        ks.run("COMMAND", "GETKEYS", "SORT", "abc", "STORE", "invalid", "STORE", "def")
+            .should.equal("*2\r\n$3\r\nabc\r\n$3\r\ndef\r\n");
+        // BY/GET take patterns, not keys
+        ks.run("COMMAND", "GETKEYS", "SORT", "abc", "BY", "w_*", "GET", "g_*")
+            .should.equal("*1\r\n$3\r\nabc\r\n");
+        ks.run("COMMAND", "GETKEYS", "SORT_RO", "abc").should.equal("*1\r\n$3\r\nabc\r\n");
+        // default: first arg is the key
+        ks.run("COMMAND", "GETKEYS", "GET", "mykey").should.equal("*1\r\n$5\r\nmykey\r\n");
+    }
 }

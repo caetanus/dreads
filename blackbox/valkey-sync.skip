@@ -127,3 +127,10 @@ Loading from legacy (Redis <= v7.0.x, rdb_ver < 11) persistence
 # tests. AOF stream-group rewrite is covered by our own compaction round-trip.
 Empty stream with no lastid can be rewrite into AOF correctly
 XREADGROUP ACK would propagate entries-read
+# DEBUG OBJECT ql_listpack_max / ql_compressed report Redis quicklist node
+# internals (list-max-listpack-size, list-compress-depth node compression).
+# dreads' own list container reports encoding:quicklist but does not do per-node
+# compression, so ql_compressed:1 isn't real — emitting it would be a lie, and
+# implementing quicklist compression would mirror Redis's internal storage
+# mechanism. Encoding-only introspection gap.
+SORT STORE quicklist with the right options

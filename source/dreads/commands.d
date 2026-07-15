@@ -123,6 +123,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
                 repHelp!"COMMAND"(o);
+            else if (args.length >= 2 && eqICKeyword(args[0].str, "GETKEYS"))
+                commandGetKeys(args[1 .. $], o);
             else
                 repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
             break;
@@ -5605,6 +5607,54 @@ public bool eqICKeyword(scope const(char)[] s, scope const(char)[] upper) @nogc 
             return false;
     }
     return true;
+}
+
+/// COMMAND GETKEYS <command> [args...] — the keys a command would touch. SORT is
+/// the source key plus the STORE destination (last STORE wins); SORT_RO is just
+/// the source; other commands fall back to the first argument as the key.
+private void commandGetKeys(const(RVal)[] cmd, ref ByteBuffer o) @nogc nothrow
+{
+    auto uname = cmd[0].str;
+    auto a = cmd[1 .. $]; // the target command's own arguments
+    const(char)[][2] keys;
+    size_t nk = 0;
+    if (eqICKeyword(uname, "SORT") || eqICKeyword(uname, "SORT_RO"))
+    {
+        if (a.length < 1)
+        {
+            repError(o, "ERR Invalid number of arguments specified for command");
+            return;
+        }
+        keys[nk++] = a[0].str; // the source key
+        if (eqICKeyword(uname, "SORT"))
+        {
+            const(char)[] store;
+            for (size_t i = 1; i < a.length;)
+            {
+                if (eqICKeyword(a[i].str, "STORE") && i + 1 < a.length)
+                    store = a[i + 1].str, i += 2; // last STORE wins
+                else if ((eqICKeyword(a[i].str, "BY") || eqICKeyword(a[i].str, "GET"))
+                        && i + 1 < a.length)
+                    i += 2; // BY/GET take a pattern arg, not a key
+                else if (eqICKeyword(a[i].str, "LIMIT") && i + 2 < a.length)
+                    i += 3;
+                else
+                    i++; // ALPHA / ASC / DESC / unknown
+            }
+            if (store.length)
+                keys[nk++] = store;
+        }
+    }
+    else if (a.length >= 1)
+        keys[nk++] = a[0].str; // best-effort default: first arg is the key
+    else
+    {
+        repError(o, "ERR The command has no key arguments");
+        return;
+    }
+    repArrayHeader(o, nk);
+    foreach (k; keys[0 .. nk])
+        repBulk(o, k);
 }
 
 /// XREAD [COUNT n] STREAMS key [key ...] id [id ...] — non-blocking only.

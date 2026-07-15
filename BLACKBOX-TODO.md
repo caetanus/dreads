@@ -52,7 +52,7 @@ leakage).
 | unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
-| unit/sort | 44 | 22 | completes; BY/GET/STORE debt (biggest single-file) |
+| unit/sort | 54 | 0 | **PASSES** (1 skip N/A: DEBUG OBJECT ql_compressed = quicklist node compression we don't model) |
 | unit/expire | 66 | 5 | aborts: tcl `table_size` var (import-source landed) |
 | unit/keyspace | 45 | 1 | aborts: stream-cgroups COPY (ERR syntax) |
 | unit/other | 25 | 2 | aborts: CONFIG SET unsupported param |

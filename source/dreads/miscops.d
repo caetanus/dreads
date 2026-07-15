@@ -2,7 +2,6 @@ module dreads.miscops;
 
 // LPOS, LMPOP, SORT, LCS, HRANDFIELD — the remaining list/string/hash tail.
 
-import core.stdc.stdlib : qsort;
 
 import dreads.commands : eqICKeyword, parseDouble, parseLong;
 import dreads.dict : StrVal;
@@ -205,27 +204,35 @@ private struct SortItem
     double num;
 }
 
-extern (C) private int sortNumAsc(scope const void* a, scope const void* b) nothrow @nogc
-{
-    auto x = cast(const(SortItem)*) a;
-    auto y = cast(const(SortItem)*) b;
-    return x.num < y.num ? -1 : (x.num > y.num ? 1 : 0);
-}
-
-extern (C) private int sortAlphaAsc(scope const void* a, scope const void* b) nothrow @nogc
+// Lexicographic (memcmp, shorter-first on a prefix tie) byte compare.
+private int cmpBytes(const(char)[] x, const(char)[] y) @nogc nothrow
 {
     import core.stdc.string : memcmp;
 
-    auto x = cast(const(SortItem)*) a;
-    auto y = cast(const(SortItem)*) b;
-    auto minl = x.sv.length < y.sv.length ? x.sv.length : y.sv.length;
+    auto minl = x.length < y.length ? x.length : y.length;
     if (minl)
     {
-        auto c = memcmp(x.sv.ptr, y.sv.ptr, minl);
+        auto c = memcmp(x.ptr, y.ptr, minl);
         if (c)
             return c < 0 ? -1 : 1;
     }
-    return x.sv.length < y.sv.length ? -1 : (x.sv.length > y.sv.length ? 1 : 0);
+    return x.length < y.length ? -1 : (x.length > y.length ? 1 : 0);
+}
+
+// "less" predicates for std.algorithm.sort. Both break ties by the element value
+// so the order is a TOTAL order — the (unstable) introsort still yields a
+// deterministic result (equal-weight, equal-value items are indistinguishable).
+private bool lessNum(ref const SortItem x, ref const SortItem y) @nogc nothrow
+{
+    if (x.num != y.num)
+        return x.num < y.num;
+    return cmpBytes(x.v, y.v) < 0;
+}
+
+private bool lessAlpha(ref const SortItem x, ref const SortItem y) @nogc nothrow
+{
+    auto c = cmpBytes(x.sv, y.sv);
+    return c ? c < 0 : cmpBytes(x.v, y.v) < 0;
 }
 
 /// SORT BY/GET pattern lookup: the first '*' becomes the element; an optional
@@ -245,7 +252,9 @@ private bool lookupPattern(ref Keyspace ks, const(char)[] pat, const(char)[] e,
     {
         foreach (idx; 0 .. pat.length - 1)
         {
-            if (pat[idx] == '-' && pat[idx + 1] == '>')
+            // split key from hash field on `->`, but only when a non-empty field
+            // follows; a trailing `->` stays part of the key (get x:*-> => x:a->)
+            if (pat[idx] == '-' && pat[idx + 1] == '>' && idx + 2 < pat.length)
             {
                 keyPat = pat[0 .. idx];
                 fieldPat = pat[idx + 2 .. $];
@@ -369,10 +378,12 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     // GET projections in container order)
     bool dontsort = byPat.length != 0
         && memchr(byPat.ptr, '*', byPat.length) is null;
-    // ...except when the result must be reproducible: a STOREd list re-enters
-    // via AOF/raft replay and scripts replay verbatim, so Redis forces
-    // alphabetical order there (set slot order isn't replay-stable)
-    if (dontsort && (storeKey.length != 0 || gInScript))
+    // ...except for a SET whose result must be reproducible: a STOREd/scripted
+    // SORT re-enters via AOF/raft replay, and a set's slot order isn't replay-
+    // stable, so force a deterministic alpha sort there. List (insertion) and
+    // zset (score) order ARE stable, so they keep their native nosort order.
+    if (dontsort && obj !is null && obj.type == ObjType.set
+            && (storeKey.length != 0 || gInScript))
     {
         dontsort = false;
         byPat = null;
@@ -425,20 +436,20 @@ public void sortCmd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repError(o, "ERR One or more scores can't be converted into double");
         return;
     }
+    import std.algorithm.mutation : reverse;
+    import std.algorithm.sorting : sort;
+
+    auto hits = items[0 .. n];
     if (!dontsort)
     {
-        qsort(items.ptr, n, SortItem.sizeof, alpha ? &sortAlphaAsc : &sortNumAsc);
-        if (desc)
-        {
-            foreach (k; 0 .. n / 2)
-            {
-                auto t = items[k];
-                items[k] = items[n - 1 - k];
-                items[n - 1 - k] = t;
-            }
-        }
+        if (alpha)
+            hits.sort!lessAlpha;
+        else
+            hits.sort!lessNum;
     }
-    auto hits = items[0 .. n];
+    // DESC reverses the result — whether sorted or kept in native (nosort) order
+    if (desc)
+        hits.reverse();
     auto off = cast(size_t)(limOff < 0 ? 0 : limOff);
     if (off >= hits.length)
         hits = null;
