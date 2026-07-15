@@ -313,13 +313,20 @@ These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
   (hot-path cost); blocking/pubsub/connection commands handled before the
   dispatch chokepoint aren't call-counted. Revisit if real latency stats are
   wanted.
-- **Connection registry (commit 702f79c):** intrusive doubly-linked list of every
-  live `Conn*` (each lives on its serveClient fiber stack; single event loop ⇒ no
-  locking). Powers `CLIENT LIST` (all clients), channel kill-on-revoke, and
-  DELUSER disconnecting OTHER sessions, and **CLIENT KILL** (commit 26444e5:
-  ID/USER/SKIPME filters, self-kill closes after reply). `addr` is still `?`
-  (no peer-address plumbing), so ADDR/LADDR filters and the legacy addr form
-  never match; TYPE/MAXAGE are accepted but unmodelled.
+- **Connection registry (commit 702f79c; reworked to smart pointers, `blackbox`):**
+  every connection now lives in a `Shared!Conn` owned by its serveClient fiber; the
+  registry is a single `Dict!(Weak!Conn)` keyed by client id (the old intrusive
+  doubly-linked list + `regNext/regPrev` are gone). Lookups (`connById`, CLIENT
+  UNBLOCK) return a strong `lock()`, and iteration (CLIENT LIST/KILL, kill-on-revoke,
+  DELUSER other-session disconnect) snapshots the ids then re-`lock()`s each — so a
+  conn that dies mid-iteration (tcp.close may yield) is skipped and the one being
+  acted on is kept alive by its lock. This makes the tracking-era teardown UAF
+  impossible by construction (a cross-fiber delivery holds the Conn alive across its
+  push). Conn resources (`oq`, `sub`/`shardSub`, `clientName`) are RAII now — freed
+  by `Conn.~this` after every registry unlink, with **no manual `free()`** in the
+  connection lifecycle. `addr` is still `?` (no peer-address plumbing), so ADDR/LADDR
+  filters and the legacy addr form never match; TYPE/MAXAGE are accepted but
+  unmodelled.
 - Later acl.tcl `start_server` blocks (aclfile-based) remain `external:skip`:
   dreads persists users via the AOF/raft log, not an `aclfile` (see
   `aof-is-ours`), so `ACL LOAD/SAVE` return "not configured to use an ACL file".

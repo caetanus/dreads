@@ -50,6 +50,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import emplace.vector : Vector;
+import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.stream : nowMs;
 import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
@@ -368,10 +369,6 @@ private struct Conn
     LocalManualEvent oqEvt;
     Task oqWriter;
     bool oqClosing;
-    // Intrusive registry links (all live connections, for CLIENT LIST and
-    // killing sessions on ACL DELUSER / channel revoke). Single event-loop
-    // thread ⇒ no locking.
-    Conn* regPrev, regNext;
     // Blocked-client wait (BLPOP family — see the `event-driven` skill). One
     // single-shot event per connection (reused each block) + a per-block
     // generation so a returned/re-blocking fiber's stale deque entries
@@ -396,11 +393,15 @@ private struct Conn
     }
 }
 
-// Registry of every live connection (intrusive doubly-linked list for iteration)
-// PLUS an id→Conn* index for O(1) lookup (CLIENT UNBLOCK, tracking redirect
-// resolution). All access is on the single event-loop thread, so no locking.
-private __gshared Conn* gConnHead;
-private __gshared Dict!(Conn*) gConnById; // keyed by the id's raw 8 bytes
+// Registry of every live connection: an id→Weak!Conn index. It is the single
+// source of truth for both O(1) lookup (CLIENT UNBLOCK, tracking redirect) and
+// iteration (CLIENT LIST / KILL, ACL revoke) — the old intrusive list is gone.
+// Each connection lives in a Shared!Conn owned by its serveClient fiber; the
+// registry holds a WEAK observer, so a cross-fiber user resolves it via lock()
+// and keeps the Conn (and its RAII resources) alive for the duration of the
+// access — the UAF that killed tracking is impossible by construction. All
+// access is on the single event-loop thread, so the counts need no atomics.
+private __gshared Dict!(Weak!Conn) gConnById; // keyed by the id's raw 8 bytes
 
 // The 8 raw bytes of a client id, used as the gConnById key (HashMap.set dups it).
 private const(char)[] connIdKey(ref const ulong id) @nogc nothrow @trusted
@@ -408,33 +409,37 @@ private const(char)[] connIdKey(ref const ulong id) @nogc nothrow @trusted
     return (cast(const(char)*)&id)[0 .. ulong.sizeof];
 }
 
-/// O(1) live-connection lookup by id (null if none).
-private Conn* connById(ulong id) nothrow @trusted
+/// O(1) live-connection lookup by id. Returns a STRONG lock (empty if the id is
+/// unknown or its connection has died) — hold it while touching the Conn so it
+/// cannot be freed under a yield.
+private Shared!Conn connById(ulong id) nothrow @trusted
 {
-    auto p = gConnById.get(connIdKey(id));
-    return p !is null ? *p : null;
+    if (auto w = gConnById.get(connIdKey(id)))
+        return w.lock();
+    return Shared!Conn.init;
 }
 
-private void registerConn(Conn* c) @nogc nothrow
+private void registerConn(ref Shared!Conn sc) @nogc nothrow
 {
-    c.regPrev = null;
-    c.regNext = gConnHead;
-    if (gConnHead !is null)
-        gConnHead.regPrev = c;
-    gConnHead = c;
-    gConnById.set(connIdKey(c.id), c);
+    gConnById.set(connIdKey(sc.get().id), sc.weaken());
 }
 
-private void unregisterConn(Conn* c) @nogc nothrow
+private void unregisterConn(ulong id) @nogc nothrow
 {
-    gConnById.remove(connIdKey(c.id));
-    if (c.regPrev !is null)
-        c.regPrev.regNext = c.regNext;
-    else if (gConnHead is c)
-        gConnHead = c.regNext;
-    if (c.regNext !is null)
-        c.regNext.regPrev = c.regPrev;
-    c.regPrev = c.regNext = null;
+    gConnById.remove(connIdKey(id));
+}
+
+/// Snapshot every live connection's id into `outv`. Iterating the registry
+/// directly while killing/closing conns is unsafe (tcp.close may yield and let a
+/// target fiber unregister mid-iteration, mutating gConnById). Callers walk the
+/// id snapshot and re-resolve each via connById() (which returns a strong lock),
+/// so a conn that died in the meantime is simply skipped and the one being acted
+/// on is kept alive by its lock. ids are monotonic, so there is no ABA reuse.
+private void snapshotConnIds(ref Vector!ulong outv) nothrow @trusted
+{
+    foreach (key, ref w; gConnById)
+        if (key.length == ulong.sizeof)
+            outv.put(*cast(const(ulong)*) key.ptr);
 }
 
 // --- blocked-client FIFO registry (BLPOP family) ----------------------------
@@ -684,9 +689,14 @@ private void aclKillRevokedSubscribers(const(AclUser)* u) nothrow
 {
     if (u is null || u.root.allChannels)
         return; // gaining allchannels can never revoke an existing subscription
-    for (auto p = gConnHead; p !is null;)
+    Vector!ulong ids;
+    snapshotConnIds(ids);
+    foreach (id; ids[])
     {
-        auto nxt = p.regNext; // p may be unlinked by killConn
+        auto s = connById(id);
+        if (s.isNull)
+            continue;
+        auto p = &s.get();
         if (p.user is u && p.totalSubs > 0)
         {
             bool revoked = false;
@@ -713,7 +723,6 @@ private void aclKillRevokedSubscribers(const(AclUser)* u) nothrow
             if (revoked)
                 killConn(p);
         }
-        p = nxt;
     }
 }
 
@@ -874,7 +883,12 @@ private void serveClient(TCPConnection tcp) nothrow
     ByteBuffer inb;
     ByteBuffer outb;
     Arena arena;
-    Conn c;
+    // The connection lives in a refcounted control block; this fiber holds the
+    // sole strong ref (`sc`). `c` is a stable pointer into that block, valid for
+    // the whole scope. A cross-fiber lock() on the registry's Weak can keep the
+    // Conn alive past this fiber's return, so an in-flight delivery never dangles.
+    auto sc = Shared!Conn.make();
+    Conn* c = &sc.get();
     c.tcp = tcp;
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
@@ -884,23 +898,25 @@ private void serveClient(TCPConnection tcp) nothrow
     // unauthenticated and get NOAUTH until they AUTH as another user.
     c.user = aclUser("default");
     c.authed = c.user is null || (c.user.enabled && c.user.nopass);
-    c.sub.ctx = &c;
+    c.sub.ctx = c; // connSink resolves ctx back to this Conn* (lives in the block)
     c.sub.sink = &connSink;
-    c.shardSub.ctx = &c;
+    c.shardSub.ctx = c;
     c.shardSub.sink = &connSink;
-    registerConn(&c);
+    registerConn(sc);
     scope (exit)
     {
         gPubSub.dropAll(&c.sub); // no further connSink after this
         gShardPubSub.dropAll(&c.shardSub);
-        shutdownOutput(c); // stops the writer fiber; the ring is freed by Conn.~this
-        unregisterMonitor(&c);
-        unregisterConn(&c);
+        shutdownOutput(*c); // stops the writer fiber; the ring is freed by Conn.~this
+        unregisterMonitor(c);
+        unregisterConn(c.id);
         if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
             gBlockedClients--;
-        waitPurgeConn(&c); // drop any lingering block-waiter entries (no dangling &c)
-        // sub/shardSub Dicts, oq ring and clientName are released by Conn.~this
-        // when this fiber's `c` goes out of scope — no manual free() here.
+        waitPurgeConn(c); // drop any lingering block-waiter entries (no dangling c)
+        // sub/shardSub Dicts, oq ring and clientName are released by Conn.~this,
+        // which runs when `sc`'s last strong ref drops (after every registry
+        // unlink above, and after any outstanding cross-fiber lock releases) —
+        // no manual free() here.
     }
     try
     {
@@ -978,13 +994,13 @@ private void serveClient(TCPConnection tcp) nothrow
                 if (cmd.type == RType.Array && cmd.arr.length == 0)
                     continue;
                 gRespProto = c.resp3 ? 3 : 2;
-                keep = handleCommand(c, cmd, buf[start .. p], outb, arena);
+                keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
                 if (gNotifyFlags)
                     flushPendingNotify();
                 arena.reset();
             }
             if (c.pendingCount > 0)
-                flushPending(c, outb);
+                flushPending(*c, outb);
             gAof.flush();
             flushOut();
             if (outerReplay)
@@ -1075,7 +1091,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     if (cmd.type == RType.Array && cmd.arr.length == 0)
                         continue; // blank inline line — Redis ignores it silently
                     gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
-                    keep = handleCommand(c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                    keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
                     arena.reset();
@@ -1084,7 +1100,7 @@ private void serveClient(TCPConnection tcp) nothrow
                 // Reap the chunk's trailing run of pipelined writes (their replies
                 // come last, in order) before flushing the batch to the client.
                 if (c.pendingCount > 0)
-                    flushPending(c, outb);
+                    flushPending(*c, outb);
                 gAof.flush();
                 flushOut();
             }
@@ -1826,14 +1842,20 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                     // disconnect OTHER sessions authed as a deleted user (the
                     // self connection is handled after the reply via selfDeleted).
                     // Done BEFORE aclDelUser frees the AclUser (we compare c.user).
-                    foreach (ref a; cmd.arr[2 .. $])
-                        for (auto p = gConnHead; p !is null;)
-                        {
-                            auto nxt = p.regNext;
-                            if (p !is &c && p.user !is null && p.user.name == a.str)
-                                killConn(p);
-                            p = nxt;
-                        }
+                    {
+                        Vector!ulong ids;
+                        snapshotConnIds(ids);
+                        foreach (ref a; cmd.arr[2 .. $])
+                            foreach (id; ids[])
+                            {
+                                auto s = connById(id);
+                                if (s.isNull)
+                                    continue;
+                                auto p = &s.get();
+                                if (p !is &c && p.user !is null && p.user.name == a.str)
+                                    killConn(p);
+                            }
+                    }
                     long n = 0;
                     foreach (ref a; cmd.arr[2 .. $])
                         if (aclDelUser(a.str))
@@ -4573,8 +4595,14 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         // enumerate every live connection (the registry) — one info line each
         static ByteBuffer lb; // TLS
         lb.clear();
-        for (auto p = gConnHead; p !is null; p = p.regNext)
-            appendConnInfo(p, lb);
+        Vector!ulong ids;
+        snapshotConnIds(ids);
+        foreach (id; ids[])
+        {
+            auto s = connById(id);
+            if (!s.isNull)
+                appendConnInfo(&s.get(), lb);
+        }
         repBulk(o, cast(const(char)[]) lb.data);
     }
     else if (eqICDebug(sub, "KILL"))
@@ -4613,7 +4641,8 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         long unblocked = 0;
         if (!paused)
         {
-            auto p = connById(cast(ulong) id); // O(1) id lookup
+            auto s = connById(cast(ulong) id); // O(1) id lookup -> strong lock
+            auto p = s.isNull ? null : &s.get();
             if (p !is null && p !is &c && p.blocked)
             {
                 p.unblockReq = mode;
@@ -4788,9 +4817,15 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
     long killed = 0;
     bool killSelf = false;
     if (!unmatched && !haveAddr) // ADDR/unmodelled filters can't match anything
-        for (auto p = gConnHead; p !is null;)
+    {
+        Vector!ulong ids;
+        snapshotConnIds(ids);
+        foreach (id; ids[])
         {
-            auto nxt = p.regNext;
+            auto s = connById(id);
+            if (s.isNull)
+                continue;
+            auto p = &s.get();
             bool match = true;
             if (haveId && p.id != cast(ulong) byId)
                 match = false;
@@ -4807,8 +4842,8 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
                 else
                     killConn(p);
             }
-            p = nxt;
         }
+    }
     repInt(o, killed);
     if (killSelf)
     {
