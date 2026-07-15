@@ -395,9 +395,24 @@ private struct Conn
     }
 }
 
-// Registry of every live connection (intrusive doubly-linked list). All access
-// is on the single event-loop thread, so no synchronisation is needed.
+// Registry of every live connection (intrusive doubly-linked list for iteration)
+// PLUS an id→Conn* index for O(1) lookup (CLIENT UNBLOCK, tracking redirect
+// resolution). All access is on the single event-loop thread, so no locking.
 private __gshared Conn* gConnHead;
+private __gshared Dict!(Conn*) gConnById; // keyed by the id's raw 8 bytes
+
+// The 8 raw bytes of a client id, used as the gConnById key (HashMap.set dups it).
+private const(char)[] connIdKey(ref const ulong id) @nogc nothrow @trusted
+{
+    return (cast(const(char)*)&id)[0 .. ulong.sizeof];
+}
+
+/// O(1) live-connection lookup by id (null if none).
+private Conn* connById(ulong id) nothrow @trusted
+{
+    auto p = gConnById.get(connIdKey(id));
+    return p !is null ? *p : null;
+}
 
 private void registerConn(Conn* c) @nogc nothrow
 {
@@ -406,10 +421,12 @@ private void registerConn(Conn* c) @nogc nothrow
     if (gConnHead !is null)
         gConnHead.regPrev = c;
     gConnHead = c;
+    gConnById.set(connIdKey(c.id), c);
 }
 
 private void unregisterConn(Conn* c) @nogc nothrow
 {
+    gConnById.remove(connIdKey(c.id));
     if (c.regPrev !is null)
         c.regPrev.regNext = c.regNext;
     else if (gConnHead is c)
@@ -4594,15 +4611,16 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
         long unblocked = 0;
         if (!paused)
-            for (auto p = gConnHead; p !is null; p = p.regNext)
-                if (p.id == cast(ulong) id && p !is &c && p.blocked)
-                {
-                    p.unblockReq = mode;
-                    if (p.blockEvtInit)
-                        p.blockEvt.emit(); // wake it; the block loop honours unblockReq
-                    unblocked = 1;
-                    break;
-                }
+        {
+            auto p = connById(cast(ulong) id); // O(1) id lookup
+            if (p !is null && p !is &c && p.blocked)
+            {
+                p.unblockReq = mode;
+                if (p.blockEvtInit)
+                    p.blockEvt.emit(); // wake it; the block loop honours unblockReq
+                unblocked = 1;
+            }
+        }
         repInt(o, unblocked);
         return true;
     }
