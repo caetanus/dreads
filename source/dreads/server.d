@@ -29,7 +29,7 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclEncodeCanonicalSetuser, aclApplyCanonical, aclCanAccessChannel, aclKeyDenied,
     aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
     aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive, aclDeniedDb,
-    aclCanAccessDb, aclCanAccessKey;
+    aclCanAccessDb, aclCanAccessKey, forEachCommandKey;
 import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
@@ -54,7 +54,7 @@ import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.stream : nowMs;
 import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
-import dreads.dict : Dict;
+import dreads.dict : Dict, Unit;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
 import dreads.resp;
@@ -386,6 +386,26 @@ private struct Conn
     // `unblockReq` is set by another client (1 = TIMEOUT reply, 2 = -UNBLOCKED).
     bool blocked;
     ubyte unblockReq;
+    // CLIENT TRACKING (client-side caching invalidation). `tracking` gates it all
+    // (mirrored by gTrackCount, the `unlikely` fast-path gate). Default mode: keys
+    // the client READS are recorded in gInvalTable (key -> conn-id set); a later
+    // write to such a key sends an `invalidate` message. BCAST mode: no per-key
+    // table — any write whose key matches one of `trackPrefixes` is invalidated.
+    // Delivery is a RESP3 push on this conn (redir==0) or a pub/sub message to
+    // `__redis__:invalidate` on the conn whose id is `trackRedir`.
+    bool tracking;
+    bool trackBcast; // BCAST: invalidate by key-prefix, not by recorded key
+    bool trackOptin; // OPTIN: record a read only right after CLIENT CACHING YES
+    bool trackOptout; // OPTOUT: record every read unless CLIENT CACHING NO
+    bool trackNoloop; // NOLOOP: don't invalidate keys THIS conn just modified
+    bool trackCachingYes; // one-shot: OPTIN armed / OPTOUT disarmed for next cmd
+    bool trackRedirBroken; // redirect target gone -> one tracking-redir-broken push
+    ulong trackRedir; // REDIRECT target conn id (0 = RESP3 push to self)
+    Dict!Unit trackPrefixes; // BCAST prefixes (owned keys); empty = whole keyspace
+    // Self-invalidations (this conn wrote a key IT cached, RESP3 no-redirect) are
+    // staged here and flushed AFTER the command reply, so the push trails the
+    // reply. Cross-conn and redirect invalidations go straight out (other fiber).
+    ByteBuffer pendingInval;
 
     @property size_t totalSubs() const @nogc nothrow
     {
@@ -440,6 +460,243 @@ private void snapshotConnIds(ref Vector!ulong outv) nothrow @trusted
     foreach (key, ref w; gConnById)
         if (key.length == ulong.sizeof)
             outv.put(*cast(const(ulong)*) key.ptr);
+}
+
+// --- CLIENT TRACKING (client-side caching invalidation) ---------------------
+// Two server-global registries, both gated by `gTrackCount` (the unlikely
+// fast-path check on the command path): when it is 0 nothing here runs.
+//   * gInvalTable — DEFAULT mode: a read records `key -> {conn ids that cached
+//     it}`; a later write to that key sends each an `invalidate` and drops the
+//     entry (one-shot, like Redis's invalidation table).
+//   * gBcastConns — BCAST mode: the id set of BCAST clients; a write whose key
+//     matches one of the client's prefixes is invalidated (no per-key table).
+// Delivery resolves the target through the Weak!Conn registry (connById -> a
+// strong lock) so the target Conn stays alive across the push — the Phase-C
+// guarantee is what makes this safe from another fiber's write path.
+private __gshared Dict!(Dict!Unit) gInvalTable; // default mode: key -> conn-id set
+private __gshared Dict!Unit gBcastConns; // bcast mode: conn-id set
+private __gshared size_t gTrackCount; // # tracking conns (the unlikely gate)
+
+// Append an invalidation frame to `o`. asMessage => a pub/sub `message` on
+// `__redis__:invalidate` (redirect delivery; `>3` push for a RESP3 target, else
+// `*3`); otherwise a RESP3 `>2 invalidate` push (self delivery). A null key is
+// the FLUSHALL/FLUSHDB "everything" signal (null-array payload).
+private void buildInvalFrame(ref ByteBuffer o, bool resp3, bool asMessage,
+        scope const(char)[] key) nothrow
+{
+    if (asMessage)
+    {
+        o.appendByte(resp3 ? '>' : '*');
+        o.append("3\r\n");
+        repBulk(o, "message");
+        repBulk(o, "__redis__:invalidate");
+    }
+    else
+    {
+        o.append(">2\r\n"); // RESP3 push (only a RESP3 conn ever gets self-push)
+        repBulk(o, "invalidate");
+    }
+    if (key is null)
+        o.append("*-1\r\n");
+    else
+    {
+        o.append("*1\r\n");
+        repBulk(o, key);
+    }
+}
+
+// Enqueue an invalidation on `target`'s async output. The target must be in
+// subMode (a redirect target is — it subscribed to __redis__:invalidate; a
+// RESP3 self-tracking conn is put in subMode when tracking is enabled).
+private void sendInvalToConn(ref Conn target, bool asMessage, scope const(char)[] key) nothrow
+{
+    if (!target.subMode)
+        return;
+    static ByteBuffer fb; // TLS scratch
+    fb.clear();
+    buildInvalFrame(fb, target.resp3, asMessage, key);
+    auto m = rcFromBytes(fb.data);
+    if (target.oq.push(m))
+        target.oqEvt.emit();
+    rcRelease(m);
+}
+
+// Route one invalidation to the tracking conn `trackedId` (key null = all).
+// `writerId` is the conn that modified the key (for NOLOOP). Redirect => deliver
+// to the redirect target as a message; self (no redirect) writer => defer to the
+// conn's pendingInval so the push trails its own reply; otherwise push now.
+private void deliverInvalidateTo(ulong trackedId, ulong writerId, scope const(char)[] key) nothrow
+{
+    auto s = connById(trackedId);
+    if (s.isNull)
+        return;
+    auto tc = &s.get();
+    if (!tc.tracking)
+        return;
+    if (tc.trackNoloop && trackedId == writerId)
+        return; // NOLOOP: don't tell a client about keys it changed itself
+    if (tc.trackRedir != 0)
+    {
+        auto rs = connById(tc.trackRedir);
+        if (rs.isNull)
+        {
+            tc.trackRedirBroken = true; // target gone: flagged for a redir-broken push
+            return;
+        }
+        sendInvalToConn(rs.get(), true, key);
+    }
+    else if (trackedId == writerId)
+        buildInvalFrame(tc.pendingInval, tc.resp3, false, key); // deferred self-push
+    else
+        sendInvalToConn(*tc, false, key);
+}
+
+// True if a BCAST client's prefixes cover `key` (no prefixes => whole keyspace).
+private bool bcastPrefixMatch(ref Conn tc, scope const(char)[] key) nothrow @trusted
+{
+    if (tc.trackPrefixes.length == 0)
+        return true;
+    foreach (pfx, ref _; tc.trackPrefixes)
+        if (key.length >= pfx.length && key[0 .. pfx.length] == pfx)
+            return true;
+    return false;
+}
+
+// Record that conn `c` cached read-key `key` (DEFAULT mode invalidation table).
+private void trackRecordKey(ref Conn c, scope const(char)[] key) nothrow
+{
+    auto set = gInvalTable.get(key);
+    if (set is null)
+    {
+        gInvalTable.set(key, Dict!Unit.init);
+        set = gInvalTable.get(key);
+    }
+    set.set(connIdKey(c.id), Unit());
+}
+
+// A write touched `key`: fan out invalidations (default table + bcast prefixes).
+// The conn-id set is collected in a @nogc pass first (HashMap.opApply requires a
+// @nogc body), then delivery — which allocs/emits — runs over the collected ids.
+private void trackInvalidateKey(ref Conn writer, scope const(char)[] key) nothrow @trusted
+{
+    static Vector!ulong targets; // TLS: fully consumed before this call returns
+    if (auto set = gInvalTable.get(key))
+    {
+        targets.clear();
+        foreach (idk, ref _; *set)
+            if (idk.length == ulong.sizeof)
+                targets.put(*cast(const(ulong)*) idk.ptr);
+        gInvalTable.remove(key); // one-shot: the cached copies are now stale
+        foreach (id; targets[])
+            deliverInvalidateTo(id, writer.id, key);
+    }
+    if (gBcastConns.length)
+    {
+        targets.clear();
+        foreach (idk, ref _; gBcastConns)
+            if (idk.length == ulong.sizeof)
+                targets.put(*cast(const(ulong)*) idk.ptr);
+        foreach (id; targets[])
+        {
+            auto s = connById(id);
+            if (s.isNull)
+                continue;
+            auto tc = &s.get();
+            if (tc.tracking && tc.trackBcast && bcastPrefixMatch(*tc, key))
+                deliverInvalidateTo(id, writer.id, key);
+        }
+    }
+}
+
+// FLUSHALL / FLUSHDB: tell every tracking client "everything is invalid" and
+// drop the whole default table.
+private void trackInvalidateAll(ulong writerId) nothrow
+{
+    if (gTrackCount == 0)
+        return;
+    Vector!ulong ids;
+    snapshotConnIds(ids);
+    foreach (id; ids[])
+    {
+        auto s = connById(id);
+        if (!s.isNull && s.get().tracking)
+            deliverInvalidateTo(id, writerId, null);
+    }
+    gInvalTable.free();
+}
+
+// Turn tracking OFF for `c`, releasing its registry membership and prefixes.
+private void trackDisable(ref Conn c) nothrow
+{
+    if (!c.tracking)
+        return;
+    c.tracking = false;
+    gBcastConns.remove(connIdKey(c.id));
+    c.trackBcast = c.trackOptin = c.trackOptout = c.trackNoloop = false;
+    c.trackCachingYes = false;
+    c.trackRedir = 0;
+    c.trackRedirBroken = false;
+    c.trackPrefixes.free();
+    if (gTrackCount)
+        gTrackCount--;
+    // Stale ids may linger in gInvalTable key-sets; they resolve to no/again-non-
+    // tracking conns on delivery and are dropped when the key is next written, so
+    // a full O(table) sweep here is unnecessary (delivery re-checks .tracking).
+}
+
+// Whether a read by `c` should record its keys (OPTIN/OPTOUT gate the default).
+private bool trackShouldRecord(ref Conn c) nothrow
+{
+    if (c.trackOptin)
+        return c.trackCachingYes; // OPTIN: only right after CLIENT CACHING YES
+    if (c.trackOptout)
+        return !c.trackCachingYes; // OPTOUT: always, unless CLIENT CACHING NO
+    return true; // default mode records every read
+}
+
+// Post-command tracking hook (only reached when gTrackCount > 0). A write fans
+// out invalidations for its written keys; a read by a tracking client records
+// its read keys (default mode only — BCAST needs no per-key table). Keys are
+// collected in a @nogc pass (forEachCommandKey is @nogc), then acted on.
+private void trackAfterCommand(ref Conn c, scope const(char)[] uname,
+        scope const(RVal)[] arr, bool isWrite) nothrow @trusted
+{
+    char[16] lc = void;
+    if (uname.length > lc.length)
+        return;
+    foreach (i, ch; uname)
+        lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    auto lname = cast(const(char)[]) lc[0 .. uname.length];
+    if (isWrite)
+    {
+        // FLUSHALL/FLUSHDB touch no named key — they invalidate EVERYTHING.
+        if (lname == "flushall" || lname == "flushdb")
+        {
+            trackInvalidateAll(c.id);
+            return;
+        }
+        static Vector!(const(char)[]) wk; // TLS: slices into `arr`, used within call
+        wk.clear();
+        forEachCommandKey!((scope const(char)[] key, bool nr, bool nw) @nogc nothrow @trusted {
+            if (nw)
+                wk.put(key);
+            return true;
+        })(lname, arr);
+        foreach (key; wk[])
+            trackInvalidateKey(c, key);
+    }
+    else if (c.tracking && !c.trackBcast && trackShouldRecord(c))
+    {
+        static Vector!(const(char)[]) rk;
+        rk.clear();
+        forEachCommandKey!((scope const(char)[] key, bool nr, bool nw) @nogc nothrow @trusted {
+            if (nr)
+                rk.put(key);
+            return true;
+        })(lname, arr);
+        foreach (key; rk[])
+            trackRecordKey(c, key);
+    }
 }
 
 // --- blocked-client FIFO registry (BLPOP family) ----------------------------
@@ -908,6 +1165,7 @@ private void serveClient(TCPConnection tcp) nothrow
         gPubSub.dropAll(&c.sub); // no further connSink after this
         gShardPubSub.dropAll(&c.shardSub);
         shutdownOutput(*c); // stops the writer fiber; the ring is freed by Conn.~this
+        trackDisable(*c); // drop tracking registry membership + gTrackCount
         unregisterMonitor(c);
         unregisterConn(c.id);
         if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
@@ -926,16 +1184,29 @@ private void serveClient(TCPConnection tcp) nothrow
 
         // Write the accumulated reply buffer (shares the one ordered path with
         // pub/sub messages so a subscribe confirmation never trails a later message).
+        // A tracking client's own-key invalidation is staged in pendingInval and
+        // enqueued AFTER the reply, so the `invalidate` push always trails it.
         void flushOut()
         {
-            if (outb.empty)
+            if (outb.empty && c.pendingInval.empty)
                 return;
             if (c.subMode)
             {
-                auto m = rcFromBytes(outb.data);
-                if (c.oq.push(m))
-                    c.oqEvt.emit();
-                rcRelease(m);
+                if (!outb.empty)
+                {
+                    auto m = rcFromBytes(outb.data);
+                    if (c.oq.push(m))
+                        c.oqEvt.emit();
+                    rcRelease(m);
+                }
+                if (!c.pendingInval.empty)
+                {
+                    auto pm = rcFromBytes(c.pendingInval.data);
+                    if (c.oq.push(pm))
+                        c.oqEvt.emit();
+                    rcRelease(pm);
+                    c.pendingInval.clear();
+                }
             }
             else
             {
@@ -2125,6 +2396,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             c.watching = false;
             gPubSub.dropAll(&c.sub);
             gShardPubSub.dropAll(&c.shardSub);
+            trackDisable(c); // RESET clears CLIENT TRACKING state too
             c.user = aclUser("default"); // back to the default user
             c.authed = c.user is null || c.user.nopass;
             repSimple(o, "RESET");
@@ -2746,7 +3018,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // count when the bit/field actually changed).
     if (o.length > outBefore && o.data[outBefore] != '-' && !gWriteNoOp)
     {
-        if (isWriteCommand(uname) || !propagationOverride.empty)
+        immutable isW = isWriteCommand(uname) || !propagationOverride.empty;
+        if (isW)
         {
             gWriteEpoch++; // WATCH visibility
             gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
@@ -2759,8 +3032,16 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             else if (isWriteCommand(uname))
                 gAof.append(rawCmd);
         }
+        // CLIENT TRACKING: a write invalidates the cached copies of its keys; a
+        // read by a tracking client records its keys. Gated by gTrackCount so a
+        // server with no tracking clients pays only this one comparison.
+        if (gTrackCount > 0)
+            trackAfterCommand(c, uname, cmd.arr, isW);
     }
     propagationOverride.clear();
+    // The one-shot CLIENT CACHING toggle is consumed by the command it preceded.
+    if (c.trackCachingYes && (c.trackOptin || c.trackOptout))
+        c.trackCachingYes = false;
     return keep;
 }
 
@@ -4739,11 +5020,227 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
             || eqICDebug(sub, "SETINFO"))
         repSimple(o, "OK");
+    else if (eqICDebug(sub, "TRACKING") && args.length >= 2)
+        clientTracking(c, args[1 .. $], o);
+    else if (eqICDebug(sub, "CACHING") && args.length == 2)
+        clientCaching(c, args[1].str, o);
+    else if (eqICDebug(sub, "GETREDIR") && args.length == 1)
+        repInt(o, c.tracking ? cast(long) c.trackRedir : -1);
+    else if (eqICDebug(sub, "TRACKINGINFO") && args.length == 1)
+        clientTrackingInfo(c, o);
     else if (eqICDebug(sub, "HELP"))
         repHelp!"CLIENT"(o);
     else
         repUnknownSubcommand(o, "CLIENT", sub);
     return true;
+}
+
+// CLIENT TRACKING <ON|OFF> [REDIRECT id] [PREFIX p ...] [BCAST] [OPTIN] [OPTOUT]
+// [NOLOOP] — enable/disable client-side caching invalidation for this connection.
+private void clientTracking(ref Conn c, const(RVal)[] opts, ref ByteBuffer o) nothrow
+{
+    bool on;
+    if (eqICDebug(opts[0].str, "ON"))
+        on = true;
+    else if (eqICDebug(opts[0].str, "OFF"))
+        on = false;
+    else
+    {
+        repError(o, "ERR syntax error");
+        return;
+    }
+    bool bcast, optin, optout, noloop, haveRedir;
+    long redir = 0;
+    Dict!Unit prefixes; // parsed into a scratch, only applied on success
+    scope (exit)
+        prefixes.free();
+    size_t i = 1;
+    while (i < opts.length)
+    {
+        auto a = opts[i].str;
+        if (eqICDebug(a, "REDIRECT") && i + 1 < opts.length)
+        {
+            if (!parseLong(opts[i + 1].str, redir) || redir < 0)
+            {
+                repError(o, "ERR Invalid client ID");
+                return;
+            }
+            haveRedir = true;
+            i += 2;
+        }
+        else if (eqICDebug(a, "PREFIX") && i + 1 < opts.length)
+        {
+            prefixes.set(opts[i + 1].str, Unit());
+            i += 2;
+        }
+        else if (eqICDebug(a, "BCAST"))
+        {
+            bcast = true;
+            i++;
+        }
+        else if (eqICDebug(a, "OPTIN"))
+        {
+            optin = true;
+            i++;
+        }
+        else if (eqICDebug(a, "OPTOUT"))
+        {
+            optout = true;
+            i++;
+        }
+        else if (eqICDebug(a, "NOLOOP"))
+        {
+            noloop = true;
+            i++;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+    }
+    if (optin && optout)
+    {
+        repError(o, "ERR You can't specify both OPTIN mode and OPTOUT mode");
+        return;
+    }
+    if (prefixes.length && !bcast)
+    {
+        repError(o, "ERR PREFIX option requires BCAST mode to be enabled");
+        return;
+    }
+    if (bcast && (optin || optout))
+    {
+        repError(o, "ERR OPTIN and OPTOUT are not compatible with BCAST");
+        return;
+    }
+    if (!on)
+    {
+        trackDisable(c);
+        repSimple(o, "OK");
+        return;
+    }
+    // A RESP2 client can only be notified through a redirection connection.
+    if (!c.resp3 && !(haveRedir && redir != 0))
+    {
+        repError(o, "ERR Client tracking can be enabled only in RESP3 mode or when a "
+                ~ "redirection client is specified via the 'REDIRECT' option");
+        return;
+    }
+    if (haveRedir && redir != 0 && connById(cast(ulong) redir).isNull)
+    {
+        repError(o, "ERR The client ID you want redirect to does not exist");
+        return;
+    }
+    // Can't flip OPTIN<->OPTOUT (or in/out of a caching mode) without turning
+    // tracking off first — mirrors Valkey's guard.
+    if (c.tracking && ((c.trackOptin && optout) || (c.trackOptout && optin)
+            || (c.trackOptin && !optin && !optout) || (c.trackOptout && !optin && !optout)
+            || (!c.trackOptin && !c.trackOptout && (optin || optout))))
+    {
+        repError(o, "ERR You can't switch OPTIN/OPTOUT mode before disabling "
+                ~ "tracking for this client, and then re-enabling it with a different mode.");
+        return;
+    }
+    immutable wasTracking = c.tracking;
+    c.tracking = true;
+    c.trackBcast = bcast;
+    c.trackOptin = optin;
+    c.trackOptout = optout;
+    c.trackNoloop = noloop;
+    c.trackRedir = haveRedir ? cast(ulong) redir : 0;
+    c.trackRedirBroken = false;
+    c.trackPrefixes.free();
+    foreach (p, ref _; prefixes)
+        c.trackPrefixes.set(p, Unit());
+    if (bcast)
+        gBcastConns.set(connIdKey(c.id), Unit());
+    else
+        gBcastConns.remove(connIdKey(c.id));
+    // RESP3 self-tracking pushes arrive from other fibers, so its output must be
+    // the async (oq) path; a redirect target already engaged it by subscribing.
+    if (c.trackRedir == 0 && c.resp3)
+        enterSubMode(c);
+    if (!wasTracking)
+        gTrackCount++;
+    repSimple(o, "OK");
+}
+
+// CLIENT CACHING <YES|NO> — arm the one-shot per-command caching toggle for the
+// next read (only meaningful in OPTIN/OPTOUT mode).
+private void clientCaching(ref Conn c, scope const(char)[] yn, ref ByteBuffer o) nothrow
+{
+    if (!c.tracking || !(c.trackOptin || c.trackOptout))
+    {
+        repError(o, "ERR CLIENT CACHING can be called only when the client is in "
+                ~ "tracking mode with OPTIN or OPTOUT mode enabled");
+        return;
+    }
+    if (eqICDebug(yn, "YES"))
+    {
+        if (c.trackOptout)
+        {
+            repError(o, "ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode.");
+            return;
+        }
+        c.trackCachingYes = true;
+    }
+    else if (eqICDebug(yn, "NO"))
+    {
+        if (c.trackOptin)
+        {
+            repError(o, "ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode.");
+            return;
+        }
+        c.trackCachingYes = true; // one-shot exception armed (mode decides its sense)
+    }
+    else
+    {
+        repError(o, "ERR syntax error");
+        return;
+    }
+    repSimple(o, "OK");
+}
+
+// CLIENT TRACKINGINFO — a map of this connection's tracking state.
+private void clientTrackingInfo(ref Conn c, ref ByteBuffer o) nothrow @trusted
+{
+    repMapHeader(o, 3);
+    // 1) flags — collect the active flag names into a small stack list
+    repBulk(o, "flags");
+    size_t nf = 0;
+    const(char)[][8] flags;
+    if (!c.tracking)
+        flags[nf++] = "off";
+    else
+    {
+        flags[nf++] = "on";
+        if (c.trackBcast)
+            flags[nf++] = "bcast";
+        if (c.trackOptin)
+            flags[nf++] = "optin";
+        if (c.trackOptout)
+            flags[nf++] = "optout";
+        if (c.trackCachingYes && c.trackOptin)
+            flags[nf++] = "caching-yes";
+        if (c.trackCachingYes && c.trackOptout)
+            flags[nf++] = "caching-no";
+        if (c.trackNoloop)
+            flags[nf++] = "noloop";
+        if (c.trackRedirBroken)
+            flags[nf++] = "broken_redirect";
+    }
+    repArrayHeader(o, nf);
+    foreach (k; 0 .. nf)
+        repBulk(o, flags[k]);
+    // 2) redirect
+    repBulk(o, "redirect");
+    repInt(o, c.tracking ? cast(long) c.trackRedir : -1);
+    // 3) prefixes
+    repBulk(o, "prefixes");
+    repArrayHeader(o, c.trackPrefixes.length);
+    foreach (p, ref _; c.trackPrefixes)
+        repBulk(o, p);
 }
 
 // CLIENT KILL — the operational lever to sever a rogue user/connection so it
