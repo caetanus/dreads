@@ -134,3 +134,11 @@ XREADGROUP ACK would propagate entries-read
 # implementing quicklist compression would mirror Redis's internal storage
 # mechanism. Encoding-only introspection gap.
 SORT STORE quicklist with the right options
+# WATCH is a conservative GLOBAL epoch (gWriteEpoch): any write by any client
+# between WATCH and EXEC aborts the transaction, stricter than Redis's per-key
+# tracking (documented in DRIFT.md). This test WATCHes dstset, then an unrelated
+# client SMOVEs a member already in dst (so dst is unchanged but src is) and
+# expects EXEC to still succeed — that needs per-key WATCH (signalModifiedKey at
+# each mutation site). Our behavior is SAFE (over-aborts, never under-aborts), a
+# real feature TODO, not an architectural divergence.
+SMOVE only notify dstset when the addition is successful

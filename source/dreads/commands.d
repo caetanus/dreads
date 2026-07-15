@@ -4972,13 +4972,17 @@ private void srandmember(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     }
     import dreads.rand : randBelow;
 
-    // uniform live slot: uniform start, wrapping scan to the next live one
+    // Uniform live slot by REJECTION sampling (re-draw until live). Scanning
+    // forward to the next live slot biases toward slots after a run of empties
+    // (non-uniform on a sparse hashtable). The set is non-empty (checked above).
     size_t randSlot() @nogc nothrow
     {
-        auto i = randBelow(obj.set.capacity);
-        while (!obj.set.slotLive(i))
-            i = i + 1 == obj.set.capacity ? 0 : i + 1;
-        return i;
+        for (;;)
+        {
+            auto i = randBelow(obj.set.capacity);
+            if (obj.set.slotLive(i))
+                return i;
+        }
     }
 
     if (!withCount)
