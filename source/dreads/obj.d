@@ -59,6 +59,11 @@ public __gshared bool gImportMode;
 /// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
 public __gshared long gBlockedClients;
 
+/// CLIENT TRACKING invalidation hook: when a key is physically removed by an
+/// expiry (active or lazy), the server layer queues a tracking invalidation for
+/// it. Null until the server installs it (so obj.d stays independent of tracking).
+public __gshared void function(scope const(char)[] key) nothrow @nogc gTrackInvalidateHook;
+
 /// CLIENT PAUSE state (server layer owns the barrier/replay; kept here so INFO in
 /// the data plane can read it without a module cycle). `gPauseUntilMs` is the
 /// absolute deadline (0 = not paused); `gPauseAll` true = pause ALL, false = WRITE
@@ -355,6 +360,8 @@ public struct Keyspace
                 if (obj !is null && obj.expireAtMs == e.key) // still the live TTL
                 {
                     notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
+                    if (gTrackInvalidateHook !is null)
+                        gTrackInvalidateHook(key); // invalidate client-side caches
                     d.del(key);
                     dropped++;
                     gExpiredKeys++;
@@ -514,6 +521,8 @@ public struct Keyspace
             disarmSubExpire(k);
             d.del(k);
             notifyKeyspaceEvent(NClass.expired, "expired", k);
+            if (gTrackInvalidateHook !is null)
+                gTrackInvalidateHook(k); // invalidate client-side caches
             gExpiredKeys++;
             return null;
         }

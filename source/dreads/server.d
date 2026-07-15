@@ -223,7 +223,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
     }
     {
-        import dreads.obj : lruClock, gActiveExpire, gActiveEviction;
+        import dreads.obj : lruClock, gActiveExpire, gActiveEviction, gTrackInvalidateHook;
         import dreads.rand : seedRand;
         import dreads.stream : nowMs;
 
@@ -243,7 +243,23 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             // busy script can't stall the loop and SCRIPT KILL can reach it
             startLuaScriptPool();
         }
+        // Wire the expiry->tracking-invalidation hook (a key removed by expiry
+        // queues a CLIENT TRACKING invalidation, gated by gTrackCount).
+        gTrackInvalidateHook = (scope const(char)[] key) @nogc nothrow {
+            if (gTrackCount)
+            {
+                trackInvalidateKey(key);
+                gExpireKeys.set(key, Unit()); // server-caused: exempt from NOLOOP
+            }
+        };
         setTimer(1.seconds, delegate() @trusted nothrow {
+            // Pin THIS cycle's clock to wall time. detNow() otherwise returns the
+            // last command's frozen gClock (never reset to 0 after dispatch), which
+            // is stale here — so a background active-expire/eviction cycle would
+            // compare deadlines against a frozen "now" and never fire while idle.
+            import dreads.det : freezeClock;
+
+            freezeClock(0); // 0 => freeze the current wall clock into gClock
             lruClock = cast(uint)(nowMs() / 1000);
             // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
             // is a propagated DEL) is held until the window lifts, like eviction.
@@ -257,6 +273,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
             releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
             flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
+            if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
+                flushTrackingInval(0);
             gAof.fsyncNow();
         }, true);
     }
@@ -546,19 +564,30 @@ private void deliverInvalidateTo(ulong trackedId, ulong writerId, scope const(ch
         sendInvalToConn(rs.get(), true, key);
     }
     else if (trackedId == writerId)
-        buildInvalFrame(tc.pendingInval, tc.resp3, false, key); // deferred self-push
+    {
+        if (tc.subMode) // deferred self-push (RESP3 self-tracking has async output)
+            buildInvalFrame(tc.pendingInval, tc.resp3, false, key);
+    }
     else
         sendInvalToConn(*tc, false, key);
 }
 
-// True if a BCAST client's prefixes cover `key` (no prefixes => whole keyspace).
-private bool bcastPrefixMatch(ref Conn tc, scope const(char)[] key) nothrow @trusted
+// Does a BCAST client's prefixes cover `key`? On a match, `group` is the matching
+// prefix (or "" for whole-keyspace), which is how invalidations are grouped into
+// one message per prefix. No prefixes => whole keyspace, group "".
+private bool bcastMatch(ref Conn tc, scope const(char)[] key, out const(char)[] group) @nogc nothrow @trusted
 {
     if (tc.trackPrefixes.length == 0)
+    {
+        group = "";
         return true;
+    }
     foreach (pfx, ref _; tc.trackPrefixes)
         if (key.length >= pfx.length && key[0 .. pfx.length] == pfx)
+        {
+            group = pfx;
             return true;
+        }
     return false;
 }
 
@@ -574,38 +603,206 @@ private void trackRecordKey(ref Conn c, scope const(char)[] key) nothrow
     set.set(connIdKey(c.id), Unit());
 }
 
-// A write touched `key`: fan out invalidations (default table + bcast prefixes).
-// The conn-id set is collected in a @nogc pass first (HashMap.opApply requires a
-// @nogc body), then delivery — which allocs/emits — runs over the collected ids.
-private void trackInvalidateKey(ref Conn writer, scope const(char)[] key) nothrow @trusted
+// Pending invalidations accumulated during ONE top-level command (grouped so a
+// client gets ONE message per group): key = idBytes(8) ++ group, value = key set.
+// Default mode uses group ""; BCAST uses the matching prefix. Flushed (delivered)
+// at the top-level command boundary — after the command's own reply is staged so
+// a self-push trails it.
+private __gshared Dict!(Dict!Unit) gPend;
+// BCAST keys written this command (raw). Which bcast client/prefix each belongs to
+// is resolved at flush (connById is not @nogc, but the expiry accumulation path is).
+private __gshared Dict!Unit gBcastPendingKeys;
+// Keys invalidated by a SERVER-caused event (expiry) this cycle. NOLOOP suppresses
+// keys the CLIENT modified, but not these — so an expiry of a key the client also
+// wrote in the same command still reaches it. Cleared at flush.
+private __gshared Dict!Unit gExpireKeys;
+
+private void pendAdd(ulong id, scope const(char)[] group, scope const(char)[] key) @nogc nothrow @trusted
 {
-    static Vector!ulong targets; // TLS: fully consumed before this call returns
+    static ByteBuffer ck; // TLS composite-key scratch
+    ck.clear();
+    ck.append((cast(const(char)*)&id)[0 .. ulong.sizeof]);
+    ck.append(group);
+    auto comp = cast(const(char)[]) ck.data;
+    auto set = gPend.get(comp);
+    if (set is null)
+    {
+        gPend.set(comp, Dict!Unit.init);
+        set = gPend.get(comp);
+    }
+    set.set(key, Unit()); // HashMap.set dups the key -> owned past the command
+}
+
+// A write (or an expiry/eviction) touched `key`: queue invalidations (default
+// table + bcast prefixes) into gPend, grouped. NOLOOP is applied at flush, so no
+// writer identity is needed here. @nogc-safe (pure accumulation), so the expiry
+// path can call it. Conn-id sets are collected in a @nogc pass first.
+private void trackInvalidateKey(scope const(char)[] key) @nogc nothrow @trusted
+{
+    static Vector!ulong ids; // TLS
     if (auto set = gInvalTable.get(key))
     {
-        targets.clear();
+        ids.clear();
         foreach (idk, ref _; *set)
             if (idk.length == ulong.sizeof)
-                targets.put(*cast(const(ulong)*) idk.ptr);
+                ids.put(*cast(const(ulong)*) idk.ptr);
         gInvalTable.remove(key); // one-shot: the cached copies are now stale
-        foreach (id; targets[])
-            deliverInvalidateTo(id, writer.id, key);
+        foreach (id; ids[])
+            pendAdd(id, "", key); // default mode: one message per client
     }
+    // BCAST: just stash the key; flush resolves which client/prefix it hits.
     if (gBcastConns.length)
+        gBcastPendingKeys.set(key, Unit());
+}
+
+// Build a grouped invalidation frame (multiple keys) into `o`. asMessage => a
+// pub/sub `message` on __redis__:invalidate (redirect); else a RESP3 `invalidate`
+// push (self). The key payload is a RESP array of the set's keys.
+private void buildGroupedFrame(ref ByteBuffer o, bool resp3, bool asMessage, ref Dict!Unit keys) nothrow @trusted
+{
+    if (asMessage)
     {
-        targets.clear();
+        o.appendByte(resp3 ? '>' : '*');
+        o.append("3\r\n");
+        repBulk(o, "message");
+        repBulk(o, "__redis__:invalidate");
+    }
+    else
+    {
+        o.append(">2\r\n");
+        repBulk(o, "invalidate");
+    }
+    repArrayHeader(o, keys.length);
+    foreach (k, ref _; keys)
+        repBulk(o, k);
+}
+
+// Enqueue a grouped invalidation frame on `target`'s async output (subMode only).
+private void sendGrouped(ref Conn target, bool asMessage, ref Dict!Unit keys) nothrow @trusted
+{
+    if (!target.subMode)
+        return;
+    static ByteBuffer fb;
+    fb.clear();
+    buildGroupedFrame(fb, target.resp3, asMessage, keys);
+    auto m = rcFromBytes(fb.data);
+    if (target.oq.push(m))
+        target.oqEvt.emit();
+    rcRelease(m);
+}
+
+// Route one grouped keyset to a tracking conn `id` (NOLOOP-aware, redirect/self).
+// `bcastMode` must match the conn's current mode: a default-table entry left over
+// from before the client switched to BCAST (or vice-versa) is dropped, not sent.
+private void deliverGroup(ulong id, ulong writerId, ref Dict!Unit keys, bool bcastMode) nothrow @trusted
+{
+    auto s = connById(id);
+    if (s.isNull)
+        return;
+    auto tc = &s.get();
+    if (!tc.tracking || tc.trackBcast != bcastMode)
+        return;
+    // NOLOOP suppresses keys THIS client changed — but not server-caused expiries
+    // (in gExpireKeys), even when the client also wrote the key this command.
+    static Dict!Unit kept; // TLS: the NOLOOP-surviving subset
+    if (tc.trackNoloop && id == writerId)
+    {
+        kept.clear();
+        foreach (k, ref _; keys)
+            if (gExpireKeys.exists(k))
+                kept.set(k, Unit());
+        if (kept.length == 0)
+            return;
+    }
+    auto eff = (tc.trackNoloop && id == writerId) ? &kept : &keys;
+    if (tc.trackRedir != 0)
+    {
+        auto rs = connById(tc.trackRedir);
+        if (rs.isNull)
+        {
+            tc.trackRedirBroken = true;
+            return;
+        }
+        sendGrouped(rs.get(), true, *eff);
+    }
+    else if (tc.subMode)
+    {
+        if (id == writerId) // self-push trails the reply (via pendingInval)
+            buildGroupedFrame(tc.pendingInval, tc.resp3, false, *eff);
+        else
+            sendGrouped(*tc, false, *eff);
+    }
+}
+
+// Deliver every accumulated group at the top-level command boundary. `writerId`
+// is the conn that ran the command (for NOLOOP; 0 for server-side expiry).
+private void flushTrackingInval(ulong writerId) nothrow @trusted
+{
+    // DEFAULT mode: gPend is already grouped as idBytes ++ "" -> key set.
+    if (gPend.length)
+    {
+        static Vector!(const(char)[]) comps; // slices into gPend keys, valid until free
+        comps.clear();
+        foreach (ck, ref _; gPend)
+            comps.put(ck);
+        foreach (ck; comps[])
+        {
+            if (ck.length < ulong.sizeof)
+                continue;
+            if (auto set = gPend.get(ck))
+                deliverGroup(*cast(const(ulong)*) ck.ptr, writerId, *set, false);
+        }
+        gPend.clear();
+    }
+    // BCAST mode: for each bcast client, split the written keys by matching prefix
+    // and deliver one message per prefix (group).
+    if (gBcastPendingKeys.length && gBcastConns.length)
+    {
+        static Vector!ulong bids;
+        bids.clear();
         foreach (idk, ref _; gBcastConns)
             if (idk.length == ulong.sizeof)
-                targets.put(*cast(const(ulong)*) idk.ptr);
-        foreach (id; targets[])
+                bids.put(*cast(const(ulong)*) idk.ptr);
+        static Vector!(const(char)[]) bkeys;
+        bkeys.clear();
+        foreach (k, ref _; gBcastPendingKeys)
+            bkeys.put(k);
+        static Dict!(Dict!Unit) groups; // group -> key set (owned); reused per conn
+        foreach (id; bids[])
         {
             auto s = connById(id);
             if (s.isNull)
                 continue;
             auto tc = &s.get();
-            if (tc.tracking && tc.trackBcast && bcastPrefixMatch(*tc, key))
-                deliverInvalidateTo(id, writer.id, key);
+            if (!tc.tracking || !tc.trackBcast)
+                continue;
+            // group keys by matching prefix (only the prefixes this key hits)
+            groups.clear();
+            foreach (k; bkeys[])
+            {
+                const(char)[] grp;
+                if (!bcastMatch(*tc, k, grp))
+                    continue;
+                auto g = groups.get(grp);
+                if (g is null)
+                {
+                    groups.set(grp, Dict!Unit.init);
+                    g = groups.get(grp);
+                }
+                g.set(k, Unit());
+            }
+            static Vector!(const(char)[]) gnames;
+            gnames.clear();
+            foreach (gn, ref _; groups)
+                gnames.put(gn);
+            foreach (gn; gnames[])
+                if (auto g = groups.get(gn))
+                    deliverGroup(id, writerId, *g, true);
         }
+        groups.clear();
     }
+    gBcastPendingKeys.clear();
+    gExpireKeys.clear(); // consumed: this cycle's server-caused keys are delivered
 }
 
 // FLUSHALL / FLUSHDB: tell every tracking client "everything is invalid" and
@@ -622,7 +819,7 @@ private void trackInvalidateAll(ulong writerId) nothrow
         if (!s.isNull && s.get().tracking)
             deliverInvalidateTo(id, writerId, null);
     }
-    gInvalTable.free();
+    gInvalTable.clearShrink(); // every cached key is gone: reset and reclaim the table
 }
 
 // Turn tracking OFF for `c`, releasing its registry membership and prefixes.
@@ -636,7 +833,7 @@ private void trackDisable(ref Conn c) nothrow
     c.trackCachingYes = false;
     c.trackRedir = 0;
     c.trackRedirBroken = false;
-    c.trackPrefixes.free();
+    c.trackPrefixes.clearShrink(); // the conn lives on (tracking off) — reset, not delete
     if (gTrackCount)
         gTrackCount--;
     // Stale ids may linger in gInvalTable key-sets; they resolve to no/again-non-
@@ -683,7 +880,7 @@ private void trackAfterCommand(ref Conn c, scope const(char)[] uname,
             return true;
         })(lname, arr);
         foreach (key; wk[])
-            trackInvalidateKey(c, key);
+            trackInvalidateKey(key);
     }
     else if (c.tracking && !c.trackBcast && trackShouldRecord(c))
     {
@@ -1268,6 +1465,8 @@ private void serveClient(TCPConnection tcp) nothrow
                 keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
                 if (gNotifyFlags)
                     flushPendingNotify();
+                if (gTrackCount)
+                    flushTrackingInval(c.id); // grouped invalidations for this command
                 arena.reset();
             }
             if (c.pendingCount > 0)
@@ -1365,6 +1564,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
+                    if (gTrackCount)
+                        flushTrackingInval(c.id); // grouped invalidations for this command
                     arena.reset();
                 }
                 inb.consume(pos);
@@ -2728,6 +2929,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 c.clientName.put(setName);
             }
             c.resp3 = ver == 3;
+            // A client that was tracking (no redirect) over RESP2 only starts
+            // receiving invalidation pushes once it upgrades to RESP3 — engage
+            // its async output now so cross-fiber pushes have a queue to land on.
+            if (c.resp3 && c.tracking && c.trackRedir == 0)
+                enterSubMode(c);
             gRespProto = ver; // the HELLO reply itself is encoded in the new proto
             repMapHeader(o, 7);
             repBulk(o, "server");
@@ -5051,9 +5257,8 @@ private void clientTracking(ref Conn c, const(RVal)[] opts, ref ByteBuffer o) no
     }
     bool bcast, optin, optout, noloop, haveRedir;
     long redir = 0;
-    Dict!Unit prefixes; // parsed into a scratch, only applied on success
-    scope (exit)
-        prefixes.free();
+    Dict!Unit prefixes; // parsed into a scratch, only applied on success (its
+    // ~this reclaims it at scope exit — no manual teardown)
     size_t i = 1;
     while (i < opts.length)
     {
@@ -5120,23 +5325,15 @@ private void clientTracking(ref Conn c, const(RVal)[] opts, ref ByteBuffer o) no
         repSimple(o, "OK");
         return;
     }
-    // A RESP2 client can only be notified through a redirection connection.
-    if (!c.resp3 && !(haveRedir && redir != 0))
-    {
-        repError(o, "ERR Client tracking can be enabled only in RESP3 mode or when a "
-                ~ "redirection client is specified via the 'REDIRECT' option");
-        return;
-    }
     if (haveRedir && redir != 0 && connById(cast(ulong) redir).isNull)
     {
         repError(o, "ERR The client ID you want redirect to does not exist");
         return;
     }
-    // Can't flip OPTIN<->OPTOUT (or in/out of a caching mode) without turning
-    // tracking off first — mirrors Valkey's guard.
-    if (c.tracking && ((c.trackOptin && optout) || (c.trackOptout && optin)
-            || (c.trackOptin && !optin && !optout) || (c.trackOptout && !optin && !optout)
-            || (!c.trackOptin && !c.trackOptout && (optin || optout))))
+    // Can't flip OPTIN<->OPTOUT without disabling tracking first (Valkey guard).
+    // Enabling on RESP2 without a redirect is allowed but inert: nothing is
+    // delivered until the client switches to RESP3 (which engages async output).
+    if (c.tracking && ((c.trackOptin && optout) || (c.trackOptout && optin)))
     {
         repError(o, "ERR You can't switch OPTIN/OPTOUT mode before disabling "
                 ~ "tracking for this client, and then re-enabling it with a different mode.");
