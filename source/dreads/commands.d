@@ -1792,8 +1792,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             long nf;
             if (fi >= args.length || !eqICKeyword(args[fi].str, "FIELDS"))
             {
-                repError(o,
-                        "ERR Mandatory keyword FIELDS is missing or not at the right position");
+                // a trailing FIELDS with no count/fields after it is a numfields
+                // error (more specific), not the keyword-position error
+                if (eqICKeyword(args[$ - 1].str, "FIELDS"))
+                    repError(o, "ERR numfields should be greater than 0 and"
+                            ~ " match the provided number of fields");
+                else
+                    repError(o, "ERR Mandatory keyword FIELDS is missing"
+                            ~ " or not at the right position");
                 break;
             }
             if (fi + 2 > args.length)

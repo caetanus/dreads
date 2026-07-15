@@ -1484,4 +1484,23 @@ version (unittest)
         ks.run("HSET", "hh", "f", "123456789"); // 9 chars > 8
         ks.run("OBJECT", "ENCODING", "hh").should.equal("$9\r\nhashtable\r\n");
     }
+
+    // HGETEX with a trailing FIELDS (no count/fields after) reports the numfields
+    // error, matching HSETEX/HEXPIRE — not the keyword-position error. First
+    // caught by unit/hashexpire.
+    @("blackbox.hgetex_trailing_fields_error")
+    unittest
+    {
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        immutable want = "-ERR numfields should be greater than 0 and match the provided number of fields\r\n";
+        ks.run("HGETEX", "myhash", "PERSIST", "PERSIST", "FIELDS").should.equal(want);
+        ks.run("HSETEX", "myhash", "KEEPTTL", "KEEPTTL", "KEEPTTL", "FIELDS").should.equal(want);
+        ks.run("HEXPIRE", "myhash", "10", "NX", "NX", "FIELDS").should.equal(want);
+        // FIELDS genuinely absent (not trailing) still reports the position error
+        ks.run("HGETEX", "myhash", "PERSIST", "a", "b")
+            .should.startWith("-ERR Mandatory keyword FIELDS");
+    }
 }

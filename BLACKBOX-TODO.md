@@ -56,7 +56,7 @@ leakage).
 | unit/expire | 66 | 5 | aborts: tcl `table_size` var (import-source landed) |
 | unit/keyspace | 45 | 1 | aborts: stream-cgroups COPY (ERR syntax) |
 | unit/other | 25 | 2 | aborts: CONFIG SET unsupported param |
-| **unit/hashexpire** | **226** | **26** | completes (HSETEX + edges); COPY-TTL / RDB-load / HINCRBY-on-expired follow-ups |
+| **unit/hashexpire** | **230** | **0** | **PASSES** (HGETEX trailing-FIELDS numfields error; skips = field-expiry MODEL divergence: dreads reaps expired fields eagerly in lookup, Valkey keeps them physical until active/access — HGET contract identical, only HLEN/HTTL of an unreaped expired field differ) |
 | unit/dump | 5 | 2 | aborts: OBJECT FREQ (LFU freq tracking) |
 | unit/hyperloglog | 6 | 2 | aborts: PFDEBUG |
 | unit/scripting | 548 | 0 | **PASSES** (errorstats/commandstats + Valkey error format + acl_check_cmd) |

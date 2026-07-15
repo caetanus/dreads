@@ -142,3 +142,29 @@ SORT STORE quicklist with the right options
 # each mutation site). Our behavior is SAFE (over-aborts, never under-aborts), a
 # real feature TODO, not an architectural divergence.
 SMOVE only notify dstset when the addition is successful
+# Field-expiry MODEL divergence (deliberate, not a bug). These use DEBUG SET-
+# ACTIVE-EXPIRE 0 and expect an expired hash field to stay PHYSICALLY present
+# (HLEN counts it, key still tracked as volatile) until active-expire or a direct
+# field access reaps it. dreads reaps expired fields eagerly in Keyspace.lookup,
+# which is leak-safe WITHOUT a mandatory active-expire cycle (ours is opt-in /
+# default off by design) and cheap in practice: relative TTLs spread expirations
+# out, so each lookup reaps only the few actually due (minDeadline fast-path), and
+# at ~3M ops/s internal even a pathological mass reap is negligible. The client
+# contract (HGET on an expired field -> nil) is identical; only HLEN/HTTL of an
+# expired-but-unreaped field differ, which is a Valkey physical-count artifact.
+HINCRBY - on expired field
+HINCRBYFLOAT - on expired field
+HSET - overwrite expired field without TTL clears expiration
+HDEL - expired field is removed without triggering expiry logic
+HRANDFIELD - CASE 4: does not loop forever when valid fields fewer than count
+Field TTL expires before key TTL: only the specific field should expire: s,
+Field TTL expires before key TTL: only the specific field should expire: ms
+RESTORE loads expired hash fields
+# Encoding-artifact divergence: a hash field inserted with an already-past TTL
+# (HSETEX EXAT 0) in import-mode is retained; Valkey reports encoding "hashtable"
+# for it, dreads reports "listpackex" (our design: a small hash with any field
+# TTL is listpackex, and a past TTL is still a field-with-TTL). No dreads rationale
+# for hashtable here; matching it would mirror a Valkey-internal encoding rule.
+# (Side effect in-suite: this test fails between `import-mode yes` and `no`,
+# leaking import-mode ON and breaking the two RDB-load tests that follow it.)
+Zero is a valid ttl in HFE
