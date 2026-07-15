@@ -49,7 +49,7 @@ leakage).
 | unit/type/list | 271 | 10 | `CLIENT PAUSE` now implemented; **hangs** at a blocking↔pause / commandstats test — re-sweep |
 | unit/pause | 19 | 0 | **PASSES** (1 skip N/A: deferring-client write-backpressure timing — dreads buffers server-side by design) |
 | unit/dump | 15 | 1 | **MIGRATE landed** (DUMP->RESTORE over cached socket; 14 two-instance tests are external:skip, verified live vs valkey 9.1; the runnable cached-connection-release test passes); stream DUMP/RESTORE byte-exact both ways; only remaining fail = RESTORE shared-NACK corruption reject (expects "Bad data format", we say "checksum are wrong") |
-| unit/type/hash | 81 | 8 | completes (DUMP unblocked); 4 uniq = HRANDFIELD/HINCRBYFLOAT |
+| unit/type/hash | 85 | 0 | **PASSES** (HINCRBYFLOAT long-double repr + NaN/Inf + value-update spill; HRANDFIELD uniform via rejection sampling) |
 | unit/type/set | 115 | 4 | completes; SRANDMEMBER distribution |
 | unit/bitops | 49 | 2 | completes; SETBIT fuzz |
 | unit/sort | 54 | 0 | **PASSES** (1 skip N/A: DEBUG OBJECT ql_compressed = quicklist node compression we don't model) |

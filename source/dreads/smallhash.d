@@ -116,13 +116,6 @@ struct SmallHash
             fieldTTL.remove(k);
         if (big)
             return large.set(k, v);
-        foreach (i; 0 .. count)
-            if (fieldAt(i) == k)
-            {
-                vals[i].free(); // overwrite frees the old value
-                vals[i] = v;
-                return false;
-            }
         import dreads.config : gConfig;
 
         // live thresholds — the suite flips them via CONFIG SET
@@ -130,6 +123,19 @@ struct SmallHash
             : cast(size_t) gConfig.hashMaxListpackEntries;
         immutable maxVal = gConfig.hashMaxListpackValue < 0 ? 0
             : cast(size_t) gConfig.hashMaxListpackValue;
+        foreach (i; 0 .. count)
+            if (fieldAt(i) == k)
+            {
+                // an update whose new value exceeds the listpack limit must spill
+                if (v.len() > maxVal)
+                {
+                    spill();
+                    return large.set(k, v);
+                }
+                vals[i].free(); // overwrite frees the old value
+                vals[i] = v;
+                return false;
+            }
         if (count >= limit || k.length > maxVal || v.len() > maxVal)
         {
             spill();

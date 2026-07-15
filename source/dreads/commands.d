@@ -3038,8 +3038,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "incrbyfloat");
                 break;
             }
-            double delta;
-            if (!parseDouble(args[1].str, delta))
+            real delta;
+            if (!parseReal(args[1].str, delta))
             {
                 repError(o, "ERR value is not a valid float");
                 break;
@@ -3051,21 +3051,21 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repWrongType(o);
                 break;
             }
-            double cur = 0;
+            real cur = 0;
             char[24] sb = void;
-            if (obj !is null && !parseDouble(obj.str.bytes(sb), cur))
+            if (obj !is null && !parseReal(obj.str.bytes(sb), cur))
             {
                 repError(o, "ERR value is not a valid float");
                 break;
             }
             auto nv = cur + delta;
-            if (nv != nv || nv == double.infinity || nv == -double.infinity)
+            if (nv != nv || nv == real.infinity || nv == -real.infinity)
             {
                 repError(o, "ERR increment would produce NaN or Infinity");
                 break;
             }
-            char[40] b = void;
-            auto res = fmtDouble(b, nv);
+            char[64] b = void;
+            auto res = fmtReal(b, nv);
             ulong keptTtl = obj is null ? 0 : obj.expireAtMs;
             if (obj is null)
                 ks.setStr(args[0].str, res);
@@ -4185,35 +4185,47 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "hincrbyfloat");
                 break;
             }
-            double delta;
-            if (!parseDouble(args[2].str, delta))
+            real delta;
+            if (!parseReal(args[2].str, delta))
             {
                 repError(o, "ERR value is not a valid float");
                 break;
             }
+            // reject an inf/nan increment BEFORE touching the keyspace (the key
+            // must not be created on a bad increment)
+            if (delta != delta || delta == real.infinity || delta == -real.infinity)
+            {
+                repError(o, "ERR value is NaN or Infinity");
+                break;
+            }
             bool wrong;
-            auto obj = ks.getOrCreate(args[0].str, ObjType.hash, wrong);
+            auto obj = ks.lookupTyped(args[0].str, ObjType.hash, wrong);
             if (wrong)
             {
                 repWrongType(o);
                 break;
             }
-            double cur = 0;
-            auto f = obj.hash.get(args[1].str);
+            real cur = 0;
             char[24] hsb = void;
-            if (f !is null && !parseDouble(f.bytes(hsb), cur))
+            if (obj !is null)
             {
-                repError(o, "ERR hash value is not a float");
-                break;
+                auto f = obj.hash.get(args[1].str);
+                if (f !is null && !parseReal(f.bytes(hsb), cur))
+                {
+                    repError(o, "ERR hash value is not a float");
+                    break;
+                }
             }
             auto nv = cur + delta;
-            if (nv != nv || nv == double.infinity || nv == -double.infinity)
+            if (nv != nv || nv == real.infinity || nv == -real.infinity)
             {
                 repError(o, "ERR increment would produce NaN or Infinity");
                 break;
             }
-            char[40] b = void;
-            auto res = fmtDouble(b, nv);
+            char[64] b = void;
+            auto res = fmtReal(b, nv);
+            if (obj is null)
+                obj = ks.getOrCreate(args[0].str, ObjType.hash, wrong);
             obj.hash.set(args[1].str, StrVal.of(res));
             notifyKeyspaceEvent(NClass.hash, "hincrbyfloat", args[0].str);
             repBulk(o, res);
@@ -6316,6 +6328,50 @@ public const(char)[] fmtDouble(return ref char[40] buf, double d) @nogc nothrow
         n = snprintf(buf.ptr, buf.length, "%lld", cast(long) d);
     else
         n = snprintf(buf.ptr, buf.length, "%.17g", d);
+    return buf[0 .. n];
+}
+
+/// Parse a full-string long double (80-bit `real`), for the INCRBYFLOAT family's
+/// higher-precision arithmetic. Accepts inf/nan (callers reject them explicitly).
+public bool parseReal(scope const(char)[] s, out real v) @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : strtold;
+
+    if (s.length == 0 || s.length >= 512 || s[0] == ' ' || s[0] == '\t')
+        return false;
+    char[512] buf = void;
+    buf[0 .. s.length] = s[];
+    buf[s.length] = 0;
+    char* end;
+    v = strtold(buf.ptr, &end);
+    return end == buf.ptr + s.length; // the whole string must be consumed
+}
+
+/// Redis "human" long-double representation (INCRBYFLOAT/HINCRBYFLOAT reply):
+/// fixed `%.17Lf`, then strip trailing zeros and a trailing '.'. Long double keeps
+/// values like 1.9 exact enough that 17 decimals round cleanly (issue #2846).
+public const(char)[] fmtReal(return ref char[64] buf, real d) @nogc nothrow
+{
+    int n = snprintf(buf.ptr, buf.length, "%.17Lf", d);
+    bool hasDot = false;
+    foreach (c; buf[0 .. n])
+        if (c == '.')
+        {
+            hasDot = true;
+            break;
+        }
+    if (hasDot)
+    {
+        while (n > 0 && buf[n - 1] == '0')
+            n--;
+        if (n > 0 && buf[n - 1] == '.')
+            n--;
+    }
+    if (n == 2 && buf[0] == '-' && buf[1] == '0') // normalize negative zero
+    {
+        buf[0] = '0';
+        n = 1;
+    }
     return buf[0 .. n];
 }
 

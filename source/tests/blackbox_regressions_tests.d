@@ -1447,4 +1447,41 @@ version (unittest)
         // default: first arg is the key
         ks.run("COMMAND", "GETKEYS", "GET", "mykey").should.equal("*1\r\n$5\r\nmykey\r\n");
     }
+
+    // HINCRBYFLOAT/INCRBYFLOAT long-double representation (issue #2846), NaN/Inf
+    // rejection without creating the key, and the listpack->hashtable spill when a
+    // value UPDATE exceeds the threshold. First caught by unit/type/hash + incr.
+    @("blackbox.incrbyfloat_repr_and_spill")
+    unittest
+    {
+        import dreads.config : gConfig;
+
+        Keyspace ks;
+        auto saved = gConfig.hashMaxListpackValue;
+        scope (exit)
+        {
+            ks.d.free();
+            gConfig.hashMaxListpackValue = saved;
+        }
+
+        // #2846: long-double repr trims cleanly (1.9, not 1.8999999999999999)
+        ks.run("HINCRBYFLOAT", "h", "f", "1.23").should.equal("$4\r\n1.23\r\n");
+        ks.run("HINCRBYFLOAT", "h", "f", "0.77").should.equal("$1\r\n2\r\n");
+        ks.run("HINCRBYFLOAT", "h", "f", "-0.1").should.equal("$3\r\n1.9\r\n");
+        // string INCRBYFLOAT: net zero is "0", not "-0"
+        ks.run("INCRBYFLOAT", "s", "0.5").should.equal("$3\r\n0.5\r\n");
+        ks.run("INCRBYFLOAT", "s", "-0.5").should.equal("$1\r\n0\r\n");
+
+        // a +inf increment is rejected and does NOT create the key
+        ks.run("HINCRBYFLOAT", "ghost", "f", "+inf")
+            .should.equal("-ERR value is NaN or Infinity\r\n");
+        ks.run("EXISTS", "ghost").should.equal(":0\r\n");
+
+        // updating a field's value past hash-max-listpack-value spills to hashtable
+        gConfig.hashMaxListpackValue = 8;
+        ks.run("HSET", "hh", "f", "0");
+        ks.run("OBJECT", "ENCODING", "hh").should.equal("$8\r\nlistpack\r\n");
+        ks.run("HSET", "hh", "f", "123456789"); // 9 chars > 8
+        ks.run("OBJECT", "ENCODING", "hh").should.equal("$9\r\nhashtable\r\n");
+    }
 }

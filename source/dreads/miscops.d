@@ -727,13 +727,18 @@ public void hrandfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     import dreads.rand : randBelow;
     import dreads.resp : gRespProto;
 
-    // uniform live slot: uniform start, wrapping scan to the next live one
+    // Uniform live slot by REJECTION sampling: re-draw until a slot is live.
+    // Scanning forward to the next live slot would bias toward slots that follow
+    // a run of empties (non-uniform on a sparse hashtable). The hash is non-empty
+    // (checked above), so this terminates; expected draws = 1/loadfactor.
     size_t randSlot() @nogc nothrow
     {
-        auto i = randBelow(obj.hash.capacity);
-        while (!obj.hash.slotLive(i))
-            i = i + 1 == obj.hash.capacity ? 0 : i + 1;
-        return i;
+        for (;;)
+        {
+            auto i = randBelow(obj.hash.capacity);
+            if (obj.hash.slotLive(i))
+                return i;
+        }
     }
 
     if (!withCount)
