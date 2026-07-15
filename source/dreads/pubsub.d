@@ -112,6 +112,11 @@ public struct Subscriber
         channels.free();
         patterns.free();
     }
+
+    // RAII: the channel/pattern Dicts are released when the owning Conn is
+    // destroyed. Idempotent (Dict.free nulls its table), so an explicit dropAll
+    // during teardown followed by this dtor is safe.
+    ~this() @nogc nothrow { free(); }
 }
 
 /// Growable malloc'd array of subscriber pointers.

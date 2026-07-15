@@ -49,6 +49,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
 }
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
+import emplace.vector : Vector;
 import dreads.notify : flushPendingNotify, gNotifyFlags;
 import dreads.stream : nowMs;
 import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
@@ -331,7 +332,7 @@ private struct Conn
     Subscriber shardSub;
     ulong id;
     Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
-    const(char)[] clientName; // malloc'd
+    Vector!char clientName; // owned (RAII); freed with the Conn, never manually
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // ACL: the connection's user (default at connect) and whether it has cleared
     // authentication (nopass default => true immediately; requirepass => set at
@@ -773,6 +774,12 @@ private struct OutQueue
         ring = null;
         cap = head = tail = count = 0;
     }
+
+    // RAII: the ring (and the refs it still holds) is released when the owning
+    // Conn is destroyed — no manual free() in the teardown path. Idempotent
+    // (free() nulls ring). A raw-pointer resource ⇒ move-only, never copied.
+    ~this() @nogc nothrow { free(); }
+    @disable this(this);
 }
 
 // Drains a subscriber connection's output queue to its socket. The only writer
@@ -836,7 +843,8 @@ private void shutdownOutput(ref Conn c) nothrow
     catch (Exception)
     {
     }
-    c.oq.free();
+    // The ring itself is freed by OutQueue.~this (via Conn.~this) — not here,
+    // so a cross-fiber connSink racing this teardown can't hit a freed ring.
 }
 
 /// Pub/sub delivery sink: runs on the *publisher's* fiber. It only enqueues on
@@ -885,17 +893,14 @@ private void serveClient(TCPConnection tcp) nothrow
     {
         gPubSub.dropAll(&c.sub); // no further connSink after this
         gShardPubSub.dropAll(&c.shardSub);
-        shutdownOutput(c);
-        c.sub.free();
-        c.shardSub.free();
+        shutdownOutput(c); // stops the writer fiber; the ring is freed by Conn.~this
         unregisterMonitor(&c);
         unregisterConn(&c);
         if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
             gBlockedClients--;
         waitPurgeConn(&c); // drop any lingering block-waiter entries (no dangling &c)
-        import dreads.mem : freeSlice;
-
-        c.clientName.freeSlice;
+        // sub/shardSub Dicts, oq ring and clientName are released by Conn.~this
+        // when this fiber's `c` goes out of scope — no manual free() here.
     }
     try
     {
@@ -1242,7 +1247,7 @@ private void aclLogViolation(ref Conn c, string reason, scope const(char)[] obj,
     ci.clear();
     ci.append("id=0 addr=? name=");
     if (c.clientName.length)
-        ci.append(c.clientName);
+        ci.append(c.clientName[]);
     // client-info reports the command the CLIENT issued, not the denied object:
     // inside EXEC that is "exec" (the queued command is only the LOG object).
     ci.append(" cmd=");
@@ -2355,8 +2360,6 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "HELLO":
         {
-            import dreads.mem : freeSlice, mallocDup;
-
             int ver = c.resp3 ? 3 : 2;
             if (args.length >= 1)
             {
@@ -2427,8 +2430,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // auth (if any) succeeded — now it's safe to apply the client name
             if (haveSetname)
             {
-                c.clientName.freeSlice;
-                c.clientName = mallocDup(setName);
+                c.clientName.clear();
+                c.clientName.put(setName);
             }
             c.resp3 = ver == 3;
             gRespProto = ver; // the HELLO reply itself is encoded in the new proto
@@ -4519,7 +4522,7 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
     auto n = snprintf(b.ptr, b.length,
             "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
             ~ " multi=%d flags=%s cmd=%.*s user=%.*s resp=%d\n",
-            c.id, cast(int) c.clientName.length, c.clientName.ptr,
+            c.id, cast(int) c.clientName.length, c.clientName[].ptr,
             cast(int)(c.dbp - &gDbs[0]), cast(int) c.sub.subCount, 0,
             cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
             c.importSource ? "I".ptr : "N".ptr,
@@ -4534,8 +4537,6 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     import core.stdc.stdio : snprintf;
 
-    import dreads.mem : freeSlice, mallocDup;
-
     if (args.length == 0)
     {
         repError(o, "ERR wrong number of arguments for 'client' command");
@@ -4545,7 +4546,7 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     if (eqICDebug(sub, "ID"))
         repInt(o, cast(long) c.id);
     else if (eqICDebug(sub, "GETNAME"))
-        repBulk(o, c.clientName);
+        repBulk(o, c.clientName[]);
     else if (eqICDebug(sub, "SETNAME") && args.length == 2)
     {
         foreach (ch; args[1].str)
@@ -4556,8 +4557,8 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
                 return true;
             }
         }
-        c.clientName.freeSlice;
-        c.clientName = mallocDup(args[1].str);
+        c.clientName.clear();
+        c.clientName.put(args[1].str);
         repSimple(o, "OK");
     }
     else if (eqICDebug(sub, "INFO"))
