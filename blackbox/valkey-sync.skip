@@ -188,3 +188,14 @@ Client tracking prefixes memory overhead
 # Script-issued command tracking: redis.call reads inside EVAL should record keys.
 # Needs the tracking hook on the main-thread redis.call path (scripts run off-loop).
 Tracking only occurs for scripts when a command calls a read-only command
+# BCAST prefix-collision errors: rejecting overlapping prefixes is correct, but the
+# error string names the colliding pair in a Valkey-internal order that differs
+# between same-command and vs-existing collisions (can't match without their src).
+BCAST with prefix collisions throw errors
+BCAST self-collision at later index is rejected
+BCAST identical prefix at later index is rejected
+BCAST empty prefix collides with any prefix
+# Eviction tracking: the invalidation hook IS wired (evictOneVictim -> trackInvalidateKey),
+# but the test's wait_lazyfree_done polls lazyfree_pending_objects, which dreads doesn't
+# emit (it frees synchronously, no lazyfree thread) — so the test setup never completes.
+Tracking invalidation message of eviction keys should be before response

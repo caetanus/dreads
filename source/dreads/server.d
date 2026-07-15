@@ -495,24 +495,22 @@ private __gshared Dict!(Dict!Unit) gInvalTable; // default mode: key -> conn-id 
 private __gshared Dict!Unit gBcastConns; // bcast mode: conn-id set
 private __gshared size_t gTrackCount; // # tracking conns (the unlikely gate)
 
-// Append an invalidation frame to `o`. asMessage => a pub/sub `message` on
-// `__redis__:invalidate` (redirect delivery; `>3` push for a RESP3 target, else
-// `*3`); otherwise a RESP3 `>2 invalidate` push (self delivery). A null key is
-// the FLUSHALL/FLUSHDB "everything" signal (null-array payload).
-private void buildInvalFrame(ref ByteBuffer o, bool resp3, bool asMessage,
-        scope const(char)[] key) nothrow
+// Append a single-key (or null = FLUSHALL/FLUSHDB "everything") invalidation
+// frame to `o`, framed by the TARGET's protocol: a RESP3 client gets an
+// `invalidate` PUSH, a RESP2 redirection connection a pub/sub `message` on
+// __redis__:invalidate.
+private void buildInvalFrame(ref ByteBuffer o, bool resp3, scope const(char)[] key) nothrow
 {
-    if (asMessage)
+    if (resp3)
     {
-        o.appendByte(resp3 ? '>' : '*');
-        o.append("3\r\n");
-        repBulk(o, "message");
-        repBulk(o, "__redis__:invalidate");
+        o.append(">2\r\n");
+        repBulk(o, "invalidate");
     }
     else
     {
-        o.append(">2\r\n"); // RESP3 push (only a RESP3 conn ever gets self-push)
-        repBulk(o, "invalidate");
+        o.append("*3\r\n");
+        repBulk(o, "message");
+        repBulk(o, "__redis__:invalidate");
     }
     if (key is null)
         o.append("*-1\r\n");
@@ -526,13 +524,13 @@ private void buildInvalFrame(ref ByteBuffer o, bool resp3, bool asMessage,
 // Enqueue an invalidation on `target`'s async output. The target must be in
 // subMode (a redirect target is — it subscribed to __redis__:invalidate; a
 // RESP3 self-tracking conn is put in subMode when tracking is enabled).
-private void sendInvalToConn(ref Conn target, bool asMessage, scope const(char)[] key) nothrow
+private void sendInvalToConn(ref Conn target, scope const(char)[] key) nothrow
 {
     if (!target.subMode)
         return;
     static ByteBuffer fb; // TLS scratch
     fb.clear();
-    buildInvalFrame(fb, target.resp3, asMessage, key);
+    buildInvalFrame(fb, target.resp3, key);
     auto m = rcFromBytes(fb.data);
     if (target.oq.push(m))
         target.oqEvt.emit();
@@ -561,15 +559,15 @@ private void deliverInvalidateTo(ulong trackedId, ulong writerId, scope const(ch
             tc.trackRedirBroken = true; // target gone: flagged for a redir-broken push
             return;
         }
-        sendInvalToConn(rs.get(), true, key);
+        sendInvalToConn(rs.get(), key);
     }
     else if (trackedId == writerId)
     {
         if (tc.subMode) // deferred self-push (RESP3 self-tracking has async output)
-            buildInvalFrame(tc.pendingInval, tc.resp3, false, key);
+            buildInvalFrame(tc.pendingInval, tc.resp3, key);
     }
     else
-        sendInvalToConn(*tc, false, key);
+        sendInvalToConn(*tc, key);
 }
 
 // Does a BCAST client's prefixes cover `key`? On a match, `group` is the matching
@@ -655,22 +653,23 @@ private void trackInvalidateKey(scope const(char)[] key) @nogc nothrow @trusted
         gBcastPendingKeys.set(key, Unit());
 }
 
-// Build a grouped invalidation frame (multiple keys) into `o`. asMessage => a
-// pub/sub `message` on __redis__:invalidate (redirect); else a RESP3 `invalidate`
-// push (self). The key payload is a RESP array of the set's keys.
-private void buildGroupedFrame(ref ByteBuffer o, bool resp3, bool asMessage, ref Dict!Unit keys) nothrow @trusted
+// Build a grouped invalidation frame (multiple keys) into `o`. The framing keys
+// off the TARGET's protocol, not self-vs-redirect: a RESP3 client (whether it is
+// the tracker itself or a RESP3 redirection connection) receives an `invalidate`
+// PUSH; a RESP2 redirection connection receives a pub/sub `message` on
+// __redis__:invalidate. The key payload is a RESP array of the set's keys.
+private void buildGroupedFrame(ref ByteBuffer o, bool resp3, ref Dict!Unit keys) nothrow @trusted
 {
-    if (asMessage)
-    {
-        o.appendByte(resp3 ? '>' : '*');
-        o.append("3\r\n");
-        repBulk(o, "message");
-        repBulk(o, "__redis__:invalidate");
-    }
-    else
+    if (resp3)
     {
         o.append(">2\r\n");
         repBulk(o, "invalidate");
+    }
+    else
+    {
+        o.append("*3\r\n");
+        repBulk(o, "message");
+        repBulk(o, "__redis__:invalidate");
     }
     repArrayHeader(o, keys.length);
     foreach (k, ref _; keys)
@@ -678,13 +677,13 @@ private void buildGroupedFrame(ref ByteBuffer o, bool resp3, bool asMessage, ref
 }
 
 // Enqueue a grouped invalidation frame on `target`'s async output (subMode only).
-private void sendGrouped(ref Conn target, bool asMessage, ref Dict!Unit keys) nothrow @trusted
+private void sendGrouped(ref Conn target, ref Dict!Unit keys) nothrow @trusted
 {
     if (!target.subMode)
         return;
     static ByteBuffer fb;
     fb.clear();
-    buildGroupedFrame(fb, target.resp3, asMessage, keys);
+    buildGroupedFrame(fb, target.resp3, keys);
     auto m = rcFromBytes(fb.data);
     if (target.oq.push(m))
         target.oqEvt.emit();
@@ -723,14 +722,14 @@ private void deliverGroup(ulong id, ulong writerId, ref Dict!Unit keys, bool bca
             tc.trackRedirBroken = true;
             return;
         }
-        sendGrouped(rs.get(), true, *eff);
+        sendGrouped(rs.get(), *eff);
     }
     else if (tc.subMode)
     {
         if (id == writerId) // self-push trails the reply (via pendingInval)
-            buildGroupedFrame(tc.pendingInval, tc.resp3, false, *eff);
+            buildGroupedFrame(tc.pendingInval, tc.resp3, *eff);
         else
-            sendGrouped(*tc, false, *eff);
+            sendGrouped(*tc, *eff);
     }
 }
 
@@ -2672,18 +2671,22 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     if (gMonitorCount > 0)
         feedMonitors(c, cmd);
 
-    if (c.totalSubs > 0)
+    // A RESP3 client may run ANY command while subscribed (push frames keep
+    // messages out-of-band); a RESP2 client is restricted to the pub/sub verbs
+    // plus PING/QUIT/RESET/HELLO (HELLO lets it upgrade to RESP3 and escape this).
+    if (c.totalSubs > 0 && !c.resp3)
     {
         switch (uname)
         {
         case "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE":
-        case "SSUBSCRIBE", "SUNSUBSCRIBE", "PING", "QUIT", "RESET":
+        case "SSUBSCRIBE", "SUNSUBSCRIBE", "PING", "QUIT", "RESET", "HELLO":
             break;
         default:
             o.append("-ERR Can't execute '");
             foreach (ch; name)
                 o.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
-            o.append("': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context\r\n");
+            o.append(
+                "': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / HELLO / RESET are allowed in this context\r\n");
             return true;
         }
     }
@@ -3932,6 +3935,11 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
         gAof.append(delCmd.data);
     }
     notifyKeyspaceEvent(NClass.evicted, "evicted", victim);
+    if (gTrackCount) // CLIENT TRACKING: an evicted key invalidates cached copies
+    {
+        trackInvalidateKey(victim);
+        gExpireKeys.set(victim, Unit()); // server-caused: exempt from NOLOOP
+    }
     ks.d.del(victim);
     gWriteEpoch++;
     gEvictedKeys++;
