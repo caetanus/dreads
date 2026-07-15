@@ -1446,6 +1446,17 @@ version (unittest)
         ks.run("COMMAND", "GETKEYS", "SORT_RO", "abc").should.equal("*1\r\n$3\r\nabc\r\n");
         // default: first arg is the key
         ks.run("COMMAND", "GETKEYS", "GET", "mykey").should.equal("*1\r\n$5\r\nmykey\r\n");
+        // multi-key via the shared key-spec (the old first-arg stub got these wrong):
+        ks.run("COMMAND", "GETKEYS", "MGET", "a", "b", "c")
+            .should.equal("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+        ks.run("COMMAND", "GETKEYS", "DEL", "a", "b")
+            .should.equal("*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+        ks.run("COMMAND", "GETKEYS", "MSET", "a", "1", "b", "2") // every other arg is a key
+            .should.equal("*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+        ks.run("COMMAND", "GETKEYS", "COPY", "src", "dst") // read src + write dst
+            .should.equal("*2\r\n$3\r\nsrc\r\n$3\r\ndst\r\n");
+        ks.run("COMMAND", "GETKEYS", "ZUNIONSTORE", "dest", "2", "s1", "s2") // static dest + numkeys
+            .should.equal("*3\r\n$4\r\ndest\r\n$2\r\ns1\r\n$2\r\ns2\r\n");
     }
 
     // HINCRBYFLOAT/INCRBYFLOAT long-double representation (issue #2846), NaN/Inf

@@ -5705,47 +5705,29 @@ public bool eqICKeyword(scope const(char)[] s, scope const(char)[] upper) @nogc 
 /// the source; other commands fall back to the first argument as the key.
 private void commandGetKeys(const(RVal)[] cmd, ref ByteBuffer o) @nogc nothrow
 {
-    auto uname = cmd[0].str;
-    auto a = cmd[1 .. $]; // the target command's own arguments
-    const(char)[][2] keys;
-    size_t nk = 0;
-    if (eqICKeyword(uname, "SORT") || eqICKeyword(uname, "SORT_RO"))
+    import dreads.acl : getCommandKeys, KeyRef;
+
+    // Delegate to the shared key-spec extractor (same source ACL uses). The tables
+    // are lowercase-keyed, so normalise the target command name first.
+    auto raw = cmd[0].str;
+    if (raw.length > 32)
     {
-        if (a.length < 1)
-        {
-            repError(o, "ERR Invalid number of arguments specified for command");
-            return;
-        }
-        keys[nk++] = a[0].str; // the source key
-        if (eqICKeyword(uname, "SORT"))
-        {
-            const(char)[] store;
-            for (size_t i = 1; i < a.length;)
-            {
-                if (eqICKeyword(a[i].str, "STORE") && i + 1 < a.length)
-                    store = a[i + 1].str, i += 2; // last STORE wins
-                else if ((eqICKeyword(a[i].str, "BY") || eqICKeyword(a[i].str, "GET"))
-                        && i + 1 < a.length)
-                    i += 2; // BY/GET take a pattern arg, not a key
-                else if (eqICKeyword(a[i].str, "LIMIT") && i + 2 < a.length)
-                    i += 3;
-                else
-                    i++; // ALPHA / ASC / DESC / unknown
-            }
-            if (store.length)
-                keys[nk++] = store;
-        }
+        repError(o, "ERR The command has no key arguments");
+        return;
     }
-    else if (a.length >= 1)
-        keys[nk++] = a[0].str; // best-effort default: first arg is the key
-    else
+    char[32] lc = void;
+    foreach (i, ch; raw)
+        lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    KeyRef[256] buf = void;
+    immutable nk = getCommandKeys(lc[0 .. raw.length], cmd, buf);
+    if (nk == 0)
     {
         repError(o, "ERR The command has no key arguments");
         return;
     }
     repArrayHeader(o, nk);
-    foreach (k; keys[0 .. nk])
-        repBulk(o, k);
+    foreach (i; 0 .. nk)
+        repBulk(o, buf[i].key);
 }
 
 /// XREAD [COUNT n] STREAMS key [key ...] id [id ...] — non-blocking only.

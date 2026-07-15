@@ -13,6 +13,7 @@ module dreads.acl;
 
 import dreads.aclcat : AclCat, gCmdCats, aclCatBit;
 import dreads.mem : mallocDup, freeSlice;
+import dreads.resp : RVal;
 import emplace.vector : Vector;
 
 /// All ACL category names (for `ACL CAT`), derived from the generated enum.
@@ -770,14 +771,36 @@ bool aclKeyDenied(const(AclUser)* u, scope const(char)[] name, scope const(RVal)
     return aclDeniedKey(u, name, arr) !is null;
 }
 
-/// The first key this command touches that the user CANNOT access, or null if
-/// all are allowed (used both for enforcement and for the ACL LOG object name).
-const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
+/// One key a command touches, with its access type.
+struct KeyRef
+{
+    const(char)[] key;
+    bool needR, needW;
+}
+
+// case-insensitive compare of `a` against a lowercase literal `lit`.
+private bool kwLit(scope const(char)[] a, scope const(char)[] lit) @nogc nothrow @safe
+{
+    if (a.length != lit.length)
+        return false;
+    foreach (i, c; a)
+        if (((c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c) != lit[i])
+            return false;
+    return true;
+}
+
+/// SINGLE SOURCE OF COMMAND-KEY TRUTH. Visit every key `name` (LOWERCASE) touches
+/// in `arr` (arr[0] = command name), in spec order — static specs, then numkeys
+/// specs, then keyword-positioned keys (SORT/GEORADIUS STORE, XREAD STREAMS,
+/// MIGRATE KEYS) — calling `fn(key, needR, needW)`. `fn` returns false to stop
+/// early. Returns false iff `fn` stopped it. Both ACL enforcement (`aclDeniedKey`)
+/// and key discovery (`getCommandKeys` for COMMAND GETKEYS + CLIENT TRACKING) go
+/// through this, so there is exactly ONE key-extraction implementation.
+package bool forEachCommandKey(alias fn)(scope const(char)[] name, scope const(RVal)[] arr)
+        @trusted nothrow @nogc
 {
     import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
 
-    if (u.root.allKeys)
-        return null;
     immutable argc = cast(int) arr.length;
     foreach (ref ks; gCmdKeySpecs) // static index+range specs
     {
@@ -788,8 +811,8 @@ const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope co
         {
             if (idx < 1)
                 continue;
-            if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
-                return arr[idx].str;
+            if (!fn(arr[idx].str, ks.needR, ks.needW))
+                return false;
         }
     }
     foreach (ref ks; gCmdKeyNumSpecs) // numkeys-based specs
@@ -808,60 +831,94 @@ const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope co
             immutable idx = first + cast(int) i * ks.step;
             if (idx < 1 || idx >= argc)
                 break;
-            if (!aclCanAccessKey(u, arr[idx].str, ks.needR, ks.needW))
-                return arr[idx].str;
+            if (!fn(arr[idx].str, ks.needR, ks.needW))
+                return false;
         }
     }
     // keyword-positioned keys (STORE dests, XREAD STREAMS keys, MIGRATE KEYS)
-    return aclKeywordDeniedKey(u, name, arr, argc);
-}
-
-private const(char)[] aclKeywordDeniedKey(const(AclUser)* u, scope const(char)[] name,
-        scope const(RVal)[] arr, int argc) @trusted nothrow @nogc
-{
-    static bool kw(scope const(char)[] a, scope const(char)[] lit) @nogc nothrow @safe
-    {
-        if (a.length != lit.length)
-            return false;
-        foreach (i, c; a)
-            if (((c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c) != lit[i])
-                return false;
-        return true;
-    }
-
     switch (name)
     {
     case "georadius", "georadiusbymember", "sort", "sort_ro":
+        // STORE and STOREDIST are distinct destinations, each LAST-wins (SORT/
+        // GEORADIUS only write the last of each) — so a `STORE a STORE b` writes
+        // only b, and ACL/GETKEYS must report exactly the written key(s).
+        const(char)[] store, storedist;
+        bool hasStore, hasDist;
         for (int i = 1; i + 1 < argc; i++)
-            if ((kw(arr[i].str, "store") || kw(arr[i].str, "storedist"))
-                    && !aclCanAccessKey(u, arr[i + 1].str, false, true))
-                return arr[i + 1].str;
-        return null;
+        {
+            if (kwLit(arr[i].str, "store"))
+            {
+                store = arr[i + 1].str;
+                hasStore = true;
+            }
+            else if (kwLit(arr[i].str, "storedist"))
+            {
+                storedist = arr[i + 1].str;
+                hasDist = true;
+            }
+        }
+        if (hasStore && !fn(store, false, true))
+            return false;
+        if (hasDist && !fn(storedist, false, true))
+            return false;
+        return true;
     case "xread", "xreadgroup":
         for (int i = 1; i < argc; i++)
-            if (kw(arr[i].str, "streams"))
+            if (kwLit(arr[i].str, "streams"))
             {
-                immutable rest = argc - (i + 1);
-                immutable nkeys = rest / 2;
+                immutable nkeys = (argc - (i + 1)) / 2;
                 foreach (j; 0 .. nkeys)
-                    if (!aclCanAccessKey(u, arr[i + 1 + j].str, true, false))
-                        return arr[i + 1 + j].str;
+                    if (!fn(arr[i + 1 + j].str, true, false))
+                        return false;
                 break;
             }
-        return null;
+        return true;
     case "migrate":
         for (int i = 1; i < argc; i++)
-            if (kw(arr[i].str, "keys"))
+            if (kwLit(arr[i].str, "keys"))
             {
                 foreach (j; i + 1 .. argc)
-                    if (!aclCanAccessKey(u, arr[j].str, true, true))
-                        return arr[j].str;
+                    if (!fn(arr[j].str, true, true))
+                        return false;
                 break;
             }
-        return null;
+        return true;
     default:
-        return null;
+        return true;
     }
+}
+
+/// Collect the keys `name` (LOWERCASE) touches into `buf`, returning the count.
+/// Truncates silently at `buf.length` — acceptable for CLIENT TRACKING / COMMAND
+/// GETKEYS (ACL calls forEachCommandKey directly and is never truncated).
+size_t getCommandKeys(scope const(char)[] name, scope const(RVal)[] arr, scope KeyRef[] buf)
+        @trusted nothrow @nogc
+{
+    size_t n = 0;
+    forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
+        if (n < buf.length)
+            buf[n++] = KeyRef(key, needR, needW);
+        return true;
+    })(name, arr);
+    return n;
+}
+
+/// The first key this command touches that the user CANNOT access, or null if
+/// all are allowed (used both for enforcement and for the ACL LOG object name).
+const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
+{
+    if (u.root.allKeys)
+        return null;
+    const(char)[] denied = null;
+    forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
+        if (!aclCanAccessKey(u, key, needR, needW))
+        {
+            denied = key;
+            return false; // stop at the first denied key
+        }
+        return true;
+    })(name, arr);
+    return denied;
 }
 
 // --- database (db=) permission checks ---------------------------------------
