@@ -1293,6 +1293,16 @@ private void enterSubMode(ref Conn c) nothrow
     c.oqWriter = runTask(&oqWriterLoop, &c);
 }
 
+// Close a socket, swallowing the throw — scope(exit) can't contain a `catch`.
+private void closeQuiet(ref TCPConnection tcp) nothrow
+{
+    try
+        tcp.close();
+    catch (Exception)
+    {
+    }
+}
+
 // Stop the writer fiber and free the queue at connection teardown. A plain
 // nothrow function because scope(exit) may not contain a catch.
 private void shutdownOutput(ref Conn c) nothrow
@@ -1368,6 +1378,10 @@ private void serveClient(TCPConnection tcp) nothrow
         if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
             gBlockedClients--;
         waitPurgeConn(c); // drop any lingering block-waiter entries (no dangling c)
+        // Close the socket LAST — after shutdownOutput has drained the output
+        // queue. Closing earlier would make the writer see a disconnected socket
+        // and silently drop the final reply (e.g. QUIT's +OK on a subscriber).
+        closeQuiet(tcp);
         // sub/shardSub Dicts, oq ring and clientName are released by Conn.~this,
         // which runs when `sc`'s last strong ref drops (after every registry
         // unlink above, and after any outstanding cross-fiber lock releases) —
@@ -1582,11 +1596,9 @@ private void serveClient(TCPConnection tcp) nothrow
     {
         // peer vanished mid read/write; just drop the connection
     }
-    try
-        tcp.close();
-    catch (Exception)
-    {
-    }
+    // NOTE: the socket is closed in the scope(exit) above, AFTER shutdownOutput
+    // drains the output queue — so a final reply (QUIT's +OK on a subscriber) is
+    // written before the close instead of being dropped against a dead socket.
 }
 
 // True when `cmd` is a raft write that may be pipelined (fired without blocking
@@ -1914,6 +1926,17 @@ private void appendAge(ref ByteBuffer o, long ms) @nogc nothrow
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
+    // CLIENT TRACKING: the redirect target died while an invalidation was pending.
+    // Tell this (RESP3) client once, ahead of its next reply, then drop the dead
+    // redirect. It can re-arm with a fresh REDIRECT afterwards.
+    if (c.trackRedirBroken && c.resp3)
+    {
+        o.append(">2\r\n");
+        repBulk(o, "tracking-redir-broken");
+        repInt(o, cast(long) c.trackRedir);
+        c.trackRedirBroken = false;
+        c.trackRedir = 0;
+    }
     // Pipelining flush point: anything that is not itself a pipelinable write
     // must first reap all in-flight writes, in order.
     if (c.pendingCount > 0 && !isDeferrableWrite(c, cmd))
