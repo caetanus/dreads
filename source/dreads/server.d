@@ -2518,15 +2518,15 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "BGREWRITEAOF":
         {
-            if (!gAof.enabled)
-            {
-                repError(o, "ERR AOF is not enabled");
-                return true;
-            }
-            if (aofRewrite(gAof, gAofPath, gKeys))
-                repSimple(o, "Background append only file rewriting started");
-            else
+            // Durability is Raft's job (see sync-is-noop-raft): a client asking to
+            // compact the append-only log is served by the real rewrite when our
+            // AOF is enabled, and is a success NO-OP otherwise — never an error
+            // (Redis itself allows BGREWRITEAOF regardless of `appendonly`, and the
+            // durable state here is the Raft log, not a client-triggered AOF dump).
+            if (gAof.enabled && !aofRewrite(gAof, gAofPath, gKeys))
                 repError(o, "ERR AOF rewrite failed");
+            else
+                repSimple(o, "Background append only file rewriting started");
             return true;
         }
     case "MONITOR":
