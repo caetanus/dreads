@@ -1,11 +1,11 @@
 # Blackbox compatibility TODO
 
-> **TODO (fuzz the whole sweep):** run the ENTIRE blackbox sweep in a loop with a
-> per-file timeout to catch INTERMITTENT hangs/races, not just a single pass. A
-> real intermittent lost-wakeup in the list blocking/unblock code slipped past a
-> clean single run (271/10, completed) but reproduced on the 1st fuzz run (hang,
-> 200s timeout, right after "List of various encodings - sanitize dump"). One pass
-> is not proof; the blocking/unblock paths especially need repeated runs.
+> **Fuzz the whole sweep — DONE (2026-07-15):** `blackbox/sweep-fuzz.sh N tmo`
+> loops the ENTIRE sweep N times with a short per-file timeout to catch
+> INTERMITTENT hangs/races. After the blocking-path fixes it runs **4×17 files,
+> hangs=0**. (History: a real intermittent lost-wakeup in list blocking slipped
+> past a clean single run — 271/10 completed — but reproduced on the 1st fuzz run;
+> one pass is not proof, so re-run this after any change to blocking/unblock/pause.)
 >
 > **RESOLVED (2026-07-15) — the list "hang" was THREE stacked server-layer bugs in
 > the blocking path, all found by fuzzing `unit/type/list` in a loop (20/20 clean
@@ -83,11 +83,12 @@ leakage).
 | unit/dump | 15 | 1 | **MIGRATE landed** (DUMP->RESTORE over cached socket; 14 two-instance tests are external:skip, verified live vs valkey 9.1; the runnable cached-connection-release test passes); stream DUMP/RESTORE byte-exact both ways; only remaining fail = RESTORE shared-NACK corruption reject (expects "Bad data format", we say "checksum are wrong") |
 | unit/type/hash | 85 | 0 | **PASSES** (HINCRBYFLOAT long-double repr + NaN/Inf + value-update spill; HRANDFIELD uniform via rejection sampling) |
 | unit/type/set | 116 | 0 | **PASSES** (SRANDMEMBER uniform via rejection sampling; 1 skip = per-key WATCH TODO, we use a conservative global epoch) |
-| unit/bitops | 49 | 2 | completes; SETBIT fuzz |
+| unit/bitops | 50 | 0 | **PASSES** (2026-07-15: SETBIT/BITFIELD only dirty on real change — gWriteNoOp) |
+| unit/bitfield | 18 | 0 | **PASSES** |
 | unit/sort | 54 | 0 | **PASSES** (1 skip N/A: DEBUG OBJECT ql_compressed = quicklist node compression we don't model) |
-| unit/expire | 66 | 5 | aborts: tcl `table_size` var (import-source landed) |
-| unit/keyspace | 45 | 1 | aborts: stream-cgroups COPY (ERR syntax) |
-| unit/other | 25 | 2 | aborts: CONFIG SET unsupported param |
+| unit/expire | ~67 | ~3 | GETEX arg-before-type FIXED (2026-07-15); remaining: import-mode (import-source state = Valkey replication feature, N/A) + tcl `table_size` abort |
+| unit/keyspace | 65 | 0 | **PASSES** (2026-07-15: MOVE REPLACE + per-db notify, deep stream COPY via Stream.dup, random RANDOMKEY, SWAPDB errors; 1 skip: pathological glob = Valkey DoS-guard divergence) |
+| unit/other | ~25 | 2 | CONFIG INFO vs CONFIG GET return different config sets/orders (need one shared ordered registry); DEBUG LOADAOF roundtrip = dreads' own AOF format (aof-is-ours) |
 | **unit/hashexpire** | **230** | **0** | **PASSES** (HGETEX trailing-FIELDS numfields error; skips = field-expiry MODEL divergence: dreads reaps expired fields eagerly in lookup, Valkey keeps them physical until active/access — HGET contract identical, only HLEN/HTTL of an unreaped expired field differ) |
 | unit/dump | 5 | 2 | aborts: OBJECT FREQ (LFU freq tracking) |
 | unit/hyperloglog | 6 | 2 | aborts: PFDEBUG |
