@@ -1,5 +1,12 @@
 # Blackbox compatibility TODO
 
+> **TODO (fuzz the whole sweep):** run the ENTIRE blackbox sweep in a loop with a
+> per-file timeout to catch INTERMITTENT hangs/races, not just a single pass. A
+> real intermittent lost-wakeup in the list blocking/unblock code slipped past a
+> clean single run (271/10, completed) but reproduced on the 1st fuzz run (hang,
+> 200s timeout, right after "List of various encodings - sanitize dump"). One pass
+> is not proof; the blocking/unblock paths especially need repeated runs.
+
 Failures found running the **Valkey test suite** against a live dreads in
 external mode (`./runtest --host … --port … --single <file>`), on **db 9**
 (no `--singledb`, exercising multi-DB). Valkey is used as a read-only oracle.

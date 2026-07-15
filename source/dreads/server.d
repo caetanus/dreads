@@ -2095,13 +2095,17 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     case "BLPOP":
     case "BRPOP":
         {
+            immutable eb = gTotalErrorReplies, ob = o.length;
             blockingPop(c, args, uname[1] == 'L', o, arena);
+            statBlockingReply(uname, o, ob, eb); // count once when it finally returns
             return true;
         }
     case "BZPOPMIN":
     case "BZPOPMAX":
         {
+            immutable eb = gTotalErrorReplies, ob = o.length;
             blockingZPop(c, args, uname == "BZPOPMAX", o, arena);
+            statBlockingReply(uname, o, ob, eb);
             return true;
         }
     case "BLMOVE":
@@ -2120,8 +2124,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, terr);
                 return true;
             }
+            immutable eb = gTotalErrorReplies, ob = o.length;
             blockingRetry(c, cmd.arr[0 .. $ - 1], uname == "BLMOVE" ? "LMOVE"
                     : "RPOPLPUSH", "$-1\r\n", timeoutMs, o, arena);
+            statBlockingReply(uname, o, ob, eb);
             return true;
         }
     case "XREAD":
@@ -2213,8 +2219,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 repError(o, terr);
                 return true;
             }
+            immutable eb = gTotalErrorReplies, ob = o.length;
             blockingRetry(c, cmd.arr[1 .. $], uname == "BLMPOP" ? "LMPOP" : "ZMPOP",
                     "*-1\r\n", timeoutMs, o, arena, true);
+            statBlockingReply(uname, o, ob, eb);
             return true;
         }
     case "HELLO":
@@ -4135,12 +4143,20 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
 /// blocking serves happen in the server layer and bypass executeCommand's
 /// accounting, so a blocked XREADGROUP that wakes with -NOGROUP would otherwise
 /// not register (calls/failed_calls/total_error_replies). Mirrors that path.
-private void statBlockingReply(string lname, ref ByteBuffer o, size_t outBefore, ulong errPrev) nothrow
+private void statBlockingReply(scope const(char)[] uname, ref ByteBuffer o,
+        size_t outBefore, ulong errPrev) nothrow
 {
     immutable errored = o.length > outBefore && o.data[outBefore] == '-';
     if (errored && gTotalErrorReplies == errPrev)
         statErrorReply(cast(const(char)[]) o.data[outBefore .. $]);
-    statCall(aclCmdIndex(lname), errored);
+    char[16] lc = void; // aclCmdIndex wants the lowercase name
+    immutable n = uname.length <= lc.length ? uname.length : lc.length;
+    foreach (i; 0 .. n)
+    {
+        immutable ch = uname[i];
+        lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    }
+    statCall(aclCmdIndex(cast(const(char)[]) lc[0 .. n]), errored);
 }
 
 /// XREADGROUP ... BLOCK ms ... >  : strips the BLOCK pair and retries the group

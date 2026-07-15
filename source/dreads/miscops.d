@@ -36,6 +36,11 @@ public void lpos(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Aren
                         ~ "2 from the second ... or use negative to start from the end of the list");
                 return;
             }
+            if (rank == long.min) // -rank overflows when scanning from the tail
+            {
+                repError(o, "ERR value is out of range");
+                return;
+            }
             i += 2;
         }
         else if (eqICKeyword(args[i].str, "COUNT") && i + 1 < args.length)
