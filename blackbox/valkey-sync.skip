@@ -199,3 +199,12 @@ BCAST empty prefix collides with any prefix
 # but the test's wait_lazyfree_done polls lazyfree_pending_objects, which dreads doesn't
 # emit (it frees synchronously, no lazyfree thread) — so the test setup never completes.
 Tracking invalidation message of eviction keys should be before response
+# GEO: dreads uses an exact O(n) linear scan, not Redis's geohash-cell neighbor
+# scan, so the UNSORTED (no ASC/DESC/COUNT) result order differs where zset-score
+# order != cell-scan order (a documented design divergence, geo.d). GEOSEARCH
+# BYPOLYGON is a Valkey extension not implemented.
+GEORADIUSBYMEMBER crossing pole search
+GEOSEARCH BYPOLYGON with invalid COUNT
+GEOSEARCH BYPOLYGON standard operations
+GEOSEARCH BYPOLYGON across hemispheres
+GEOSEARCH BYPOLYGON overlapping edges

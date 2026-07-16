@@ -349,6 +349,7 @@ private struct SearchSpec
     bool asc, desc;
     long count = 0;
     bool countAny;
+    bool hasFromLonLat, hasByRadius, hasAny; // for GEOSEARCH origin/shape validation
     bool withCoord, withDist, withHash;
     const(char)[] storeKey; // GEORADIUS STORE
     const(char)[] storeDistKey; // GEORADIUS STOREDIST k / GEOSEARCHSTORE STOREDIST
@@ -369,12 +370,14 @@ private bool parseSearchOpts(const(RVal)[] opts, ref SearchSpec sp, bool allowSt
         }
         else if (eqICKeyword(w, "FROMLONLAT") && i + 2 < opts.length)
         {
+            sp.hasFromLonLat = true;
             if (!parseDouble(opts[i + 1].str, sp.lon) || !parseDouble(opts[i + 2].str, sp.lat))
                 return false;
             i += 3;
         }
         else if (eqICKeyword(w, "BYRADIUS") && i + 2 < opts.length)
         {
+            sp.hasByRadius = true;
             if (!parseDouble(opts[i + 1].str, sp.radiusM) || !unitFactor(opts[i + 2].str, sp.unit))
                 return false;
             sp.radiusM *= sp.unit;
@@ -409,8 +412,14 @@ private bool parseSearchOpts(const(RVal)[] opts, ref SearchSpec sp, bool allowSt
             if (i < opts.length && eqICKeyword(opts[i].str, "ANY"))
             {
                 sp.countAny = true;
+                sp.hasAny = true;
                 i++;
             }
+        }
+        else if (eqICKeyword(w, "ANY")) // bare ANY (no preceding COUNT) — flagged,
+        {
+            sp.hasAny = true; // validated to a specific "ANY requires COUNT" error
+            i++;
         }
         else if (eqICKeyword(w, "WITHCOORD"))
         {
@@ -497,7 +506,12 @@ private long runSearch(ref Keyspace ks, ref SearchSpec sp, ref Arena arena,
             return 1;
         return 0;
     });
-    if (!sp.countAny)
+    // Sort by distance ONLY when the client asked for order: explicit ASC/DESC,
+    // or a plain COUNT (which returns the N CLOSEST → implies a sort). No COUNT
+    // and no ASC/DESC → Redis returns the matches UNSORTED (zset/geohash order,
+    // which is exactly walkRange's order). COUNT ... ANY is unsorted too, unless
+    // ASC/DESC is also present (then the ANY-selected subset is sorted).
+    if (sp.asc || sp.desc || (sp.count > 0 && !sp.countAny))
         qsort(hits.ptr, n, GeoHit.sizeof, sp.desc ? &hitCmpDesc : &hitCmpAsc);
     if (sp.count && n > cast(size_t) sp.count)
         n = cast(size_t) sp.count;
@@ -555,6 +569,39 @@ private void storeHits(ref Keyspace ks, scope const(char)[] dest,
     repInt(o, cast(long) hits.length);
 }
 
+// "ERR member <m> does not exist" (GEO*BYMEMBER / GEOSEARCH FROMMEMBER miss).
+private void repNoMember(ref ByteBuffer o, scope const(char)[] m) @nogc nothrow
+{
+    o.appendByte('-');
+    o.append("ERR member ");
+    foreach (ch; m)
+        o.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
+    o.append(" does not exist\r\n");
+}
+
+// ANY without COUNT is invalid for every search form. Returns the error text, or
+// null. (The pattern `*ANY*requires*COUNT*` is what the suite matches.)
+private string anyNeedsCount(ref const SearchSpec sp) @nogc nothrow
+{
+    return (sp.hasAny && sp.count == 0)
+        ? "ERR the ANY argument requires COUNT argument" : null;
+}
+
+// GEOSEARCH must have exactly one origin (FROMMEMBER|FROMLONLAT) and one shape
+// (BYRADIUS|BYBOX). Returns the error text to emit, or null when valid.
+private string geoSearchValidate(ref const SearchSpec sp) @nogc nothrow
+{
+    if (sp.fromMember && sp.hasFromLonLat)
+        return "ERR syntax error";
+    if (!sp.fromMember && !sp.hasFromLonLat)
+        return "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH";
+    if (sp.hasByRadius && sp.byBox)
+        return "ERR syntax error";
+    if (!sp.hasByRadius && !sp.byBox)
+        return "ERR exactly one of BYRADIUS, BYBOX and BYPOLYGON can be specified for GEOSEARCH";
+    return null;
+}
+
 /// GEOSEARCH key <FROMMEMBER m | FROMLONLAT lon lat> <BYRADIUS r u | BYBOX w h u> [opts]
 public void geosearch(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref Arena arena) @nogc nothrow
 {
@@ -565,10 +612,19 @@ public void geosearch(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref
     }
     SearchSpec sp;
     sp.key = args[0].str;
-    if (!parseSearchOpts(args[1 .. $], sp, false) || (sp.radiusM < 0 && !sp.byBox)
-            || (!sp.fromMember && sp.lon == 0 && sp.lat == 0 && sp.radiusM < 0))
+    if (!parseSearchOpts(args[1 .. $], sp, false))
     {
         repError(o, "ERR syntax error");
+        return;
+    }
+    if (auto e = geoSearchValidate(sp))
+    {
+        repError(o, e);
+        return;
+    }
+    if (auto e = anyNeedsCount(sp))
+    {
+        repError(o, e);
         return;
     }
     GeoHit[] hits;
@@ -581,7 +637,7 @@ public void geosearch(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, ref
     }
     if (r < 0)
     {
-        repError(o, "ERR could not decode requested zset member");
+        repNoMember(o, sp.member);
         return;
     }
     emitHits(o, hits, sp);
@@ -604,9 +660,19 @@ public void geosearchstore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o
     }
     SearchSpec sp;
     sp.key = args[1].str;
-    if (!parseSearchOpts(opts, sp, false) || (sp.radiusM < 0 && !sp.byBox))
+    if (!parseSearchOpts(opts, sp, false))
     {
         repError(o, "ERR syntax error");
+        return;
+    }
+    if (auto e = geoSearchValidate(sp))
+    {
+        repError(o, e);
+        return;
+    }
+    if (auto e = anyNeedsCount(sp))
+    {
+        repError(o, e);
         return;
     }
     GeoHit[] hits;
@@ -619,7 +685,7 @@ public void geosearchstore(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o
     }
     if (r < 0)
     {
-        repError(o, "ERR could not decode requested zset member");
+        repNoMember(o, sp.member);
         return;
     }
     storeHits(ks, args[0].str, hits, storeDist, sp.unit, o);
@@ -665,6 +731,19 @@ public void georadius(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         repError(o, "ERR syntax error");
         return;
     }
+    if (auto e = anyNeedsCount(sp))
+    {
+        repError(o, e);
+        return;
+    }
+    // STORE/STOREDIST write a plain zset — the WITH* projections make no sense.
+    if ((sp.storeKey.length || sp.storeDistKey.length)
+            && (sp.withCoord || sp.withDist || sp.withHash))
+    {
+        repError(o, "ERR STORE option in GEORADIUS is not compatible with "
+                ~ "WITHDIST, WITHHASH and WITHCOORD options");
+        return;
+    }
     GeoHit[] hits;
     bool wrong;
     auto r = runSearch(ks, sp, arena, hits, wrong);
@@ -675,7 +754,7 @@ public void georadius(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     }
     if (r < 0)
     {
-        repError(o, "ERR could not decode requested zset member");
+        repNoMember(o, sp.member);
         return;
     }
     if (sp.storeKey.length)
