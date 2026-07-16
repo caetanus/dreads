@@ -10,9 +10,11 @@ N=300000 C=50 P=16 bench/run.sh   # override ops / connections / pipeline depth
 ```
 
 > Numbers are **machine-specific** — always re-run `bench/run.sh` on your box.
-> The values below were measured on: Manjaro Linux (kernel 6.1), AVX2 CPU,
-> LDC 1.42 / LLVM 21, jemalloc, dreads release build (`-mcpu=x86-64-v3`),
-> Valkey 9.1.0, Redis 7.4.9. `SET`, `-c50 -P16`, `N=300000`, loopback.
+> Manjaro Linux (kernel 6.1), AVX2 CPU, LDC / LLVM, jemalloc, dreads release
+> build, Valkey 9.1.0, Redis 7.4.9. `-c50 -P16`, loopback, pinned single-thread.
+> The **solo in-memory** row was re-measured on the current build (SET, `N=1M`,
+> median of 3); the AOF and replication/raft rows are from the earlier run and
+> not yet re-measured.
 
 ## Results (`-c50 -P16`, writes/sec)
 
@@ -20,9 +22,9 @@ N=300000 C=50 P=16 bench/run.sh   # override ops / connections / pipeline depth
 
 | system | mode | rps | durability |
 |---|---|---|---|
-| **dreads** | solo (in-memory) | **~1.30M** | none |
+| **dreads** | solo (in-memory) | **~1.48M** | none |
 | **dreads** | persistent AOF | **~0.91M** | group-commit fsync (≈`everysec`) |
-| Valkey | solo (in-memory) | ~0.85M | none |
+| Valkey 9.1 | solo (in-memory) | ~1.01M | none |
 | Redis 7 | solo (in-memory) | ~0.84M | none |
 | Redis 7 | AOF `everysec` | ~0.59M | batched fsync |
 | Redis 7 | AOF `always` | ~0.22M | fsync per write |
@@ -44,9 +46,9 @@ N=300000 C=50 P=16 bench/run.sh   # override ops / connections / pipeline depth
 
 ## Interpretation
 
-- **Engine.** dreads standalone (~1.30M) is ~1.5× Valkey/Redis standalone
-  (~0.85M) and ~1.5× on the persistent path — the D + zero-GC + arena engine is
-  simply fast.
+- **Engine.** dreads standalone (~1.48M SET) is ~1.5× Valkey 9.1 standalone
+  (~1.01M) and leads on every command type (GET/SET/INCR/LPUSH/SADD/HSET/ZADD,
+  1.1–1.5×; see the README table) — the D + zero-GC + arena engine is simply fast.
 
 - **Synchronous replication is the headline.** For the guarantee raft actually
   provides — every write durable on a majority before the client is told OK —
