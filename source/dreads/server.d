@@ -3072,7 +3072,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // AOF is enabled, and is a success NO-OP otherwise — never an error
             // (Redis itself allows BGREWRITEAOF regardless of `appendonly`, and the
             // durable state here is the Raft log, not a client-triggered AOF dump).
-            if (gAof.enabled && !aofRewrite(gAof, gAofPath, gKeys))
+            if (gAof.enabled && !aofRewrite(gAof, gAofPath))
                 repError(o, "ERR AOF rewrite failed");
             else
                 repSimple(o, "Background append only file rewriting started");
@@ -3963,12 +3963,19 @@ private bool freeMemoryIfNeeded() nothrow
     refreshDetClock();
     bool volatileOnly, randomPick;
     evictionMode(volatileOnly, randomPick);
+    // Evict across EVERY database (Redis samples all dbs), not just db 0.
     foreach (_; 0 .. 128) // eviction budget per triggering command
     {
-        if (!evictOneVictim(gKeys, volatileOnly, randomPick))
-            return false;
-        if (usedMemory() <= gConfig.maxmemory)
-            return true;
+        bool any = false;
+        foreach (ref d; gDbs)
+        {
+            if (usedMemory() <= gConfig.maxmemory)
+                return true;
+            if (evictOneVictim(d, volatileOnly, randomPick))
+                any = true;
+        }
+        if (!any)
+            break; // nothing evictable in any db
     }
     return usedMemory() <= gConfig.maxmemory;
 }

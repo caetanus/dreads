@@ -25,7 +25,22 @@ version (Windows)
 
 import dreads.commands : dispatch;
 import dreads.mem : Arena, ByteBuffer;
-import dreads.obj : Keyspace, RObj;
+import dreads.obj : Keyspace, RObj, gDbs, NUM_DBS;
+
+// Emit a `SELECT <db>` RESP command into `buf` — the multi-db framing marker used
+// by both the live log (on a db change) and the rewrite (before each db's dump).
+private void emitSelect(ref ByteBuffer buf, int db) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    char[12] nb = void;
+    immutable n = snprintf(nb.ptr, nb.length, "%d", db);
+    if (n <= 0)
+        return;
+    repArrayHeader(buf, 2);
+    repBulk(buf, "SELECT");
+    repBulk(buf, nb[0 .. n]);
+}
 import dreads.resp;
 import dreads.scripting : evalCommand;
 
@@ -34,6 +49,22 @@ public struct Aof
     private FILE* f;
     private ByteBuffer pending;
     private bool dirty;
+    // The db the log stream is currently positioned on (-1 = unknown, force a
+    // SELECT on the next append). A write on a different db emits `SELECT <db>`
+    // first, so replay routes each command to the right database.
+    private int lastDb = -1;
+
+    // Prepend a `SELECT` if the ambient command db (gNotifyDb) changed since the
+    // last logged write. Called by every append path.
+    private void maybeSelect() @nogc nothrow
+    {
+        import dreads.notify : gNotifyDb;
+
+        if (gNotifyDb == lastDb)
+            return;
+        lastDb = gNotifyDb;
+        emitSelect(pending, gNotifyDb);
+    }
 
     @property bool enabled() const @nogc nothrow
     {
@@ -48,6 +79,7 @@ public struct Aof
         zpath[0 .. path.length] = path;
         zpath[path.length] = 0;
         f = fopen(zpath.ptr, "ab");
+        lastDb = -1; // fresh handle: the first append re-emits its SELECT
         return f !is null;
     }
 
@@ -66,6 +98,7 @@ public struct Aof
     {
         if (f is null)
             return;
+        maybeSelect();
         pending.append(bytes);
     }
 
@@ -75,6 +108,7 @@ public struct Aof
     {
         if (f is null)
             return;
+        maybeSelect();
         repArrayHeader(pending, rest.length + 2);
         repBulk(pending, "EVAL");
         repBulk(pending, body_);
@@ -302,7 +336,7 @@ private void emitHashFieldTTLs(ref ByteBuffer buf, scope const(char)[] key, RObj
 /// BGREWRITEAOF: rewrites the log as the canonical rebuild command set.
 /// Runs synchronously — the event loop is single-threaded, so the keyspace
 /// cannot change under us. Reopens the live handle on success.
-public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) nothrow
+public bool aofRewrite(ref Aof live, scope const(char)[] path) nothrow
 {
     import core.stdc.stdio : rename;
 
@@ -320,7 +354,15 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path, ref Keyspace ks) 
         return false;
 
     ByteBuffer buf;
-    dumpKeyspace(ks, buf);
+    // Dump every non-empty database, each preceded by its `SELECT <db>` marker so
+    // replay restores keys into the right db. (An empty db needs no output.)
+    foreach (ref d; gDbs)
+    {
+        if (d.d.length == 0)
+            continue;
+        emitSelect(buf, d.db);
+        dumpKeyspace(d, buf);
+    }
     // ACL registry is global (not per-db): re-emit users so the compacted AOF
     // still recreates them on replay.
     import dreads.acl : aclDumpUsers;
@@ -417,8 +459,34 @@ private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer s
     dispatch(cmd, ks, sink, arena);
 }
 
-/// Loads an AOF into ks. Returns the number of commands replayed, or -1 when
-/// the file exists but is unreadable. A truncated tail is tolerated (warned).
+// Recognise a replay-stream `SELECT <n>` (0 <= n < NUM_DBS) and return its db.
+private bool aofIsSelect(ref const RVal cmd, out int db) @nogc nothrow
+{
+    if (cmd.type != RType.Array || cmd.arr.length != 2 || cmd.arr[0].str.length != 6)
+        return false;
+    static immutable sel = "select";
+    foreach (i, ch; cmd.arr[0].str)
+        if ((ch | 0x20) != sel[i])
+            return false;
+    long v = 0;
+    auto s = cmd.arr[1].str;
+    if (s.length == 0 || s.length > 2)
+        return false;
+    foreach (ch; s)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+        v = v * 10 + (ch - '0');
+    }
+    if (v < 0 || v >= NUM_DBS)
+        return false;
+    db = cast(int) v;
+    return true;
+}
+
+/// Loads an AOF into ks (the db-0 keyspace). A `SELECT <n>` in the stream routes
+/// subsequent commands into `gDbs[n]`. Returns the number of commands replayed,
+/// or -1 when the file exists but is unreadable. A truncated tail is tolerated.
 public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
 {
     char[512] zpath = void;
@@ -435,6 +503,7 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
     Arena arena;
     long count = 0;
     bool corrupt = false;
+    Keyspace* curKs = &ks; // a `SELECT <n>` re-points this into gDbs
 
     for (;;)
     {
@@ -456,7 +525,15 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
                 corrupt = true;
                 break;
             }
-            replayCommand(cmd, ks, sink, arena);
+            int selDb;
+            if (aofIsSelect(cmd, selDb))
+            {
+                // db 0 is the passed-in keyspace itself (which IS db 0 — for a
+                // standalone unit-test ks it is NOT gDbs[0]); higher dbs are gDbs.
+                curKs = selDb == 0 ? &ks : &gDbs[selDb];
+                continue; // a SELECT marker is routing, not a replayed command
+            }
+            replayCommand(cmd, *curKs, sink, arena);
             sink.clear();
             arena.reset();
             // replayed handlers (PEXPIREAT, XADD, ...) write the propagation
