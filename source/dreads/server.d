@@ -2823,6 +2823,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
             enterSubMode(c); // async output before any message can be delivered
+            c.replyCmdExempt = true; // ssubscribe confirmations bypass CLIENT REPLY OFF/SKIP
             foreach (ref a; args)
             {
                 gShardPubSub.subscribe(&c.shardSub, a.str);
@@ -2832,6 +2833,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "SUNSUBSCRIBE":
         {
+            c.replyCmdExempt = true; // sunsubscribe confirmations bypass CLIENT REPLY OFF/SKIP
             if (args.length == 0)
             {
                 subReply(o, "sunsubscribe", null, c.shardSub.subCount);
@@ -3112,6 +3114,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
             enterSubMode(c); // async output before any message can be delivered
+            c.replyCmdExempt = true; // (un)subscribe confirmations bypass CLIENT REPLY OFF/SKIP
             foreach (ref a; args)
             {
                 if (pattern)
@@ -3127,6 +3130,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             bool pattern = uname[0] == 'P';
             auto verb = pattern ? "punsubscribe" : "unsubscribe";
+            c.replyCmdExempt = true; // (un)subscribe confirmations bypass CLIENT REPLY OFF/SKIP
             if (args.length > 0)
             {
                 foreach (ref a; args)
