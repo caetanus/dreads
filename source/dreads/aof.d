@@ -147,6 +147,20 @@ public struct Aof
 /// keys skipped). This IS the compaction: dead history (SET-then-DEL,
 /// overwrites, expired) collapses into current state. Shared by BGREWRITEAOF
 /// and the Raft snapshot.
+/// Dump EVERY non-empty database as a SELECT-framed rebuild command stream — the
+/// shared serialization for the AOF rewrite and the raft snapshot. Replay
+/// (aofLoad / loadSnapshot) restores each key to the db named by its SELECT.
+public void dumpAllKeyspaces(ref ByteBuffer buf) nothrow
+{
+    foreach (ref d; gDbs)
+    {
+        if (d.d.length == 0)
+            continue;
+        emitSelect(buf, d.db);
+        dumpKeyspace(d, buf);
+    }
+}
+
 public void dumpKeyspace(ref Keyspace ks, ref ByteBuffer buf) nothrow
 {
     import dreads.stream : nowMs;
@@ -354,15 +368,7 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path) nothrow
         return false;
 
     ByteBuffer buf;
-    // Dump every non-empty database, each preceded by its `SELECT <db>` marker so
-    // replay restores keys into the right db. (An empty db needs no output.)
-    foreach (ref d; gDbs)
-    {
-        if (d.d.length == 0)
-            continue;
-        emitSelect(buf, d.db);
-        dumpKeyspace(d, buf);
-    }
+    dumpAllKeyspaces(buf); // every non-empty db, SELECT-framed
     // ACL registry is global (not per-db): re-emit users so the compacted AOF
     // still recreates them on replay.
     import dreads.acl : aclDumpUsers;
@@ -459,8 +465,9 @@ private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer s
     dispatch(cmd, ks, sink, arena);
 }
 
-// Recognise a replay-stream `SELECT <n>` (0 <= n < NUM_DBS) and return its db.
-private bool aofIsSelect(ref const RVal cmd, out int db) @nogc nothrow
+/// Recognise a replay-stream `SELECT <n>` (0 <= n < NUM_DBS) and return its db.
+/// Shared by AOF replay and the raft snapshot loader.
+public bool aofIsSelect(ref const RVal cmd, out int db) @nogc nothrow
 {
     if (cmd.type != RType.Array || cmd.arr.length != 2 || cmd.arr[0].str.length != 6)
         return false;

@@ -428,17 +428,26 @@ final class Replicator
     {
         try
         {
-            keys.clear();
+            foreach (ref d; gDbs) // a snapshot is authoritative for EVERY db
+                d.clear();
+            import dreads.commands : dispatch;
+            import dreads.aof : aofIsSelect;
+
+            auto curKs = keys; // a `SELECT <n>` re-points into gDbs
             size_t pos = 0;
             while (pos < data.length)
             {
                 RVal cmd;
                 if (parseValue(data, pos, arena, cmd) != ParseStatus.ok)
                     break;
-                import dreads.commands : dispatch;
-
+                int selDb;
+                if (aofIsSelect(cmd, selDb))
+                {
+                    curKs = &gDbs[selDb];
+                    continue;
+                }
                 sink.clear();
-                dispatch(cmd, *keys, sink, arena);
+                dispatch(cmd, *curKs, sink, arena);
                 arena.reset();
             }
         }
@@ -466,13 +475,13 @@ final class Replicator
 
     private void sendCompaction()
     {
-        import dreads.aof : dumpKeyspace;
+        import dreads.aof : dumpAllKeyspaces;
 
         import dreads.acl : aclDumpUsers;
 
         static ByteBuffer dump;
         dump.clear();
-        dumpKeyspace(*keys, dump);
+        dumpAllKeyspaces(dump); // every non-empty db, SELECT-framed
         aclDumpUsers(dump); // global ACL registry rides in the snapshot too
         ctlQ.put(dump.data, null, appliedIndex, CtlKind.compact);
         lastCompactApplied = appliedIndex;
