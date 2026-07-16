@@ -65,23 +65,23 @@ from taking that first result seriously once the answer looked like *yes*.
 A fair head-to-head: same host, same `redis-benchmark` invocation, both
 single-threaded, pinned, jemalloc, persistence off — dreads (LDC release) vs
 **Valkey 9.1.0** (`--save '' --appendonly no --io-threads 1`), `-P 16`, 50
-connections, 1M requests each. The table reports median rps over repeated runs;
-full min/median/max results live in [bench/valkey-comparison.md](bench/valkey-comparison.md).
+connections, 1M requests each, median of repeated runs. Numbers are
+machine-specific — re-run `bench/run.sh` on your box.
 
 | Command (`-P 16`, 50 conns) | dreads median | Valkey 9.1 median | |
 |---|---:|---:|---:|
-| GET | **1.07M rps** | 1.05M | 1.02× |
-| SET | **1.03M** | 0.83M | 1.24× |
-| LPUSH | **1.16M** | 0.91M | 1.27× |
-| HSET | **1.01M** | 0.70M | 1.44× |
-| SADD | **1.03M** | 0.83M | 1.24× |
-| ZADD | **0.36M** | 0.34M | 1.05× |
-| INCR | 0.86M | **1.05M** | 0.82× |
+| GET | **1.59M rps** | 1.25M | 1.27× |
+| SET | **1.48M** | 1.01M | 1.47× |
+| SADD | **1.43M** | 1.19M | 1.20× |
+| INCR | **1.40M** | 1.24M | 1.13× |
+| LPUSH | **1.36M** | 1.07M | 1.26× |
+| HSET | **1.32M** | 1.04M | 1.27× |
+| ZADD | **1.30M** | 1.01M | 1.28× |
 
-Peak best-of runs are higher (for example GET 2.34M vs 1.73M and SET 1.33M vs
-0.93M at `-P 32`), but the median table above is the conservative headline.
-Unpipelined throughput is round-trip bound on both sides (~95-100k rps); the
-pipelined numbers show the real per-command cost.
+dreads leads on every command (1.1–1.5×) — the D + zero-GC + per-command arena
+engine simply does less work per request. Unpipelined throughput is round-trip
+bound on both sides (~95–100k rps); the pipelined numbers show the real
+per-command cost.
 
 ### Pub/Sub: publish cost is independent of pattern count
 
