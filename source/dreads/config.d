@@ -356,18 +356,23 @@ public bool isRuntimeSettable(string lname) nothrow
     }
 }
 
-/// Known Valkey parameters that dreads does not model but that the test
-/// harness (and real clients) set via CONFIG SET — accepted as advisory
-/// no-ops so an override block doesn't abort. Truly-unknown names still error.
-/// Mostly network-binding / security-posture / startup knobs with no runtime
-/// effect on our single-thread, raft-replicated engine.
-public bool isKnownNoopParam(string lname) nothrow
+/// COMPAT MODE — known Valkey parameters dreads does not actually model. CONFIG
+/// SET on one of these returns OK and does NOTHING; it is an explicit
+/// compatibility shim (so clients and the test harness's `start_server
+/// {overrides}` don't choke on a config we simply don't have), NOT a claim that
+/// the setting takes effect. Truly-unknown names still error. Deliberately EXCLUDED:
+/// security-posture knobs (`protected-mode`, `enable-protected-configs`,
+/// `enable-debug-command`, `enable-module-command`) — silently OK-ing
+/// "protected-mode no" while ignoring it is a lie a security tool would trust
+/// (and those only appear in external:skip suite blocks anyway). Kept are
+/// network-binding + operational knobs that are genuinely inert on our
+/// single-thread, raft-replicated engine.
+public bool isCompatModeParam(string lname) nothrow
 {
     switch (lname)
     {
-    case "bind", "unixsocket", "protected-mode", "enable-protected-configs",
-        "enable-debug-command", "enable-module-command", "hash-seed",
-        "rename-command", "tcp-backlog", "tcp-keepalive", "timeout",
+    case "bind", "unixsocket", "hash-seed", "rename-command",
+        "tcp-backlog", "tcp-keepalive", "timeout",
         "repl-diskless-sync", "repl-diskless-load", "rdb-key-save-delay",
         "propagation-error-behavior", "latency-tracking", "io-threads":
         return true;

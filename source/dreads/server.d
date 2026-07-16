@@ -47,7 +47,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
         return gScriptWritesHook !is null && gScriptWritesHook(uname, cmd);
     return isPausedByWrite(uname);
 }
-import dreads.config : applyDirective, gConfig, isRuntimeSettable, isKnownNoopParam, parseMemory;
+import dreads.config : applyDirective, gConfig, isRuntimeSettable, isCompatModeParam, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
@@ -2798,6 +2798,20 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // plus PING/QUIT/RESET/HELLO (HELLO lets it upgrade to RESP3 and escape this).
     if (c.totalSubs > 0 && !c.resp3)
     {
+        // In RESP2 subscribe mode a bare reply would be ambiguous with a pushed
+        // message, so PING answers as a 2-element array ["pong", <arg or "">].
+        if (uname == "PING")
+        {
+            if (cmd.arr.length > 2)
+            {
+                repError(o, "ERR wrong number of arguments for 'ping' command");
+                return true;
+            }
+            repArrayHeader(o, 2);
+            repBulk(o, "pong");
+            repBulk(o, cmd.arr.length == 2 ? cmd.arr[1].str : "");
+            return true;
+        }
         switch (uname)
         {
         case "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE":
@@ -3787,9 +3801,10 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
             }
             if (!isRuntimeSettable(lname))
             {
-                // A known-but-unmodelled Valkey param is accepted as an advisory
-                // no-op; only a genuinely-unknown name is rejected.
-                if (isKnownNoopParam(lname))
+                // COMPAT MODE: a known Valkey param we don't model returns OK and
+                // does nothing (an explicit shim, not real support); a genuinely
+                // unknown name is still rejected.
+                if (isCompatModeParam(lname))
                     return 0;
                 return 1; // startup-only or unknown parameters
             }
@@ -5307,15 +5322,22 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
     foreach (k, ch; pf)
         flagsz[k] = ch;
     flagsz[pf.length] = '\0';
+    // Per-connection memory/buffer accounting (qbuf*, argv-mem, rbs, obl/oll/omem,
+    // tot-mem) is NOT tracked — the input/output buffers live on the serve fiber's
+    // stack, not on Conn. Report 0 (honest "not measured") rather than a fabricated
+    // plausible number; the introspection globs accept it, and a monitoring client
+    // reads 0 as unpopulated instead of trusting a made-up size. fd is likewise not
+    // the real socket fd (vibe abstracts it) — report the connection id as a stable,
+    // unique per-client handle.
     char[512] b = void;
     auto n = snprintf(b.ptr, b.length,
-            "id=%llu addr=%.*s laddr=%.*s fd=%d name=%.*s age=%lld idle=%lld flags=%s"
-            ~ " capa=%s db=%d sub=%d psub=%d ssub=%d multi=%d watch=%d qbuf=0 qbuf-free=20474"
-            ~ " argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=20512"
+            "id=%llu addr=%.*s laddr=%.*s fd=%llu name=%.*s age=%lld idle=%lld flags=%s"
+            ~ " capa=%s db=%d sub=%d psub=%d ssub=%d multi=%d watch=%d qbuf=0 qbuf-free=0"
+            ~ " argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0"
             ~ " events=r cmd=%.*s user=%.*s redir=%lld resp=%d lib-name=%.*s lib-ver=%.*s"
             ~ " tot-net-in=%llu tot-net-out=%llu tot-cmds=%llu\n",
             c.id, cast(int) addr.length, addr.ptr, cast(int) laddr.length, laddr.ptr,
-            c.id == 0 ? 0 : 1, cast(int) c.clientName.length, c.clientName[].ptr,
+            c.id, cast(int) c.clientName.length, c.clientName[].ptr,
             age, idle, flagsz.ptr,
             c.capaRedirect ? "r".ptr : "".ptr,
             c.dbp.db, cast(int) c.sub.channels.length, cast(int) c.sub.patterns.length,
