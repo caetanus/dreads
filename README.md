@@ -189,6 +189,19 @@ for only at the boundaries where another service or shard is involved.
   key expiry and eviction invalidate too, and a dead redirection target yields a
   `tracking-redir-broken` push. `tracking.tcl` passes 29/0 (skips: rax-memory
   accounting, in-script command tracking, BCAST prefix-collision error strings).
+- **Connection introspection & admin (`CLIENT`)**: `CLIENT INFO`/`LIST` emit the
+  full Valkey field set (`age`/`idle`, `tot-net-in`/`tot-net-out`/`tot-cmds`,
+  `lib-name`/`lib-ver`, `redir`, `resp`, `cmd=container|subcommand`, …), with one
+  shared filter engine for `CLIENT LIST` and `CLIENT KILL` — `id`, `type`, `addr`,
+  `laddr`, `ip`, `user`, `name`, `flags`, `capa`, `lib-name`/`lib-ver`, `db`,
+  `maxage`/`idle`/`skipme`, and every `not-*` negation, with Valkey-exact error
+  messages. Plus `CLIENT SETINFO`, `CAPA`, `REPLY ON|OFF|SKIP`, `READONLY`/
+  `READWRITE`, `INFO connected_clients`, `sdscatrepr`-escaped `MONITOR` output, and
+  a `PUBSUB NUMPAT` that counts *unique* patterns. `introspection.tcl` passes 59/61
+  (the 2 skips: `redis.call` sub-command counting — cross-thread — and RDB
+  `bgsave`, which dreads has no fork for). The per-command cost stays off the hot
+  path: byte/command counters live in the serve loop, and the container-command
+  test is deferred to `CLIENT INFO` (verified SET/GET-neutral by A/B benchmark).
 - **AUTH + ACL**: real authentication and a full ACL engine. `AUTH`/`HELLO
   AUTH`, `ACL SETUSER|DELUSER|GETUSER|LIST|USERS|CAT|WHOAMI|GENPASS` with
   Valkey-format rule output. Passwords are **Argon2id** (libsodium, OWASP
