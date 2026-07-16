@@ -64,11 +64,11 @@ private enum READ_CHUNK = 16 * 1024;
 
 // The event loop is single-threaded, so shared state needs no locking.
 // The logical databases live in `gDbs` (dreads.obj); client commands dispatch
-// against the *connection's* selected db (`Conn.dbp`). `gKeys` names db 0 — used
-// by the paths that are STILL db-0-only: AOF replay/rewrite (persistence) and the
-// on-demand write-path eviction (freeMemoryIfNeeded). Blocking (per-(db,key)),
-// keyspace notifications (channel carries the command's db), and the active-
-// eviction timer (sweeps every db) are already multi-db. See BLACKBOX-TODO.md.
+// against the *connection's* selected db (`Conn.dbp`). `gKeys` is just an alias
+// for db 0 (`gDbs[0]`), used where db 0 is genuinely the starting point (the AOF
+// replay begins there and follows `SELECT` markers into the other dbs). The
+// persistence (AOF live/rewrite/replay + raft snapshot), eviction, blocking, and
+// keyspace-notification paths are ALL multi-db now.
 private ref Keyspace gKeys() @property @nogc nothrow @trusted
 {
     return gDbs[0];
@@ -3950,8 +3950,8 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
     return true;
 }
 
-// Write path: free memory synchronously before an allocating write. Operates on
-// the connection's db 0 view (gKeys); budgeted so one command can't stall.
+// Write path: free memory synchronously before an allocating write. Evicts across
+// every database (like Redis samples all dbs); budgeted so one command can't stall.
 private bool freeMemoryIfNeeded() nothrow
 {
     if (usedMemory() <= gConfig.maxmemory)

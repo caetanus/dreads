@@ -281,20 +281,15 @@ round-trip EACH (pipelining them is a future optimization). Add
 
 ## Multi-DB peripheral gaps (not yet exercised, known incomplete)
 
-The core SELECT/MOVE/SWAPDB path is multi-db. **Fixed since:** keyspace
-notifications now carry the command's db (`__keyspace@<db>__` via `gNotifyDb`,
-set by the dispatch + the active-expire/eviction cycles); blocking is
-per-`(db,key)`; the active-eviction timer sweeps every db. **Still db-0-only:**
-
-- **Standalone AOF SELECT-logging**: replay/rewrite loads/dumps only db 0 —
-  needs a `SELECT N` marker (or equivalent framing) before writes on db N. Raft
-  live proposals already carry the db index; raft snapshots still need per-db
-  framing.
-- **On-demand write-path eviction** (`freeMemoryIfNeeded`) evicts from db 0 only
-  (`gKeys`); it should sample across all dbs like Redis. (The active-eviction
-  timer already sweeps every db.)
-- **MULTI-replay / SELECT-in-MULTI** still want a Valkey audit.
-- **CLIENT LIST/INFO** reports the real db, but `addr` is still `?`.
+Multi-DB is complete (2026-07-16). The core SELECT/MOVE/SWAPDB path plus every
+peripheral: keyspace notifications carry the command's db (`__keyspace@<db>__` via
+`gNotifyDb`); blocking is per-`(db,key)`; the AOF is SELECT-framed end to end
+(live append on a db change, rewrite dumps every non-empty db, replay routes
+`SELECT` into `gDbs[n]`); the raft snapshot dumps/loads every db; eviction (both
+the write-path and the timer) covers all dbs; `SELECT` inside MULTI changes the db
+for the rest of the transaction. `Keyspace.db` is a first-class field (no pointer
+arithmetic). Remaining unrelated gap: **CLIENT LIST/INFO** reports the real db but
+`addr` is still `?`.
 
 ## ACL / AUTH (2026-07-13, `auth-acl` → `master`)
 - **acl.tcl block-1 now PASSES COMPLETELY: 88 ok / 0 err** (was 17 at the start

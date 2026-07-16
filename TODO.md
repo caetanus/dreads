@@ -62,18 +62,18 @@ external mode (`/tmp/valkey/runtest --host … --port … --single <file>`), on 
   cold-lookup benchmark from tie to a WIN. Cost: `keyAt` O(n); small SSCAN would
   return all at once (Redis listpack behaviour). See `bench/small-containers.md`.
 
-## Multi-DB peripheral (the remaining db-0-only paths)
+## Multi-DB peripheral — DONE (2026-07-16)
 
-- **DONE:** keyspace notifications now carry the command's db
-  (`__keyspace@<db>__`, `gNotifyDb`); blocking is per-`(db,key)`; the
-  active-eviction timer sweeps every db.
-- **Still db-0-only:** AOF replay/rewrite loads/dumps only db 0 (needs a
-  `SELECT N` marker / per-db framing; raft live log already carries the db,
-  raft snapshot still needs it), and the **on-demand write-path eviction**
-  (`freeMemoryIfNeeded`) evicts from db 0 only — should sample across all dbs
-  like Redis.
-- MULTI-replay / SELECT-in-MULTI still want a Valkey audit. See memory
-  `multi-db`.
+Every peripheral path is multi-db now:
+- Keyspace notifications carry the command's db (`__keyspace@<db>__`, `gNotifyDb`).
+- Blocking is per-`(db,key)`; the active-eviction timer sweeps every db.
+- **AOF** is SELECT-framed end to end (live append emits `SELECT <db>` on a db
+  change, rewrite dumps every non-empty db, replay routes `SELECT` into `gDbs[n]`).
+- **Raft snapshot** dumps/loads every db (shared `dumpAllKeyspaces` + SELECT
+  routing).
+- **On-demand write-path eviction** evicts across all dbs.
+- **SELECT-in-MULTI** already works (a queued SELECT changes the db for the rest
+  of the transaction).
 - `DEBUG RELOAD`/`LOADAOF` are stubbed no-ops — do a real in-process AOF
   round-trip (dreads HAS persistence; see memory `dreads-is-not-in-memory-only`).
 
