@@ -1264,7 +1264,7 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
     if (gReplicator !is null)
     {
         encodeCmd(effScratch, arr);
-        auto dbIdx = cast(size_t)(&ks - &gDbs[0]);
+        auto dbIdx = cast(size_t) ks.db;
         if (dbIdx >= NUM_DBS)
             dbIdx = 0;
         try
@@ -1514,7 +1514,7 @@ private bool routeToPool(LuaReqKind kind, scope const(RVal)[] args, ref Keyspace
     import dreads.det : detNow = now;
     import dreads.obj : gDbs, NUM_DBS;
 
-    auto dbi = cast(size_t)(&ks - &gDbs[0]);
+    auto dbi = cast(size_t) ks.db;
     if (dbi >= NUM_DBS)
         dbi = 0;
     luaExecOnPool(kind, args, bySha, readOnly, cast(ushort) dbi, detNow(), gPendingScriptUser, o);

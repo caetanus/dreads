@@ -79,6 +79,13 @@ public __gshared ulong gPauseIssuer; // conn id that set the pause (exempt from 
 public enum NUM_DBS = 16;
 public __gshared Keyspace[NUM_DBS] gDbs;
 
+/// Stamp each slot with its identity at startup, so `gDbs[i].db == i`.
+shared static this()
+{
+    foreach (int i, ref d; gDbs)
+        d.db = i;
+}
+
 public struct RObj
 {
     ObjType type;
@@ -243,6 +250,13 @@ public struct RObj
 public struct Keyspace
 {
     Dict!RObj d;
+
+    /// This keyspace's logical database index — its SLOT identity in `gDbs`, set
+    /// once at startup. It is the transparent way to get the db number (e.g. for a
+    /// `__keyspace@<db>__` channel) without recovering it by pointer arithmetic
+    /// (`&ks - &gDbs[0]`). SWAPDB swaps slot *contents*, not identities, so it
+    /// restores `db` afterwards. A standalone Keyspace (unit tests) keeps db 0.
+    int db;
 
     /// The "drop-soon" index for active expiration: absolute deadline (ms) ->
     /// the keys that expire at exactly that instant. Ordered by deadline, so a

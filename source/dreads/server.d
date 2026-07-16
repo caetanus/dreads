@@ -267,9 +267,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             // is a propagated DEL) is held until the window lifts, like eviction.
             immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
             if (!paused)
-                foreach (i, ref d; gDbs) // drop-soon sweep across every database
+                foreach (ref d; gDbs) // drop-soon sweep across every database
                 {
-                    gNotifyDb = cast(int) i; // "expired" fires on THIS db's channel
+                    gNotifyDb = d.db; // "expired" fires on THIS db's channel
                     d.activeExpireCycle();
                     d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
                 }
@@ -1900,7 +1900,7 @@ private bool aclDenies(ref Conn c, const ref RVal cmd, string uname,
     // database ACL (`db=`): restrict which DBs the user may touch.
     if (!c.user.root.allDbs)
     {
-        auto ddb = aclDeniedDb(c.user, lname, cmd.arr, cast(int)(c.dbp - &gDbs[0]));
+        auto ddb = aclDeniedDb(c.user, lname, cmd.arr, c.dbp.db);
         if (ddb !is null)
         {
             statRejected(cidx);
@@ -3156,7 +3156,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             {
                 gWriteEpoch++;
                 gKeyActivity.emit();
-                signalReadyKeys(cast(int)(c.dbp - &gDbs[0]), *c.dbp);
+                signalReadyKeys(c.dbp.db, *c.dbp);
             }
             return true;
         }
@@ -3197,13 +3197,13 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 else
                 {
                     try
-                        gReplicator.proposeWrite(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]), o);
+                        gReplicator.proposeWrite(rawCmd, nowMs(), cast(ushort) c.dbp.db, o);
                     catch (Exception)
                         repError(o, "ERR replication error");
                 }
                 return true;
             }
-            auto h = gReplicator.proposeAsync(rawCmd, nowMs(), cast(ushort)(c.dbp - &gDbs[0]));
+            auto h = gReplicator.proposeAsync(rawCmd, nowMs(), cast(ushort) c.dbp.db);
             if (h is null) // lost leadership since the flush-point check
             {
                 repError(o, "READONLY You can't write against a read only replica.");
@@ -3258,7 +3258,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             gWriteEpoch++; // WATCH visibility
             gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
-            signalReadyKeys(cast(int)(c.dbp - &gDbs[0]), *c.dbp); // wake pop-family fronts
+            signalReadyKeys(c.dbp.db, *c.dbp); // wake pop-family fronts
         }
         if (gAof.enabled)
         {
@@ -3883,7 +3883,7 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
     import dreads.notify : notifyKeyspaceEvent, NClass, gNotifyDb;
     import dreads.obj : gEvictedKeys;
 
-    gNotifyDb = cast(int)(&ks - &gDbs[0]); // "evicted" fires on the victim db's channel
+    gNotifyDb = ks.db; // "evicted" fires on the victim db's channel
     auto cap = ks.d.capacity;
     if (cap == 0 || ks.length == 0)
         return false;
@@ -4466,7 +4466,7 @@ private void blockingPop(ref Conn c, const(RVal)[] args, bool fromLeft,
         return;
     }
     auto keys = args[0 .. $ - 1];
-    immutable db = cast(int)(c.dbp - &gDbs[0]);
+    immutable db = c.dbp.db;
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
     bool registered = false;
@@ -4571,7 +4571,7 @@ private void blockingZPop(ref Conn c, const(RVal)[] args, bool popMax,
         return;
     }
     auto keys = args[0 .. $ - 1];
-    immutable db = cast(int)(c.dbp - &gDbs[0]);
+    immutable db = c.dbp.db;
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
     bool registered = false;
@@ -4715,7 +4715,7 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
     import dreads.obj : ObjType;
 
     immutable srcType = verb == "ZMPOP" ? ObjType.zset : ObjType.list;
-    immutable db = cast(int)(c.dbp - &gDbs[0]);
+    immutable db = c.dbp.db;
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
     bool registered = false;
@@ -5067,7 +5067,7 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
             "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
             ~ " multi=%d flags=%s cmd=%.*s user=%.*s resp=%d\n",
             c.id, cast(int) c.clientName.length, c.clientName[].ptr,
-            cast(int)(c.dbp - &gDbs[0]), cast(int) c.sub.subCount, 0,
+            c.dbp.db, cast(int) c.sub.subCount, 0,
             cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
             c.importSource ? "I".ptr : "N".ptr,
             cast(int) lastCmd.length, lastCmd.ptr,

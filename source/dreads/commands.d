@@ -76,13 +76,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
 
     freezeClock(applyTime);
     // Shape keyspace-notification channels for THIS command's database, so
-    // __keyspace@<db>__ / __keyevent@<db>__ carry the right index (not @0). Clamp:
-    // unit tests dispatch a standalone Keyspace not inside gDbs, so the pointer
-    // difference is meaningless there — fall back to db 0.
-    {
-        immutable idx = &ks - &gDbs[0];
-        gNotifyDb = (idx >= 0 && idx < cast(ptrdiff_t) NUM_DBS) ? cast(int) idx : 0;
-    }
+    // __keyspace@<db>__ / __keyevent@<db>__ carry the right index (not @0). The db
+    // is the keyspace's own identity — no pointer arithmetic (a standalone unit-
+    // test Keyspace keeps db 0).
+    gNotifyDb = ks.db;
     if (cmd.type != RType.Array || cmd.arr.length == 0)
     {
         repError(o, "ERR empty command");
@@ -3988,6 +3985,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 import std.algorithm.mutation : swap;
 
                 swap(gDbs[cast(size_t) a], gDbs[cast(size_t) b]);
+                // The swap moves CONTENTS between slots; each slot keeps its own
+                // identity (so a cached dbp and its .db stay consistent).
+                gDbs[cast(size_t) a].db = cast(int) a;
+                gDbs[cast(size_t) b].db = cast(int) b;
             }
             repSimple(o, "OK");
             break;
