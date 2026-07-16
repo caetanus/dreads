@@ -97,6 +97,14 @@ public struct ByteBuffer
     {
         len = 0;
     }
+
+    /// Drops everything past the first n bytes (n must be <= length). Used to
+    /// roll back a reply that CLIENT REPLY OFF/SKIP suppresses.
+    void truncate(size_t n) @nogc nothrow
+    {
+        if (n < len)
+            len = n;
+    }
 }
 
 /// Region allocator: bump-pointer allocation, freed all at once with reset().

@@ -375,6 +375,9 @@ public struct PubSub
     private size_t maxLeftOnlyLen, maxRightOnlyLen; // probe bounds per index
     private size_t maxBothLeftLen, maxBothRightLen;
     private size_t patternEntries; // total (subscriber, pattern) pairs
+    // Distinct pattern strings -> #subscribers on each. PUBSUB NUMPAT reports the
+    // number of *unique* patterns (Redis semantics), not the pair count above.
+    private Dict!size_t patCounts;
     // Active-channel index for PUBSUB CHANNELS <pat>: ordered (skiplist) sets of
     // channel names, normal and reversed, so a pattern's prefix/suffix becomes a
     // lexicographic range (find-left / find-right) instead of an O(channels) scan.
@@ -537,6 +540,10 @@ public struct PubSub
         else
             (kind == PatKind.matchAll ? matchAll : fallback).add(e);
         patternEntries++;
+        if (auto cp = patCounts.get(p))
+            (*cp)++;
+        else
+            patCounts.set(p, 1);
     }
 
     private void removePattern(Subscriber* s, scope const(char)[] p) @nogc nothrow
@@ -586,6 +593,9 @@ public struct PubSub
         e.freeRaw();
         cfree(e);
         patternEntries--;
+        if (auto cp = patCounts.get(p))
+            if (--(*cp) == 0)
+                patCounts.del(p);
     }
 
     private void emitPmessage(Subscriber* s, scope const(char)[] pat,
@@ -862,10 +872,10 @@ public struct PubSub
         return list is null ? 0 : list.len;
     }
 
-    /// Total pattern subscriptions (Redis counts unique patterns; see DRIFT).
+    /// Number of *unique* patterns with at least one subscriber (PUBSUB NUMPAT).
     size_t patternCount() const @nogc nothrow
     {
-        return patternEntries;
+        return patCounts.length;
     }
 }
 
@@ -1017,6 +1027,35 @@ unittest // multiple distinct-header patterns on ONE subscriber all match
     assert(ps.publish("a:1", "x") == 1); // each header must still be found
     assert(ps.publish("b:1", "x") == 1);
     assert(ps.publish("c:1", "x") == 1);
+}
+
+unittest // PUBSUB NUMPAT counts UNIQUE patterns, not (subscriber,pattern) pairs
+{
+    PubSub ps;
+    FakeClient a, b, c;
+    a.init_();
+    b.init_();
+    c.init_();
+    scope (exit)
+    {
+        a.sub.free();
+        b.sub.free();
+        c.sub.free();
+    }
+    // three subscribers on the SAME pattern => one unique pattern.
+    assert(ps.psubscribe(&a.sub, "news.*"));
+    assert(ps.psubscribe(&b.sub, "news.*"));
+    assert(ps.psubscribe(&c.sub, "news.*"));
+    assert(ps.patternCount == 1);
+    // a distinct pattern lifts the unique count to two.
+    assert(ps.psubscribe(&a.sub, "sports.*"));
+    assert(ps.patternCount == 2);
+    // dropping two of the three "news.*" subscribers keeps the pattern alive.
+    ps.punsubscribe(&a.sub, "news.*");
+    ps.punsubscribe(&b.sub, "news.*");
+    assert(ps.patternCount == 2); // news.* (c) + sports.* (a)
+    ps.punsubscribe(&c.sub, "news.*"); // last news.* subscriber leaves
+    assert(ps.patternCount == 1); // only sports.* remains
 }
 
 unittest // suffix (rightIndex), general (fallback) and match-all

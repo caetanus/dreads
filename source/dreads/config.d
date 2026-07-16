@@ -356,6 +356,26 @@ public bool isRuntimeSettable(string lname) nothrow
     }
 }
 
+/// Known Valkey parameters that dreads does not model but that the test
+/// harness (and real clients) set via CONFIG SET — accepted as advisory
+/// no-ops so an override block doesn't abort. Truly-unknown names still error.
+/// Mostly network-binding / security-posture / startup knobs with no runtime
+/// effect on our single-thread, raft-replicated engine.
+public bool isKnownNoopParam(string lname) nothrow
+{
+    switch (lname)
+    {
+    case "bind", "unixsocket", "protected-mode", "enable-protected-configs",
+        "enable-debug-command", "enable-module-command", "hash-seed",
+        "rename-command", "tcp-backlog", "tcp-keepalive", "timeout",
+        "repl-diskless-sync", "repl-diskless-load", "rdb-key-save-delay",
+        "propagation-error-behavior", "latency-tracking", "io-threads":
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// Loads a config file. Returns false when the file cannot be read or a
 /// directive is invalid; unknownOut collects unknown directive names.
 public bool loadConfig(string path, ref Config cfg, void delegate(string line) onWarn = null)

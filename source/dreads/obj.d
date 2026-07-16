@@ -59,6 +59,12 @@ public __gshared bool gImportMode;
 /// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
 public __gshared long gBlockedClients;
 
+/// INFO clients: number of live client connections. TLS (not __gshared) on
+/// purpose — with the coming per-thread sharding each shard accepts and serves
+/// its own connections, so this is a per-thread tally that INFO aggregates;
+/// a shared counter would both race and need migrating. See register/unregister.
+public long gConnectedClients;
+
 /// CLIENT TRACKING invalidation hook: when a key is physically removed by an
 /// expiry (active or lazy), the server layer queues a tracking invalidation for
 /// it. Null until the server installs it (so obj.d stays independent of tracking).

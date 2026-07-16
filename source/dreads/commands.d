@@ -2841,7 +2841,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
-            import dreads.obj : gBlockedClients, gDbs, gExpiredKeys, gExpiredFields,
+            import dreads.obj : gBlockedClients, gConnectedClients, gDbs, gExpiredKeys, gExpiredFields,
                 gEvictedKeys, gPauseUntilMs, gPauseAll;
             import dreads.stream : nowMs;
 
@@ -2857,9 +2857,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             immutable actions = !paused ? "none" : (gPauseAll ? "all" : "write");
             immutable long premain = paused ? cast(long)(gPauseUntilMs - now) : 0;
             auto n = snprintf(b.ptr, b.length,
-                    "# Clients\r\nblocked_clients:%lld\r\npaused_reason:%s\r\n"
+                    "# Clients\r\nconnected_clients:%lld\r\nblocked_clients:%lld\r\npaused_reason:%s\r\n"
                     ~ "paused_actions:%s\r\npaused_timeout_milliseconds:%lld\r\n",
-                    gBlockedClients, reason.ptr, actions.ptr, premain);
+                    gConnectedClients, gBlockedClients, reason.ptr, actions.ptr, premain);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
                     "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",

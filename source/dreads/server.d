@@ -47,13 +47,13 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
         return gScriptWritesHook !is null && gScriptWritesHook(uname, cmd);
     return isPausedByWrite(uname);
 }
-import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
+import dreads.config : applyDirective, gConfig, isRuntimeSettable, isKnownNoopParam, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags, gNotifyDb;
 import dreads.stream : nowMs;
-import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
+import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients, gConnectedClients;
 import dreads.dict : Dict, Unit;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
@@ -357,6 +357,19 @@ private struct Conn
     Vector!char clientName; // owned (RAII); freed with the Conn, never manually
 Vector!char addr; // "ip:port" of the peer, captured at connect (CLIENT LIST addr=)
 Vector!char laddr; // "ip:port" of the local end the peer connected to (laddr=)
+long connMs; // wall time at connect (CLIENT LIST age=)
+long lastActiveMs; // wall time of the last command (CLIENT LIST idle=)
+Vector!char libName, libVer; // CLIENT SETINFO lib-name / lib-ver
+// CLIENT LIST/INFO byte + command statistics. netIn counts raw request bytes
+// consumed off the socket (per parsed command), netOut counts reply bytes
+// written, cmds counts every command executed (incl. redis.call sub-commands).
+ulong totNetIn, totNetOut, totCmds;
+bool capaRedirect; // CLIENT CAPA redirect: advertises the `r` capability (capa=r)
+bool readonlyFlag; // READONLY issued (cluster read-only mode); surfaces as flags=r
+// CLIENT REPLY: replyOff silences every reply until CLIENT REPLY ON; replySkipNext
+// silences the single next command's reply (CLIENT REPLY SKIP). replyCmdExempt is
+// a per-command latch so the CLIENT REPLY command itself is never suppressed.
+bool replyOff, replySkipNext, replyCmdExempt;
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // ACL: the connection's user (default at connect) and whether it has cleared
     // authentication (nopass default => true immediately; requirepass => set at
@@ -405,6 +418,12 @@ Vector!char laddr; // "ip:port" of the local end the peer connected to (laddr=)
     // every command token fits in 32 (longest is GEORADIUSBYMEMBER_RO = 20).
     char[32] lastCmdBuf = void;
     ubyte lastCmdLen;
+    // Raw arg[1] (subcommand token) of the last command, for CLIENT INFO's
+    // `cmd=container|sub` form. Stored cheaply here (a bounded copy) and joined
+    // LAZILY in appendConnInfo — the container test (aclIsContainer scans ~80
+    // entries) must NOT run on the command hot path.
+    char[32] lastArgBuf = void;
+    ubyte lastArgLen;
     // CLIENT UNBLOCK: `blocked` is true while parked in a blocking command;
     // `unblockReq` is set by another client (1 = TIMEOUT reply, 2 = -UNBLOCKED).
     bool blocked;
@@ -465,11 +484,13 @@ private Shared!Conn connById(ulong id) nothrow @trusted
 private void registerConn(ref Shared!Conn sc) @nogc nothrow
 {
     gConnById.set(connIdKey(sc.get().id), sc.weaken());
+    gConnectedClients++;
 }
 
 private void unregisterConn(ulong id) @nogc nothrow
 {
-    gConnById.remove(connIdKey(id));
+    if (gConnById.remove(connIdKey(id)))
+        gConnectedClients--;
 }
 
 /// Snapshot every live connection's id into `outv`. Iterating the registry
@@ -1371,6 +1392,8 @@ private void serveClient(TCPConnection tcp) nothrow
     catch (Exception)
     {
     }
+    c.connMs = nowMs(); // for CLIENT LIST age=/idle=
+    c.lastActiveMs = c.connMs;
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
     // ACL: start as the default user; a nopass default is authenticated at once,
@@ -1443,6 +1466,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     c.wlock.unlock();
                 tcp.write(outb.data);
             }
+            c.totNetOut += outb.length;
             outb.clear();
         }
 
@@ -1493,7 +1517,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 if (cmd.type == RType.Array && cmd.arr.length == 0)
                     continue;
                 gRespProto = c.resp3 ? 3 : 2;
+                immutable replyPre = outb.length;
+                c.replyCmdExempt = false;
                 keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
+                postCommand(*c, outb, replyPre, p - start);
                 if (gNotifyFlags)
                     flushPendingNotify();
                 if (gTrackCount)
@@ -1574,6 +1601,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 if (n == 0)
                     break;
                 inb.grow(n);
+                // Stamp activity ONCE per read (drives CLIENT LIST idle=). One
+                // clock read amortized over the whole pipeline batch — a per-command
+                // clock_gettime was a real throughput hit.
+                c.lastActiveMs = nowMs();
 
                 size_t pos = 0;
                 while (keep)
@@ -1592,7 +1623,10 @@ private void serveClient(TCPConnection tcp) nothrow
                     if (cmd.type == RType.Array && cmd.arr.length == 0)
                         continue; // blank inline line — Redis ignores it silently
                     gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
+                    immutable replyPre = outb.length;
+                    c.replyCmdExempt = false;
                     keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                    postCommand(*c, outb, replyPre, pos - cmdStart);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
                     if (gTrackCount)
@@ -1662,6 +1696,7 @@ private void flushBeforeBlock(ref Conn c, ref ByteBuffer o) nothrow
                 c.wlock.unlock();
             c.tcp.write(o.data);
         }
+        c.totNetOut += o.length;
         o.clear();
     }
     catch (Exception)
@@ -1954,9 +1989,40 @@ private void appendAge(ref ByteBuffer o, long ms) @nogc nothrow
         o.append(b[0 .. n]);
 }
 
+// Per-command CLIENT bookkeeping, run by the serve loop AFTER handleCommand
+// returns (a command blocked in BLPOP completes only when handleCommand returns,
+// so tot-cmds ticks at completion for free — no scope(exit) needed). Kept out of
+// handleCommand: a try/finally there pessimizes the hot path. `consumed` is the
+// request's raw byte count; `replyPre` is outb.length captured before the command.
+// NOTE: do NOT `pragma(inline, true)` this — force-inlining its @safe body into
+// serveClient flips serveClient to inferred-@safe, which makes dmd @safe-check
+// vibe's waitForDataEx and trips a latent @safe/@system bug in vibe-core 2.14.0.
+// LDC inlines it on its own at -O, so the pragma bought nothing anyway.
+private void postCommand(ref Conn c, ref ByteBuffer o, size_t replyPre, size_t consumed) @nogc nothrow
+{
+    c.totNetIn += consumed;
+    c.totCmds++;
+    // CLIENT REPLY OFF/SKIP roll the reply back; the CLIENT REPLY command itself
+    // latched replyCmdExempt so it is never suppressed. SKIP is one-shot.
+    if (!c.replyCmdExempt)
+    {
+        if (c.replySkipNext)
+        {
+            o.truncate(replyPre);
+            c.replySkipNext = false;
+        }
+        else if (c.replyOff)
+            o.truncate(replyPre);
+    }
+}
+
 private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
         ref ByteBuffer o, ref Arena arena) nothrow
 {
+    // NOTE: per-command CLIENT bookkeeping (tot-net-in/tot-cmds, CLIENT REPLY
+    // suppression, idle= timestamp) is done by the serve loop around this call, NOT
+    // here — a scope(exit) in this hot nothrow function measurably hurt throughput
+    // (LDC emits try/finally cleanup that pessimizes the common path).
     // CLIENT TRACKING: the redirect target died while an invalidation was pending.
     // Tell this (RESP3) client once, ahead of its next reply, then drop the dead
     // redirect. It can re-arm with a fresh REDIRECT afterwards.
@@ -1990,12 +2056,27 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
-    // record the last command (lowercase) for CLIENT LIST's cmd= field
+    // record the last command name (lowercase) for CLIENT LIST's cmd= field, and
+    // stash the raw arg[1] token so a container command can render as
+    // `container|subcommand` — the container test is deferred to appendConnInfo.
     if (name.length <= c.lastCmdBuf.length)
     {
         foreach (i, ch; name)
             c.lastCmdBuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
         c.lastCmdLen = cast(ubyte) name.length;
+        if (cmd.arr.length >= 2)
+        {
+            auto sub = cmd.arr[1].str;
+            immutable sn = sub.length <= c.lastArgBuf.length ? sub.length : c.lastArgBuf.length;
+            foreach (i; 0 .. sn)
+            {
+                immutable ch = sub[i];
+                c.lastArgBuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+            }
+            c.lastArgLen = cast(ubyte) sn;
+        }
+        else
+            c.lastArgLen = 0;
     }
 
     // CLIENT PAUSE barrier — before ACL/dispatch/AOF. A matching command (ALL, or a
@@ -2643,12 +2724,21 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             repSimple(o, "OK");
             return true;
         }
+    case "READONLY":
+        c.readonlyFlag = true; // cluster read-only mode (flags=r); no-op otherwise
+        repSimple(o, "OK");
+        return true;
+    case "READWRITE":
+        c.readonlyFlag = false;
+        repSimple(o, "OK");
+        return true;
     case "RESET":
         {
             c.inMulti = false;
             c.multiHasWrite = false;
             c.multiQueue.clear();
             c.watching = false;
+            c.readonlyFlag = false;
             gPubSub.dropAll(&c.sub);
             gShardPubSub.dropAll(&c.shardSub);
             trackDisable(c); // RESET clears CLIENT TRACKING state too
@@ -3691,8 +3781,14 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 }
                 return 2;
             }
-            if (!isRuntimeSettable(lname)) // startup-only or unknown parameters
-                return 1;
+            if (!isRuntimeSettable(lname))
+            {
+                // A known-but-unmodelled Valkey param is accepted as an advisory
+                // no-op; only a genuinely-unknown name is rejected.
+                if (isKnownNoopParam(lname))
+                    return 0;
+                return 1; // startup-only or unknown parameters
+            }
             bool ok = false;
             try
                 ok = applyDirective(lname, value, gConfig);
@@ -5073,11 +5169,45 @@ private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
     foreach (ref a; cmd.arr)
     {
         line.append(` "`);
+        // sdscatrepr: named escapes for the common controls, \xHH for the rest,
+        // everything else printable verbatim (matches Redis MONITOR quoting).
         foreach (ch; a.str)
         {
-            if (ch == '"' || ch == '\\')
-                line.appendByte('\\');
-            line.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
+            switch (ch)
+            {
+            case '\\':
+                line.append(`\\`);
+                break;
+            case '"':
+                line.append(`\"`);
+                break;
+            case '\n':
+                line.append(`\n`);
+                break;
+            case '\r':
+                line.append(`\r`);
+                break;
+            case '\t':
+                line.append(`\t`);
+                break;
+            case '\a':
+                line.append(`\a`);
+                break;
+            case '\b':
+                line.append(`\b`);
+                break;
+            default:
+                if (ch >= 0x20 && ch < 0x7f)
+                    line.appendByte(ch);
+                else
+                {
+                    char[8] hx = void;
+                    auto hn = snprintf(hx.ptr, hx.length, "\\x%02x",
+                            cast(uint)(cast(ubyte) ch));
+                    line.append(hx[0 .. hn]);
+                }
+                break;
+            }
         }
         line.appendByte('"');
     }
@@ -5093,25 +5223,106 @@ private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
 
 /// CLIENT GETNAME/SETNAME/ID/INFO/NO-EVICT/NO-TOUCH/LIST (minimal).
 // One CLIENT LIST / CLIENT INFO line for a connection (newline-terminated).
+// CLIENT SETINFO <lib-name|lib-ver> <value> — attach a client library identity
+// to this connection (surfaced in CLIENT INFO/LIST). The value may not contain
+// spaces, newlines or other control characters; RESET does NOT clear it.
+private void clientSetInfo(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    if (args.length != 2)
+    {
+        repError(o, "ERR wrong number of arguments for 'client|setinfo' command");
+        return;
+    }
+    auto attr = args[0].str;
+    auto val = args[1].str;
+    foreach (ch; val)
+    {
+        if (ch == ' ' || ch == '\n' || ch == '\r' || ch < 0x21 || ch == 0x7f)
+        {
+            repError(o,
+                    "ERR lib-name/lib-ver cannot contain spaces, newlines or special characters.");
+            return;
+        }
+    }
+    if (eqICDebug(attr, "lib-name"))
+    {
+        c.libName.clear();
+        c.libName.put(val);
+    }
+    else if (eqICDebug(attr, "lib-ver"))
+    {
+        c.libVer.clear();
+        c.libVer.put(val);
+    }
+    else
+    {
+        repError(o, "ERR Unrecognized option");
+        return;
+    }
+    repSimple(o, "OK");
+}
+
 private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
 {
     import core.stdc.stdio : snprintf;
 
-    auto lastCmd = c.lastCmdLen ? cast(const(char)[]) c.lastCmdBuf[0 .. c.lastCmdLen] : "NULL";
+    // Build cmd= lazily (this runs only on CLIENT LIST/INFO, never the hot path):
+    // a container command renders as `container|subcommand`.
+    char[65] cmdBuf = void;
+    const(char)[] lastCmd = "NULL";
+    if (c.lastCmdLen)
+    {
+        auto name = cast(const(char)[]) c.lastCmdBuf[0 .. c.lastCmdLen];
+        if (c.lastArgLen && aclIsContainer(name))
+        {
+            size_t k;
+            foreach (ch; name)
+                cmdBuf[k++] = ch;
+            cmdBuf[k++] = '|';
+            foreach (ch; c.lastArgBuf[0 .. c.lastArgLen])
+                cmdBuf[k++] = ch;
+            lastCmd = cast(const(char)[]) cmdBuf[0 .. k];
+        }
+        else
+            lastCmd = name;
+    }
     auto addr = c.addr.length ? cast(const(char)[]) c.addr[] : "?";
     auto laddr = c.laddr.length ? cast(const(char)[]) c.laddr[] : "?";
-    char[288] b = void;
+    auto ln = c.libName.length ? cast(const(char)[]) c.libName[] : "";
+    auto lv = c.libVer.length ? cast(const(char)[]) c.libVer[] : "";
+    immutable now = nowMs();
+    long age = c.connMs ? (now - c.connMs) / 1000 : 0;
+    long idle = c.lastActiveMs ? (now - c.lastActiveMs) / 1000 : 0;
+    if (idle < 0)
+        idle = 0;
+    // redir: the tracking redirection target id, or -1 when there is none.
+    long redir = (c.tracking && c.trackRedir) ? cast(long) c.trackRedir : -1;
+    char[8] fbuf = void;
+    auto pf = connFlags(*c, fbuf[]);
+    char[9] flagsz = void; // null-terminated for %s
+    foreach (k, ch; pf)
+        flagsz[k] = ch;
+    flagsz[pf.length] = '\0';
+    char[512] b = void;
     auto n = snprintf(b.ptr, b.length,
-            "id=%llu addr=%.*s laddr=%.*s fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
-            ~ " multi=%d flags=%s cmd=%.*s user=%.*s resp=%d\n",
+            "id=%llu addr=%.*s laddr=%.*s fd=%d name=%.*s age=%lld idle=%lld flags=%s"
+            ~ " capa=%s db=%d sub=%d psub=%d ssub=%d multi=%d watch=%d qbuf=0 qbuf-free=20474"
+            ~ " argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=20512"
+            ~ " events=r cmd=%.*s user=%.*s redir=%lld resp=%d lib-name=%.*s lib-ver=%.*s"
+            ~ " tot-net-in=%llu tot-net-out=%llu tot-cmds=%llu\n",
             c.id, cast(int) addr.length, addr.ptr, cast(int) laddr.length, laddr.ptr,
-            cast(int) c.clientName.length, c.clientName[].ptr,
-            c.dbp.db, cast(int) c.sub.subCount, 0,
-            cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
-            c.importSource ? "I".ptr : "N".ptr,
+            c.id == 0 ? 0 : 1, cast(int) c.clientName.length, c.clientName[].ptr,
+            age, idle, flagsz.ptr,
+            c.capaRedirect ? "r".ptr : "".ptr,
+            c.dbp.db, cast(int) c.sub.channels.length, cast(int) c.sub.patterns.length,
+            cast(int) c.shardSub.channels.length,
+            c.inMulti ? cast(int) c.multiCount : -1, c.watching ? 1 : 0,
             cast(int) lastCmd.length, lastCmd.ptr,
             cast(int)(c.user !is null ? c.user.name.length : 7),
-            c.user !is null ? c.user.name.ptr : "default".ptr, c.resp3 ? 3 : 2);
+            c.user !is null ? c.user.name.ptr : "default".ptr,
+            redir, c.resp3 ? 3 : 2,
+            cast(int) ln.length, ln.ptr, cast(int) lv.length, lv.ptr,
+            c.totNetIn, c.totNetOut, c.totCmds);
     if (n > 0)
         o.append(b[0 .. n]);
 }
@@ -5152,20 +5363,7 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         repBulk(o, cast(const(char)[]) lb.data);
     }
     else if (eqICDebug(sub, "LIST"))
-    {
-        // enumerate every live connection (the registry) — one info line each
-        static ByteBuffer lb; // TLS
-        lb.clear();
-        Vector!ulong ids;
-        snapshotConnIds(ids);
-        foreach (id; ids[])
-        {
-            auto s = connById(id);
-            if (!s.isNull)
-                appendConnInfo(&s.get(), lb);
-        }
-        repBulk(o, cast(const(char)[]) lb.data);
-    }
+        return clientList(c, args[1 .. $], o);
     else if (eqICDebug(sub, "KILL"))
         return clientKill(c, args[1 .. $], o);
     else if (eqICDebug(sub, "UNBLOCK"))
@@ -5242,8 +5440,10 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         import dreads.stream : nowMs;
 
         long ms;
-        if (!parseLong(args[1].str, ms) || ms < 0)
+        if (!parseLong(args[1].str, ms))
             repError(o, "ERR timeout is not an integer or out of range");
+        else if (ms < 0)
+            repError(o, "ERR timeout is negative");
         else
         {
             bool all = true; // default ALL (matches Valkey)
@@ -5297,13 +5497,55 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
         gPauseEvt.emit(); // wake parked fibers to replay their held commands
         repSimple(o, "OK");
     }
-    else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH")
-            || eqICDebug(sub, "SETINFO"))
+    else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH"))
+    {
+        // both take ON|OFF; no-op semantically but the argument is validated.
+        if (args.length == 2 && (eqICDebug(args[1].str, "ON") || eqICDebug(args[1].str, "OFF")))
+            repSimple(o, "OK");
+        else
+            repError(o, "ERR syntax error");
+    }
+    else if (eqICDebug(sub, "SETINFO"))
+        clientSetInfo(c, args[1 .. $], o);
+    else if (eqICDebug(sub, "CAPA"))
+    {
+        // CLIENT CAPA <cap> [cap ...] — advertise client capabilities. Only
+        // `redirect` is modelled (surfaces as capa=r); unknown caps are ignored.
+        foreach (ref a; args[1 .. $])
+            if (eqICDebug(a.str, "REDIRECT"))
+                c.capaRedirect = true;
         repSimple(o, "OK");
+    }
+    else if (eqICDebug(sub, "REPLY") && args.length == 2)
+    {
+        // CLIENT REPLY ON|OFF|SKIP — control reply delivery for this connection.
+        // The REPLY command itself is exempt from suppression (see handleCommand).
+        c.replyCmdExempt = true;
+        if (eqICDebug(args[1].str, "ON"))
+        {
+            c.replyOff = false;
+            c.replySkipNext = false;
+            repSimple(o, "OK");
+        }
+        else if (eqICDebug(args[1].str, "OFF"))
+            c.replyOff = true; // silent from here until ON
+        else if (eqICDebug(args[1].str, "SKIP"))
+        {
+            if (!c.replyOff)
+                c.replySkipNext = true; // silence the next command's reply
+        }
+        else
+            repError(o, "ERR syntax error");
+    }
     else if (eqICDebug(sub, "TRACKING") && args.length >= 2)
         clientTracking(c, args[1 .. $], o);
-    else if (eqICDebug(sub, "CACHING") && args.length == 2)
-        clientCaching(c, args[1].str, o);
+    else if (eqICDebug(sub, "CACHING"))
+    {
+        if (args.length != 2)
+            repError(o, "ERR wrong number of arguments for 'client|caching' command");
+        else
+            clientCaching(c, args[1].str, o);
+    }
     else if (eqICDebug(sub, "GETREDIR") && args.length == 1)
         repInt(o, c.tracking ? cast(long) c.trackRedir : -1);
     else if (eqICDebug(sub, "TRACKINGINFO") && args.length == 1)
@@ -5522,11 +5764,489 @@ private void clientTrackingInfo(ref Conn c, ref ByteBuffer o) nothrow @trusted
 // (default yes). ADDR/LADDR match the peer/local address captured at connect;
 // TYPE/MAXAGE are accepted but unmodelled (match nothing). Returns false only when
 // the CALLER killed itself (SKIPME no) so the read loop closes it AFTER the reply.
+// Client type as CLIENT LIST/KILL's TYPE/NOT-TYPE filter sees it. dreads has no
+// replication clients (raft replaces it), so only NORMAL and PUBSUB ever occur;
+// MASTER/REPLICA are recognized names that simply match no live connection.
+private enum : int
+{
+    CT_NORMAL = 0,
+    CT_REPLICA = 1,
+    CT_MASTER = 2,
+    CT_PUBSUB = 3,
+}
+
+private int connType(ref Conn p) @nogc nothrow
+{
+    return (p.sub.subCount > 0 || p.shardSub.subCount > 0) ? CT_PUBSUB : CT_NORMAL;
+}
+
+private int parseClientType(scope const(char)[] v) @nogc nothrow
+{
+    if (eqICDebug(v, "NORMAL"))
+        return CT_NORMAL;
+    if (eqICDebug(v, "MASTER"))
+        return CT_MASTER;
+    if (eqICDebug(v, "REPLICA") || eqICDebug(v, "SLAVE"))
+        return CT_REPLICA;
+    if (eqICDebug(v, "PUBSUB"))
+        return CT_PUBSUB;
+    return -1;
+}
+
+// Recognized CLIENT LIST `flags=` letters (used to validate a FLAGS filter).
+private enum string VALID_CLIENT_FLAGS = "AbcdeiMNOPrRSTtuUx";
+
+private bool flagKnown(char ch) @nogc nothrow
+{
+    foreach (v; VALID_CLIENT_FLAGS)
+        if (v == ch)
+            return true;
+    return false;
+}
+
+// The IP portion of an "ip:port" string (everything before the last colon).
+// For a bracketed IPv6 "[::1]:port" the brackets are stripped too.
+private const(char)[] ipOf(scope const(char)[] addr) @nogc nothrow
+{
+    size_t colon = addr.length;
+    foreach (i, ch; addr)
+        if (ch == ':')
+            colon = i;
+    auto ip = colon < addr.length ? addr[0 .. colon] : addr;
+    if (ip.length >= 2 && ip[0] == '[' && ip[$ - 1] == ']')
+        ip = ip[1 .. $ - 1];
+    return ip;
+}
+
+private void repMsgErr(ref ByteBuffer o, scope const(char)[] prefix,
+        scope const(char)[] name) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    char[256] b = void;
+    auto n = snprintf(b.ptr, b.length, "%.*s%.*s",
+            cast(int) prefix.length, prefix.ptr, cast(int) name.length, name.ptr);
+    if (n > 0)
+        repError(o, cast(const(char)[]) b[0 .. n]);
+}
+
+private void repQuotedErr(ref ByteBuffer o, scope const(char)[] prefix,
+        scope const(char)[] name) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    char[192] b = void;
+    auto n = snprintf(b.ptr, b.length, "%.*s'%.*s'",
+            cast(int) prefix.length, prefix.ptr, cast(int) name.length, name.ptr);
+    if (n > 0)
+        repError(o, cast(const(char)[]) b[0 .. n]);
+}
+
+// Regression coverage for the pure CLIENT LIST/KILL filter helpers (see the
+// Valkey introspection suite: ADDR/IP/TYPE/FLAGS filters and the flag validation).
+unittest
+{
+    // ipOf: strip the trailing :port; unwrap [..] for IPv6.
+    assert(ipOf("127.0.0.1:12345") == "127.0.0.1");
+    assert(ipOf("[::1]:6379") == "::1");
+    assert(ipOf("noport") == "noport");
+
+    // parseClientType is case-insensitive; unknown => -1.
+    assert(parseClientType("normal") == CT_NORMAL);
+    assert(parseClientType("PubSub") == CT_PUBSUB);
+    assert(parseClientType("replica") == CT_REPLICA);
+    assert(parseClientType("slave") == CT_REPLICA);
+    assert(parseClientType("bogus") == -1);
+
+    // flagKnown accepts documented letters, rejects the rest (FLAGS validation).
+    assert(flagKnown('N') && flagKnown('r') && flagKnown('O'));
+    assert(!flagKnown('Q') && !flagKnown('Z'));
+
+    // flagsSubset: every requested letter must be present in the client's set.
+    assert(flagsSubset("N", "N"));
+    assert(!flagsSubset("N", "r"));
+    assert(flagsSubset("", "N")); // empty request matches anything
+    assert(flagsSubset("Ir", "Ir") && !flagsSubset("Ir", "I"));
+}
+
+// CLIENT LIST [ID id...] [TYPE t] [NOT-TYPE t] [ADDR a] [LADDR a] [USER u]
+// [NOT-USER u] [SKIPME y/n] [MAXAGE s] [NAME n] [FLAGS f] — one info line per
+// connection matching every filter (repeated NOT-TYPE keeps the last one).
+private bool flagsSubset(scope const(char)[] need, scope const(char)[] have) @nogc nothrow
+{
+    foreach (ch; need)
+    {
+        bool has = false;
+        foreach (h; have)
+            if (h == ch)
+            {
+                has = true;
+                break;
+            }
+        if (!has)
+            return false;
+    }
+    return true;
+}
+
+// Compose a client's `flags=` string into `buf`. Plain clients are "N"; special
+// states add a letter (I import-source, r read-only). Empty => "N".
+private const(char)[] connFlags(ref Conn p, return scope char[] buf) @nogc nothrow
+{
+    size_t n = 0;
+    if (p.importSource)
+        buf[n++] = 'I';
+    if (p.readonlyFlag)
+        buf[n++] = 'r';
+    if (n == 0)
+        buf[n++] = 'N';
+    return buf[0 .. n];
+}
+
+// Every CLIENT LIST / CLIENT KILL filter, positive and its NOT- negation.
+private struct ClientFilter
+{
+    Vector!ulong ids, notIds;
+    int type = -1, notType = -1;
+    long db = -1, notDb = -1, maxage = -1, minIdle = -1;
+    const(char)[] addr, laddr, ip, notIp, user, notUser, name, notName,
+        flags, notFlags, capa, notCapa, libName, notLibName, libVer, notLibVer;
+    bool hasAddr, hasLaddr, hasIp, hasNotIp, hasUser, hasNotUser, hasName, hasNotName,
+        hasFlags, hasNotFlags, hasCapa, hasNotCapa, hasLibName, hasNotLibName,
+        hasLibVer, hasNotLibVer, skipme;
+}
+
+// Consume one ID list into `dst` (>0 each). rc: 0 ok, 1 syntax (no int), 2 range.
+private int parseIdList(ref Vector!ulong dst, const(RVal)[] args, ref size_t i) nothrow
+{
+    bool any = false;
+    while (i < args.length)
+    {
+        long v;
+        if (!parseLong(args[i].str, v))
+            break;
+        if (v <= 0)
+            return 2;
+        dst.put(cast(ulong) v);
+        any = true;
+        i++;
+    }
+    return any ? 0 : 1;
+}
+
+private bool parseNonNeg(scope const(char)[] v, ref long dst, ref ByteBuffer o) nothrow
+{
+    if (!parseLong(v, dst))
+    {
+        repError(o, "ERR value is not an integer or out of range");
+        return false;
+    }
+    if (dst < 0)
+    {
+        repError(o, "ERR value should be greater than 0");
+        return false;
+    }
+    return true;
+}
+
+// Parse CLIENT LIST/KILL filter tokens into `fl`. On a bad argument writes the
+// error to `o` and returns false. `fl.skipme` should hold the caller's default
+// before the call (KILL: true, LIST: false); a SKIPME token overrides it.
+private bool parseClientFilter(ref ClientFilter fl, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    size_t i = 0;
+    while (i < args.length)
+    {
+        auto f = args[i].str;
+        // ID / NOT-ID take one or more client ids (stop at the next keyword).
+        if (eqICDebug(f, "ID") || eqICDebug(f, "NOT-ID"))
+        {
+            immutable neg = eqICDebug(f, "NOT-ID");
+            i++;
+            immutable rc = parseIdList(neg ? fl.notIds : fl.ids, args, i);
+            if (rc == 1)
+            {
+                repError(o, "ERR syntax error");
+                return false;
+            }
+            if (rc == 2)
+            {
+                repError(o, "ERR client-id should be greater than 0");
+                return false;
+            }
+            continue;
+        }
+        if (i + 1 >= args.length)
+        {
+            repError(o, "ERR syntax error");
+            return false;
+        }
+        auto v = args[i + 1].str;
+        if (eqICDebug(f, "TYPE"))
+        {
+            fl.type = parseClientType(v);
+            if (fl.type < 0)
+            {
+                repQuotedErr(o, "ERR Unknown client type ", v);
+                return false;
+            }
+        }
+        else if (eqICDebug(f, "NOT-TYPE"))
+        {
+            fl.notType = parseClientType(v);
+            if (fl.notType < 0)
+            {
+                repQuotedErr(o, "ERR Unknown client type ", v);
+                return false;
+            }
+        }
+        else if (eqICDebug(f, "USER"))
+        {
+            if (aclUser(v) is null)
+            {
+                repQuotedErr(o, "ERR No such user ", v);
+                return false;
+            }
+            fl.user = v;
+            fl.hasUser = true;
+        }
+        else if (eqICDebug(f, "NOT-USER"))
+        {
+            if (aclUser(v) is null)
+            {
+                repQuotedErr(o, "ERR No such user ", v);
+                return false;
+            }
+            fl.notUser = v;
+            fl.hasNotUser = true;
+        }
+        else if (eqICDebug(f, "FLAGS") || eqICDebug(f, "NOT-FLAGS"))
+        {
+            foreach (ch; v)
+                if (!flagKnown(ch))
+                {
+                    repMsgErr(o, "ERR Unknown flags found in the provided filter: ", v);
+                    return false;
+                }
+            if (eqICDebug(f, "NOT-FLAGS"))
+            {
+                fl.notFlags = v;
+                fl.hasNotFlags = true;
+            }
+            else
+            {
+                fl.flags = v;
+                fl.hasFlags = true;
+            }
+        }
+        else if (eqICDebug(f, "ADDR"))
+        {
+            fl.addr = v;
+            fl.hasAddr = true;
+        }
+        else if (eqICDebug(f, "LADDR"))
+        {
+            fl.laddr = v;
+            fl.hasLaddr = true;
+        }
+        else if (eqICDebug(f, "IP"))
+        {
+            fl.ip = v;
+            fl.hasIp = true;
+        }
+        else if (eqICDebug(f, "NOT-IP"))
+        {
+            fl.notIp = v;
+            fl.hasNotIp = true;
+        }
+        else if (eqICDebug(f, "NAME"))
+        {
+            fl.name = v;
+            fl.hasName = true;
+        }
+        else if (eqICDebug(f, "NOT-NAME"))
+        {
+            fl.notName = v;
+            fl.hasNotName = true;
+        }
+        else if (eqICDebug(f, "CAPA"))
+        {
+            fl.capa = v;
+            fl.hasCapa = true;
+        }
+        else if (eqICDebug(f, "NOT-CAPA"))
+        {
+            fl.notCapa = v;
+            fl.hasNotCapa = true;
+        }
+        else if (eqICDebug(f, "LIB-NAME"))
+        {
+            fl.libName = v;
+            fl.hasLibName = true;
+        }
+        else if (eqICDebug(f, "NOT-LIB-NAME"))
+        {
+            fl.notLibName = v;
+            fl.hasNotLibName = true;
+        }
+        else if (eqICDebug(f, "LIB-VER"))
+        {
+            fl.libVer = v;
+            fl.hasLibVer = true;
+        }
+        else if (eqICDebug(f, "NOT-LIB-VER"))
+        {
+            fl.notLibVer = v;
+            fl.hasNotLibVer = true;
+        }
+        else if (eqICDebug(f, "DB"))
+        {
+            if (!parseNonNeg(v, fl.db, o))
+                return false;
+        }
+        else if (eqICDebug(f, "NOT-DB"))
+        {
+            if (!parseNonNeg(v, fl.notDb, o))
+                return false;
+        }
+        else if (eqICDebug(f, "MAXAGE"))
+        {
+            if (!parseNonNeg(v, fl.maxage, o))
+                return false;
+        }
+        else if (eqICDebug(f, "IDLE"))
+        {
+            if (!parseNonNeg(v, fl.minIdle, o))
+                return false;
+        }
+        else if (eqICDebug(f, "SKIPME"))
+        {
+            if (eqICDebug(v, "YES"))
+                fl.skipme = true;
+            else if (eqICDebug(v, "NO"))
+                fl.skipme = false;
+            else
+            {
+                repError(o, "ERR syntax error");
+                return false;
+            }
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
+            return false;
+        }
+        i += 2;
+    }
+    return true;
+}
+
+private bool matchesFilter(ref ClientFilter fl, Conn* p, Conn* self, long now) @nogc nothrow
+{
+    if (fl.ids.length)
+    {
+        bool inSet = false;
+        foreach (fid; fl.ids[])
+            if (fid == p.id)
+            {
+                inSet = true;
+                break;
+            }
+        if (!inSet)
+            return false;
+    }
+    foreach (fid; fl.notIds[])
+        if (fid == p.id)
+            return false;
+    immutable pt = connType(*p);
+    if (fl.type >= 0 && pt != fl.type)
+        return false;
+    if (fl.notType >= 0 && pt == fl.notType)
+        return false;
+    if (fl.hasAddr && p.addr[] != fl.addr)
+        return false;
+    if (fl.hasLaddr && p.laddr[] != fl.laddr)
+        return false;
+    if (fl.hasIp && ipOf(p.addr[]) != fl.ip)
+        return false;
+    if (fl.hasNotIp && ipOf(p.addr[]) == fl.notIp)
+        return false;
+    if (fl.hasUser && !(p.user !is null && p.user.name == fl.user))
+        return false;
+    if (fl.hasNotUser && p.user !is null && p.user.name == fl.notUser)
+        return false;
+    if (fl.hasName && p.clientName[] != fl.name)
+        return false;
+    if (fl.hasNotName && p.clientName[] == fl.notName)
+        return false;
+    if (fl.hasLibName && p.libName[] != fl.libName)
+        return false;
+    if (fl.hasNotLibName && p.libName[] == fl.notLibName)
+        return false;
+    if (fl.hasLibVer && p.libVer[] != fl.libVer)
+        return false;
+    if (fl.hasNotLibVer && p.libVer[] == fl.notLibVer)
+        return false;
+    if (fl.db >= 0 && p.dbp.db != fl.db)
+        return false;
+    if (fl.notDb >= 0 && p.dbp.db == fl.notDb)
+        return false;
+    char[8] fbuf = void;
+    auto pf = connFlags(*p, fbuf[]);
+    if (fl.hasFlags && !flagsSubset(fl.flags, pf))
+        return false;
+    if (fl.hasNotFlags && flagsSubset(fl.notFlags, pf))
+        return false;
+    auto pcapa = p.capaRedirect ? "r" : "";
+    if (fl.hasCapa && !flagsSubset(fl.capa, pcapa))
+        return false;
+    if (fl.hasNotCapa && flagsSubset(fl.notCapa, pcapa))
+        return false;
+    if (fl.maxage >= 0)
+    {
+        immutable age = p.connMs ? (now - p.connMs) / 1000 : 0;
+        if (age < fl.maxage)
+            return false;
+    }
+    if (fl.minIdle >= 0)
+    {
+        immutable idle = p.lastActiveMs ? (now - p.lastActiveMs) / 1000 : 0;
+        if (idle < fl.minIdle)
+            return false;
+    }
+    if (fl.skipme && p is self)
+        return false;
+    return true;
+}
+
+private bool clientList(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
+{
+    ClientFilter fl; // LIST default: skipme = false (the caller is listed)
+    if (!parseClientFilter(fl, args, o))
+        return true;
+    static ByteBuffer lb; // TLS
+    lb.clear();
+    immutable now = nowMs();
+    Vector!ulong ids;
+    snapshotConnIds(ids);
+    foreach (id; ids[])
+    {
+        auto s = connById(id);
+        if (s.isNull)
+            continue;
+        auto p = &s.get();
+        if (matchesFilter(fl, p, &c, now))
+            appendConnInfo(p, lb);
+    }
+    repBulk(o, cast(const(char)[]) lb.data);
+    return true;
+}
+
 private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     if (args.length == 0)
     {
-        repError(o, "ERR syntax error");
+        repError(o, "ERR wrong number of arguments for 'client|kill' command");
         return true;
     }
     // legacy single-argument form: CLIENT KILL addr:port -> +OK / -No such client
@@ -5551,90 +6271,28 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
         repError(o, "ERR No such client");
         return true;
     }
-    if (args.length % 2 != 0)
-    {
-        repError(o, "ERR syntax error");
+    ClientFilter fl;
+    fl.skipme = true; // KILL default: spare the caller unless SKIPME no
+    if (!parseClientFilter(fl, args, o))
         return true;
-    }
-    // parse filters
-    long byId = -1;
-    const(char)[] byUser, byAddr, byLaddr;
-    bool haveId, haveUser, haveAddr, haveLaddr, skipme = true, unmatched = false;
-    for (size_t i = 0; i + 1 < args.length; i += 2)
-    {
-        auto f = args[i].str;
-        auto v = args[i + 1].str;
-        if (eqICDebug(f, "ID"))
-        {
-            if (!parseLong(v, byId) || byId < 0)
-            {
-                repError(o, "ERR client-id should be greater than 0");
-                return true;
-            }
-            haveId = true;
-        }
-        else if (eqICDebug(f, "USER"))
-        {
-            byUser = v;
-            haveUser = true;
-        }
-        else if (eqICDebug(f, "ADDR"))
-        {
-            byAddr = v;
-            haveAddr = true;
-        }
-        else if (eqICDebug(f, "LADDR"))
-        {
-            byLaddr = v;
-            haveLaddr = true;
-        }
-        else if (eqICDebug(f, "SKIPME"))
-            skipme = eqICDebug(v, "YES");
-        else if (eqICDebug(f, "TYPE") || eqICDebug(f, "MAXAGE"))
-        {
-            // TYPE/MAXAGE are accepted but not modelled (no replica/age tracking);
-            // an unmodelled filter matches nothing so we never over-kill.
-            unmatched = true;
-        }
-        else
-        {
-            repError(o, "ERR syntax error");
-            return true;
-        }
-    }
     long killed = 0;
     bool killSelf = false;
-    if (!unmatched) // an unmodelled filter (TYPE/MAXAGE) matches nothing
+    immutable now = nowMs();
+    Vector!ulong ids;
+    snapshotConnIds(ids);
+    foreach (id; ids[])
     {
-        Vector!ulong ids;
-        snapshotConnIds(ids);
-        foreach (id; ids[])
-        {
-            auto s = connById(id);
-            if (s.isNull)
-                continue;
-            auto p = &s.get();
-            bool match = true;
-            if (haveId && p.id != cast(ulong) byId)
-                match = false;
-            if (match && haveUser
-                    && !(p.user !is null && p.user.name == byUser))
-                match = false;
-            if (match && haveAddr && p.addr[] != byAddr)
-                match = false;
-            if (match && haveLaddr && p.laddr[] != byLaddr)
-                match = false;
-            if (match && skipme && p is &c)
-                match = false;
-            if (match)
-            {
-                killed++;
-                if (p is &c)
-                    killSelf = true; // defer: reply must flush before we close
-                else
-                    killConn(p);
-            }
-        }
+        auto s = connById(id);
+        if (s.isNull)
+            continue;
+        auto p = &s.get();
+        if (!matchesFilter(fl, p, &c, now))
+            continue;
+        killed++;
+        if (p is &c)
+            killSelf = true; // defer: reply must flush before we close
+        else
+            killConn(p);
     }
     repInt(o, killed);
     if (killSelf)

@@ -93,6 +93,7 @@ leakage).
 | unit/dump | 5 | 2 | aborts: OBJECT FREQ (LFU freq tracking) |
 | unit/hyperloglog | 6 | 2 | aborts: PFDEBUG |
 | unit/scripting | 548 | 0 | **PASSES** (errorstats/commandstats + Valkey error format + acl_check_cmd) |
+| unit/introspection | 59 | 2 | went 6→59 (2026-07-16): full CLIENT INFO/LIST field set + unified CLIENT LIST/KILL filters (id/type/addr/laddr/ip/user/name/flags/capa/lib-name/lib-ver/db + all NOT- negations + maxage/idle/skipme), SETINFO, CAPA, REPLY ON/OFF/SKIP, READONLY flag, PUBSUB NUMPAT unique-pattern dedup, INFO connected_clients, MONITOR sdscatrepr escaping, known-noop CONFIG params. 2 remaining: (a) tot-cmds for redis.call sub-commands = cross-thread script accounting (would need the caller Conn on the writer thread — deferred, not worth a new gshared); (b) CLIENT KILL during bgsave = RDB bgsave / rdb_bgsave_in_progress, N/A (dreads persists via AOF+raft, no RDB fork) |
 
 Landed 2026-07-14 (this session): HEXPIRE family + HSETEX + HGETEX; DUMP/RESTORE
 (external AOF-command<->RDB translator, both phases, bidirectional Valkey 9.1
