@@ -2,9 +2,10 @@ module dreads.notify;
 
 // Redis keyspace notifications. A keyspace-mutating command fires an event that,
 // gated by the `notify-keyspace-events` flags, publishes to:
-//   __keyspace@0__:<key>    with message = <event>   (K flag)
-//   __keyevent@0__:<event>  with message = <key>     (E flag)
-// dreads is single-DB, so the db is always 0. The command layer (commands.d)
+//   __keyspace@<db>__:<key>    with message = <event>   (K flag)
+//   __keyevent@<db>__:<event>  with message = <key>     (E flag)
+// The <db> is the index of the database the command touched (gNotifyDb, set by
+// the dispatch and the active-expire/eviction cycles). The command layer (commands.d)
 // calls notifyKeyspaceEvent without depending on the server/pubsub module: the
 // server installs `gNotifyPublish` pointing at gPubSub.publish.
 
@@ -94,15 +95,16 @@ bool parseNotifyFlags(scope const(char)[] s, out uint flags) @nogc nothrow
 /// Queue an event of `klass` (published after the command). No-op unless the
 /// class is enabled and at least one of K/E is set. @nogc: safe to call from the
 /// command dispatch. Cheap in the common (disabled) case: one bit test.
+/// The db index the notification channels are shaped for — set by the command
+/// dispatch (and the active-expire/eviction loops) to the keyspace being touched,
+/// so `__keyspace@<db>__` / `__keyevent@<db>__` name the RIGHT database, not 0.
+public __gshared int gNotifyDb;
+
 void notifyKeyspaceEvent(uint klass, scope const(char)[] event, scope const(char)[] key) @nogc nothrow
 {
-    immutable f = gNotifyFlags;
-    if (!(f & klass))
-        return;
-    if (f & NClass.keyspace) // __keyspace@0__:<key> , message = <event>
-        queuePair("__keyspace@0__:", key, event);
-    if (f & NClass.keyevent) // __keyevent@0__:<event> , message = <key>
-        queuePair("__keyevent@0__:", event, key);
+    // Delegate to the db-aware formatter with the current command's db — the
+    // channel is `__keyspace@<gNotifyDb>__`, not a hardcoded @0.
+    notifyKeyspaceEventDb(gNotifyDb, klass, event, key);
 }
 
 /// Like notifyKeyspaceEvent but targets a SPECIFIC db's channels — needed by the
@@ -116,10 +118,12 @@ void notifyKeyspaceEventDb(int db, uint klass, scope const(char)[] event,
     immutable f = gNotifyFlags;
     if (!(f & klass))
         return;
-    char[24] ksbuf = void, kebuf = void;
+    char[32] ksbuf = void, kebuf = void;
     immutable kn = snprintf(ksbuf.ptr, ksbuf.length, "__keyspace@%d__:", db);
     immutable en = snprintf(kebuf.ptr, kebuf.length, "__keyevent@%d__:", db);
-    if (kn <= 0 || en <= 0)
+    // snprintf returns the would-be length; guard against a truncating (too-large)
+    // db so the slice can never run past the buffer.
+    if (kn <= 0 || kn > ksbuf.length || en <= 0 || en > kebuf.length)
         return;
     if (f & NClass.keyspace)
         queuePair(ksbuf[0 .. kn], key, event);

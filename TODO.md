@@ -62,14 +62,17 @@ external mode (`/tmp/valkey/runtest --host … --port … --single <file>`), on 
   cold-lookup benchmark from tie to a WIN. Cost: `keyAt` O(n); small SSCAN would
   return all at once (Redis listpack behaviour). See `bench/small-containers.md`.
 
-## Multi-DB peripheral (still hardwired to db 0)
+## Multi-DB peripheral (the remaining db-0-only paths)
 
-- Keyspace notifications publish `__keyspace@0__` (should use the conn's db).
-- Standalone-AOF SELECT-logging still needs a per-db marker. Raft live log
-  entries now carry the db index; raft **snapshot** dumping still needs per-db
-  framing.
-- Eviction / blocking re-dispatch / MULTI-replay paths need a multi-DB audit.
-  SELECT-in-MULTI in particular must be verified against Valkey. See memory
+- **DONE:** keyspace notifications now carry the command's db
+  (`__keyspace@<db>__`, `gNotifyDb`); blocking is per-`(db,key)`; the
+  active-eviction timer sweeps every db.
+- **Still db-0-only:** AOF replay/rewrite loads/dumps only db 0 (needs a
+  `SELECT N` marker / per-db framing; raft live log already carries the db,
+  raft snapshot still needs it), and the **on-demand write-path eviction**
+  (`freeMemoryIfNeeded`) evicts from db 0 only — should sample across all dbs
+  like Redis.
+- MULTI-replay / SELECT-in-MULTI still want a Valkey audit. See memory
   `multi-db`.
 - `DEBUG RELOAD`/`LOADAOF` are stubbed no-ops — do a real in-process AOF
   round-trip (dreads HAS persistence; see memory `dreads-is-not-in-memory-only`).

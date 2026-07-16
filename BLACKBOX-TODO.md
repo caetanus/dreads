@@ -281,18 +281,20 @@ round-trip EACH (pipelining them is a future optimization). Add
 
 ## Multi-DB peripheral gaps (not yet exercised, known incomplete)
 
-These pass the core SELECT/MOVE/SWAPDB path but are still hardwired to db 0:
+The core SELECT/MOVE/SWAPDB path is multi-db. **Fixed since:** keyspace
+notifications now carry the command's db (`__keyspace@<db>__` via `gNotifyDb`,
+set by the dispatch + the active-expire/eviction cycles); blocking is
+per-`(db,key)`; the active-eviction timer sweeps every db. **Still db-0-only:**
 
-- **Keyspace notifications** publish with a hardcoded `db 0` in the channel
-  (`__keyspace@0__`). Should use the connection's current db index.
-- **Standalone AOF SELECT-logging**: replay runs from the log stream and needs
-  a `SELECT N` marker (or equivalent framing) before writes on db N. Raft live
-  proposals already carry the db index; raft snapshots still need per-db
-  framing instead of dumping only db 0.
-- **Eviction, blocking re-dispatch, and MULTI-replay** paths need a multi-DB
-  audit. SELECT inside MULTI must be verified against Valkey; any replay path
-  that dispatches with a fixed `ks` can silently target the wrong DB.
-- **CLIENT LIST/INFO** now reports the real db, but `addr` is still `?`.
+- **Standalone AOF SELECT-logging**: replay/rewrite loads/dumps only db 0 —
+  needs a `SELECT N` marker (or equivalent framing) before writes on db N. Raft
+  live proposals already carry the db index; raft snapshots still need per-db
+  framing.
+- **On-demand write-path eviction** (`freeMemoryIfNeeded`) evicts from db 0 only
+  (`gKeys`); it should sample across all dbs like Redis. (The active-eviction
+  timer already sweeps every db.)
+- **MULTI-replay / SELECT-in-MULTI** still want a Valkey audit.
+- **CLIENT LIST/INFO** reports the real db, but `addr` is still `?`.
 
 ## ACL / AUTH (2026-07-13, `auth-acl` → `master`)
 - **acl.tcl block-1 now PASSES COMPLETELY: 88 ok / 0 err** (was 17 at the start

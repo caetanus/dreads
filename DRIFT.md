@@ -7,20 +7,25 @@ dreads' dispatch tables (`LC_ALL=C` set-diff of case labels), plus a hand-audit
 of semantic differences in commands we *do* implement. Regenerate whenever the
 dispatch grows.
 
-**Status: 229 of 258 base commands implemented; 29 missing.** Module
-families (RedisJSON, RediSearch, Bloom, TimeSeries — bundled in the Redis 8
-image) are out of scope entirely.
+**Status: 243 of 257 base commands implemented; 14 missing.** Every missing
+command is an architectural exclusion (cluster / legacy replication wire /
+sentinel) or an internal debug command — dreads otherwise implements the entire
+base data + admin surface. Module families (RedisJSON, RediSearch, Bloom,
+TimeSeries — bundled in the Redis 8 image) are out of scope entirely.
 
 ## Missing commands
 
 | Family | Missing | Why |
 |---|---|---|
-| **hash-field TTL (11)** | hexpire hpexpire hexpireat hpexpireat httl hpttl hexpiretime hpexpiretime hpersist hgetex hsetex | Per-field hash expiry (Valkey/Redis 7.4+); new + niche, not yet built |
 | **cluster (5)** | cluster clusterscan asking readonly readwrite | Excluded by owner decision — intersects Raft/sharding |
-| **replication (7)** | replicaof slaveof failover psync sync replconf restore-asking | Replication is the Raft roadmap (`vendor/raft`), not the legacy wire protocol |
-| **serialization (3)** | dump restore migrate | Need an RDB-compatible (or documented custom) value serialization format |
+| **replication (6)** | replicaof slaveof failover psync sync replconf | Replication is the Raft roadmap (`vendor/raft`), not the legacy wire protocol |
 | **hll debug (2)** | pfdebug pfselftest | Internal debug commands |
 | **sentinel (1)** | sentinel | Sentinel HA is out of scope (Raft handles failover) |
+
+Implemented since the previous count (was listed missing): the **hash-field TTL**
+family (`HEXPIRE`/`HPEXPIRE`/`HTTL`/`HPERSIST`/`HGETEX`/`HSETEX`/… —
+`hashexpire.tcl` 230/0) and **serialization** (`DUMP`/`RESTORE`/`MIGRATE`,
+interop-verified against Valkey 9.1).
 
 AUTH and the full ACL command set (`ACL SETUSER|GETUSER|…`) ARE implemented and
 enforced — see the AUTH + ACL entry below.
@@ -123,21 +128,21 @@ These exist but do not match Redis exactly:
   (`+get|foo`), `ACL CAT <category>` command listing, subscriber-kill on channel
   revoke, blocked-command ACL re-check, ACL v2 selectors.
 - **Keyspace notifications**: `notify-keyspace-events` flags (K/E/g/$/l/s/h/z/x/
-  e/t/m/n/d/A) and the `__keyspace@0__` / `__keyevent@0__` channels work. All
-  common write commands fire events — string (SET/SETNX/SETEX/GETSET/GETDEL/
+  e/t/m/n/d/A) and the `__keyspace@<db>__` / `__keyevent@<db>__` channels work —
+  the channel names carry the **actual database index** the command touched (the
+  dispatch shapes them; the active-expire and eviction cycles set the swept db).
+  All common write commands fire events — string (SET/SETNX/SETEX/GETSET/GETDEL/
   APPEND/SETRANGE/INCR*/DECR*/INCRBYFLOAT/MSET), generic (DEL/EXPIRE/PERSIST/
   RENAME/COPY, plus `del` when a container empties), list (L/RPUSH, L/RPUSHX,
   L/RPOP, LSET, LREM, LINSERT, LTRIM, LMOVE/RPOPLPUSH), hash (HSET/HSETNX/HDEL/
   HINCRBY/HINCRBYFLOAT), set (SADD/SREM/SPOP/SMOVE, S{INTER,UNION,DIFF}STORE),
   zset (ZADD/ZREM/ZINCRBY/ZPOPMIN/ZPOPMAX, Z{UNION,INTER,DIFF}STORE, ZRANGESTORE,
-  ZREMRANGEBY{RANK,SCORE,LEX}), stream (XADD/XDEL/XTRIM/XSETID), and `expired`.
-  Store/trim/remrange variants fire only when they actually mutate (empty result
-  emits `del` on the destination instead). Still NOT covered: `evicted`/`e`
-  (maxmemory eviction), `keymiss`/`m`, `new`/`n` key events, and stream
-  consumer-group events (XGROUP/XCLAIM). Events fire only on the standalone path
-  (not the Raft apply path), notification channel names still use db 0 even
-  when the client selected another DB, and `CONFIG SET notify-keyspace-events`
-  is wired for standalone runtime changes.
+  ZREMRANGEBY{RANK,SCORE,LEX}), stream (XADD/XDEL/XTRIM/XSETID), `expired`, and
+  `evicted` (maxmemory). Store/trim/remrange variants fire only when they actually
+  mutate (empty result emits `del` on the destination instead). Still NOT covered:
+  `keymiss`/`m`, `new`/`n` key events, and stream consumer-group events
+  (XGROUP/XCLAIM). Events fire on the standalone path (not the Raft apply path),
+  and `CONFIG SET notify-keyspace-events` is wired for standalone runtime changes.
 - **maxmemory/LRU**: accounting via jemalloc `stats.allocated` (Linux only —
   inert elsewhere); approximate LRU samples 5 keys per eviction;
   `allkeys-lfu`/`volatile-ttl` policies not implemented. Scripts honour the

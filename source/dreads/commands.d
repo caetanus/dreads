@@ -12,7 +12,7 @@ import core.stdc.string : memcpy;
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
-import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass;
+import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass, gNotifyDb;
 import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode;
 import dreads.resp;
 import dreads.stream : FieldPair, Stream, StreamID;
@@ -75,6 +75,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     import dreads.det : freezeClock;
 
     freezeClock(applyTime);
+    // Shape keyspace-notification channels for THIS command's database, so
+    // __keyspace@<db>__ / __keyevent@<db>__ carry the right index (not @0). Clamp:
+    // unit tests dispatch a standalone Keyspace not inside gDbs, so the pointer
+    // difference is meaningless there — fall back to db 0.
+    {
+        immutable idx = &ks - &gDbs[0];
+        gNotifyDb = (idx >= 0 && idx < cast(ptrdiff_t) NUM_DBS) ? cast(int) idx : 0;
+    }
     if (cmd.type != RType.Array || cmd.arr.length == 0)
     {
         repError(o, "ERR empty command");

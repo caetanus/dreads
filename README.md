@@ -152,12 +152,15 @@ for only at the boundaries where another service or shard is involved.
 
 ## Features
 
-- **229 of Valkey's 258 base commands** — see [DRIFT.md](DRIFT.md) for the
-  honest gap list and every semantic difference. All data types including
-  **streams** with consumer groups; **GEO** (geohash-scored zsets, Redis-exact
-  outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**; TTL/expiration with
-  the full `SET` option set (including Valkey's `SET ... IFEQ` / `DELIFEQ`
-  compare-and-set) and opt-in active expiry; the `SCAN` family;
+- **243 of Valkey's 257 base commands** — see [DRIFT.md](DRIFT.md) for the
+  honest gap list and every semantic difference (the 14 missing are all cluster /
+  legacy-replication / sentinel / debug — architectural exclusions). All data
+  types including **streams** with consumer groups; **GEO** (geohash-scored zsets,
+  Redis-exact outputs); **bitmaps** with `BITFIELD`; **HyperLogLog**;
+  **per-field hash TTL** (`HEXPIRE` family); **DUMP/RESTORE/MIGRATE**;
+  TTL/expiration with the full `SET` option set (including Valkey's
+  `SET ... IFEQ` / `DELIFEQ` compare-and-set) and opt-in active expiry; the
+  `SCAN` family;
   `SORT`, `LCS`, `OBJECT ENCODING`; **16 logical databases** (`SELECT`,
   `SWAPDB`, `MOVE`, per-connection keyspace); transactions
   (`MULTI`/`EXEC`/`WATCH`); **blocking commands** (`BLPOP`, `BLMOVE`,
@@ -173,8 +176,8 @@ for only at the boundaries where another service or shard is involved.
 - **Pub/Sub**: `SUBSCRIBE`/`PSUBSCRIBE` (glob) / `PUBLISH`/`PUBSUB`, shard
   pub/sub, subscribe-mode command gating (a RESP3 subscriber may run any command;
   a RESP2 one is limited to the pub/sub verbs + `PING`/`QUIT`/`RESET`/`HELLO`),
-  and **keyspace notifications**. Notification channel names are still db-0-shaped
-  (`__keyspace@0__` / `__keyevent@0__`) while the multi-DB tail is being closed.
+  and **keyspace notifications** (`__keyspace@<db>__` / `__keyevent@<db>__` — the
+  channel carries the actual database index the command touched, not a fixed 0).
 - **Client-side caching (`CLIENT TRACKING`)**: server-assisted invalidation over
   a connection registry of `Weak` handles (a cross-fiber delivery `lock()`s the
   target, so it can't dangle). Default and **`BCAST`** modes (per-prefix message

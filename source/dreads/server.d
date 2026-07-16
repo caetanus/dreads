@@ -51,7 +51,7 @@ import dreads.config : applyDirective, gConfig, isRuntimeSettable, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
 import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
-import dreads.notify : flushPendingNotify, gNotifyFlags;
+import dreads.notify : flushPendingNotify, gNotifyFlags, gNotifyDb;
 import dreads.stream : nowMs;
 import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients;
 import dreads.dict : Dict, Unit;
@@ -64,9 +64,11 @@ private enum READ_CHUNK = 16 * 1024;
 
 // The event loop is single-threaded, so shared state needs no locking.
 // The logical databases live in `gDbs` (dreads.obj); client commands dispatch
-// against the *connection's* selected db (`Conn.db`). `gKeys` names db 0 — used
-// by the replay/persistence/eviction/blocking paths, which are still db-0-only
-// (multi-db there is a TODO; see BLACKBOX-TODO.md).
+// against the *connection's* selected db (`Conn.dbp`). `gKeys` names db 0 — used
+// by the paths that are STILL db-0-only: AOF replay/rewrite (persistence) and the
+// on-demand write-path eviction (freeMemoryIfNeeded). Blocking (per-(db,key)),
+// keyspace notifications (channel carries the command's db), and the active-
+// eviction timer (sweeps every db) are already multi-db. See BLACKBOX-TODO.md.
 private ref Keyspace gKeys() @property @nogc nothrow @trusted
 {
     return gDbs[0];
@@ -265,8 +267,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             // is a propagated DEL) is held until the window lifts, like eviction.
             immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
             if (!paused)
-                foreach (ref d; gDbs) // drop-soon sweep across every database
+                foreach (i, ref d; gDbs) // drop-soon sweep across every database
                 {
+                    gNotifyDb = cast(int) i; // "expired" fires on THIS db's channel
                     d.activeExpireCycle();
                     d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
                 }
@@ -3877,9 +3880,10 @@ private void evictionMode(out bool volatileOnly, out bool randomPick) nothrow
 // Returns false when nothing is evictable (empty, or volatile-only with no TTLs).
 private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick) nothrow
 {
-    import dreads.notify : notifyKeyspaceEvent, NClass;
+    import dreads.notify : notifyKeyspaceEvent, NClass, gNotifyDb;
     import dreads.obj : gEvictedKeys;
 
+    gNotifyDb = cast(int)(&ks - &gDbs[0]); // "evicted" fires on the victim db's channel
     auto cap = ks.d.capacity;
     if (cap == 0 || ks.length == 0)
         return false;
