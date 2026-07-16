@@ -355,6 +355,8 @@ private struct Conn
     ulong id;
     Keyspace* dbp; // current db (SELECT); a direct pointer avoids re-indexing gDbs per command
     Vector!char clientName; // owned (RAII); freed with the Conn, never manually
+Vector!char addr; // "ip:port" of the peer, captured at connect (CLIENT LIST addr=)
+Vector!char laddr; // "ip:port" of the local end the peer connected to (laddr=)
     bool resp3; // negotiated RESP3 via HELLO 3 (default RESP2)
     // ACL: the connection's user (default at connect) and whether it has cleared
     // authentication (nopass default => true immediately; requirepass => set at
@@ -1356,6 +1358,19 @@ private void serveClient(TCPConnection tcp) nothrow
     auto sc = Shared!Conn.make();
     Conn* c = &sc.get();
     c.tcp = tcp;
+    // Capture the peer + local "ip:port" once, for CLIENT LIST/INFO addr=/laddr=
+    // and CLIENT KILL ADDR/LADDR. vibe's toString may throw / GC-allocate; it's a
+    // one-time connect cost, copied into the conn's owned buffers.
+    try
+    {
+        auto ra = tcp.remoteAddress.toString();
+        c.addr.put(cast(const(char)[]) ra);
+        auto la = tcp.localAddress.toString();
+        c.laddr.put(cast(const(char)[]) la);
+    }
+    catch (Exception)
+    {
+    }
     c.id = ++gClientIds;
     c.dbp = &gDbs[0]; // default to db 0
     // ACL: start as the default user; a nopass default is authenticated at once,
@@ -1745,9 +1760,16 @@ private void aclLogViolation(ref Conn c, string reason, scope const(char)[] obj,
 {
     import dreads.stream : nowMs;
 
+    import core.stdc.stdio : snprintf;
+
     static ByteBuffer ci; // TLS
     ci.clear();
-    ci.append("id=0 addr=? name=");
+    char[24] idb = void;
+    ci.append("id=");
+    ci.append(idb[0 .. snprintf(idb.ptr, idb.length, "%llu", c.id)]);
+    ci.append(" addr=");
+    ci.append(c.addr.length ? cast(const(char)[]) c.addr[] : "?");
+    ci.append(" name=");
     if (c.clientName.length)
         ci.append(c.clientName[]);
     // client-info reports the command the CLIENT issued, not the denied object:
@@ -1794,9 +1816,16 @@ private bool authenticateConn(ref Conn c, scope const(char)[] who, scope const(c
     u = aclUser(who);
     if (!ok || u is null || !u.enabled)
     {
+        import core.stdc.stdio : snprintf;
+
         static ByteBuffer ai; // TLS
         ai.clear();
-        ai.append("id=0 addr=? cmd=auth");
+        char[24] idb = void;
+        ai.append("id=");
+        ai.append(idb[0 .. snprintf(idb.ptr, idb.length, "%llu", c.id)]);
+        ai.append(" addr=");
+        ai.append(c.addr.length ? cast(const(char)[]) c.addr[] : "?");
+        ai.append(" cmd=auth");
         aclLogAdd("auth", c.inMulti ? "multi" : "toplevel", "AUTH", who,
                 cast(const(char)[]) ai.data, nowMs());
         return false;
@@ -5069,11 +5098,14 @@ private void appendConnInfo(Conn* c, ref ByteBuffer o) nothrow
     import core.stdc.stdio : snprintf;
 
     auto lastCmd = c.lastCmdLen ? cast(const(char)[]) c.lastCmdBuf[0 .. c.lastCmdLen] : "NULL";
-    char[224] b = void;
+    auto addr = c.addr.length ? cast(const(char)[]) c.addr[] : "?";
+    auto laddr = c.laddr.length ? cast(const(char)[]) c.laddr[] : "?";
+    char[288] b = void;
     auto n = snprintf(b.ptr, b.length,
-            "id=%llu addr=? laddr=? fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
+            "id=%llu addr=%.*s laddr=%.*s fd=1 name=%.*s db=%d sub=%d psub=%d ssub=%d"
             ~ " multi=%d flags=%s cmd=%.*s user=%.*s resp=%d\n",
-            c.id, cast(int) c.clientName.length, c.clientName[].ptr,
+            c.id, cast(int) addr.length, addr.ptr, cast(int) laddr.length, laddr.ptr,
+            cast(int) c.clientName.length, c.clientName[].ptr,
             c.dbp.db, cast(int) c.sub.subCount, 0,
             cast(int) c.shardSub.subCount, c.inMulti ? cast(int) c.multiCount : -1,
             c.importSource ? "I".ptr : "N".ptr,
@@ -5486,10 +5518,10 @@ private void clientTrackingInfo(ref Conn c, ref ByteBuffer o) nothrow @trusted
 // can't take the server down with it (see [[acl-script-enforcement]]). Two forms:
 //   CLIENT KILL <addr:port>                      (legacy: +OK / -No such client)
 //   CLIENT KILL <FILTER value>...                (new: reply = count killed)
-// Filters: ID <id>, USER <name>, ADDR/LADDR <a>, TYPE <t>, SKIPME yes|no
-// (default yes). dreads has no peer address, so ADDR/LADDR never match; MAXAGE is
-// unsupported. Returns false only when the CALLER killed itself (SKIPME no) so
-// the read loop closes it AFTER this reply flushes.
+// Filters: ID <id>, USER <name>, ADDR/LADDR <ip:port>, TYPE <t>, SKIPME yes|no
+// (default yes). ADDR/LADDR match the peer/local address captured at connect;
+// TYPE/MAXAGE are accepted but unmodelled (match nothing). Returns false only when
+// the CALLER killed itself (SKIPME no) so the read loop closes it AFTER the reply.
 private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     if (args.length == 0)
@@ -5497,10 +5529,25 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
         repError(o, "ERR syntax error");
         return true;
     }
-    // legacy single-argument form: CLIENT KILL addr:port
+    // legacy single-argument form: CLIENT KILL addr:port -> +OK / -No such client
     if (args.length == 1)
     {
-        // dreads doesn't track peer addresses, so no client can ever match.
+        auto want = args[0].str;
+        Vector!ulong ids;
+        snapshotConnIds(ids);
+        foreach (id; ids[])
+        {
+            auto s = connById(id);
+            if (s.isNull)
+                continue;
+            auto p = &s.get();
+            if (p.addr[] == want && p !is &c)
+            {
+                killConn(p);
+                repSimple(o, "OK");
+                return true;
+            }
+        }
         repError(o, "ERR No such client");
         return true;
     }
@@ -5511,8 +5558,8 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
     }
     // parse filters
     long byId = -1;
-    const(char)[] byUser, byAddr;
-    bool haveId, haveUser, haveAddr, skipme = true, unmatched = false;
+    const(char)[] byUser, byAddr, byLaddr;
+    bool haveId, haveUser, haveAddr, haveLaddr, skipme = true, unmatched = false;
     for (size_t i = 0; i + 1 < args.length; i += 2)
     {
         auto f = args[i].str;
@@ -5531,10 +5578,15 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
             byUser = v;
             haveUser = true;
         }
-        else if (eqICDebug(f, "ADDR") || eqICDebug(f, "LADDR"))
+        else if (eqICDebug(f, "ADDR"))
         {
             byAddr = v;
-            haveAddr = true; // no peer address in dreads ⇒ never matches
+            haveAddr = true;
+        }
+        else if (eqICDebug(f, "LADDR"))
+        {
+            byLaddr = v;
+            haveLaddr = true;
         }
         else if (eqICDebug(f, "SKIPME"))
             skipme = eqICDebug(v, "YES");
@@ -5552,7 +5604,7 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
     }
     long killed = 0;
     bool killSelf = false;
-    if (!unmatched && !haveAddr) // ADDR/unmodelled filters can't match anything
+    if (!unmatched) // an unmodelled filter (TYPE/MAXAGE) matches nothing
     {
         Vector!ulong ids;
         snapshotConnIds(ids);
@@ -5567,6 +5619,10 @@ private bool clientKill(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothro
                 match = false;
             if (match && haveUser
                     && !(p.user !is null && p.user.name == byUser))
+                match = false;
+            if (match && haveAddr && p.addr[] != byAddr)
+                match = false;
+            if (match && haveLaddr && p.laddr[] != byLaddr)
                 match = false;
             if (match && skipme && p is &c)
                 match = false;
