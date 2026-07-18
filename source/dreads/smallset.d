@@ -14,6 +14,9 @@ module dreads.smallset;
 // convention, NOT a destructor (a union field may not have one).
 
 import dreads.dict : canonicalInt, Dict, Unit;
+import dreads.alloc : KeyspaceAllocator;
+import emplace.hashmap : HashMap;
+import std.experimental.allocator : reallocate;
 
 struct SmallSet
 {
@@ -37,7 +40,7 @@ struct SmallSet
     private size_t blen, bcap;
     private Ent* ents; // one entry per member, into the blob
     private size_t count, ecap;
-    private Dict!Unit large; // large mode
+    private HashMap!(Unit, KeyspaceAllocator) large; // large mode
 
     /// The Redis-equivalent encoding, backed by the real small/large state.
     const(char)[] encoding() const @nogc nothrow
@@ -185,14 +188,12 @@ struct SmallSet
             return c;
         }
         // fast path: one blob copy + one entry-array copy
-        import core.stdc.stdlib : malloc;
-
         if (count)
         {
-            c.blob = cast(ubyte*) malloc(blen);
+            c.blob = cast(ubyte*) KeyspaceAllocator.instance.allocate(blen).ptr;
             c.blob[0 .. blen] = blob[0 .. blen]; // slice copy
             c.bcap = c.blen = blen;
-            c.ents = cast(Ent*) malloc(count * Ent.sizeof);
+            c.ents = cast(Ent*) KeyspaceAllocator.instance.allocate(count * Ent.sizeof).ptr;
             c.ents[0 .. count] = ents[0 .. count];
             c.ecap = c.count = count;
         }
@@ -211,18 +212,16 @@ struct SmallSet
 
     void free() @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : cfree = free;
-
         clear();
         if (blob !is null)
         {
-            cfree(blob);
+            KeyspaceAllocator.instance.deallocate((cast(void*) blob)[0 .. bcap]);
             blob = null;
             bcap = 0;
         }
         if (ents !is null)
         {
-            cfree(ents);
+            KeyspaceAllocator.instance.deallocate((cast(void*) ents)[0 .. ecap * Ent.sizeof]);
             ents = null;
             ecap = 0;
         }
@@ -240,22 +239,24 @@ struct SmallSet
     // append member bytes to the blob + an entry, growing both 2x as needed
     private void append(scope const(char)[] m) @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : realloc;
-
         if (blen + m.length > bcap)
         {
             auto nc = bcap ? bcap * 2 : 16; // small first cap: tiny sets stay tiny
             while (nc < blen + m.length)
                 nc *= 2;
-            blob = cast(ubyte*) realloc(blob, nc);
-            assert(blob !is null, "out of memory");
+            void[] blk = blob is null ? null : (cast(void*) blob)[0 .. bcap];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, nc);
+            assert(ok, "out of memory");
+            blob = cast(ubyte*) blk.ptr;
             bcap = nc;
         }
         if (count == ecap)
         {
             immutable nc = ecap ? ecap * 2 : 4;
-            ents = cast(Ent*) realloc(ents, nc * Ent.sizeof);
-            assert(ents !is null, "out of memory");
+            void[] blk = ents is null ? null : (cast(void*) ents)[0 .. ecap * Ent.sizeof];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, nc * Ent.sizeof);
+            assert(ok, "out of memory");
+            ents = cast(Ent*) blk.ptr;
             ecap = nc;
         }
         blob[blen .. blen + m.length] = cast(const(ubyte)[]) m[]; // slice copy
