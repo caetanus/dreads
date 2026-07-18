@@ -49,31 +49,43 @@ else
             Mallocator);
 }
 
-static if (is(typeof(DataBackend.instance)))
-{
-    // Stateless singleton backend (Mallocator/GCAllocator): use it as-is.
-    alias KeyspaceAllocator = DataBackend;
-}
-else
-{
-    // Stateful composed backend: one global instance, exposed via `instance` so the
-    // emplace containers' `Allocator.instance.allocate/deallocate` reach its state.
-    private __gshared DataBackend gDataAlloc;
+// Wrap the backend in a StatsCollector tracking live bytes: this is the REAL,
+// PORTABLE data-memory count (works on any build, not just jemalloc+Linux), so
+// maxmemory enforcement stops being "virtual". The existing pre-check reads
+// `keyspaceBytesUsed()` and refuses/evicts at the limit — the builder "fails at
+// maxmemory" via that gate, never by a null the containers would assert on.
+import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
 
-    struct KeyspaceAllocator
+alias DataAllocator = StatsCollector!(DataBackend, Options.bytesUsed);
+
+// Always stateful now (the collector holds counters), so one global instance with
+// an `instance` accessor — drops straight into emplace's `Allocator.instance`
+// pattern. Single event-loop thread ⇒ the __gshared instance is race-free.
+private __gshared DataAllocator gDataAlloc;
+
+struct KeyspaceAllocator
+{
+    static @property ref DataAllocator instance() @nogc nothrow @trusted
     {
-        static @property ref DataBackend instance() @nogc nothrow @trusted
-        {
-            return gDataAlloc;
-        }
+        return gDataAlloc;
     }
 }
 
-// Feasibility probe: the data plane is @nogc nothrow, so the chosen backend must
-// allocate/free in that context. Compiling this is the whole point of phase 0.
+/// Live bytes currently held by the keyspace data allocator — the real,
+/// build-portable figure that drives maxmemory (replaces the jemalloc-only mallctl).
+ulong keyspaceBytesUsed() @nogc nothrow @trusted
+{
+    return cast(ulong) gDataAlloc.bytesUsed;
+}
+
+// Feasibility probe: the data plane is @nogc nothrow, so the backend must
+// allocate/free in that context, and the collector must count.
 @nogc nothrow unittest
 {
+    immutable before = keyspaceBytesUsed();
     auto b = KeyspaceAllocator.instance.allocate(500);
     assert(b.length >= 500);
+    assert(keyspaceBytesUsed() >= before + 500);
     KeyspaceAllocator.instance.deallocate(b);
+    assert(keyspaceBytesUsed() == before);
 }
