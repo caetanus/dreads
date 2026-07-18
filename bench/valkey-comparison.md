@@ -45,21 +45,39 @@ build-swappability / real portable OOM accounting — not throughput.
 `StrVal` tagged union stores int-encoded values (a native `long` add; bytes
 materialised only on read), so INCR is now dreads-favourable (1.15×).
 
-## SET with EX (TTL write path)
+## SET with EX (TTL write path) — insert only (EX 100 never expires mid-run)
 
 | | dreads active-off (default) | dreads active-on | Valkey |
 |---|---:|---:|---:|
 | SET EX 100 (median) | **~824k** | ~556k | ~700k |
 
-Active expiry is opt-in. **Off by default the TTL write path beats Valkey** (~824k
-vs ~700k) — the deadline is just stamped on the value, lazily checked on access.
-**On, it drops below Valkey** (~556k) because dreads keeps expires in an ordered
-**RB-tree** (`deadline → keys`, O(log n) insert) for a deterministic in-order drain,
-whereas Valkey keeps a **hash** (`key → deadline`, O(1) insert) and drains by random
-sampling. The tree costs the SET-EX hot path to make the active-expire cycle and
-backlog drains (import-release) cheap; the `removeRight`/`rb_first_cached` work makes
-that drain O(1)-amortised. Tree-vs-hash is a real tradeoff, paid only when active
-expiry is on.
+Active expiry is opt-in. With a 100s TTL nothing expires during the run, so this is
+the pure INSERT path. **Off by default the TTL write path beats Valkey** (~824k vs
+~700k) — the deadline is just stamped on the value, lazily checked on access. **On,
+it drops** (~556k) because dreads keeps expires in an ordered **RB-tree**
+(`deadline → keys`, O(log n) insert) vs Valkey's **hash** (`key → deadline`, O(1)).
+Tree-vs-hash is a real tradeoff paid only when active expiry is on.
+
+## Active expiry LIVE — short TTL, keys actually expiring mid-run
+
+`bench/active-expire-bench.sh`: SET with PX 100–200 over a 2M keyspace, so keys
+expire DURING the run and the background cycle reaps them (competing with request
+handling on the one loop). Interleaved, server core 2, client cores 3–11.
+
+| | dreads active-off | dreads active-on | Valkey |
+|---|---:|---:|---:|
+| SET PX (median, ~300k reaped/run) | ~553–556k | **~553–557k** | ~562–572k |
+
+**Under real expiry churn, active-on ties Valkey (0.97–0.99×) and matches dreads'
+own active-off — active expiry is ~free on throughput.** The RB-tree insert cost
+(above) is hidden here because the drain keeps the table small, offsetting it.
+Caveat: under this *synthetic* ~300k/s expiry pressure dreads reaps less
+aggressively (`ACTIVE_EXPIRE_BUDGET=20k` / 200ms = 100k/s cap → keys linger, dbsize
+645k post-run draining to 483k idle); Valkey's adaptive cycle reaps more. A
+memory-timeliness gap, tunable via budget/interval (trades loop-time), irrelevant at
+realistic expiry rates. The **split/lazyfree** exploration confirmed offloading the
+drain teardown does NOT help here — d.del dominates on-loop (bench/expire_bench.d);
+lazyfree's win is async free of one giant value (bench/lazyfree_bench.d, 7.6×).
 
 ## Allocator composition — fragmentation (`bench/rss_churn.sh`)
 
