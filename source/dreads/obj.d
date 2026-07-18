@@ -13,6 +13,7 @@ import dreads.smallset : SmallSet;
 import dreads.smallhash : SmallHash;
 import dreads.smallzset : SmallZSet;
 import emplace.map : Map;
+import emplace.hashmap : HashMap;
 import dreads.alloc : KeyspaceAllocator;
 import emplace.vector : Vector;
 
@@ -256,7 +257,12 @@ public struct RObj
 
 public struct Keyspace
 {
-    Dict!RObj d;
+    // The keyspace's key->value table routes through KeyspaceAllocator (the
+    // swappable region/freelist composition), not the default Mallocator, so the
+    // data plane's backing is a build-time choice. (Dict = HashMap; we spell the
+    // allocator here rather than change the global Dict alias, which also serves
+    // non-keyspace maps — the conn registry, scripts.)
+    HashMap!(RObj, KeyspaceAllocator) d;
 
     /// This keyspace's logical database index — its SLOT identity in `gDbs`, set
     /// once at startup. It is the transparent way to get the db number (e.g. for a
