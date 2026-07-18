@@ -41,6 +41,15 @@
 			"mainSourceFile": "bench/lookup_bench.d",
 			"targetName": "lookup_bench",
 			"targetType": "executable"
+		},
+		{
+			"name": "expire-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/expire_bench.d",
+			"targetName": "expire_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
