@@ -149,16 +149,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
 
         // --- keyspace ---
     case "DEL":
-    case "UNLINK": // same effect; our free is synchronous either way
+    case "UNLINK":
         {
             if (args.length == 0)
             {
                 arityErr(o, name.length == 3 ? "del" : "unlink");
                 break;
             }
+            // UNLINK frees a big scattered value off the event loop (lazyfree) when
+            // enabled; DEL is always synchronous. Both are identical client-visible.
+            immutable lazy_ = name.length == 6; // "UNLINK"
             long n = 0;
             foreach (ref a; args)
-                if (ks.del(a.str))
+                if (lazy_ ? ks.unlink(a.str) : ks.del(a.str))
                 {
                     n++;
                     notifyKeyspaceEvent(NClass.generic, "del", a.str);

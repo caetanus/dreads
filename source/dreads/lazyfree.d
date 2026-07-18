@@ -92,7 +92,7 @@ struct BatchSink
 /// The tear-down routine: given the job context, walk the value and push every
 /// backing block into `sink`. Runs on the free-thread; must NOT deallocate and
 /// must NOT touch the KeyspaceAllocator.
-alias GatherFn = void function(void* ctx, ref BatchSink sink) nothrow;
+alias GatherFn = void function(void* ctx, ref BatchSink sink) @nogc nothrow;
 
 /// The lazyfree worker: a dedicated OS thread draining a submit ring, plus a
 /// reclaim ring the loop drains. One instance, owned by the server.
@@ -110,6 +110,12 @@ final class LazyFree
     private shared ulong inlineJobs; // freed on the loop because the ring was full
     private shared ulong reclaimedBlocks;
 
+    // partially-drained batch carried across ticks so a huge value's deallocate is
+    // BOUNDED per drain call (no one-burst stall). Loop-thread-only state.
+    private Block* curBlocks;
+    private size_t curLen;
+    private size_t curPos;
+
     this(size_t submitCap = 1024, size_t reclaimCap = 1024)
     {
         submit.setup(submitCap);
@@ -125,7 +131,7 @@ final class LazyFree
     /// Loop thread: hand a value off for off-loop tear-down. Non-blocking — if the
     /// submit ring is full the value is torn down INLINE (right here on the loop)
     /// so a free is never dropped. Returns true if it was queued off-loop.
-    bool enqueue(GatherFn gather, void* ctx) nothrow
+    bool enqueue(GatherFn gather, void* ctx) @nogc nothrow
     {
         if (submit.push(null, cast(void*) gather, cast(ulong) cast(size_t) ctx))
         {
@@ -139,28 +145,42 @@ final class LazyFree
         return false;
     }
 
-    /// Loop thread: deallocate everything the free-thread has gathered since the
-    /// last drain. Call from the server tick. Returns the number of blocks freed.
-    size_t drainReclaimed() nothrow @trusted
+    /// Loop thread: deallocate up to `budget` gathered blocks (default: all). Call
+    /// from the server tick with a bound so a giant value's deallocate is spread
+    /// over ticks instead of stalling the loop in one burst; a partially-drained
+    /// batch is carried to the next call. Returns the number of blocks freed.
+    size_t drainReclaimed(size_t budget = size_t.max) nothrow @trusted
     {
         size_t n = 0;
-        const(ubyte)[] payload;
-        void* tag;
-        ulong meta;
-        uint kind;
-        while (reclaim.front(payload, tag, meta, kind))
+        while (n < budget)
         {
-            auto blocks = cast(Block*) tag;
-            immutable len = cast(size_t) meta;
-            foreach (i; 0 .. len)
+            if (curBlocks is null)
             {
-                auto blk = blocks[i];
+                const(ubyte)[] payload;
+                void* tag;
+                ulong meta;
+                uint kind;
+                if (!reclaim.front(payload, tag, meta, kind))
+                    break; // nothing pending
+                curBlocks = cast(Block*) tag;
+                curLen = cast(size_t) meta;
+                curPos = 0;
+                reclaim.pop(); // the array pointer is ours now; free the ring slot
+            }
+            while (curPos < curLen && n < budget)
+            {
+                auto blk = curBlocks[curPos];
                 KeyspaceAllocator.instance.deallocate((cast(ubyte*) blk.ptr)[0 .. blk.size]);
+                curPos++;
                 n++;
             }
-            if (blocks !is null)
-                free(blocks); // the Mallocator-backed scratch array
-            reclaim.pop();
+            if (curPos >= curLen) // batch drained: free the Mallocator scratch array
+            {
+                if (curBlocks !is null)
+                    free(curBlocks);
+                curBlocks = null;
+                curLen = curPos = 0;
+            }
         }
         if (n)
             atomicStore(reclaimedBlocks, atomicLoad(reclaimedBlocks) + n);
@@ -169,7 +189,7 @@ final class LazyFree
 
     @property bool reclaimPending() nothrow
     {
-        return !reclaim.empty();
+        return curBlocks !is null || !reclaim.empty();
     }
 
     @property ulong statSubmitted() nothrow
@@ -211,7 +231,7 @@ final class LazyFree
 
     // Tear a value down entirely on the calling thread (the full-ring fallback and
     // the shutdown path). Gathers into a local batch then deallocates immediately.
-    private void freeInline(GatherFn gather, void* ctx) nothrow @trusted
+    private void freeInline(GatherFn gather, void* ctx) @nogc nothrow @trusted
     {
         BatchSink sink;
         gather(ctx, sink);
@@ -221,14 +241,23 @@ final class LazyFree
         sink.dropScratch();
     }
 
-    private void wake() nothrow
+    private void wake() @nogc nothrow @trusted
     {
         mtx.lock_nothrow();
-        try
-            cond.notify();
-        catch (Exception)
+        // Condition.notify() is pthread_cond_signal underneath (no allocation) but
+        // isn't annotated @nogc; call it through a @nogc-typed function pointer so
+        // enqueue() stays @nogc (the command dispatch path is @nogc). Sound: single
+        // caller, no GC work, exceptions swallowed.
+        static void doNotify(Condition c) nothrow
         {
+            try
+                c.notify();
+            catch (Exception)
+            {
+            }
         }
+
+        (cast(void function(Condition) @nogc nothrow)&doNotify)(cond);
         mtx.unlock_nothrow();
     }
 
@@ -322,7 +351,7 @@ version (unittest)
         size_t n;
     }
 
-    private void testGather(void* ctx, ref BatchSink sink) nothrow @trusted
+    private void testGather(void* ctx, ref BatchSink sink) @nogc nothrow @trusted
     {
         auto c = cast(TestCtx*) ctx;
         foreach (i; 0 .. c.n)
@@ -365,6 +394,42 @@ version (unittest)
         lf.statSubmitted.should.equal(1UL);
         lf.statInline.should.equal(0UL);
         lf.statReclaimedBlocks.should.equal(cast(ulong) N);
+    }
+
+    @("lazyfree.budgeted_drain_spreads_over_calls")
+    unittest
+    {
+        import core.thread : Thread;
+        import core.time : msecs;
+
+        immutable before = keyspaceBytesUsed();
+        enum N = 100;
+        Block[N] blks;
+        foreach (i; 0 .. N)
+        {
+            auto b = KeyspaceAllocator.instance.allocate(64 + i);
+            blks[i] = Block(b.ptr, b.length);
+        }
+        auto ctx = TestCtx(blks.ptr, N);
+        auto lf = new LazyFree(64, 64);
+        lf.enqueue(&testGather, &ctx);
+        foreach (_; 0 .. 500) // wait for the batch to be published
+        {
+            if (lf.reclaimPending)
+                break;
+            Thread.sleep(1.msecs);
+        }
+        // drain 30 blocks at a time — the partial batch must carry across calls.
+        size_t total = 0;
+        immutable a = lf.drainReclaimed(30);
+        (a <= 30).should.equal(true);
+        total += a;
+        (lf.reclaimPending).should.equal(true); // batch not fully drained yet
+        while (lf.reclaimPending)
+            total += lf.drainReclaimed(30);
+        total.should.equal(cast(size_t) N);
+        lf.stop();
+        keyspaceBytesUsed().should.equal(before);
     }
 
     @("lazyfree.stop_drains_inflight")

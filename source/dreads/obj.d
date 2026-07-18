@@ -15,7 +15,9 @@ import dreads.smallzset : SmallZSet;
 import emplace.map : Map;
 import emplace.hashmap : HashMap;
 import dreads.alloc : KeyspaceAllocator;
+import dreads.lazyfree : BatchSink, LazyFree;
 import emplace.vector : Vector;
+import std.experimental.allocator.mallocator : Mallocator;
 
 public enum ObjType : ubyte
 {
@@ -97,6 +99,26 @@ shared static this()
 {
     foreach (int i, ref d; gDbs)
         d.db = i;
+}
+
+/// Global off-loop free worker (UNLINK / lazyfree-lazy-server-del). Null unless the
+/// server enabled it at startup; when null, deletes free inline.
+__gshared LazyFree gLazyFree;
+
+/// Only offload a value this big or bigger — below it the scattered chase fits in
+/// cache and the thread-handoff fixed cost isn't worth it (bench: the win grows with
+/// size, 1.5x at 100k nodes to 7.6x at 1M). Tunable; validated by the UNLINK bench.
+enum size_t LAZYFREE_MIN_ELEMS = 512;
+
+/// GatherFn (runs on the free-thread) for a DETACHED RObj wrapper (Mallocator-
+/// allocated by `Keyspace.unlink`). Gathers the value's backing blocks — the
+/// scattered chase — into `sink` for the loop to deallocate, then frees the wrapper
+/// STRUCT itself (Mallocator is thread-safe; the element blocks belong to the loop).
+void gatherRObjLazy(void* ctx, ref BatchSink sink) @nogc nothrow @trusted
+{
+    auto ro = cast(RObj*) ctx;
+    ro.gatherBlocks((void* p, size_t s) @nogc nothrow => sink.add(p, s));
+    Mallocator.instance.deallocate((cast(void*) ro)[0 .. RObj.sizeof]);
 }
 
 public struct RObj
@@ -190,6 +212,30 @@ public struct RObj
             return zset.length;
         case ObjType.stream:
             return stream.length;
+        }
+    }
+
+    /// Off-loop free (lazyfree): the container types whose teardown is a SCATTERED
+    /// pointer-chase worth offloading to the free-thread. Only list for now (a pure
+    /// node walk, no nested Dict/arrays); other types fall back to inline free.
+    /// Extend as each type's gatherBlocks is added AND benchmarked to win.
+    bool lazyFreeable() const @nogc nothrow
+    {
+        return type == ObjType.list;
+    }
+
+    /// Record every backing block of this value via `add`, freeing NOTHING (see
+    /// DList.gatherBlocks). Only lazyFreeable() types are handled — the caller MUST
+    /// gate on lazyFreeable() so an unsupported type is never silently leaked here.
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow
+    {
+        switch (type)
+        {
+        case ObjType.list:
+            list.gatherBlocks(add);
+            break;
+        default:
+            break; // not offloaded; gated out in the caller (lazyFreeable())
         }
     }
 
@@ -669,6 +715,31 @@ public struct Keyspace
         return d.del(k);
     }
 
+    /// Delete `k`, freeing a big SCATTERED value OFF the event loop (UNLINK) when
+    /// lazyfree is enabled and the value is large + offloadable; otherwise a plain
+    /// synchronous del. The value is moved out of the table into a stable
+    /// Mallocator wrapper (so it survives the table slot's reuse), then handed to
+    /// the free-thread which chases + gathers its blocks for the loop to deallocate.
+    bool unlink(scope const(char)[] k) @nogc nothrow
+    {
+        auto o = lookup(k);
+        if (o is null)
+            return false;
+        disarmExpire(k, o.expireAtMs);
+        disarmSubExpire(k);
+        if (gLazyFree !is null && o.lazyFreeable() && o.containerLen() >= LAZYFREE_MIN_ELEMS)
+        {
+            // move the value into a stable heap home, remove the table entry WITHOUT
+            // freeing it (steal), then offload the teardown. enqueue() falls back to
+            // an inline free (on the loop) if its ring is momentarily full.
+            auto w = cast(RObj*) Mallocator.instance.allocate(RObj.sizeof).ptr;
+            d.steal(k, *w);
+            gLazyFree.enqueue(&gatherRObjLazy, w);
+            return true;
+        }
+        return d.del(k);
+    }
+
     bool exists(scope const(char)[] k) @nogc nothrow
     {
         return lookup(k) !is null;
@@ -863,4 +934,52 @@ unittest // every type frees through the union without leaking valgrind-wise
     // the next cycle drains the remainder
     assert(ks.activeExpireCycle() == 5000);
     assert(ks.length == 0);
+}
+
+@("obj.unlink_offloads_big_list_to_lazyfree")
+unittest // UNLINK hands a big list to the free-thread; small ones free inline
+{
+    import dreads.lazyfree : LazyFree;
+    import core.thread : Thread;
+    import core.time : msecs;
+
+    gLazyFree = new LazyFree();
+    scope (exit)
+    {
+        gLazyFree.stop();
+        gLazyFree = null;
+    }
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    bool wrong;
+
+    // a small list is BELOW the threshold → freed inline (never offloaded)
+    foreach (i; 0 .. 8)
+        ks.getOrCreate("small", ObjType.list, wrong).list.pushBack("x");
+    assert(ks.unlink("small"));
+    assert(ks.length == 0);
+    assert(gLazyFree.statSubmitted == 0); // inline, not queued
+
+    // a big list is offloaded: removed from the table at once, torn down off-loop
+    enum size_t NEL = LAZYFREE_MIN_ELEMS + 100;
+    foreach (i; 0 .. NEL)
+        ks.getOrCreate("big", ObjType.list, wrong).list.pushBack("payload-bytes");
+    assert(ks.length == 1);
+    assert(ks.unlink("big"));
+    assert(ks.length == 0); // gone from the keyspace immediately
+    assert(ks.lookup("big") is null);
+    assert(gLazyFree.statSubmitted == 1); // went off-loop
+
+    // drain what the free-thread gathered, as the server tick would
+    foreach (_; 0 .. 3000)
+    {
+        if (gLazyFree.reclaimPending)
+            gLazyFree.drainReclaimed();
+        if (gLazyFree.statReclaimedBlocks >= NEL)
+            break;
+        Thread.sleep(1.msecs);
+    }
+    assert(gLazyFree.statReclaimedBlocks == NEL); // every node block freed on the loop
 }

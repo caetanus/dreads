@@ -75,7 +75,7 @@ void freeInline(void* head) @trusted
 }
 
 // GatherFn: chase the list OFF the loop, recording each node block (frees nothing).
-void gatherList(void* ctx, ref BatchSink sink) nothrow @trusted
+void gatherList(void* ctx, ref BatchSink sink) @nogc nothrow @trusted
 {
     auto p = ctx;
     while (p !is null)

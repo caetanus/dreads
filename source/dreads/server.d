@@ -238,6 +238,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
 
         gActiveExpire = gConfig.activeExpire; // drop-soon timer only runs when enabled
         gActiveEviction = gConfig.activeEviction; // background maxmemory eviction
+        if (gConfig.lazyfreeLazyServerDel)
+        {
+            import dreads.lazyfree : LazyFree;
+            import dreads.obj : gLazyFree;
+
+            gLazyFree = new LazyFree(); // spawns the off-loop free-thread (UNLINK)
+        }
         lruClock = cast(uint)(nowMs() / 1000);
         seedRand(nowMs()); // shuffle the random-pick commands per boot
         {
@@ -267,7 +274,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // also run 5x more often.
         setTimer(200.msecs, delegate() @trusted nothrow {
             import dreads.det : freezeClock;
-            import dreads.obj : gActiveExpire;
+            import dreads.obj : gActiveExpire, gLazyFree;
+
+            // Reclaim blocks the free-thread gathered from off-loop UNLINKs. Bounded
+            // per tick so a giant value's deallocate spreads over ticks instead of
+            // stalling the loop in one burst. Runs regardless of active expiry.
+            if (gLazyFree !is null)
+                gLazyFree.drainReclaimed(100_000);
 
             // Cheap early-out: with active expiry off (the default) this fast timer
             // must do NOTHING — no clock read, no db sweep, no flush — so it never

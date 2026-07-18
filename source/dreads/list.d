@@ -62,6 +62,22 @@ public struct DList
         count = 0;
     }
 
+    // Off-loop free support (lazyfree): record every backing block via `add`,
+    // freeing NOTHING. The scattered next-pointer chase — the cache-miss-bound cost
+    // of freeing a big list — runs on the free-thread; the loop later deallocates
+    // the recorded blocks. Read-only: the list is left intact (its owner, a detached
+    // RObj wrapper, is discarded after this returns). Same block size as freeNode.
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow @trusted
+    {
+        auto n = head;
+        while (n !is null)
+        {
+            auto next = n.next;
+            add(cast(void*) n, Node.sizeof + n.len);
+            n = next;
+        }
+    }
+
     void pushFront(scope const(char)[] v) @nogc nothrow
     {
         auto n = mkNode(v);
