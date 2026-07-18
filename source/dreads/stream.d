@@ -4,11 +4,18 @@ module dreads.stream;
 // sorted malloc'd array — IDs are monotonically increasing, so appends keep
 // order and range queries binary-search the lower bound. Fully @nogc.
 
-import core.stdc.stdlib : crealloc = realloc, cfree = free, malloc;
 import core.stdc.string : memmove;
 
 import dreads.dict : Dict, Unit;
-import dreads.mem : freeSlice, mallocDup;
+import dreads.alloc : KeyspaceAllocator;
+import emplace.hashmap : HashMap;
+import std.experimental.allocator : reallocate;
+import dreads.mem : memFreeSlice = freeSlice, memMallocDup = mallocDup;
+
+// Stream payload is keyspace data — its field/value byte copies route through the
+// swappable KeyspaceAllocator, like StrVal. Binding once keeps call sites clean.
+private alias mallocDup = memMallocDup!KeyspaceAllocator;
+private alias freeSlice = memFreeSlice!KeyspaceAllocator;
 
 public struct StreamID
 {
@@ -93,12 +100,12 @@ public struct Group
     PelEntry* pel;
     size_t plen;
     size_t pcap;
-    Dict!ConsumerInfo consumers;
+    HashMap!(ConsumerInfo, KeyspaceAllocator) consumers;
 
-    void free() @nogc nothrow
+    void free() @nogc nothrow @trusted
     {
         if (pel !is null)
-            cfree(pel);
+            KeyspaceAllocator.instance.deallocate((cast(void*) pel)[0 .. pcap * PelEntry.sizeof]);
         pel = null;
         plen = pcap = 0;
         consumers.free();
@@ -198,9 +205,12 @@ public struct Group
         }
         if (plen == pcap)
         {
-            pcap = pcap ? pcap * 2 : 8;
-            pel = cast(PelEntry*) crealloc(pel, pcap * PelEntry.sizeof);
-            assert(pel !is null, "out of memory");
+            immutable ncap = pcap ? pcap * 2 : 8;
+            void[] blk = pel is null ? null : (cast(void*) pel)[0 .. pcap * PelEntry.sizeof];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, ncap * PelEntry.sizeof);
+            assert(ok, "out of memory");
+            pel = cast(PelEntry*) blk.ptr;
+            pcap = ncap;
         }
         if (i < plen)
             memmove(&pel[i + 1], &pel[i], (plen - i) * PelEntry.sizeof);
@@ -234,7 +244,7 @@ public struct Stream
     StreamID lastId; // survives even when all entries are gone
     ulong entriesAdded; // total ever XADDed (monotonic; XINFO entries-added)
     StreamID maxDeletedId; // greatest id ever XDELeted (XINFO max-deleted-entry-id)
-    Dict!Group groups; // consumer groups by name
+    HashMap!(Group, KeyspaceAllocator) groups; // consumer groups by name
 
     /// XINFO recorded-first-entry-id: the id of the oldest live entry, or 0-0.
     @property StreamID recordedFirstId() const @nogc nothrow
@@ -247,19 +257,12 @@ public struct Stream
         return len;
     }
 
-    void free() @nogc nothrow
+    void free() @nogc nothrow @trusted
     {
         foreach (i; 0 .. len)
-        {
-            foreach (j; 0 .. entries[i].npairs)
-            {
-                freeSlice(entries[i].pairs[j].field);
-                freeSlice(entries[i].pairs[j].value);
-            }
-            cfree(entries[i].pairs);
-        }
+            freeEntry(i);
         if (entries !is null)
-            cfree(entries);
+            KeyspaceAllocator.instance.deallocate((cast(void*) entries)[0 .. cap * SEntry.sizeof]);
         entries = null;
         len = cap = 0;
         lastId = StreamID(0, 0);
@@ -370,14 +373,17 @@ public struct Stream
             return false;
         if (len == cap)
         {
-            cap = cap ? cap * 2 : 8;
-            entries = cast(SEntry*) crealloc(entries, cap * SEntry.sizeof);
-            assert(entries !is null, "out of memory");
+            immutable ncap = cap ? cap * 2 : 8;
+            void[] blk = entries is null ? null : (cast(void*) entries)[0 .. cap * SEntry.sizeof];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, ncap * SEntry.sizeof);
+            assert(ok, "out of memory");
+            entries = cast(SEntry*) blk.ptr;
+            cap = ncap;
         }
         auto e = &entries[len];
         e.id = id;
         e.npairs = src.length;
-        e.pairs = cast(FieldPair*) malloc(src.length * FieldPair.sizeof);
+        e.pairs = cast(FieldPair*) KeyspaceAllocator.instance.allocate(src.length * FieldPair.sizeof).ptr;
         assert(e.pairs !is null, "out of memory");
         foreach (i, ref p; src)
         {
@@ -445,14 +451,15 @@ public struct Stream
         return drop;
     }
 
-    private void freeEntry(size_t i) @nogc nothrow
+    private void freeEntry(size_t i) @nogc nothrow @trusted
     {
         foreach (j; 0 .. entries[i].npairs)
         {
             entries[i].pairs[j].field.freeSlice;
             entries[i].pairs[j].value.freeSlice;
         }
-        cfree(entries[i].pairs);
+        KeyspaceAllocator.instance.deallocate(
+            (cast(void*) entries[i].pairs)[0 .. entries[i].npairs * FieldPair.sizeof]);
     }
 
     /// First index with id >= target.

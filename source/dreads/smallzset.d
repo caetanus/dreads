@@ -9,6 +9,9 @@ module dreads.smallzset;
 // surface. free()/RAII, no ~this (union field). See [[small-collections-llvm]].
 
 import dreads.zset : ZSet;
+import dreads.alloc : KeyspaceAllocator;
+import dreads.mem : allocZeroed;
+import std.experimental.allocator : reallocate;
 
 struct SmallZSet
 {
@@ -214,14 +217,12 @@ struct SmallZSet
         }
         if (count)
         {
-            import core.stdc.stdlib : malloc;
-
-            c.blob = cast(ubyte*) malloc(blen);
+            c.blob = cast(ubyte*) KeyspaceAllocator.instance.allocate(blen).ptr;
             c.blob[0 .. blen] = blob[0 .. blen];
             c.bcap = c.blen = blen;
-            c.ents = cast(Ent*) malloc(count * Ent.sizeof);
+            c.ents = cast(Ent*) KeyspaceAllocator.instance.allocate(count * Ent.sizeof).ptr;
             c.ents[0 .. count] = ents[0 .. count];
-            c.scores = cast(double*) malloc(count * double.sizeof);
+            c.scores = cast(double*) KeyspaceAllocator.instance.allocate(count * double.sizeof).ptr;
             c.scores[0 .. count] = scores[0 .. count];
             c.cap = c.count = count;
         }
@@ -238,19 +239,17 @@ struct SmallZSet
 
     void free() @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : cfree = free;
-
         clear();
         if (blob !is null)
         {
-            cfree(blob);
+            KeyspaceAllocator.instance.deallocate((cast(void*) blob)[0 .. bcap]);
             blob = null;
             bcap = 0;
         }
         if (ents !is null)
         {
-            cfree(ents);
-            cfree(scores);
+            KeyspaceAllocator.instance.deallocate((cast(void*) ents)[0 .. cap * Ent.sizeof]);
+            KeyspaceAllocator.instance.deallocate((cast(void*) scores)[0 .. cap * double.sizeof]);
             ents = null;
             scores = null;
             cap = 0;
@@ -270,24 +269,29 @@ struct SmallZSet
     // insert (s, m) at its sorted position; member bytes appended to the blob
     private void insert(double s, scope const(char)[] m) @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : realloc;
-
         // grow blob + index
         if (blen + m.length > bcap)
         {
             auto nc = bcap ? bcap * 2 : 16;
             while (nc < blen + m.length)
                 nc *= 2;
-            blob = cast(ubyte*) realloc(blob, nc);
-            assert(blob !is null, "out of memory");
+            void[] blk = blob is null ? null : (cast(void*) blob)[0 .. bcap];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, nc);
+            assert(ok, "out of memory");
+            blob = cast(ubyte*) blk.ptr;
             bcap = nc;
         }
         if (count == cap)
         {
             immutable nc = cap ? cap * 2 : 4;
-            ents = cast(Ent*) realloc(ents, nc * Ent.sizeof);
-            scores = cast(double*) realloc(scores, nc * double.sizeof);
-            assert(ents !is null && scores !is null, "out of memory");
+            void[] eblk = ents is null ? null : (cast(void*) ents)[0 .. cap * Ent.sizeof];
+            immutable okE = reallocate(KeyspaceAllocator.instance, eblk, nc * Ent.sizeof);
+            assert(okE, "out of memory");
+            ents = cast(Ent*) eblk.ptr;
+            void[] sblk = scores is null ? null : (cast(void*) scores)[0 .. cap * double.sizeof];
+            immutable okS = reallocate(KeyspaceAllocator.instance, sblk, nc * double.sizeof);
+            assert(okS, "out of memory");
+            scores = cast(double*) sblk.ptr;
             cap = nc;
         }
         // append member bytes at the end of the blob

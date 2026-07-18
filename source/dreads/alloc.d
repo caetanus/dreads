@@ -56,7 +56,81 @@ else
 // maxmemory" via that gate, never by a null the containers would assert on.
 import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
 
-alias DataAllocator = StatsCollector!(DataBackend, Options.bytesUsed);
+// Debug-only live-range tracker (version=DreadsAllocTrack). Sits under the stats
+// collector and asserts the moment the backend hands out a block overlapping a
+// still-live one (aliasing) or frees a block that isn't live (double/foreign
+// free) — the definitive diagnostic for a freelist that a bad free has poisoned.
+version (DreadsAllocTrack)
+{
+    struct Tracked(Backend)
+    {
+        Backend b;
+        private static struct Rec
+        {
+            void* p;
+            size_t n;
+        }
+
+        private __gshared Rec[1 << 18] live;
+        private __gshared size_t nlive;
+
+        enum alignment = Backend.alignment;
+
+        void[] allocate(size_t n) @nogc nothrow @trusted
+        {
+            auto r = b.allocate(n);
+            if (r.ptr !is null)
+            {
+                foreach (i; 0 .. nlive)
+                {
+                    auto s = live[i];
+                    immutable overlap = r.ptr < s.p + s.n && s.p < r.ptr + r.length;
+                    assert(!overlap, "ALLOC HANDED OUT A BLOCK OVERLAPPING A LIVE ONE (freelist poisoned)");
+                }
+                assert(nlive < live.length, "tracker table full");
+                live[nlive++] = Rec(r.ptr, r.length);
+            }
+            return r;
+        }
+
+        bool deallocate(void[] blk) @nogc nothrow @trusted
+        {
+            if (blk.ptr is null)
+                return true;
+            foreach (i; 0 .. nlive)
+                if (live[i].p == blk.ptr)
+                {
+                    live[i] = live[nlive - 1];
+                    nlive--;
+                    return b.deallocate(blk);
+                }
+            assert(false, "DEALLOCATE OF A NON-LIVE BLOCK (double-free or foreign free)");
+        }
+
+        static if (__traits(hasMember, Backend, "reallocate"))
+            bool reallocate(ref void[] blk, size_t n) @nogc nothrow @trusted
+            {
+                void* old = blk.ptr;
+                immutable ok = b.reallocate(blk, n);
+                if (ok)
+                {
+                    foreach (i; 0 .. nlive)
+                        if (live[i].p == old)
+                        {
+                            live[i] = Rec(blk.ptr, blk.length);
+                            return ok;
+                        }
+                    if (old is null && blk.ptr !is null)
+                        live[nlive++] = Rec(blk.ptr, blk.length);
+                }
+                return ok;
+            }
+    }
+
+    alias DataAllocator = StatsCollector!(Tracked!DataBackend, Options.bytesUsed);
+}
+else
+    alias DataAllocator = StatsCollector!(DataBackend, Options.bytesUsed);
 
 // Always stateful now (the collector holds counters), so one global instance with
 // an `instance` accessor — drops straight into emplace's `Allocator.instance`
@@ -88,4 +162,35 @@ ulong keyspaceBytesUsed() @nogc nothrow @trusted
     assert(keyspaceBytesUsed() >= before + 500);
     KeyspaceAllocator.instance.deallocate(b);
     assert(keyspaceBytesUsed() == before);
+}
+
+// Contract guard: `reallocate` across a Segregator threshold (b.length <= t < s)
+// must still resize correctly and NOT overflow a neighbor. Segregator.reallocate
+// returns false on a cross-threshold move, but the std free-function falls back to
+// allocate-new/copy/deallocate-old, so the grow succeeds. The containers grow by
+// doubling (crossing thresholds), so this path is load-bearing — guards sandwich
+// the block to catch any regression that leaves it undersized.
+@nogc nothrow unittest
+{
+    import std.experimental.allocator : reallocate;
+
+    void[] g1 = KeyspaceAllocator.instance.allocate(256);
+    void[] b = KeyspaceAllocator.instance.allocate(64);
+    void[] g2 = KeyspaceAllocator.instance.allocate(256);
+    (cast(ubyte[]) g1)[] = 0xEE;
+    (cast(ubyte[]) g2)[] = 0xEE;
+
+    immutable ok = reallocate(KeyspaceAllocator.instance, b, 256); // 64 -> 256 crosses 128
+    assert(ok, "reallocate across the 128 threshold returned false");
+    assert(b.length == 256, "reallocate did not actually resize");
+    (cast(ubyte[]) b)[] = 0x22; // write the full claimed size
+
+    foreach (x; cast(ubyte[]) g1)
+        assert(x == 0xEE, "reallocate overflowed into the low neighbor");
+    foreach (x; cast(ubyte[]) g2)
+        assert(x == 0xEE, "reallocate overflowed into the high neighbor");
+
+    KeyspaceAllocator.instance.deallocate(g1);
+    KeyspaceAllocator.instance.deallocate(b);
+    KeyspaceAllocator.instance.deallocate(g2);
 }

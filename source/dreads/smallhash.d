@@ -9,7 +9,14 @@ module dreads.smallhash;
 // ~this (union field).
 
 import dreads.dict : Dict, StrVal;
+import dreads.alloc : KeyspaceAllocator;
 import emplace.vector : Vector;
+import emplace.hashmap : HashMap;
+import std.experimental.allocator : reallocate;
+
+// Field-TTL side-map, keyed by field name -> absolute deadline (ms). Keyspace
+// data, so it routes through KeyspaceAllocator like the rest of the hash.
+private alias FieldTTLMap = HashMap!(ulong, KeyspaceAllocator);
 
 struct SmallHash
 {
@@ -27,7 +34,7 @@ struct SmallHash
     private Ent* ents; // one per field, into the blob
     private StrVal* vals; // parallel value array (vals[i] belongs to ents[i])
     private size_t count, cap;
-    private Dict!StrVal large;
+    private HashMap!(StrVal, KeyspaceAllocator) large;
 
     // Per-field TTL side-map (HEXPIRE family). NULL until the first field TTL is
     // set — a hash without field expiry pays nothing (one null pointer). Keyed by
@@ -35,7 +42,7 @@ struct SmallHash
     // field names, so it survives blob realloc / small->large spill (which key by
     // name too). See [[keyspace]] field-TTL design: this is the per-hash analog of
     // RObj.expireAtMs; the *active* reap is driven by a separate tagged index.
-    private Dict!(ulong)* fieldTTL;
+    private FieldTTLMap* fieldTTL;
     // A cached LOWER BOUND on the field deadlines — the O(1) fast path for lazy
     // reap: when `minDeadline > now` nothing can be due, so a hot read skips the
     // O(n) scan entirely. Kept exact by `setFieldTTL`; a `clearFieldTTL` that drops
@@ -77,7 +84,10 @@ struct SmallHash
 
     bool contains(scope const(char)[] k) const @nogc nothrow @trusted
     {
-        return (cast() this).get(k) !is null;
+        // cast the POINTER to mutable (get is non-const), NOT `(cast() this)` —
+        // copying `this` would deep-copy `large` via HashMap's postblit (an alloc
+        // on a read path) and then free it, dangling get's returned pointer.
+        return (cast(SmallHash*)&this).get(k) !is null;
     }
 
     alias exists = contains;
@@ -147,31 +157,41 @@ struct SmallHash
 
     bool remove(scope const(char)[] k) @nogc nothrow @trusted
     {
+        // Remove the field FIRST (this reads `k`), then clear its TTL entry — the
+        // reap path passes `k` as a slice INTO the fieldTTL key memory, and
+        // `fieldTTL.remove` frees that memory. Clearing the TTL first would dangle
+        // `k` before the field lookup below (a UAF the composed allocator turns
+        // into a missed removal; malloc merely left the freed bytes readable).
+        bool found;
+        if (big)
+            found = large.remove(k);
+        else
+        {
+            import core.stdc.string : memmove;
+
+            foreach (i; 0 .. count)
+                if (fieldAt(i) == k)
+                {
+                    vals[i].free();
+                    immutable pos = ents[i].pos, flen = ents[i].len;
+                    memmove(blob + pos, blob + pos + flen, blen - pos - flen);
+                    blen -= flen;
+                    foreach (j; 0 .. count)
+                        if (ents[j].pos > pos)
+                            ents[j].pos -= flen;
+                    foreach (j; i .. count - 1) // keep field/value arrays parallel + in order
+                    {
+                        ents[j] = ents[j + 1];
+                        vals[j] = vals[j + 1];
+                    }
+                    count--;
+                    found = true;
+                    break;
+                }
+        }
         if (fieldTTL !is null)
             fieldTTL.remove(k); // drop the field's TTL entry, if any
-        if (big)
-            return large.remove(k);
-        import core.stdc.string : memmove;
-
-        foreach (i; 0 .. count)
-            if (fieldAt(i) == k)
-            {
-                vals[i].free();
-                immutable pos = ents[i].pos, flen = ents[i].len;
-                memmove(blob + pos, blob + pos + flen, blen - pos - flen);
-                blen -= flen;
-                foreach (j; 0 .. count)
-                    if (ents[j].pos > pos)
-                        ents[j].pos -= flen;
-                foreach (j; i .. count - 1) // keep field/value arrays parallel + in order
-                {
-                    ents[j] = ents[j + 1];
-                    vals[j] = vals[j + 1];
-                }
-                count--;
-                return true;
-            }
-        return false;
+        return found;
     }
 
     alias del = remove;
@@ -190,9 +210,9 @@ struct SmallHash
     {
         if (fieldTTL is null)
         {
-            import core.stdc.stdlib : calloc;
+            import dreads.mem : allocZeroed;
 
-            fieldTTL = cast(Dict!(ulong)*) calloc(1, (Dict!(ulong)).sizeof);
+            fieldTTL = cast(FieldTTLMap*) allocZeroed!KeyspaceAllocator(FieldTTLMap.sizeof).ptr;
             assert(fieldTTL !is null, "out of memory");
         }
         fieldTTL.set(field, at); // Dict owns a stable copy of the field name
@@ -205,7 +225,10 @@ struct SmallHash
     {
         if (fieldTTL is null)
             return 0;
-        auto p = (cast() *fieldTTL).get(field);
+        // deref a mutable-cast pointer (lvalue ref, no copy). `(cast() *fieldTTL)`
+        // would copy the map via postblit and free it at end of statement — then
+        // `*p` below reads freed memory (a UAF the composed allocator exposes).
+        auto p = (cast(FieldTTLMap*) fieldTTL).get(field);
         return p is null ? 0 : *p;
     }
 
@@ -224,7 +247,7 @@ struct SmallHash
         if (fieldTTL is null)
             return 0;
         ulong m = 0;
-        (cast() *fieldTTL).opApply((const(char)[] _f, ref ulong at) @nogc nothrow {
+        (cast(FieldTTLMap*) fieldTTL).opApply((const(char)[] _f, ref ulong at) @nogc nothrow {
             if (m == 0 || at < m)
                 m = at;
             return 0;
@@ -282,7 +305,7 @@ struct SmallHash
             c.append(fieldAt(i), vals[i].dup());
         // clone the field-TTL side-map (keyed by name, independent of tier)
         if (fieldTTL !is null)
-            (cast() *fieldTTL).opApply((const(char)[] f, ref ulong at) @nogc nothrow {
+            (cast(FieldTTLMap*) fieldTTL).opApply((const(char)[] f, ref ulong at) @nogc nothrow {
                 c.setFieldTTL(f, at);
                 return 0;
             });
@@ -305,25 +328,23 @@ struct SmallHash
 
     void free() @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : cfree = free;
-
         clear();
         if (fieldTTL !is null)
         {
             fieldTTL.free();
-            cfree(fieldTTL);
+            KeyspaceAllocator.instance.deallocate((cast(void*) fieldTTL)[0 .. FieldTTLMap.sizeof]);
             fieldTTL = null;
         }
         if (blob !is null)
         {
-            cfree(blob);
+            KeyspaceAllocator.instance.deallocate((cast(void*) blob)[0 .. bcap]);
             blob = null;
             bcap = 0;
         }
         if (ents !is null)
         {
-            cfree(ents);
-            cfree(vals);
+            KeyspaceAllocator.instance.deallocate((cast(void*) ents)[0 .. cap * Ent.sizeof]);
+            KeyspaceAllocator.instance.deallocate((cast(void*) vals)[0 .. cap * StrVal.sizeof]);
             ents = null;
             vals = null;
             cap = 0;
@@ -341,23 +362,28 @@ struct SmallHash
 
     private void append(scope const(char)[] k, StrVal v) @nogc nothrow @trusted
     {
-        import core.stdc.stdlib : realloc;
-
         if (blen + k.length > bcap)
         {
             auto nc = bcap ? bcap * 2 : 16;
             while (nc < blen + k.length)
                 nc *= 2;
-            blob = cast(ubyte*) realloc(blob, nc);
-            assert(blob !is null, "out of memory");
+            void[] blk = blob is null ? null : (cast(void*) blob)[0 .. bcap];
+            immutable ok = reallocate(KeyspaceAllocator.instance, blk, nc);
+            assert(ok, "out of memory");
+            blob = cast(ubyte*) blk.ptr;
             bcap = nc;
         }
         if (count == cap)
         {
             immutable nc = cap ? cap * 2 : 4;
-            ents = cast(Ent*) realloc(ents, nc * Ent.sizeof);
-            vals = cast(StrVal*) realloc(vals, nc * StrVal.sizeof);
-            assert(ents !is null && vals !is null, "out of memory");
+            void[] eblk = ents is null ? null : (cast(void*) ents)[0 .. cap * Ent.sizeof];
+            immutable okE = reallocate(KeyspaceAllocator.instance, eblk, nc * Ent.sizeof);
+            assert(okE, "out of memory");
+            ents = cast(Ent*) eblk.ptr;
+            void[] vblk = vals is null ? null : (cast(void*) vals)[0 .. cap * StrVal.sizeof];
+            immutable okV = reallocate(KeyspaceAllocator.instance, vblk, nc * StrVal.sizeof);
+            assert(okV, "out of memory");
+            vals = cast(StrVal*) vblk.ptr;
             cap = nc;
         }
         blob[blen .. blen + k.length] = cast(const(ubyte)[]) k[]; // slice copy
@@ -366,5 +392,24 @@ struct SmallHash
         count++;
         blen += k.length;
     }
+}
+
+@nogc nothrow unittest // reapExpired regression: it collects due field names as
+{                       // slices INTO the fieldTTL key memory, then remove()s each.
+    // remove() must drop the field BEFORE clearing the TTL (which frees that key
+    // slice) — else `k` dangles and the composed allocator (freelist next-ptr
+    // overwrite) leaves the field un-removed. malloc hid this; this test catches it.
+    SmallHash h;
+    scope (exit)
+        h.free();
+    h.set("f1", StrVal.of("v1"));
+    h.set("f2", StrVal.of("v2"));
+    h.setFieldTTL("f1", 100); // deadline 100, reap at now=200
+    assert(h.getFieldTTL("f1") == 100);
+    immutable reaped = h.reapExpired(200);
+    assert(reaped == 1, "expired field not reaped");
+    assert(h.get("f1") is null, "reaped field still present (remove UAF)");
+    assert(h.get("f2") !is null, "live field wrongly dropped");
+    assert(h.length == 1);
 }
 

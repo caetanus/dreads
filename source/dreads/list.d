@@ -3,8 +3,8 @@ module dreads.list;
 // @nogc doubly-linked list with the payload inline in the node (one malloc
 // per element). Backs the Redis LIST type. Plain data — call free() when done.
 
-import core.stdc.stdlib : malloc, cfree = free;
 import core.stdc.string : memcpy;
+import dreads.alloc : KeyspaceAllocator;
 
 private struct Node
 {
@@ -20,15 +20,22 @@ private struct Node
     }
 }
 
-private Node* mkNode(scope const(char)[] v) @nogc nothrow
+private Node* mkNode(scope const(char)[] v) @nogc nothrow @trusted
 {
-    auto n = cast(Node*) malloc(Node.sizeof + v.length);
+    auto n = cast(Node*) KeyspaceAllocator.instance.allocate(Node.sizeof + v.length).ptr;
     assert(n !is null, "out of memory");
     n.prev = n.next = null;
     n.len = v.length;
     if (v.length)
         memcpy(cast(ubyte*) n + Node.sizeof, v.ptr, v.length);
     return n;
+}
+
+// Node is a header + inline payload; its block size is Node.sizeof + len, which
+// the node itself records — so a size-aware allocator gets the right bucket back.
+private void freeNode(Node* n) @nogc nothrow @trusted
+{
+    KeyspaceAllocator.instance.deallocate((cast(void*) n)[0 .. Node.sizeof + n.len]);
 }
 
 public struct DList
@@ -48,7 +55,7 @@ public struct DList
         while (n !is null)
         {
             auto next = n.next;
-            cfree(n);
+            freeNode(n);
             n = next;
         }
         head = tail = null;
@@ -101,7 +108,7 @@ public struct DList
             head.prev = null;
         else
             tail = null;
-        cfree(n);
+        freeNode(n);
         count--;
     }
 
@@ -114,7 +121,7 @@ public struct DList
             tail.next = null;
         else
             head = null;
-        cfree(n);
+        freeNode(n);
         count--;
     }
 
@@ -164,7 +171,7 @@ public struct DList
             n.next.prev = nn;
         else
             tail = nn;
-        cfree(n);
+        freeNode(n);
         return true;
     }
 
@@ -223,7 +230,7 @@ public struct DList
                     n.next.prev = n.prev;
                 else
                     tail = n.prev;
-                cfree(n);
+                freeNode(n);
                 count--;
                 removed++;
             }

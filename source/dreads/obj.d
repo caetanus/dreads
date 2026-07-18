@@ -210,7 +210,7 @@ public struct RObj
                     continue;
                 auto f = hash.keyAt(i);
                 c.hash.set(f, hash.valAt(i).dup());
-                immutable ttl = (cast() hash).getFieldTTL(f); // set() cleared it; restore
+                immutable ttl = hash.getFieldTTL(f); // set() cleared it; restore (getFieldTTL is const)
                 if (ttl != 0)
                     c.hash.setFieldTTL(f, ttl);
             }

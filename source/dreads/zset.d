@@ -4,10 +4,12 @@ module dreads.zset;
 // O(log n) rank queries — the same layout as Redis's zskiplist — plus a
 // member->score dict for O(1) ZSCORE. Fully @nogc, plain data, call free().
 
-import core.stdc.stdlib : malloc, cfree = free, rand;
+import core.stdc.stdlib : rand;
 import core.stdc.string : memcmp, memcpy;
 
 import dreads.dict : Dict, DoubleVal;
+import dreads.alloc : KeyspaceAllocator;
+import emplace.hashmap : HashMap;
 
 private enum MAX_LEVEL = 32;
 
@@ -39,9 +41,10 @@ private struct ZNode
     }
 }
 
-private ZNode* mkNode(ubyte lvl, double score, scope const(char)[] member) @nogc nothrow
+private ZNode* mkNode(ubyte lvl, double score, scope const(char)[] member) @nogc nothrow @trusted
 {
-    auto n = cast(ZNode*) malloc(ZNode.sizeof + Level.sizeof * lvl + member.length);
+    auto n = cast(ZNode*) KeyspaceAllocator.instance.allocate(
+        ZNode.sizeof + Level.sizeof * lvl + member.length).ptr;
     assert(n !is null, "out of memory");
     n.score = score;
     n.backward = null;
@@ -55,6 +58,15 @@ private ZNode* mkNode(ubyte lvl, double score, scope const(char)[] member) @nogc
     if (member.length)
         memcpy(cast(void*) n.member.ptr, member.ptr, member.length);
     return n;
+}
+
+// A skiplist node's block is header + Level[level] + member bytes; level and
+// memberLen are stored in the node, so a size-aware allocator gets the right
+// bucket back. The sentinel header (level == MAX_LEVEL, memberLen == 0) fits too.
+private void freeNode(ZNode* n) @nogc nothrow @trusted
+{
+    KeyspaceAllocator.instance.deallocate(
+        (cast(void*) n)[0 .. ZNode.sizeof + Level.sizeof * n.level + n.memberLen]);
 }
 
 private int cmpMember(scope const(char)[] a, scope const(char)[] b) @nogc nothrow
@@ -93,7 +105,7 @@ public struct ZSet
     private ZNode* tailN;
     private int levelCount = 0; // levels in use (0 until first insert)
     private size_t count;
-    private Dict!DoubleVal scores;
+    private HashMap!(DoubleVal, KeyspaceAllocator) scores;
 
     @property size_t length() const @nogc nothrow
     {
@@ -106,7 +118,7 @@ public struct ZSet
         while (n !is null)
         {
             auto next = n.levels[0].forward;
-            cfree(n);
+            freeNode(n);
             n = next;
         }
         header = tailN = null;
@@ -395,7 +407,7 @@ public struct ZSet
             tailN = n.backward;
         while (levelCount > 1 && header.levels[levelCount - 1].forward is null)
             levelCount--;
-        cfree(n);
+        freeNode(n);
         count--;
     }
 }
