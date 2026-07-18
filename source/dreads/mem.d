@@ -4,7 +4,8 @@ module dreads.mem;
 // The GC must never run in the data plane (see logo: "Arena memory. Zero-GC overhead").
 
 import core.stdc.stdlib : malloc, realloc, free;
-import core.stdc.string : memcpy, memmove;
+import core.stdc.string : memcpy, memmove, memset;
+import std.experimental.allocator.mallocator : Mallocator;
 
 /// Growable malloc-backed byte buffer (network in/out buffers, reply building).
 public struct ByteBuffer
@@ -192,35 +193,53 @@ public struct Arena
     }
 }
 
-/// malloc'd copy of a byte slice (storage keys/values). Free with freeSlice.
-public char[] mallocDup(scope const(char)[] s) @nogc nothrow
+// Owned-slice helpers, templatized on the allocator (`Alloc = Mallocator`). Every
+// allocation goes through `Alloc.instance.allocate`; the returned slice length is
+// exactly the requested size, so `freeSlice` can `deallocate` with the correct
+// size for size-aware backends (Mallocator ignores it). Keyspace data passes
+// `KeyspaceAllocator` (dreads.alloc); control-plane callers keep the default so
+// their bytes stay out of the maxmemory accounting.
+
+/// Owned copy of a byte slice (storage keys/values). Free with freeSlice!Alloc.
+public char[] mallocDup(Alloc = Mallocator)(scope const(char)[] s) @nogc nothrow @trusted
 {
     if (s.length == 0)
         return null;
-    auto p = cast(char*) malloc(s.length);
+    auto p = cast(char*) Alloc.instance.allocate(s.length).ptr;
     assert(p !is null, "out of memory");
     memcpy(p, s.ptr, s.length);
     return p[0 .. s.length];
 }
 
-public void freeSlice(const(char)[] s) @nogc nothrow
+/// A zero-filled owned buffer of n bytes. Free with freeSlice!Alloc.
+public char[] allocZeroed(Alloc = Mallocator)(size_t n) @nogc nothrow @trusted
 {
-    if (s.ptr !is null)
-        free(cast(void*) s.ptr);
+    if (n == 0)
+        return null;
+    auto p = cast(char*) Alloc.instance.allocate(n).ptr;
+    assert(p !is null, "out of memory");
+    memset(p, 0, n);
+    return p[0 .. n];
 }
 
-/// New malloc'd slice holding a ~ b; frees a (APPEND-style in-place growth).
-public const(char)[] mallocAppend(const(char)[] a, scope const(char)[] b) @nogc nothrow
+public void freeSlice(Alloc = Mallocator)(const(char)[] s) @nogc nothrow @trusted
+{
+    if (s.ptr !is null)
+        Alloc.instance.deallocate(cast(void[]) s);
+}
+
+/// New owned slice holding a ~ b; frees a (APPEND-style in-place growth).
+public const(char)[] mallocAppend(Alloc = Mallocator)(const(char)[] a, scope const(char)[] b) @nogc nothrow @trusted
 {
     if (b.length == 0)
         return a;
-    auto p = cast(char*) malloc(a.length + b.length);
+    auto p = cast(char*) Alloc.instance.allocate(a.length + b.length).ptr;
     assert(p !is null, "out of memory");
     if (a.length)
         memcpy(p, a.ptr, a.length);
     memcpy(p + a.length, b.ptr, b.length);
     auto r = p[0 .. a.length + b.length];
-    freeSlice(a);
+    freeSlice!Alloc(a);
     return r;
 }
 

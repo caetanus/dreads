@@ -5,7 +5,17 @@ module dreads.dict;
 // as a reusable library). This module keeps the dreads-specific value types and
 // aliases the container as `Dict` so the existing call sites are unchanged.
 
-import dreads.mem : mallocAppend, mallocDup, freeSlice;
+import dreads.alloc : KeyspaceAllocator;
+import dreads.mem : memMallocAppend = mallocAppend, memMallocDup = mallocDup,
+    memFreeSlice = freeSlice;
+
+// StrVal's owned bytes are keyspace data — route them through the swappable
+// KeyspaceAllocator so SET/APPEND/etc. exercise the data-plane allocator and
+// count toward the real maxmemory figure. Binding once here keeps every call
+// site below unchanged.
+private alias mallocDup = memMallocDup!KeyspaceAllocator;
+private alias mallocAppend = memMallocAppend!KeyspaceAllocator;
+private alias freeSlice = memFreeSlice!KeyspaceAllocator;
 
 public import emplace.hashmap : HashMap;
 

@@ -9,7 +9,7 @@ module dreads.hll;
 import core.stdc.math : log;
 import core.stdc.string : memcmp, memcpy, memset;
 
-import dreads.mem : ByteBuffer, freeSlice, mallocDup;
+import dreads.mem : ByteBuffer;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
 
@@ -96,15 +96,14 @@ private double estimate(scope const(char)[] s) @nogc nothrow
 }
 
 /// Fresh dense HLL owned by the caller.
-private char[] newHll() @nogc nothrow
+private char[] newHll() @nogc nothrow @trusted
 {
-    import core.stdc.stdlib : malloc;
+    import dreads.mem : allocZeroed;
+    import dreads.alloc : KeyspaceAllocator;
 
-    auto p = cast(char*) malloc(DENSE_BYTES);
-    assert(p !is null, "out of memory");
-    memset(p, 0, DENSE_BYTES);
+    auto p = allocZeroed!KeyspaceAllocator(DENSE_BYTES);
     p[0 .. 4] = "HYLL";
-    return p[0 .. DENSE_BYTES];
+    return p;
 }
 
 /// The key's HLL bytes for writing, creating if missing.

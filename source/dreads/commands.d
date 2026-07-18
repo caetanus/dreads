@@ -3046,8 +3046,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
             {
                 import dreads.mem : mallocDup;
+                import dreads.alloc : KeyspaceAllocator;
 
-                obj.str.setRaw(mallocDup(buf)); // frees the old buffer, adopts the new
+                obj.str.setRaw(mallocDup!KeyspaceAllocator(buf)); // frees old, adopts new
             }
             notifyKeyspaceEvent(NClass.str, "setrange", args[0].str);
             repInt(o, cast(long) newLen);

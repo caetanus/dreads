@@ -8,7 +8,8 @@ import core.bitop : popcnt;
 import core.stdc.string : memcpy, memset;
 
 import dreads.commands : eqICKeyword, normalizeRange, parseLong, gWriteNoOp;
-import dreads.mem : Arena, ByteBuffer, freeSlice, mallocDup;
+import dreads.alloc : KeyspaceAllocator;
+import dreads.mem : Arena, ByteBuffer, allocZeroed;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
 
@@ -40,30 +41,17 @@ private char[] ensureBytes(ref Keyspace ks, scope const(char)[] key, size_t nbyt
     {
         RObj no;
         no.type = ObjType.str;
-        no.str.setRaw(mallocDup(zeroes(nbytes)));
+        no.str.setRaw(allocZeroed!KeyspaceAllocator(nbytes));
         ks.d.set(key, no);
         return ks.lookup(key).str.rawMut();
     }
     auto cur = obj.str.rawMut(); // materialize an int-encoded value to raw bytes
     if (cur.length >= nbytes)
-        return cur; // we own the malloc'd buffer
-    auto grown = mallocDup(zeroes(nbytes));
+        return cur; // we own the keyspace-allocated buffer
+    auto grown = allocZeroed!KeyspaceAllocator(nbytes);
     grown[0 .. cur.length] = cur[]; // slice copy, not memcpy
     obj.str.setRaw(grown); // frees the old buffer
     return grown;
-}
-
-// scratch zero-span provider for mallocDup-based growth
-private const(char)[] zeroes(size_t n) @nogc nothrow
-{
-    // mallocDup copies from this; a static zero page would limit n, so build
-    // via malloc directly instead
-    import core.stdc.stdlib : malloc;
-
-    auto p = cast(char*) malloc(n ? n : 1);
-    assert(p !is null, "out of memory");
-    memset(p, 0, n);
-    return p[0 .. n];
 }
 
 /// SETBIT key offset 0|1
