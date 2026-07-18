@@ -267,7 +267,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // also run 5x more often.
         setTimer(200.msecs, delegate() @trusted nothrow {
             import dreads.det : freezeClock;
+            import dreads.obj : gActiveExpire;
 
+            // Cheap early-out: with active expiry off (the default) this fast timer
+            // must do NOTHING — no clock read, no db sweep, no flush — so it never
+            // costs the hot path a wasted wakeup's worth of work.
+            if (!gActiveExpire)
+                return;
             freezeClock(0); // pin this cycle's clock to wall time (see below)
             // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
             // is a propagated DEL) is held until the window lifts, like eviction.
