@@ -278,31 +278,18 @@ unittest
 }
 
 // ---------------------------------------------------------------------------
-// process memory accounting (jemalloc stats; Linux only — 0 elsewhere)
+// keyspace memory accounting — the REAL, build-portable figure that drives
+// maxmemory (INFO used_memory + eviction). Now that every keyspace value routes
+// through KeyspaceAllocator, its StatsCollector counts exactly the data plane's
+// live bytes: portable (no jemalloc/Linux dependency), and tight for the eviction
+// loop (evicting a key directly lowers this number, unlike a process-wide count
+// that non-keyspace overhead can pin above the limit). See dreads.alloc.
 // ---------------------------------------------------------------------------
 
-version (linux)
+/// Live bytes held by the keyspace data allocator. Drives maxmemory.
+public ulong usedMemory() nothrow @nogc
 {
-    private extern (C) int mallctl(const(char)* name, void* oldp, size_t* oldlenp,
-            void* newp, size_t newlen) nothrow @nogc;
+    import dreads.alloc : keyspaceBytesUsed;
 
-    /// Bytes currently allocated by the process allocator (jemalloc).
-    public ulong usedMemory() nothrow @nogc
-    {
-        ulong epoch = 1;
-        size_t esz = epoch.sizeof;
-        mallctl("epoch", &epoch, &esz, &epoch, epoch.sizeof);
-        size_t allocated;
-        size_t asz = allocated.sizeof;
-        if (mallctl("stats.allocated", &allocated, &asz, null, 0) != 0)
-            return 0;
-        return allocated;
-    }
-}
-else
-{
-    public ulong usedMemory() nothrow @nogc
-    {
-        return 0; // accounting unavailable: maxmemory is inert
-    }
+    return keyspaceBytesUsed();
 }
