@@ -80,6 +80,12 @@ private __gshared Aof gAof;
 private __gshared const(char)[] gAofPath;
 public __gshared ulong gWriteEpoch; // bumped on every effective write (WATCH + INFO changes)
 private __gshared ulong gClientIds;
+// The connection whose command is executing right NOW (single-thread, set by the
+// serve loop around handleCommand). A pub/sub message published to THIS connection
+// (publish-to-self) must trail the running command's reply, not interleave before
+// it — connSink defers such a message to pendingInval (drained after outb). Null
+// between commands so an ordinary cross-client delivery goes straight to the queue.
+private __gshared Conn* gCmdConn;
 // MONITOR feed: registered connections receive every executed command
 private __gshared Conn*[64] gMonitors;
 private __gshared size_t gMonitorCount;
@@ -1354,6 +1360,21 @@ private void connSink(void* ctx, RcMsg* msg) nothrow
     auto c = cast(Conn*) ctx;
     if (!c.subMode)
         return;
+    // Publish-to-self: a message to the connection whose command is running now
+    // must trail that command's own reply (RESP3 publish-to-self inside MULTI/EVAL).
+    // Stash the frame in pendingInval, which flushOut drains AFTER outb.
+    if (c is gCmdConn)
+    {
+        if (c.resp3)
+        {
+            auto pm = rcAsPush(msg);
+            c.pendingInval.append(rcData(pm));
+            rcRelease(pm);
+        }
+        else
+            c.pendingInval.append(rcData(msg));
+        return;
+    }
     if (c.resp3)
     {
         // RESP3 wants Push framing; hand the queue our own reframed copy.
@@ -1520,7 +1541,9 @@ private void serveClient(TCPConnection tcp) nothrow
                 c.totNetIn += p - start; // count request bytes at read (a blocked cmd still shows them)
                 immutable replyPre = outb.length;
                 c.replyCmdExempt = false;
+                gCmdConn = c; // publish-to-self during this command trails its reply
                 keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
+                gCmdConn = null;
                 postCommand(*c, outb, replyPre);
                 if (gNotifyFlags)
                     flushPendingNotify();
@@ -1627,7 +1650,9 @@ private void serveClient(TCPConnection tcp) nothrow
                     c.totNetIn += pos - cmdStart; // count request bytes at read (a blocked cmd still shows them)
                     immutable replyPre = outb.length;
                     c.replyCmdExempt = false;
+                    gCmdConn = c; // publish-to-self during this command trails its reply
                     keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
+                    gCmdConn = null;
                     postCommand(*c, outb, replyPre);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
@@ -3845,12 +3870,18 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 return;
             }
         }
-        import dreads.notify : parseNotifyFlags;
+        import dreads.notify : parseNotifyFlags, notifyFlagsToString;
         import dreads.obj : gActiveExpire, gActiveEviction;
 
         gActiveExpire = gConfig.activeExpire; // mirror the runtime toggles
         gActiveEviction = gConfig.activeEviction;
-        cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
+        if (parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags))
+        {
+            // store back the CANONICAL form so CONFIG GET round-trips normalized
+            // (Redis: `KA` -> `AK`, `EA` -> `AE`, class flags in a fixed order).
+            char[24] fb = void;
+            gConfig.notifyKeyspaceEvents = notifyFlagsToString(gNotifyFlags, fb[]).idup;
+        }
         repSimple(o, "OK");
         return;
     }

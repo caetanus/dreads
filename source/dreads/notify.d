@@ -64,6 +64,35 @@ private void queuePair(scope const(char)[] chanA, scope const(char)[] chanB,
     pending.append(msg);
 }
 
+/// Render a flag bitmask back to its CANONICAL string (Redis's
+/// keyspaceEventsFlagsToString order), so CONFIG GET round-trips normalized:
+/// class flags (or `A` when all present) g$lshzxetd, then m, n, then K, E.
+/// `A` collapses the class group only — m/n stay explicit (they're not in A).
+const(char)[] notifyFlagsToString(uint flags, return scope char[] buf) @nogc nothrow
+{
+    size_t n = 0;
+    if ((flags & NClass.all) == NClass.all)
+        buf[n++] = 'A';
+    else
+    {
+        if (flags & NClass.generic) buf[n++] = 'g';
+        if (flags & NClass.str) buf[n++] = '$';
+        if (flags & NClass.list) buf[n++] = 'l';
+        if (flags & NClass.set) buf[n++] = 's';
+        if (flags & NClass.hash) buf[n++] = 'h';
+        if (flags & NClass.zset) buf[n++] = 'z';
+        if (flags & NClass.expired) buf[n++] = 'x';
+        if (flags & NClass.evicted) buf[n++] = 'e';
+        if (flags & NClass.stream) buf[n++] = 't';
+        if (flags & NClass.modevt) buf[n++] = 'd';
+    }
+    if (flags & NClass.keymiss) buf[n++] = 'm';
+    if (flags & NClass.newkey) buf[n++] = 'n';
+    if (flags & NClass.keyspace) buf[n++] = 'K';
+    if (flags & NClass.keyevent) buf[n++] = 'E';
+    return buf[0 .. n];
+}
+
 /// Parse the flag string ("KEA", "Kxge", ...) into a bitmask. false on a bad char.
 bool parseNotifyFlags(scope const(char)[] s, out uint flags) @nogc nothrow
 {
