@@ -321,7 +321,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
 
                 ks.del(args[0].str);
                 gExpiredKeys++;
-                notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
+                // a past deadline is an EXPIRY, not a delete: fire `expired`
+                // (client-visible); the AOF/replication still propagates a DEL.
+                notifyKeyspaceEvent(NClass.expired, "expired", args[0].str);
                 propagationOverride.clear();
                 repArrayHeader(propagationOverride, 2);
                 repBulk(propagationOverride, "DEL");
