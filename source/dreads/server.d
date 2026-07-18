@@ -87,9 +87,10 @@ private __gshared ulong gClientIds;
 // it — connSink defers such a message to pendingInval (drained after outb). Null
 // between commands so an ordinary cross-client delivery goes straight to the queue.
 private __gshared Conn* gCmdConn;
-// MONITOR feed: registered connections receive every executed command
-private __gshared Conn*[64] gMonitors;
-private __gshared size_t gMonitorCount;
+// MONITOR feed: the SET of monitor conn ids (not raw Conn*), resolved to a strong
+// lock via connById at feed time — so a monitor freed cross-fiber can never dangle.
+// Mirrors the CLIENT TRACKING id-set registries (gBcastConns), the Phase-C model.
+private __gshared Dict!Unit gMonitors;
 
 // blocked clients (BLPOP & co.) wake on any write and re-check their keys
 private __gshared LocalManualEvent gKeyActivity;
@@ -2855,7 +2856,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             return true;
     }
 
-    if (gMonitorCount > 0)
+    if (gMonitors.length > 0)
         feedMonitors(c, cmd);
 
     // A RESP3 client may run ANY command while subscribed (push frames keep
@@ -3282,10 +3283,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "MONITOR":
         {
-            if (gMonitorCount < gMonitors.length)
+            if (gMonitors.length < 64)
             {
                 enterSubMode(c); // monitors receive an async stream, like subscribers
-                gMonitors[gMonitorCount++] = &c;
+                gMonitors.set(connIdKey(c.id), Unit());
                 repSimple(o, "OK");
             }
             else
@@ -5233,15 +5234,7 @@ private void logEffect(string verb, scope const(char)[] key) nothrow
 
 private void unregisterMonitor(Conn* c) nothrow
 {
-    foreach (i; 0 .. gMonitorCount)
-    {
-        if (gMonitors[i] is c)
-        {
-            gMonitors[i] = gMonitors[gMonitorCount - 1];
-            gMonitorCount--;
-            return;
-        }
-    }
+    gMonitors.remove(connIdKey(c.id));
 }
 
 /// MONITOR feed line: +<unix>.<usec> [0 ?] "CMD" "arg" ...
@@ -5305,10 +5298,24 @@ private void feedMonitors(ref Conn from, const ref RVal cmd) nothrow
     }
     line.append("\r\n");
     auto m = rcFromBytes(line.data); // encode once, share across monitors
-    foreach (i; 0 .. gMonitorCount)
+    // Resolve each monitor id to a STRONG lock so it can't be freed under the
+    // delivery; a monitor that died is simply skipped. Index iteration (not the
+    // @nogc opApply — connSink isn't @nogc); feedMonitors never yields, so walking
+    // the table directly is safe (no concurrent mutation).
+    foreach (i; 0 .. gMonitors.capacity)
     {
-        if (gMonitors[i] !is &from)
-            connSink(cast(void*) gMonitors[i], m);
+        if (!gMonitors.slotLive(i))
+            continue;
+        auto key = gMonitors.keyAt(i);
+        if (key.length != ulong.sizeof)
+            continue;
+        immutable id = *cast(const(ulong)*) key.ptr;
+        if (id == from.id)
+            continue; // a monitor never sees its own command
+        auto s = connById(id);
+        if (s.isNull)
+            continue;
+        connSink(cast(void*)&s.get(), m);
     }
     rcRelease(m);
 }
