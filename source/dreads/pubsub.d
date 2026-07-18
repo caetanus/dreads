@@ -18,8 +18,9 @@ module dreads.pubsub;
 // keyed by that header. A publish probes only the channel's own prefixes, so the
 // header is the discriminator: cost is O(len(channel)), independent of P.
 
-import core.stdc.stdlib : malloc, realloc, cfree = free;
 import core.stdc.string : memcpy;
+import std.experimental.allocator : reallocate;
+import dreads.alloc : ConnAllocator;
 
 import dreads.commands : globMatch;
 import dreads.dict : Dict, Unit;
@@ -54,9 +55,10 @@ public struct RcMsg
 }
 
 /// Build a refcounted frame from staged bytes (refs starts at 1: the caller's).
-public RcMsg* rcFromBytes(scope const(ubyte)[] bytes) @nogc nothrow
+public RcMsg* rcFromBytes(scope const(ubyte)[] bytes) @nogc nothrow @trusted
 {
-    auto m = cast(RcMsg*) malloc(RcMsg.sizeof + (bytes.length ? bytes.length : 1));
+    auto m = cast(RcMsg*) ConnAllocator.instance.allocate(
+        RcMsg.sizeof + (bytes.length ? bytes.length : 1)).ptr;
     assert(m !is null, "out of memory");
     m.refs = 1;
     m.len = cast(uint) bytes.length;
@@ -75,10 +77,10 @@ public void rcRetain(RcMsg* m) @nogc nothrow
     m.refs++;
 }
 
-public void rcRelease(RcMsg* m) @nogc nothrow
+public void rcRelease(RcMsg* m) @nogc nothrow @trusted
 {
     if (--m.refs == 0)
-        cfree(m);
+        ConnAllocator.instance.deallocate((cast(void*) m)[0 .. RcMsg.sizeof + (m.len ? m.len : 1)]);
 }
 
 /// RESP3 subscribers receive pub/sub frames as a Push (`>`) rather than an
@@ -126,13 +128,16 @@ private struct SubList
     size_t len;
     size_t cap;
 
-    void add(Subscriber* s) @nogc nothrow
+    void add(Subscriber* s) @nogc nothrow @trusted
     {
         if (len == cap)
         {
-            cap = cap ? cap * 2 : 4;
-            items = cast(Subscriber**) realloc(items, cap * (Subscriber*).sizeof);
-            assert(items !is null, "out of memory");
+            immutable ncap = cap ? cap * 2 : 4;
+            void[] blk = items is null ? null : (cast(void*) items)[0 .. cap * (Subscriber*).sizeof];
+            immutable ok = reallocate(ConnAllocator.instance, blk, ncap * (Subscriber*).sizeof);
+            assert(ok, "out of memory");
+            items = cast(Subscriber**) blk.ptr;
+            cap = ncap;
         }
         items[len++] = s;
     }
@@ -152,10 +157,10 @@ private struct SubList
         return false;
     }
 
-    void free() @nogc nothrow
+    void free() @nogc nothrow @trusted
     {
         if (items !is null)
-            cfree(items);
+            ConnAllocator.instance.deallocate((cast(void*) items)[0 .. cap * (Subscriber*).sizeof]);
         items = null;
         len = cap = 0;
     }
@@ -210,10 +215,10 @@ private struct PatEntry
         return raw[bOff .. bOff + bLen];
     }
 
-    void freeRaw() @nogc nothrow
+    void freeRaw() @nogc nothrow @trusted
     {
         if (raw !is null)
-            cfree(raw);
+            ConnAllocator.instance.deallocate((cast(void*) raw)[0 .. (rawLen ? rawLen : 1)]);
         raw = null;
     }
 }
@@ -309,13 +314,16 @@ private struct PtrBucket
     size_t len;
     size_t cap;
 
-    void add(PatEntry* e) @nogc nothrow
+    void add(PatEntry* e) @nogc nothrow @trusted
     {
         if (len == cap)
         {
-            cap = cap ? cap * 2 : 4;
-            items = cast(PatEntry**) realloc(items, cap * (PatEntry*).sizeof);
-            assert(items !is null, "out of memory");
+            immutable ncap = cap ? cap * 2 : 4;
+            void[] blk = items is null ? null : (cast(void*) items)[0 .. cap * (PatEntry*).sizeof];
+            immutable ok = reallocate(ConnAllocator.instance, blk, ncap * (PatEntry*).sizeof);
+            assert(ok, "out of memory");
+            items = cast(PatEntry**) blk.ptr;
+            cap = ncap;
         }
         items[len++] = e;
     }
@@ -344,10 +352,10 @@ private struct PtrBucket
         return null;
     }
 
-    void free() @nogc nothrow
+    void free() @nogc nothrow @trusted
     {
         if (items !is null)
-            cfree(items);
+            ConnAllocator.instance.deallocate((cast(void*) items)[0 .. cap * (PatEntry*).sizeof]);
         items = null;
         len = cap = 0;
     }
@@ -496,16 +504,16 @@ public struct PubSub
         }
     }
 
-    private void insertPattern(Subscriber* s, scope const(char)[] p) @nogc nothrow
+    private void insertPattern(Subscriber* s, scope const(char)[] p) @nogc nothrow @trusted
     {
         uint aLen, bOff, bLen;
         auto kind = classify(p, aLen, bOff, bLen);
-        auto e = cast(PatEntry*) malloc(PatEntry.sizeof);
+        auto e = cast(PatEntry*) ConnAllocator.instance.allocate(PatEntry.sizeof).ptr;
         assert(e !is null, "out of memory");
         *e = PatEntry.init;
         e.sub = s;
         e.rawLen = cast(uint) p.length;
-        e.raw = cast(char*) malloc(p.length ? p.length : 1);
+        e.raw = cast(char*) ConnAllocator.instance.allocate(p.length ? p.length : 1).ptr;
         assert(e.raw !is null, "out of memory");
         if (p.length)
             memcpy(e.raw, p.ptr, p.length);
@@ -591,7 +599,7 @@ public struct PubSub
         else
             (kind == PatKind.matchAll ? matchAll : fallback).remove(e);
         e.freeRaw();
-        cfree(e);
+        ConnAllocator.instance.deallocate((cast(void*) e)[0 .. PatEntry.sizeof]);
         patternEntries--;
         if (auto cp = patCounts.get(p))
             if (--(*cp) == 0)
