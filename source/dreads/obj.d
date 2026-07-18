@@ -586,6 +586,14 @@ public struct Keyspace
         return o;
     }
 
+    /// Fire the `new` keyevent for a key that just came into existence (Redis's
+    /// dbAdd hook). `d.set` returns true only on a genuine insert, so this is free
+    /// on overwrites and — since the class bit is off by default — on the hot path.
+    private void dbAdd(scope const(char)[] k) @nogc nothrow
+    {
+        notifyKeyspaceEvent(NClass.newkey, "new", k);
+    }
+
     /// Existing typed object, or a fresh empty one bound to k.
     RObj* getOrCreate(scope const(char)[] k, ObjType t, out bool wrong) @nogc nothrow
     {
@@ -599,20 +607,23 @@ public struct Keyspace
             }
             return o;
         }
-        d.set(k, RObj.empty(t));
+        if (d.set(k, RObj.empty(t)))
+            dbAdd(k);
         return d.get(k);
     }
 
     /// SET semantics: overwrites whatever type currently holds k.
     void setStr(scope const(char)[] k, scope const(char)[] v) @nogc nothrow
     {
-        d.set(k, RObj.ofStr(v));
+        if (d.set(k, RObj.ofStr(v)))
+            dbAdd(k);
     }
 
     /// SET of an int-encoded value (INCR on a missing key).
     void setInt(scope const(char)[] k, long v) @nogc nothrow
     {
-        d.set(k, RObj.ofInt(v));
+        if (d.set(k, RObj.ofInt(v)))
+            dbAdd(k);
     }
 
     bool del(scope const(char)[] k) @nogc nothrow

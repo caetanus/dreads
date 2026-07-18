@@ -125,7 +125,10 @@ void notifyKeyspaceEventDb(int db, uint klass, scope const(char)[] event,
     // db so the slice can never run past the buffer.
     if (kn <= 0 || kn > ksbuf.length || en <= 0 || en > kebuf.length)
         return;
-    if (f & NClass.keyspace)
+    // `new` (and `keymiss`) are keyevent-only in Redis — there is no
+    // __keyspace__:new channel — so they never take the keyspace branch.
+    immutable eventOnly = (klass & (NClass.newkey | NClass.keymiss)) != 0;
+    if ((f & NClass.keyspace) && !eventOnly)
         queuePair(ksbuf[0 .. kn], key, event);
     if (f & NClass.keyevent)
         queuePair(kebuf[0 .. en], event, key);
