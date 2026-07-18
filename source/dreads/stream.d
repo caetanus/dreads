@@ -140,10 +140,21 @@ public struct Group
     /// dict-owned (stable) name slice.
     const(char)[] ensureConsumer(scope const(char)[] name, ulong now) @nogc nothrow
     {
+        bool created;
+        return ensureConsumer(name, now, created);
+    }
+
+    /// As above, reporting via `created` whether a new consumer was registered
+    /// (so the caller can fire the `xgroup-createconsumer` keyspace event).
+    const(char)[] ensureConsumer(scope const(char)[] name, ulong now, out bool created) @nogc nothrow
+    {
         if (auto ci = consumers.get(name))
             ci.seenTime = now;
         else
+        {
             consumers.set(name, ConsumerInfo(now, 0));
+            created = true;
+        }
         foreach (i; 0 .. consumers.capacity)
         {
             if (consumers.slotLive(i) && consumers.keyAt(i) == name)

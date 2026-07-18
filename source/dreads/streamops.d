@@ -674,11 +674,15 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         g.entriesRead = entriesRead;
         obj.stream.groups.set(gname, g);
         repSimple(o, "OK");
+        notifyKeyspaceEvent(NClass.stream, "xgroup-create", key);
         return;
     }
     if (eqICKeyword(sub, "DESTROY"))
     {
-        repInt(o, obj !is null && obj.stream.groups.del(gname) ? 1 : 0);
+        immutable destroyed = obj !is null && obj.stream.groups.del(gname);
+        repInt(o, destroyed ? 1 : 0);
+        if (destroyed)
+            notifyKeyspaceEvent(NClass.stream, "xgroup-destroy", key);
         return;
     }
     if (eqICKeyword(sub, "SETID"))
@@ -703,6 +707,7 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         }
         g.lastDelivered = at;
         repSimple(o, "OK");
+        notifyKeyspaceEvent(NClass.stream, "xgroup-setid", key);
         return;
     }
     if (eqICKeyword(sub, "CREATECONSUMER") || eqICKeyword(sub, "DELCONSUMER"))
@@ -721,11 +726,15 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         auto cname = args[3].str;
         if (eqICKeyword(sub, "CREATECONSUMER"))
         {
-            repInt(o, g.consumers.exists(cname) ? 0 : 1);
+            immutable existed = g.consumers.exists(cname);
+            repInt(o, existed ? 0 : 1);
             g.ensureConsumer(cname, nowMs());
+            if (!existed)
+                notifyKeyspaceEvent(NClass.stream, "xgroup-createconsumer", key);
             return;
         }
         // DELCONSUMER: drop its pending entries, reply how many
+        immutable existed = g.consumers.exists(cname);
         long removed = 0;
         size_t i = 0;
         while (i < g.pending.length)
@@ -740,6 +749,8 @@ public void xgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         }
         g.consumers.del(cname);
         repInt(o, removed);
+        if (existed) // no event when the consumer never existed (Redis parity)
+            notifyKeyspaceEvent(NClass.stream, "xgroup-delconsumer", key);
         return;
     }
     repUnknownSubcommand(o, "XGROUP", sub);
@@ -840,7 +851,10 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         auto g = obj.stream.groups.get(gname);
         if (rest[half + k].str == ">")
         {
-            g.ensureConsumer(cname, now);
+            bool madeConsumer;
+            g.ensureConsumer(cname, now, madeConsumer);
+            if (madeConsumer) // XREADGROUP `>` auto-registers a new consumer
+                notifyKeyspaceEvent(NClass.stream, "xgroup-createconsumer", rest[k].str);
             bool ok;
             obj.stream.nextAfter(g.lastDelivered, ok);
             if (ok)
@@ -1185,7 +1199,10 @@ public void xautoclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         return;
     }
     auto now = nowMs();
-    auto consumer = g.ensureConsumer(args[2].str, now);
+    bool madeConsumer;
+    auto consumer = g.ensureConsumer(args[2].str, now, madeConsumer);
+    if (madeConsumer) // XAUTOCLAIM auto-creates the target consumer
+        notifyKeyspaceEvent(NClass.stream, "xgroup-createconsumer", args[0].str);
     // scan the PEL from `start`, examining up to `count` entries. Live ones are
     // claimed; ones deleted from the stream go to the deleted-ids list and are
     // evicted from the PEL. (arena copies: pelSet/pelRemove mutate the list.)
@@ -1259,14 +1276,78 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
         repError(o, "ERR Invalid min-idle-time argument for XCLAIM");
         return;
     }
-    auto ids = args[4 .. $];
-    bool justId = ids.length > 0 && eqICKeyword(ids[$ - 1].str, "JUSTID");
-    if (justId)
-        ids = ids[0 .. $ - 1];
-    auto now = nowMs();
-    auto consumer = g.ensureConsumer(args[2].str, now);
-    // count claimable
-    size_t n = 0;
+    // The id list runs until the first option keyword; options follow in any order:
+    // [IDLE ms] [TIME unix-ms] [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id].
+    size_t k = 4;
+    while (k < args.length && !isXclaimOpt(args[k].str))
+        k++;
+    auto ids = args[4 .. k];
+    if (ids.length == 0)
+    {
+        repError(o, "ERR wrong number of arguments for 'xclaim' command");
+        return;
+    }
+    bool force, justId;
+    long idleMs = -1, timeMs = -1, retry = -1;
+    for (size_t oi = k; oi < args.length;)
+    {
+        auto opt = args[oi].str;
+        if (eqICKeyword(opt, "FORCE"))
+        {
+            force = true;
+            oi++;
+        }
+        else if (eqICKeyword(opt, "JUSTID"))
+        {
+            justId = true;
+            oi++;
+        }
+        else if (eqICKeyword(opt, "IDLE") && oi + 1 < args.length)
+        {
+            if (!parseLong(args[oi + 1].str, idleMs) || idleMs < 0)
+            {
+                repError(o, "ERR Invalid IDLE option argument for XCLAIM");
+                return;
+            }
+            oi += 2;
+        }
+        else if (eqICKeyword(opt, "TIME") && oi + 1 < args.length)
+        {
+            if (!parseLong(args[oi + 1].str, timeMs) || timeMs < 0)
+            {
+                repError(o, "ERR Invalid TIME option argument for XCLAIM");
+                return;
+            }
+            oi += 2;
+        }
+        else if (eqICKeyword(opt, "RETRYCOUNT") && oi + 1 < args.length)
+        {
+            if (!parseLong(args[oi + 1].str, retry) || retry < 0)
+            {
+                repError(o, "ERR Invalid RETRYCOUNT option argument for XCLAIM");
+                return;
+            }
+            oi += 2;
+        }
+        else if (eqICKeyword(opt, "LASTID") && oi + 1 < args.length)
+        {
+            StreamID li;
+            if (!parseId(args[oi + 1].str, 0, li))
+            {
+                repError(o, "ERR Invalid stream ID specified as stream command argument");
+                return;
+            }
+            oi += 2;
+            if (li > g.lastDelivered) // LASTID only advances the group cursor
+                g.lastDelivered = li;
+        }
+        else
+        {
+            repError(o, "ERR syntax error");
+            return;
+        }
+    }
+    // validate every id up front (Redis rejects the whole command on a bad id)
     foreach (ref a; ids)
     {
         StreamID id;
@@ -1275,37 +1356,72 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
             repError(o, "ERR Invalid stream ID specified as stream command argument");
             return;
         }
+    }
+    auto now = nowMs();
+    bool madeConsumer;
+    auto consumer = g.ensureConsumer(args[2].str, now, madeConsumer);
+    if (madeConsumer) // XCLAIM auto-creates the target consumer
+        notifyKeyspaceEvent(NClass.stream, "xgroup-createconsumer", args[0].str);
+    // Whether this id will be claimed: an in-PEL entry past min-idle that still
+    // exists in the stream, or (FORCE) a not-in-PEL id that exists in the stream.
+    bool willClaim(StreamID id)
+    {
+        immutable inStream = obj.stream.getEntry(id, (pairs) => 0) >= 0;
         auto pi = g.pelFind(id);
-        if (pi < 0)
-            continue;
-        auto idle = now > g.pending[pi].deliveryTimeMs ? now - g.pending[pi].deliveryTimeMs : 0;
-        if (idle < cast(ulong) minIdle)
-            continue;
-        if (obj.stream.getEntry(id, (pairs) => 0) < 0)
-            continue; // deleted entries are skipped (and not claimed)
-        n++;
+        if (pi >= 0)
+        {
+            auto idle = now > g.pending[pi].deliveryTimeMs ? now - g.pending[pi].deliveryTimeMs : 0;
+            return idle >= cast(ulong) minIdle && inStream;
+        }
+        return force && inStream;
+    }
+
+    size_t n = 0;
+    foreach (ref a; ids)
+    {
+        StreamID id;
+        parseId(a.str, 0, id);
+        if (willClaim(id))
+            n++;
     }
     repArrayHeader(o, n);
+    // delivery time: TIME wins, else now-IDLE, else now.
+    immutable dtime = timeMs >= 0 ? cast(ulong) timeMs
+        : (idleMs >= 0 ? (now > cast(ulong) idleMs ? now - cast(ulong) idleMs : 0) : now);
     foreach (ref a; ids)
     {
         StreamID id;
         parseId(a.str, 0, id);
         auto pi = g.pelFind(id);
-        if (pi < 0)
-            continue;
-        auto idle = now > g.pending[pi].deliveryTimeMs ? now - g.pending[pi].deliveryTimeMs : 0;
-        if (idle < cast(ulong) minIdle)
+        if (pi < 0 && !force)
             continue;
         if (obj.stream.getEntry(id, (pairs) => 0) < 0)
         {
-            g.pelRemove(id); // deleted from the stream: evict from the PEL, don't claim
-            continue;
+            if (pi >= 0)
+                g.pelRemove(id); // deleted from the stream: evict from the PEL, don't claim
+            continue; // FORCE on a non-existent message is ignored
         }
-        auto dc = g.pending[pi].deliveryCount + (justId ? 0 : 1);
-        g.pelSet(id, consumer, now, dc);
+        if (pi >= 0)
+        {
+            auto idle = now > g.pending[pi].deliveryTimeMs ? now - g.pending[pi].deliveryTimeMs : 0;
+            if (idle < cast(ulong) minIdle)
+                continue;
+        }
+        immutable baseCount = pi >= 0 ? g.pending[pi].deliveryCount : 0;
+        immutable dc = retry >= 0 ? cast(ulong) retry : (justId ? baseCount : baseCount + 1);
+        g.pelSet(id, consumer, dtime, dc);
         if (justId)
             repStreamId(o, id);
         else
             obj.stream.getEntry(id, (pairs) { repEntry(o, id, pairs); return 0; });
     }
+    // NB: XCLAIM/XAUTOCLAIM emit NO standalone keyspace event — only the consumer
+    // auto-creation below fires `xgroup-createconsumer` (verified against the suite).
+}
+
+// XCLAIM id-list terminator keywords.
+private bool isXclaimOpt(scope const(char)[] s) @nogc nothrow
+{
+    return eqICKeyword(s, "IDLE") || eqICKeyword(s, "TIME") || eqICKeyword(s, "RETRYCOUNT")
+        || eqICKeyword(s, "FORCE") || eqICKeyword(s, "JUSTID") || eqICKeyword(s, "LASTID");
 }

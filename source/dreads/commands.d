@@ -4228,6 +4228,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             for (size_t i = 1; i < args.length; i += 2)
                 obj.hash.set(args[i].str, StrVal.of(args[i + 1].str));
+            notifyKeyspaceEvent(NClass.hash, "hset", args[0].str); // HMSET == HSET event
             repSimple(o, "OK");
             break;
         }
