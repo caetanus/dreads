@@ -375,6 +375,14 @@ public struct Keyspace
     /// many were dropped. A bucket entry only fires when the key's *live*
     /// deadline still equals it — so any residual entry (an overwrite/DEL that
     /// bypassed disarm) self-heals here instead of resurrecting a key.
+    /// Max keys reaped per cycle. Bounds the loop-blocking cost so a big backlog
+    /// (e.g. an import-mode window closing on a million past-deadline keys) drains
+    /// over several 200ms ticks instead of stalling the event loop in one pass —
+    /// lazy expiry still hides the not-yet-reaped ones on access. Redis budgets the
+    /// same way (a per-cycle sample cap). The tree op is already O(1)-amortised;
+    /// the irreducible cost is the per-key d.del + "expired" notify, so we cap that.
+    enum size_t ACTIVE_EXPIRE_BUDGET = 20_000;
+
     size_t activeExpireCycle() @nogc nothrow
     {
         if (!gActiveExpire || gImportMode || expires.empty)
@@ -382,9 +390,13 @@ public struct Keyspace
         immutable now = detNow();
         size_t dropped = 0;
         // removeRight is a consuming range: it drains every deadline <= now in one
-        // pass, yielding each bucket live just before its node is dropped.
+        // pass, yielding each bucket live just before its node is dropped. The
+        // budget check sits at the top of each bucket, so a bucket is never left
+        // half-drained — processed buckets are gone, the rest wait for the next tick.
         foreach (e; expires.removeRight(now))
         {
+            if (dropped >= ACTIVE_EXPIRE_BUDGET)
+                break;
             foreach (j; 0 .. e.value.length)
             {
                 auto key = e.value[j];
@@ -817,4 +829,38 @@ unittest // every type frees through the union without leaking valgrind-wise
     gClock = 4_000_000; // past the OLD deadline but not the new one
     assert(ks.activeExpireCycle() == 0); // old entry was disarmed
     assert(ks.exists("forever"));
+}
+
+@nogc nothrow unittest // active-expire budget: a big backlog drains over cycles, not one stall
+{
+    import core.stdc.stdio : snprintf;
+    import dreads.det : gClock;
+
+    Keyspace ks;
+    scope (exit)
+    {
+        ks.d.free();
+        gClock = 0;
+        gActiveExpire = false;
+    }
+    gActiveExpire = true;
+    gClock = 10_000_000;
+    enum size_t N = Keyspace.ACTIVE_EXPIRE_BUDGET + 5000; // a backlog past the cap
+    foreach (i; 0 .. N)
+    {
+        char[16] kb = void;
+        immutable n = snprintf(kb.ptr, kb.length, "k%zu", i);
+        auto k = kb[0 .. n];
+        ks.setStr(k, "v");
+        immutable ulong dl = 1000 + i; // distinct deadlines, all already past
+        ks.lookup(k).expireAtMs = dl;
+        ks.armExpire(k, dl);
+    }
+    assert(ks.length == N);
+    // one cycle reaps exactly the budget; the rest stay (lazy expiry hides them)
+    assert(ks.activeExpireCycle() == Keyspace.ACTIVE_EXPIRE_BUDGET);
+    assert(ks.length == 5000);
+    // the next cycle drains the remainder
+    assert(ks.activeExpireCycle() == 5000);
+    assert(ks.length == 0);
 }
