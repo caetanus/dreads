@@ -13,7 +13,6 @@ module dreads.server;
 
 import core.builtins : expect;
 import core.stdc.stdio : printf;
-import core.stdc.stdlib : malloc, cfree = free;
 
 import core.time : seconds;
 

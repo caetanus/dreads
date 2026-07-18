@@ -1,7 +1,8 @@
 module dreads.mem;
 
-// Zero-GC building blocks: everything here is malloc-backed and @nogc.
-// The GC must never run in the data plane (see logo: "Arena memory. Zero-GC overhead").
+// Zero-GC building blocks (@nogc). The growable buffer + per-command arena back
+// the CONNECTION plane and route through dreads.alloc.ConnAllocator (swappable +
+// tracked), not raw malloc. The GC must never run in the data plane.
 
 import core.stdc.string : memcpy, memmove, memset;
 import std.experimental.allocator.mallocator : Mallocator;
