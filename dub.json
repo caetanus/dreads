@@ -32,6 +32,15 @@
 			"mainSourceFile": "bench/pubsub_bench.d",
 			"targetName": "pubsub_bench",
 			"targetType": "executable"
+		},
+		{
+			"name": "lookup-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/lookup_bench.d",
+			"targetName": "lookup_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
