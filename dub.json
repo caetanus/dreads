@@ -50,6 +50,15 @@
 			"mainSourceFile": "bench/expire_bench.d",
 			"targetName": "expire_bench",
 			"targetType": "executable"
+		},
+		{
+			"name": "lazyfree-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/lazyfree_bench.d",
+			"targetName": "lazyfree_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
