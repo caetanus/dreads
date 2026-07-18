@@ -215,24 +215,31 @@ public struct RObj
         }
     }
 
-    /// Off-loop free (lazyfree): the container types whose teardown is a SCATTERED
-    /// pointer-chase worth offloading to the free-thread. Only list for now (a pure
-    /// node walk, no nested Dict/arrays); other types fall back to inline free.
-    /// Extend as each type's gatherBlocks is added AND benchmarked to win.
+    /// Off-loop free (lazyfree) HEURISTIC: offload pays ONLY for a value whose
+    /// teardown is a DEPENDENT-POINTER CHASE — list next-ptr, zset skiplist
+    /// forward-ptr — a serial scattered traversal the free-thread absorbs off the
+    /// loop. Hash / set / stream traverse a CONTIGUOUS index (slots / entry array);
+    /// their scattered cost is in the per-leaf deallocate, which can't leave the
+    /// single-writer loop, so offloading them LOSES (bench/lazyfree_bench.d: CHAIN
+    /// ~7.4x vs INDEX ~0.9x). Those free inline. The size gate (caller) then ensures
+    /// the chase is long enough to beat the thread-handoff fixed cost.
     bool lazyFreeable() const @nogc nothrow
     {
-        return type == ObjType.list;
+        return type == ObjType.list || type == ObjType.zset;
     }
 
-    /// Record every backing block of this value via `add`, freeing NOTHING (see
-    /// DList.gatherBlocks). Only lazyFreeable() types are handled — the caller MUST
-    /// gate on lazyFreeable() so an unsupported type is never silently leaked here.
+    /// Record every backing block of this value via `add`, freeing NOTHING (mirrors
+    /// each type's free() exactly — a miss leaks, a double-add double-frees). Only
+    /// lazyFreeable() types are handled; the caller MUST gate on lazyFreeable().
     void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow
     {
         switch (type)
         {
         case ObjType.list:
             list.gatherBlocks(add);
+            break;
+        case ObjType.zset:
+            zset.gatherBlocks(add); // skiplist nodes (the chase) + scores dict
             break;
         default:
             break; // not offloaded; gated out in the caller (lazyFreeable())
@@ -982,4 +989,56 @@ unittest // UNLINK hands a big list to the free-thread; small ones free inline
         Thread.sleep(1.msecs);
     }
     assert(gLazyFree.statReclaimedBlocks == NEL); // every node block freed on the loop
+}
+
+@("obj.unlink_offloads_big_zset_no_leak")
+unittest // UNLINK offloads a big sorted set (skiplist chase); every block reclaimed
+{
+    import dreads.lazyfree : LazyFree;
+    import dreads.alloc : keyspaceBytesUsed;
+    import core.thread : Thread;
+    import core.time : msecs;
+    import core.stdc.stdio : snprintf;
+
+    gLazyFree = new LazyFree();
+    scope (exit)
+    {
+        gLazyFree.stop();
+        gLazyFree = null;
+    }
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    bool wrong;
+    ks.setStr("dummy", "x");
+    ks.del("dummy"); // force the keyspace table to allocate so `base` is stable
+    immutable base = keyspaceBytesUsed();
+
+    // > LAZYFREE_MIN_ELEMS and past the listpack spill threshold → skiplist-backed
+    enum size_t NEL = 600;
+    foreach (i; 0 .. NEL)
+    {
+        char[16] mb = void;
+        immutable m = snprintf(mb.ptr, mb.length, "m%zu", i);
+        ks.getOrCreate("z", ObjType.zset, wrong).zset.add(cast(double) i, mb[0 .. m]);
+    }
+    assert(ks.getOrCreate("z", ObjType.zset, wrong).zset.length == NEL);
+    assert(keyspaceBytesUsed() > base);
+
+    assert(ks.unlink("z"));
+    assert(ks.length == 0);
+    assert(gLazyFree.statSubmitted == 1); // a zset is a dependent chase → offloaded
+
+    // drain until every block is back; exact return to base proves gatherBlocks
+    // mirrors free() with no missed block (leak) and no double-add (double-free).
+    foreach (_; 0 .. 4000)
+    {
+        if (gLazyFree.reclaimPending)
+            gLazyFree.drainReclaimed();
+        if (keyspaceBytesUsed() == base)
+            break;
+        Thread.sleep(1.msecs);
+    }
+    assert(keyspaceBytesUsed() == base);
 }

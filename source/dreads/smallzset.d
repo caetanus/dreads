@@ -256,6 +256,24 @@ struct SmallZSet
         }
     }
 
+    // Off-loop free support (lazyfree): record every backing block via `add`,
+    // freeing NOTHING. Mirrors free() EXACTLY: the spilled ZSet (its skiplist is the
+    // offloadable chase) when big, PLUS the small-mode blob/ents/scores arrays —
+    // which spill() leaves allocated (it only zeroes count/blen), so free() releases
+    // them regardless of `big`. Read-only (the owner is discarded after this).
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow @trusted
+    {
+        if (big)
+            large.gatherBlocks(add);
+        if (blob !is null)
+            add(cast(void*) blob, bcap);
+        if (ents !is null)
+        {
+            add(cast(void*) ents, cap * Ent.sizeof);
+            add(cast(void*) scores, cap * double.sizeof);
+        }
+    }
+
     // ----- internals -----
 
     private void spill() @nogc nothrow

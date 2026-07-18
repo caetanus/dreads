@@ -127,6 +127,23 @@ public struct ZSet
         scores.free();
     }
 
+    // Off-loop free support (lazyfree): record every backing block via `add`,
+    // freeing NOTHING. The skiplist walk (levels[0].forward chase) is the scattered
+    // dependent traversal the free-thread absorbs; the member->score dict adds its
+    // slots array + each member-key copy (DoubleVal is POD, no value blocks).
+    // Mirrors free() exactly. Read-only (the owner is discarded after this).
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow @trusted
+    {
+        auto n = header;
+        while (n !is null)
+        {
+            auto next = n.levels[0].forward;
+            add(cast(void*) n, ZNode.sizeof + Level.sizeof * n.level + n.memberLen);
+            n = next;
+        }
+        scores.gatherBlocks(add);
+    }
+
     bool score(scope const(char)[] member, out double s) const @nogc nothrow
     {
         auto v = scores.get(member);
