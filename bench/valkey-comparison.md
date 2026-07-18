@@ -1,45 +1,65 @@
 # dreads vs Valkey 9.1 (and MQTT) — benchmark
 
-**Date:** 2026-07-11 · **dreads** `b062f27` (LDC release, `-O3 -release
--mcpu=x86-64-v3`, jemalloc) · **Valkey** 9.1.0 (jemalloc, `--io-threads 1`) ·
-**Mosquitto** (eclipse-mosquitto, MQTT QoS 0). Scripts: [`redis-bench.sh`](redis-bench.sh),
+**Date:** 2026-07-18 · **dreads** `2d5892c` (LDC release, `-O3 -release
+-mcpu=x86-64-v3`; keyspace + connection buffers on the swappable composed
+allocator) vs **master** `a820285` (raw malloc, pre-allocator refactor) vs
+**Valkey** 9.1.0 (jemalloc, `--io-threads 1`). Scripts: [`redis-bench.sh`](redis-bench.sh),
 [`mqtt-bench.sh`](mqtt-bench.sh) — see [README](README.md).
 
 ## Method
 
-12-core Linux box. Each server **single-threaded, pinned to one core**, client on
-separate cores, **one server at a time** (a co-resident idle server perturbs the
-numbers). Persistence off unless the AOF section. `-P 16 -c 50`, min/median/max
-over 5–7 runs (median is the honest figure).
+12-core Linux box, **performance** governor. Each server **single-threaded, pinned
+to one core** (core 2); client pinned to **9 separate cores** (3–11) — a 2-core
+client saturates before the server and hides its real throughput. **One server at
+a time** (never co-resident), but the three are **interleaved round-robin per
+round** so thermal/load drift cancels instead of skewing whoever runs last.
+`-P 16 -c 50`, N=1M, min/median/max over 5 runs (median is the honest figure).
 
-## Data operations — min · **median** · max rps
+## Data operations — min · **median** · max Mrps
 
-| Command | dreads | Valkey 9.1 | med ratio |
-|---|---|---|---:|
-| GET | 0.92M · **1.07M** · 1.12M | 0.94M · **1.05M** · 1.10M | 1.02× |
-| SET | 0.68M · **1.03M** · 1.13M | 0.68M · **0.83M** · 0.90M | 1.24× |
-| INCR | 0.74M · **0.86M** · 0.96M | 0.86M · **1.05M** · 1.09M | 0.82× |
-| LPUSH | 1.10M · **1.16M** · 1.27M | 0.79M · **0.91M** · 1.01M | 1.27× |
-| RPUSH | 0.98M · **1.20M** · 1.26M | 0.86M · **0.94M** · 1.01M | 1.28× |
-| LPOP | 1.15M · **1.28M** · 1.38M | 0.75M · **0.80M** · 0.82M | 1.61× |
-| SADD | 0.84M · **1.03M** · 1.08M | 0.68M · **0.83M** · 0.90M | 1.24× |
-| HSET | 0.86M · **1.01M** · 1.05M | 0.67M · **0.70M** · 0.76M | 1.44× |
-| SPOP | — · **1.35M** · 1.37M | — · **1.17M** · 1.25M | 1.15× |
-| ZADD | 0.32M · **0.36M** · 0.39M | 0.33M · **0.34M** · 0.35M | 1.05× |
-| ZPOPMIN | 1.01M · **1.27M** · 1.32M | 1.10M · **1.15M** · 1.20M | 1.10× |
-| MSET(10)| 0.27M · **0.28M** · 0.29M | 0.17M · **0.18M** · 0.18M | 1.56× |
+| Command | dreads (composed) | master (raw malloc) | Valkey 9.1 | dreads/valkey |
+|---|---|---|---|---:|
+| GET | 1.44 · **1.54** · 1.62 | 1.47 · **1.56** · 1.63 | 1.13 · **1.46** · 1.48 | 1.05× |
+| SET | 1.35 · **1.39** · 1.48 | 1.31 · **1.42** · 1.47 | 0.91 · **0.94** · 1.00 | 1.48× |
+| INCR | 1.34 · **1.37** · 1.41 | 1.21 · **1.39** · 1.41 | 1.15 · **1.19** · 1.24 | 1.15× |
+| LPUSH | 1.21 · **1.26** · 1.30 | 1.22 · **1.28** · 1.29 | 0.89 · **1.03** · 1.05 | 1.22× |
+| RPUSH | 1.22 · **1.27** · 1.31 | 1.27 · **1.32** · 1.34 | 1.01 · **1.08** · 1.11 | 1.18× |
+| LPOP | 1.37 · **1.41** · 1.45 | 1.02 · **1.37** · 1.44 | 0.86 · **0.94** · 0.98 | 1.50× |
+| SADD | 1.37 · **1.39** · 1.42 | 1.35 · **1.37** · 1.41 | 1.06 · **1.16** · 1.18 | 1.20× |
+| HSET | 1.32 · **1.32** · 1.35 | 1.25 · **1.33** · 1.41 | 0.89 · **0.99** · 1.03 | 1.33× |
+| SPOP | 1.45 · **1.55** · 1.65 | 1.40 · **1.57** · 1.62 | 1.30 · **1.36** · 1.38 | 1.14× |
+| ZADD | 1.20 · **1.28** · 1.31 | 1.20 · **1.29** · 1.34 | 0.85 · **0.95** · 1.00 | 1.35× |
+| ZPOPMIN | 1.42 · **1.44** · 1.47 | 1.38 · **1.44** · 1.47 | 1.21 · **1.35** · 1.38 | 1.07× |
+| MSET(10)| 0.54 · **0.57** · 0.58 | 0.55 · **0.56** · 0.59 | 0.23 · **0.24** · 0.25 | 2.38× |
 
-Peak (single server, `-P 32`, best-of-5): **GET 2.34M vs 1.73M (1.35×), SET 1.33M
-vs 0.93M (1.43×)**. dreads wins ~everywhere; INCR is Valkey's.
+dreads wins **every** op vs Valkey (GET +5% to MSET +138%).
+
+**Did the composed allocator move throughput? No — it's a tie.** `dreads (composed)`
+≈ `master (raw malloc)` on all 12 ops, within run-to-run noise. The allocator is
+<1% of CPU (the data path is network-bound), so it cannot move ops/s; its payoff is
+**RSS/fragmentation under churn** (~3–7.5% lower peak, `bench/rss_churn.sh`) plus
+build-swappability / real portable OOM accounting — not throughput.
+
+**INCR flipped since the old table.** The 2026-07-11 row had INCR as Valkey's
+(0.82×) because values were string-backed and every INCR re-parsed the string. The
+`StrVal` tagged union stores int-encoded values (a native `long` add; bytes
+materialised only on read), so INCR is now dreads-favourable (1.15×).
 
 ## SET with EX (TTL write path)
 
 | | dreads active-off (default) | dreads active-on | Valkey |
 |---|---:|---:|---:|
-| SET EX 100 (median) | ~660k | 510k | 558k |
+| SET EX 100 (median) | **~824k** | ~556k | ~700k |
 
-Active expiry is opt-in; off by default the TTL write path stays at Valkey-class
-throughput. (Active-on maintains the drop-soon index — see the expiry commits.)
+Active expiry is opt-in. **Off by default the TTL write path beats Valkey** (~824k
+vs ~700k) — the deadline is just stamped on the value, lazily checked on access.
+**On, it drops below Valkey** (~556k) because dreads keeps expires in an ordered
+**RB-tree** (`deadline → keys`, O(log n) insert) for a deterministic in-order drain,
+whereas Valkey keeps a **hash** (`key → deadline`, O(1) insert) and drains by random
+sampling. The tree costs the SET-EX hot path to make the active-expire cycle and
+backlog drains (import-release) cheap; the `removeRight`/`rb_first_cached` work makes
+that drain O(1)-amortised. Tree-vs-hash is a real tradeoff, paid only when active
+expiry is on.
 
 ## Transactions (TPS)
 
