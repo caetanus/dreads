@@ -72,7 +72,6 @@ __gshared size_t gSink;
 
 void run(int nbuckets, int keysPerBucket) @trusted
 {
-    immutable keys = cast(long) nbuckets * keysPerBucket;
     enum reps = 5;
     immutable now = cast(ulong) nbuckets; // everything is due (full drain)
 
@@ -90,8 +89,13 @@ void run(int nbuckets, int keysPerBucket) @trusted
             aNs = cast(double) dt;
     }
 
-    // B) detachLedge + walk + dispose — build fresh each rep.
-    double bNs = double.max, detachOnlyNs = double.max;
+    // B) split path, three phases timed separately:
+    //   detach  = detachLedge (O(log n) structural split)   ON loop
+    //   walk    = walkDetached, the per-key work stand-in    ON loop (== d.del pass)
+    //   dispose = disposeDetached, the node teardown         OFF loop (lazyfree)
+    // Loop-time(split) = detach + walk (dispose is offloaded); removeRight fuses
+    // its removal INTO the walk, so its whole cost is on the loop.
+    double detachNs = double.max, walkNs = double.max, disposeNs = double.max;
     foreach (_; 0 .. reps)
     {
         ExpMap m;
@@ -103,21 +107,26 @@ void run(int nbuckets, int keysPerBucket) @trusted
             gSink += v.length;
             return 0;
         });
+        immutable t2 = MonoTime.currTime;
         ExpMap.disposeDetached(det);
-        immutable dt = (MonoTime.currTime - t0).total!"nsecs";
-        immutable detachDt = (t1 - t0).total!"nsecs";
-        if (dt < bNs)
-            bNs = cast(double) dt;
-        if (detachDt < detachOnlyNs)
-            detachOnlyNs = cast(double) detachDt;
+        immutable t3 = MonoTime.currTime;
+        immutable dNs = cast(double)(t1 - t0).total!"nsecs";
+        immutable wNs = cast(double)(t2 - t1).total!"nsecs";
+        immutable zNs = cast(double)(t3 - t2).total!"nsecs";
+        if (dNs < detachNs)
+            detachNs = dNs;
+        if (wNs < walkNs)
+            walkNs = wNs;
+        if (zNs < disposeNs)
+            disposeNs = zNs;
     }
+    immutable loopSplit = detachNs + walkNs; // what the event loop actually pays
 
-    printf("nbuckets=%-8d keys/bkt=%-4d nodes=%-8d keys=%-9lld | ",
-            nbuckets, keysPerBucket, nbuckets, keys);
-    printf("removeRight %7.1f ns/node  %6.2f ns/key | ", aNs / nbuckets, aNs / keys);
-    printf("detach+dispose %7.1f ns/node  %6.2f ns/key | ", bNs / nbuckets, bNs / keys);
-    printf("detach-only %7.0f ns total (%.3f ns/node) | ", detachOnlyNs, detachOnlyNs / nbuckets);
-    printf("split/removeRight %.2fx\n", bNs / aNs);
+    printf("nbuckets=%-8d keys/bkt=%-4d nodes=%-8d | ", nbuckets, keysPerBucket, nbuckets);
+    printf("LOOP removeRight %6.1f | split(detach+walk) %6.1f ns/node ", aNs / nbuckets, loopSplit / nbuckets);
+    printf("(detach %5.1f + walk %5.1f) | offloop dispose %6.1f ns/node | ",
+            detachNs / nbuckets, walkNs / nbuckets, disposeNs / nbuckets);
+    printf("LOOP speedup %.2fx\n", aNs / loopSplit);
 }
 
 void main(string[] args) @trusted
