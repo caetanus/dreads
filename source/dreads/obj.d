@@ -13,6 +13,7 @@ import dreads.smallset : SmallSet;
 import dreads.smallhash : SmallHash;
 import dreads.smallzset : SmallZSet;
 import emplace.map : Map;
+import dreads.alloc : KeyspaceAllocator;
 import emplace.vector : Vector;
 
 public enum ObjType : ubyte
@@ -271,8 +272,8 @@ public struct Keyspace
     /// of the key strings. Purely local reclamation: the deadline is already
     /// replicated as an absolute PEXPIREAT, so every node/replay expires
     /// deterministically off its own copy — no DEL is propagated.
-    private alias ExpBucket = Vector!(const(char)[]);
-    private Map!(ulong, ExpBucket) expires;
+    private alias ExpBucket = Vector!(const(char)[], KeyspaceAllocator);
+    private Map!(ulong, ExpBucket, KeyspaceAllocator) expires;
 
     /// The secondary "sub-expiry" index: container-INTERNAL TTLs (hash fields
     /// today, zset members later). Distinct from `expires`, which keys a whole
@@ -287,8 +288,8 @@ public struct Keyspace
         const(char)[] key; // non-owning slice into Dict-owned key memory
     }
 
-    private alias SubBucket = Vector!SubEnt;
-    private Map!(ulong, SubBucket) subExpires;
+    private alias SubBucket = Vector!(SubEnt, KeyspaceAllocator);
+    private Map!(ulong, SubBucket, KeyspaceAllocator) subExpires;
 
     @disable this(this);
 
