@@ -61,6 +61,28 @@ backlog drains (import-release) cheap; the `removeRight`/`rb_first_cached` work 
 that drain O(1)-amortised. Tree-vs-hash is a real tradeoff, paid only when active
 expiry is on.
 
+## Allocator composition — fragmentation (`bench/rss_churn.sh`)
+
+The keyspace runs on a swappable composed allocator. Its point is **not** throughput
+(allocator is <1% of CPU — see the tie above) but **jemalloc-independence**: a real
+portable byte count for OOM, reclaim policy we own, and swap-by-build. Churn 265 MB
+of live data (varied sizes) over 40 delete/refill rounds, RSS vs used (lower = less
+fragmentation):
+
+| composition (build) | RSS | RSS/used |
+|---|---:|---:|
+| **composed** — freelist + bucketizer + bitmapped mid (default) | **363 MB** | **1.40** |
+| Mallocator (jemalloc), `DreadsDataMalloc` | 382 MB | 1.47 |
+| bitmap tiers, `DreadsDataBitmap` | 465 MB | 1.79 |
+| bump/region (LIFO reclaim only), `DreadsDataBump` | 916 MB | 3.53 |
+
+The composed layout is the best of the tested compositions: it beats raw jemalloc by
+~5% (hands it a coarse big-block pattern, pools fine-grained by size itself), beats a
+bitmap-heavy layout by ~22% (BitmappedBlock rounds to its block size ⇒ internal
+waste), and a bump/region 2.5× (barely reclaims). Freed blocks do **not** return to
+the OS under jemalloc either (dirty-page decay), so "our freelist vs jemalloc" is
+about *precision of reuse*, not OS return.
+
 ## Transactions (TPS)
 
 `MULTI / SET / INCR / EXEC` blocks, RESP, pipelined, verified applied.

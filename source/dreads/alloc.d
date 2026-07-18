@@ -1,9 +1,27 @@
 module dreads.alloc;
 
-// Swappable data-plane allocator for the keyspace. The point is to A/B the D
-// std.experimental.allocator building blocks (region/freelist/bitmapped) against
-// Mallocator (jemalloc) and the GC — speed AND fragmentation — by BUILD (a
-// `version`), and later to run the engine under the GC for embedded test libs.
+// Swappable data-plane allocator for the keyspace.
+//
+// WHY this exists (the reason for the whole refactor) is NOT throughput and NOT
+// even the ~5% fragmentation edge — it is INDEPENDENCE FROM jemalloc:
+//   * a StatsCollector gives a REAL, PORTABLE live-byte count (keyspaceBytesUsed /
+//     connBytesUsed) that drives maxmemory on ANY platform. jemalloc's mallctl was
+//     Linux-only and "virtual"; now OOM is real everywhere.
+//   * WE own the reclaim/reuse policy (a size-segregated freelist) instead of being
+//     hostage to jemalloc's arena + dirty-decay behaviour — note freed blocks do
+//     NOT return to the OS under jemalloc either (it holds dirty pages until decay),
+//     so the composed backend wins by handing jemalloc a COARSE pattern (few big
+//     blocks) and doing the fine pooling ourselves.
+//   * it is swappable by BUILD (composed / Mallocator / GC / bitmap / region), which
+//     is what makes the A/B below possible and lets us run under the GC for the
+//     embedded Python/Go test libs.
+//
+// Fragmentation A/B (bench/rss_churn.sh, 265 MB live, 40 churn rounds, RSS/used):
+//   composed 1.40  <  malloc/jemalloc 1.47  <  bitmap 1.79  <  bump/region 3.53.
+// The composed (freelist + bucketizer + bitmapped mid) is the best of the tested
+// compositions — bucketizer beats a bitmap-heavy layout (BitmappedBlock rounds to
+// its block size ⇒ internal waste); a bump/region barely reclaims. The bitmap/bump
+// variants stay version-gated (zero cost) as the A/B infrastructure that proved it.
 //
 // It is exposed as a global singleton with an `instance` accessor so it drops
 // straight into emplace containers' existing `Allocator.instance` pattern (no
@@ -26,6 +44,8 @@ import std.experimental.allocator.building_blocks.bucketizer : Bucketizer;
 import std.experimental.allocator.building_blocks.segregator : Segregator;
 import std.experimental.allocator.building_blocks.allocator_list : AllocatorList;
 import std.experimental.allocator.building_blocks.bitmapped_block : BitmappedBlock;
+import std.experimental.allocator.building_blocks.region : Region;
+import std.experimental.allocator.building_blocks.null_allocator : NullAllocator;
 import std.algorithm.comparison : max;
 
 private alias FList = FreeList!(Mallocator, 0, unbounded);
@@ -46,6 +66,24 @@ private alias ComposedBackend = Segregator!(
             cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
         Mallocator);
 
+// --- composition A/B variants (fragmentation study; throughput is allocator-neutral) ---
+// Bitmap-heavy: BitmappedBlock tiers instead of freelists — reclaims by clearing a
+// bit, fine granularity, no per-size free list.
+private alias BitmapBackend = Segregator!(
+        256, AllocatorList!((size_t n) => BitmappedBlock!(16)(
+            cast(ubyte[]) Mallocator.instance.allocate(max(n, 1024 * 1024))), Mallocator),
+        4072 * 1024, AllocatorList!((size_t n) => BitmappedBlock!(256)(
+            cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
+        Mallocator);
+
+// Bump/region: a growable Region that bump-allocates and only reclaims LIFO (an
+// arbitrary free is a no-op) — the "arena that barely frees" extreme, to show what
+// the freelist buys under churn.
+private alias BumpBackend = Segregator!(
+        4072 * 1024, AllocatorList!((size_t n) => Region!NullAllocator(
+            cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
+        Mallocator);
+
 version (DreadsDataGC)
 {
     import std.experimental.allocator.gc_allocator : GCAllocator;
@@ -53,6 +91,10 @@ version (DreadsDataGC)
 }
 else version (DreadsDataMalloc)
     alias DataBackend = Mallocator; // baseline: straight malloc/free (jemalloc)
+else version (DreadsDataBitmap)
+    alias DataBackend = BitmapBackend;
+else version (DreadsDataBump)
+    alias DataBackend = BumpBackend;
 else
     alias DataBackend = ComposedBackend;
 
