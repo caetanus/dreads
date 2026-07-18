@@ -56,6 +56,11 @@ public __gshared ulong gExpiredFields;
 /// instead of racing the expiry cycle. Turned off, normal expiry resumes.
 public __gshared bool gImportMode;
 
+/// The CURRENT command's client is in `CLIENT IMPORT-SOURCE ON` — set per command
+/// by the serve loop (mirrors gRespProto/gCmdConn). Only such a client may VISIT
+/// an expired-but-kept key while import-mode is on; normal clients see it as gone.
+public __gshared bool gImportSourceActive;
+
 /// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
 /// Also counts clients parked by a CLIENT PAUSE barrier (Valkey counts postponed
 /// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
@@ -536,22 +541,30 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return null;
-        if (o.expired() && !gImportMode) // import mode: bulk-load window, no expiry
+        if (o.expired())
         {
-            // A CLIENT PAUSE holds the expiry DEL (a replicated write): the key
-            // reads as logically expired (null) but is NOT deleted/counted until
-            // the window lifts and a later access reaps it. gPauseUntilMs is
-            // runtime-only (never logged), so raft replay is unaffected.
-            if (gPauseUntilMs != 0 && detNow() < gPauseUntilMs)
+            if (!gImportMode)
+            {
+                // A CLIENT PAUSE holds the expiry DEL (a replicated write): the key
+                // reads as logically expired (null) but is NOT deleted/counted until
+                // the window lifts and a later access reaps it. gPauseUntilMs is
+                // runtime-only (never logged), so raft replay is unaffected.
+                if (gPauseUntilMs != 0 && detNow() < gPauseUntilMs)
+                    return null;
+                disarmExpire(k, o.expireAtMs);
+                disarmSubExpire(k);
+                d.del(k);
+                notifyKeyspaceEvent(NClass.expired, "expired", k);
+                if (gTrackInvalidateHook !is null)
+                    gTrackInvalidateHook(k); // invalidate client-side caches
+                gExpiredKeys++;
                 return null;
-            disarmExpire(k, o.expireAtMs);
-            disarmSubExpire(k);
-            d.del(k);
-            notifyKeyspaceEvent(NClass.expired, "expired", k);
-            if (gTrackInvalidateHook !is null)
-                gTrackInvalidateHook(k); // invalidate client-side caches
-            gExpiredKeys++;
-            return null;
+            }
+            // Import window: the expired key is physically KEPT (bulk-load
+            // consistency), but only a client in `CLIENT IMPORT-SOURCE ON` may
+            // VISIT it — a normal client still sees it as gone (nil / ttl -2).
+            if (!gImportSourceActive)
+                return null;
         }
         // Lazy field expiry: reap any expired hash fields before the key is used
         // (the per-field analog of the key-level check above). The absolute field

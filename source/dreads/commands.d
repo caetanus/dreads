@@ -13,7 +13,8 @@ import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass, gNotifyDb;
-import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode;
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode,
+    gImportSourceActive;
 import dreads.resp;
 import dreads.stream : FieldPair, Stream, StreamID;
 import dreads.det : detNow = now;
@@ -200,7 +201,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             size_t n = 0;
             foreach (k, ref v; ks)
             {
-                if (v.expired()) // Redis skips logically-expired keys (no sweep needed)
+                // Redis skips logically-expired keys — unless this client is in
+                // CLIENT IMPORT-SOURCE ON (then expired-but-kept keys are visible).
+                if (v.expired() && !gImportSourceActive)
                     continue;
                 if (globMatch(pat, k))
                     n++;
@@ -208,7 +211,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repArrayHeader(o, n);
             foreach (k, ref v; ks)
             {
-                if (v.expired())
+                if (v.expired() && !gImportSourceActive)
                     continue;
                 if (globMatch(pat, k))
                     repBulk(o, k);
@@ -314,9 +317,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, 0);
                 break;
             }
-            if (absMs <= cast(long) detNow())
+            if (absMs <= cast(long) detNow() && !gImportMode)
             {
-                // already past: Valkey deletes right away and counts the expiry
+                // already past: Valkey deletes right away and counts the expiry.
+                // EXCEPT under import-mode, where a past deadline is STORED (the key
+                // is kept for the bulk-load window and reaped only after it lifts).
                 import dreads.obj : gExpiredKeys;
 
                 ks.del(args[0].str);
@@ -3788,7 +3793,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (!ks.d.slotLive(i))
                     continue;
                 auto obj = ks.d.valAt(i);
-                if (!paused && obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                if (!paused && !gImportSourceActive && obj.expireAtMs != 0 && now >= obj.expireAtMs)
                     continue; // expired: skip (a later access / active cycle reaps it)
                 repBulk(o, ks.d.keyAt(i));
                 return true;
@@ -3800,7 +3805,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 if (!ks.d.slotLive(i))
                     continue;
                 auto obj = ks.d.valAt(i);
-                if (!paused && obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                if (!paused && !gImportSourceActive && obj.expireAtMs != 0 && now >= obj.expireAtMs)
                     continue;
                 repBulk(o, ks.d.keyAt(i));
                 return true;
@@ -4708,10 +4713,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     bool typeOk = !filterType || obj.type == wantType;
                     if (typeOk)
                     {
-                        if (obj.expireAtMs != 0 && now >= obj.expireAtMs)
+                        if (obj.expireAtMs != 0 && now >= obj.expireAtMs && !gImportSourceActive)
                             ks.lookup(ks.d.keyAt(i)); // drop it via the lazy-expire path
                         else if (pat.length == 0 || globMatch(pat, ks.d.keyAt(i)))
-                            found[got++] = ks.d.keyAt(i);
+                            found[got++] = ks.d.keyAt(i); // import-source sees expired-but-kept keys
                     }
                 }
                 i++;

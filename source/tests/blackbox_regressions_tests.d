@@ -842,10 +842,13 @@ version (unittest)
     @("blackbox.import_mode_pauses_expiry")
     unittest
     {
-        // CLIENT IMPORT-SOURCE / import-mode: a bulk-load window where expiry is
-        // paused so a stream of RESTOREs with absolute (possibly past) TTLs loads
-        // consistently instead of racing the expiry cycle.
-        import dreads.obj : gImportMode;
+        // import-mode: a bulk-load window where an expired key is KEPT (not
+        // deleted). Only a `CLIENT IMPORT-SOURCE ON` client may VISIT it; a normal
+        // client still sees it as gone (nil / EXISTS 0) even though dbsize keeps
+        // the raw count. Mirrors Valkey unit/expire "visit expired key in
+        // import-source state". gImportSourceActive is set per-command by the serve
+        // loop; here we drive it directly.
+        import dreads.obj : gImportMode, gImportSourceActive;
         import dreads.det : gClock;
 
         Keyspace ks;
@@ -853,6 +856,7 @@ version (unittest)
         {
             ks.d.free();
             gImportMode = false;
+            gImportSourceActive = false;
             gClock = 0;
         }
         enum ulong T0 = 1_000_000_000;
@@ -860,10 +864,21 @@ version (unittest)
         ks.runAt(T0, "SET", "k", "v");
         ks.runAt(T0, "PEXPIRE", "k", "10"); // deadline T0+10
 
-        gImportMode = true; // import window: past-deadline key stays live
+        gImportMode = true; // window open: the expired key is kept, not deleted
+
+        // A normal client CANNOT visit it (logically expired) — but it is kept.
+        gImportSourceActive = false;
+        ks.runAt(T0 + 100, "GET", "k").expect.to.equal("$-1\r\n");
+        ks.runAt(T0 + 100, "EXISTS", "k").expect.to.equal(":0\r\n");
+        ks.runAt(T0 + 100, "DBSIZE").expect.to.equal(":1\r\n"); // physically kept
+
+        // An import-source client visits it: value, EXISTS 1, ttl 0 (expired).
+        gImportSourceActive = true;
         ks.runAt(T0 + 100, "GET", "k").expect.to.equal("$1\r\nv\r\n");
         ks.runAt(T0 + 100, "EXISTS", "k").expect.to.equal(":1\r\n");
+        ks.runAt(T0 + 100, "TTL", "k").expect.to.equal(":0\r\n");
 
+        gImportSourceActive = false;
         gImportMode = false; // window closed: lazy expiry resumes
         ks.runAt(T0 + 100, "GET", "k").expect.to.equal("$-1\r\n");
     }

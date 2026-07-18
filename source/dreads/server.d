@@ -53,7 +53,8 @@ import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags, gNotifyDb;
 import dreads.stream : nowMs;
-import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients, gConnectedClients;
+import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients, gConnectedClients,
+    gImportSourceActive;
 import dreads.dict : Dict, Unit;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
 import dreads.replicator : gReplicator;
@@ -1542,8 +1543,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 immutable replyPre = outb.length;
                 c.replyCmdExempt = false;
                 gCmdConn = c; // publish-to-self during this command trails its reply
+                gImportSourceActive = c.importSource; // gate expired-key visits
                 keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
                 gCmdConn = null;
+                gImportSourceActive = false;
                 postCommand(*c, outb, replyPre);
                 if (gNotifyFlags)
                     flushPendingNotify();
@@ -1651,8 +1654,10 @@ private void serveClient(TCPConnection tcp) nothrow
                     immutable replyPre = outb.length;
                     c.replyCmdExempt = false;
                     gCmdConn = c; // publish-to-self during this command trails its reply
+                    gImportSourceActive = c.importSource; // gate expired-key visits
                     keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
                     gCmdConn = null;
+                    gImportSourceActive = false;
                     postCommand(*c, outb, replyPre);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
