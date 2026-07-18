@@ -10,7 +10,41 @@ module dreads.alloc;
 // per-container plumbing beyond swapping the alias). Single event-loop thread, so
 // a plain __gshared instance is race-free — same reasoning as the rest of dreads.
 
+// Two swappable planes with the SAME design but SEPARATE instances/counters:
+//  - the KEYSPACE (data) plane — drives maxmemory (keyspaceBytesUsed);
+//  - the CONNECTION plane — network/reply buffers, per-command scratch, the write
+//    queue ring (connBytesUsed → client-buffer accounting).
+// Both default to the composed backend below; each is overridable to GC or straight
+// Mallocator by build (DreadsData*/DreadsConn* versions) so either plane can be A/B'd
+// or run under the GC independently.
+
 import std.experimental.allocator.mallocator : Mallocator;
+import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
+import std.experimental.allocator : unbounded;
+import std.experimental.allocator.building_blocks.free_list : FreeList;
+import std.experimental.allocator.building_blocks.bucketizer : Bucketizer;
+import std.experimental.allocator.building_blocks.segregator : Segregator;
+import std.experimental.allocator.building_blocks.allocator_list : AllocatorList;
+import std.experimental.allocator.building_blocks.bitmapped_block : BitmappedBlock;
+import std.algorithm.comparison : max;
+
+private alias FList = FreeList!(Mallocator, 0, unbounded);
+
+// The canonical general-purpose composition from the std.experimental.allocator
+// docs, re-parented onto Mallocator (we are zero-GC): size-segregated freelists
+// that RECLAIM individual frees, bitmapped blocks for the mid range, malloc for the
+// huge tail. Shared TYPE; each plane gets its own StatsCollector instance below.
+private alias ComposedBackend = Segregator!(
+        8, FreeList!(Mallocator, 0, 8),
+        128, Bucketizer!(FList, 1, 128, 16),
+        256, Bucketizer!(FList, 129, 256, 32),
+        512, Bucketizer!(FList, 257, 512, 64),
+        1024, Bucketizer!(FList, 513, 1024, 128),
+        2048, Bucketizer!(FList, 1025, 2048, 256),
+        3584, Bucketizer!(FList, 2049, 3584, 512),
+        4072 * 1024, AllocatorList!((size_t n) => BitmappedBlock!(4096)(
+            cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
+        Mallocator);
 
 version (DreadsDataGC)
 {
@@ -18,43 +52,24 @@ version (DreadsDataGC)
     alias DataBackend = GCAllocator; // embedded/test builds: GC-managed data
 }
 else version (DreadsDataMalloc)
-{
     alias DataBackend = Mallocator; // baseline: straight malloc/free (jemalloc)
-}
 else
+    alias DataBackend = ComposedBackend;
+
+version (DreadsConnGC)
 {
-    // The canonical general-purpose composition from the std.experimental.allocator
-    // docs, re-parented onto Mallocator (we are zero-GC): size-segregated freelists
-    // that RECLAIM individual frees, bitmapped blocks for the mid range, malloc for
-    // the huge tail. `deallocate` returns blocks to the freelist for reuse.
-    import std.experimental.allocator : unbounded;
-    import std.experimental.allocator.building_blocks.free_list : FreeList;
-    import std.experimental.allocator.building_blocks.bucketizer : Bucketizer;
-    import std.experimental.allocator.building_blocks.segregator : Segregator;
-    import std.experimental.allocator.building_blocks.allocator_list : AllocatorList;
-    import std.experimental.allocator.building_blocks.bitmapped_block : BitmappedBlock;
-    import std.algorithm.comparison : max;
-
-    private alias FList = FreeList!(Mallocator, 0, unbounded);
-    alias DataBackend = Segregator!(
-            8, FreeList!(Mallocator, 0, 8),
-            128, Bucketizer!(FList, 1, 128, 16),
-            256, Bucketizer!(FList, 129, 256, 32),
-            512, Bucketizer!(FList, 257, 512, 64),
-            1024, Bucketizer!(FList, 513, 1024, 128),
-            2048, Bucketizer!(FList, 1025, 2048, 256),
-            3584, Bucketizer!(FList, 2049, 3584, 512),
-            4072 * 1024, AllocatorList!((size_t n) => BitmappedBlock!(4096)(
-                cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
-            Mallocator);
+    import std.experimental.allocator.gc_allocator : GCAllocator;
+    alias ConnBackend = GCAllocator;
 }
+else version (DreadsConnMalloc)
+    alias ConnBackend = Mallocator;
+else
+    alias ConnBackend = ComposedBackend;
 
-// Wrap the backend in a StatsCollector tracking live bytes: this is the REAL,
-// PORTABLE data-memory count (works on any build, not just jemalloc+Linux), so
-// maxmemory enforcement stops being "virtual". The existing pre-check reads
-// `keyspaceBytesUsed()` and refuses/evicts at the limit — the builder "fails at
-// maxmemory" via that gate, never by a null the containers would assert on.
-import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
+// Each backend is wrapped in a StatsCollector tracking live bytes: the REAL,
+// PORTABLE memory count (works on any build, not just jemalloc+Linux). For the
+// keyspace this drives maxmemory (stops being "virtual"); for connections it feeds
+// client-buffer accounting.
 
 // Debug-only live-range tracker (version=DreadsAllocTrack). Sits under the stats
 // collector and asserts the moment the backend hands out a block overlapping a
@@ -132,11 +147,15 @@ version (DreadsAllocTrack)
 else
     alias DataAllocator = StatsCollector!(DataBackend, Options.bytesUsed);
 
-// Always stateful now (the collector holds counters), so one global instance with
-// an `instance` accessor — drops straight into emplace's `Allocator.instance`
-// pattern. Single event-loop thread ⇒ the __gshared instance is race-free.
-private __gshared DataAllocator gDataAlloc;
+alias ConnAllocatorT = StatsCollector!(ConnBackend, Options.bytesUsed);
 
+// Always stateful now (the collectors hold counters), so one global instance per
+// plane with an `instance` accessor — drops straight into the `Allocator.instance`
+// pattern. Single event-loop thread ⇒ the __gshared instances are race-free.
+private __gshared DataAllocator gDataAlloc;
+private __gshared ConnAllocatorT gConnAlloc;
+
+/// Keyspace (data) plane — every RObj value routes here; drives maxmemory.
 struct KeyspaceAllocator
 {
     static @property ref DataAllocator instance() @nogc nothrow @trusted
@@ -145,11 +164,28 @@ struct KeyspaceAllocator
     }
 }
 
+/// Connection plane — network/reply buffers, per-command scratch, the write-queue
+/// ring. Separate instance/counter so its bytes never touch maxmemory (keyspace).
+struct ConnAllocator
+{
+    static @property ref ConnAllocatorT instance() @nogc nothrow @trusted
+    {
+        return gConnAlloc;
+    }
+}
+
 /// Live bytes currently held by the keyspace data allocator — the real,
 /// build-portable figure that drives maxmemory (replaces the jemalloc-only mallctl).
 ulong keyspaceBytesUsed() @nogc nothrow @trusted
 {
     return cast(ulong) gDataAlloc.bytesUsed;
+}
+
+/// Live bytes currently held by the connection-plane allocator (network/reply
+/// buffers, scratch, write queue) — the basis for client-buffer accounting.
+ulong connBytesUsed() @nogc nothrow @trusted
+{
+    return cast(ulong) gConnAlloc.bytesUsed;
 }
 
 // Feasibility probe: the data plane is @nogc nothrow, so the backend must

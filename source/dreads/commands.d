@@ -2843,6 +2843,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         {
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
+            import dreads.alloc : connBytesUsed;
             import dreads.obj : gBlockedClients, gConnectedClients, gDbs, gExpiredKeys, gExpiredFields,
                 gEvictedKeys, gPauseUntilMs, gPauseAll;
             import dreads.stream : nowMs;
@@ -2864,8 +2865,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     gConnectedClients, gBlockedClients, reason.ptr, actions.ptr, premain);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length,
-                    "# Memory\r\nused_memory:%llu\r\nmaxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
-                    usedMemory(), gConfig.maxmemory,
+                    "# Memory\r\nused_memory:%llu\r\nmem_clients_normal:%llu\r\n"
+                    ~ "maxmemory:%llu\r\nmaxmemory_policy:%.*s\r\n",
+                    usedMemory(), connBytesUsed(), gConfig.maxmemory,
                     cast(int) gConfig.maxmemoryPolicy.length, gConfig.maxmemoryPolicy.ptr);
             ib.append(b[0 .. n]);
             n = snprintf(b.ptr, b.length, "number_of_cached_scripts:%zu\r\n",

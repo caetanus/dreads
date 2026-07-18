@@ -49,6 +49,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
 }
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, isCompatModeParam, parseMemory;
 import dreads.mem : Arena, ByteBuffer;
+import dreads.alloc : ConnAllocator;
 import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags, gNotifyDb;
@@ -1224,10 +1225,10 @@ private struct OutQueue
     private size_t cap, head, tail, count;
     ulong dropped;
 
-    void setup(size_t capacity) @nogc nothrow
+    void setup(size_t capacity) @nogc nothrow @trusted
     {
         cap = capacity;
-        ring = cast(RcMsg**) malloc(cap * (RcMsg*).sizeof);
+        ring = cast(RcMsg**) ConnAllocator.instance.allocate(cap * (RcMsg*).sizeof).ptr;
         assert(ring !is null, "out of memory");
         head = tail = count = 0;
     }
@@ -1264,7 +1265,7 @@ private struct OutQueue
         while (pop(m))
             rcRelease(m);
         if (ring !is null)
-            cfree(ring);
+            ConnAllocator.instance.deallocate((cast(void*) ring)[0 .. cap * (RcMsg*).sizeof]);
         ring = null;
         cap = head = tail = count = 0;
     }

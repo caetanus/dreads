@@ -3,9 +3,10 @@ module dreads.mem;
 // Zero-GC building blocks: everything here is malloc-backed and @nogc.
 // The GC must never run in the data plane (see logo: "Arena memory. Zero-GC overhead").
 
-import core.stdc.stdlib : malloc, realloc, free;
 import core.stdc.string : memcpy, memmove, memset;
 import std.experimental.allocator.mallocator : Mallocator;
+import std.experimental.allocator : reallocate;
+import dreads.alloc : ConnAllocator;
 
 /// Growable malloc-backed byte buffer (network in/out buffers, reply building).
 public struct ByteBuffer
@@ -16,11 +17,11 @@ public struct ByteBuffer
 
     @disable this(this);
 
-    ~this() @nogc nothrow
+    ~this() @nogc nothrow @trusted
     {
         if (ptr !is null)
         {
-            free(ptr);
+            ConnAllocator.instance.deallocate((cast(void*) ptr)[0 .. cap]);
             ptr = null;
         }
         len = cap = 0;
@@ -42,15 +43,17 @@ public struct ByteBuffer
         return ptr[0 .. len];
     }
 
-    void reserve(size_t need) @nogc nothrow
+    void reserve(size_t need) @nogc nothrow @trusted
     {
         if (len + need <= cap)
             return;
         size_t ncap = cap ? cap : 256;
         while (ncap < len + need)
             ncap *= 2;
-        ptr = cast(ubyte*) realloc(ptr, ncap);
-        assert(ptr !is null, "out of memory");
+        void[] blk = ptr is null ? null : (cast(void*) ptr)[0 .. cap];
+        immutable ok = reallocate(ConnAllocator.instance, blk, ncap);
+        assert(ok, "out of memory");
+        ptr = cast(ubyte*) blk.ptr;
         cap = ncap;
     }
 
@@ -125,19 +128,19 @@ public struct Arena
 
     @disable this(this);
 
-    ~this() @nogc nothrow
+    ~this() @nogc nothrow @trusted
     {
         Block* b = head;
         while (b !is null)
         {
             Block* next = b.next;
-            free(b);
+            ConnAllocator.instance.deallocate((cast(void*) b)[0 .. Block.sizeof + b.cap]);
             b = next;
         }
         head = null;
     }
 
-    void* alloc(size_t size, size_t alignment = 16) @nogc nothrow
+    void* alloc(size_t size, size_t alignment = 16) @nogc nothrow @trusted
     {
         if (size == 0)
             return null;
@@ -152,7 +155,7 @@ public struct Arena
             }
         }
         size_t cap = size + alignment > blockSize ? size + alignment : blockSize;
-        auto b = cast(Block*) malloc(Block.sizeof + cap);
+        auto b = cast(Block*) ConnAllocator.instance.allocate(Block.sizeof + cap).ptr;
         assert(b !is null, "out of memory");
         b.next = head;
         b.cap = cap;
@@ -180,12 +183,12 @@ public struct Arena
     }
 
     /// Frees everything allocated so far, keeping the newest block for reuse.
-    void reset() @nogc nothrow
+    void reset() @nogc nothrow @trusted
     {
         while (head !is null && head.next !is null)
         {
             Block* next = head.next;
-            free(head);
+            ConnAllocator.instance.deallocate((cast(void*) head)[0 .. Block.sizeof + head.cap]);
             head = next;
         }
         if (head !is null)
