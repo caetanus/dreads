@@ -325,7 +325,7 @@ public struct Keyspace
         if (o is null)
             return; // not in the keyspace, nothing to expire
         auto sk = d.storedKey(k); // the Dict's own stable key bytes — no dup
-        auto bucket = expires.getOrPut(at, ExpBucket.init); // one descent
+        auto bucket = expires.emplace(at); // one descent, bucket built in place
         o.expireSlot = cast(uint) bucket.length; // its position, for O(1) removal
         bucket.put(sk); // non-owning slice into Dict-owned memory
     }
@@ -417,7 +417,7 @@ public struct Keyspace
         if (o is null)
             return;
         auto sk = d.storedKey(k); // stable Dict-owned key bytes — no dup
-        auto bucket = subExpires.getOrPut(at, SubBucket.init);
+        auto bucket = subExpires.emplace(at); // bucket built in place
         o.subExpireSlot = cast(uint) bucket.length;
         o.subExpireAt = at;
         bucket.put(SubEnt(t, sk));
