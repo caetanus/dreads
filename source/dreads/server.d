@@ -14,7 +14,7 @@ module dreads.server;
 import core.builtins : expect;
 import core.stdc.stdio : printf;
 
-import core.time : seconds;
+import core.time : seconds, msecs;
 
 import vibe.core.core : runEventLoop, runTask, setTimer;
 import vibe.core.net : TCPConnection, connectTCP, listenTCP, TCPListenOptions;
@@ -261,29 +261,42 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 gExpireKeys.set(key, Unit()); // server-caused: exempt from NOLOOP
             }
         };
+        // Active expiry runs on its OWN fast 200ms timer (Valkey sweeps ~10x/s;
+        // a 1s cadence left keys logically-expired-but-present far too long). Kept
+        // separate from the 1s cron below so the fsync/eviction/lru work does NOT
+        // also run 5x more often.
+        setTimer(200.msecs, delegate() @trusted nothrow {
+            import dreads.det : freezeClock;
+
+            freezeClock(0); // pin this cycle's clock to wall time (see below)
+            // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
+            // is a propagated DEL) is held until the window lifts, like eviction.
+            immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
+            if (paused)
+                return;
+            foreach (ref d; gDbs) // drop-soon sweep across every database
+            {
+                gNotifyDb = d.db; // "expired" fires on THIS db's channel
+                d.activeExpireCycle();
+                d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
+            }
+            flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
+            if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
+                flushTrackingInval(0);
+        }, true);
         setTimer(1.seconds, delegate() @trusted nothrow {
             // Pin THIS cycle's clock to wall time. detNow() otherwise returns the
             // last command's frozen gClock (never reset to 0 after dispatch), which
-            // is stale here — so a background active-expire/eviction cycle would
-            // compare deadlines against a frozen "now" and never fire while idle.
+            // is stale here — so a background eviction cycle would compare against a
+            // frozen "now".
             import dreads.det : freezeClock;
 
             freezeClock(0); // 0 => freeze the current wall clock into gClock
             lruClock = cast(uint)(nowMs() / 1000);
-            // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
-            // is a propagated DEL) is held until the window lifts, like eviction.
-            immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
-            if (!paused)
-                foreach (ref d; gDbs) // drop-soon sweep across every database
-                {
-                    gNotifyDb = d.db; // "expired" fires on THIS db's channel
-                    d.activeExpireCycle();
-                    d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
-                }
             runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
             releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
-            flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
-            if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
+            flushPendingNotify(); // deliver any events the eviction cycle queued
+            if (gTrackCount)
                 flushTrackingInval(0);
             gAof.fsyncNow();
         }, true);
