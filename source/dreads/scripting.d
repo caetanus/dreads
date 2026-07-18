@@ -171,6 +171,20 @@ public void scriptSetPendingUser(ulong userId) nothrow @nogc
     gPendingScriptUser = userId;
 }
 
+// Pointer to the EVAL/FCALL caller's tot-cmds counter. Each redis.call a script
+// makes is a processed command on the caller (Redis counts it in the client's
+// command stats), so executeScriptCommand — which runs on the main thread, where
+// this Conn field lives — bumps it. Set right before the script runs, cleared
+// right after; single-script-at-a-time makes the __gshared pointer safe (same
+// reasoning as gPendingScriptUser).
+package ulong* gScriptCallerCmds;
+
+/// Server hook: the caller's tot-cmds counter for the script about to run (null off).
+public void scriptSetCallerCmds(ulong* p) nothrow @nogc
+{
+    gScriptCallerCmds = p;
+}
+
 // Bridge context lives wherever the VM runs: __gshared for inline (main), and
 // the same variable on the single Lua thread in pool mode (only one thread
 // touches the VM either way, so no sharing hazard).
@@ -1114,6 +1128,11 @@ package int executeScriptCommand(ref Keyspace ks, const ref RVal cmd,
         ref Arena arena, ref ByteBuffer reply, ref ByteBuffer effScratch) nothrow
 {
     import dreads.resp : gRespProto;
+
+    // Each redis.call is a processed command on the caller's connection (Redis
+    // reflects this in the client's tot-cmds / command stats).
+    if (gScriptCallerCmds !is null)
+        (*gScriptCallerCmds)++;
 
     // ACL: a redis.call must obey the CALLER's permissions, not the fact that
     // the caller was allowed to run EVAL. `userId` rides in from the connection

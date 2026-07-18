@@ -1517,10 +1517,11 @@ private void serveClient(TCPConnection tcp) nothrow
                 if (cmd.type == RType.Array && cmd.arr.length == 0)
                     continue;
                 gRespProto = c.resp3 ? 3 : 2;
+                c.totNetIn += p - start; // count request bytes at read (a blocked cmd still shows them)
                 immutable replyPre = outb.length;
                 c.replyCmdExempt = false;
                 keep = handleCommand(*c, cmd, buf[start .. p], outb, arena);
-                postCommand(*c, outb, replyPre, p - start);
+                postCommand(*c, outb, replyPre);
                 if (gNotifyFlags)
                     flushPendingNotify();
                 if (gTrackCount)
@@ -1623,10 +1624,11 @@ private void serveClient(TCPConnection tcp) nothrow
                     if (cmd.type == RType.Array && cmd.arr.length == 0)
                         continue; // blank inline line — Redis ignores it silently
                     gRespProto = c.resp3 ? 3 : 2; // reply encoding for this command
+                    c.totNetIn += pos - cmdStart; // count request bytes at read (a blocked cmd still shows them)
                     immutable replyPre = outb.length;
                     c.replyCmdExempt = false;
                     keep = handleCommand(*c, cmd, inb.data[cmdStart .. pos], outb, arena);
-                    postCommand(*c, outb, replyPre, pos - cmdStart);
+                    postCommand(*c, outb, replyPre);
                     if (gNotifyFlags)
                         flushPendingNotify(); // publish keyspace events the command queued
                     if (gTrackCount)
@@ -1991,16 +1993,17 @@ private void appendAge(ref ByteBuffer o, long ms) @nogc nothrow
 
 // Per-command CLIENT bookkeeping, run by the serve loop AFTER handleCommand
 // returns (a command blocked in BLPOP completes only when handleCommand returns,
-// so tot-cmds ticks at completion for free — no scope(exit) needed). Kept out of
-// handleCommand: a try/finally there pessimizes the hot path. `consumed` is the
-// request's raw byte count; `replyPre` is outb.length captured before the command.
+// so tot-cmds ticks at completion for free — no scope(exit) needed). tot-net-in is
+// NOT here: input bytes are counted at read time by the serve loop, so a command
+// blocked in BLPOP still shows its request bytes while parked (Redis does the same).
+// Kept out of handleCommand: a try/finally there pessimizes the hot path.
+// `replyPre` is outb.length captured before the command.
 // NOTE: do NOT `pragma(inline, true)` this — force-inlining its @safe body into
 // serveClient flips serveClient to inferred-@safe, which makes dmd @safe-check
 // vibe's waitForDataEx and trips a latent @safe/@system bug in vibe-core 2.14.0.
 // LDC inlines it on its own at -O, so the pragma bought nothing anyway.
-private void postCommand(ref Conn c, ref ByteBuffer o, size_t replyPre, size_t consumed) @nogc nothrow
+private void postCommand(ref Conn c, ref ByteBuffer o, size_t replyPre) @nogc nothrow
 {
-    c.totNetIn += consumed;
     c.totCmds++;
     // CLIENT REPLY OFF/SKIP roll the reply back; the CLIENT REPLY command itself
     // latched replyCmdExempt so it is never suppressed. SKIP is one-shot.
@@ -3270,12 +3273,14 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // at boot) or through raft consensus, one entry per write. A
             // script that fails halfway keeps its earlier writes in the log,
             // exactly like it keeps them in the dataset.
-            import dreads.scripting : gScriptWrote;
+            import dreads.scripting : gScriptWrote, scriptSetCallerCmds;
 
             gScriptWrote = false;
             immutable evalPrev = gTotalErrorReplies;
             immutable evalOut = o.length;
+            scriptSetCallerCmds(&c.totCmds); // each redis.call counts on the caller
             evalCommand(args, *c.dbp, o, arena, bySha, readOnly);
+            scriptSetCallerCmds(null);
             propagationOverride.clear();
             // commandstats/errorstats for the EVAL itself: a Lua-level error is a
             // real leaf error; an error propagated from a redis.call already
