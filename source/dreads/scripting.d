@@ -317,6 +317,18 @@ private static immutable protectGlobalsChunk = q{
         end
         return real_rawset(t, k, v)
     end
+    -- string VALUES carry a shared metatable whose __index is the REAL string
+    -- library table (that is what makes ("x"):upper() work). getmetatable("")
+    -- hands a script that metatable -> its __index -> the real table (behind the
+    -- read-only proxy), which it could then mutate: getmetatable("").__index.rep =
+    -- evil leaks into every later script. Lock the metatable so getmetatable stops
+    -- exposing it; the VM still dispatches methods through it internally.
+    local smt = getmetatable("")
+    if smt then
+        protected[smt] = true
+        protected[smt.__index] = true
+        smt.__metatable = false
+    end
 };
 
 /// Make the table on top of the stack read-only: writes raise "Attempt to

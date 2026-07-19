@@ -142,6 +142,14 @@ version (unittest)
         }
         // rawset on a script's OWN local table still works (not over-broad)
         ks.evalRun("local t = {} rawset(t, 'k', 9) return t.k").expect.to.equal(":9\r\n");
+        // V9: the string VALUE metatable reaches the real string table via its
+        // __index (getmetatable("").__index) — locked so getmetatable can't expose it
+        ks.evalRun("return type(getmetatable(''))").expect.to.contain("boolean");
+        auto vmeta = ks.evalRun("getmetatable('').__index.rep = function() return 'PWN' end return 1");
+        vmeta[0].expect.to.equal('-'); // indexing the locked (false) metatable errors
+        // and a normal script still sees pristine string methods, both call styles
+        ks.evalRun("return ('aa'):rep(2)").expect.to.equal("$4\r\naaaa\r\n");
+        ks.evalRun("return string.rep('aa', 2)").expect.to.equal("$4\r\naaaa\r\n");
 
         // round 2 — a normal script sees pristine stdlib, zero contamination
         ks.evalRun("return tostring(string.__contam)").expect.to.contain("nil");
