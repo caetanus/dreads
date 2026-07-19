@@ -148,10 +148,13 @@ public void pfadd(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc n
         return;
     }
     bool err;
+    // Creating the HLL for a missing key IS a change (Valkey: `PFADD key` with no
+    // elements on a new key returns 1 and materialises an empty HLL).
+    immutable existed = ks.exists(args[0].str);
     auto hll = hllFor(ks, args[0].str, true, o, err);
     if (err)
         return;
-    bool changed = false;
+    bool changed = !existed;
     foreach (ref a; args[1 .. $])
     {
         uint idx;

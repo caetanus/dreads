@@ -20,6 +20,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `sort` → `valkey_sort_tests.d` (2 tests: numeric/alpha/limit/desc/nosort, BY weight+hash / GET / STORE)
 - [x] `scan` → `valkey_scan_tests.d` (2 tests: SCAN match/type/count, HSCAN/SSCAN/ZSCAN + NOVALUES) [cursor-loop helper]
 - [x] `geo` → `valkey_geo_tests.d` (2 tests: add/hash/dist, geosearch byradius/frommember)
+- [x] `hyperloglog` → `valkey_hll_tests.d` (1 test: pfadd/pfcount/pfmerge) — FOUND+FIXED: PFADD empty-key creation returns 1
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
