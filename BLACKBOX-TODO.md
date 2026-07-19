@@ -335,3 +335,45 @@ arithmetic). Remaining unrelated gap: **CLIENT LIST/INFO** reports the real db b
    the most files.
 2. Re-run the sweep; record the next layer of `[err]` per file.
 3. Repeat until files run to completion, then log the true per-test failures.
+
+---
+
+## Sweep expansion triage (2026-07-19) — 24 not-yet-swept unit files run against dreads
+
+**Institutionalized into `sweep.sh` default (0 failed):** type/list-2 (2), type/list-3
+(11), type/stream (71), type/stream-cgroups (53), pubsub (35), bitfield (18),
+hashexpire (230), quit (3), pause (19), scripting (548), + auth/wait/pubsubshard
+(0/0 — ran clean, no applicable tests in external mode). Huge coverage that was
+simply missing from the sweep list.
+
+**Residue — OUT of the default until fixed or skip-listed:**
+- `dump` — 15 passed, **1 failed**: "RESTORE rejects stream with shared NACK across
+  consumers". A single RESTORE edge (stream PEL shared-NACK validation). Low.
+- `multi` — aborts on "Nested MULTI are not allowed" (exception at file setup). Likely
+  external-mode leftover state (a prior MULTI not discarded) OR a real reply diff on
+  nested MULTI. Investigate: does dreads return the exact Valkey error/behavior for
+  MULTI-inside-MULTI?
+- `hyperloglog` — aborts on "HyperLogLog self test passes" (the dense/sparse encoding
+  accuracy self-check). Possible HLL encoding/precision diff. Medium.
+- `protocol` — aborts on "ERR Protocol error" (an inline/RESP framing edge the test
+  drives deliberately; check our error string/behavior parity).
+- `info-command` — aborts: test reads a `sha1`/field from INFO/COMMAND we don't emit.
+- `introspection-2` — aborts on OBJECT-access-time ("TTL/TYPE/EXISTS do not alter the
+  last access time"): OBJECT IDLETIME / lru-touch semantics.
+- `functions` — aborts on "ERR Missing library metadata": FUNCTION LOAD library-header
+  parsing (FUNCTION support is partial).
+- `geo` — 64 passed then aborts on "I/O error reading reply" (server did NOT crash —
+  no assert/segfault in the server log; a specific GEO command likely closed the conn
+  or timed out). Investigate which GEO* command trips it.
+- `slowlog` — aborts on "ERR Unsupported CONFIG parameter" (SLOWLOG config keys).
+- `tracking` — **HANG** (exit 124) after 29 ok; hangs on the test AFTER "[skip]
+  Tracking invalidation of eviction keys before response" — a test waiting on
+  eviction-driven invalidation timing dreads doesn't emit. → add that test to
+  valkey-sync.skip (N/A: our eviction-invalidation ordering differs), then re-run.
+- `introspection` — **HANG** (exit 124) after 60 ok; hangs on "CLIENT KILL close the
+  client connection during bgsave" — dreads has no fork-based BGSAVE, so a test
+  waiting on bgsave state blocks. → skip-list the bgsave-dependent CLIENT KILL test.
+
+Next actions: (1) skip-list the two hanging tests so tracking/introspection can join
+the default; (2) triage the 9 exit=1 files one at a time — each real gap gets an OWN
+unit test (never copy the tcl), each N/A gets a skip line + rationale.

@@ -8,7 +8,14 @@ CONF=/home/caetano/lab/dreads/blackbox/dreads-suite.conf
 SKIP=/home/caetano/lab/dreads/blackbox/valkey-sync.skip
 PORT=7777
 OUT=${1:?outdir}; shift
-FILES=${@:-"unit/type/incr unit/type/string unit/type/list unit/type/hash unit/type/set unit/type/zset unit/expire unit/keyspace unit/scan unit/bitops unit/other unit/sort"}
+# The applicable Valkey unit suite run against dreads (Valkey as read-only oracle).
+# Original 12 + the 2026-07-19 expansion (all confirmed 0-failed against dreads):
+# scripting 548/0, hashexpire 230/0, stream 71/0, stream-cgroups 53/0, pubsub 35/0,
+# pause 19/0, bitfield 18/0, list-3 11/0, quit 3/0, list-2 2/0, auth/wait/pubsubshard 0/0.
+# Files still failing/hanging (multi, dump, hyperloglog, protocol, info-command,
+# introspection[-2], functions, geo, slowlog) are catalogued in BLACKBOX-TODO.md and
+# stay OUT of the default until fixed or skip-listed.
+FILES=${@:-"unit/type/incr unit/type/string unit/type/list unit/type/list-2 unit/type/list-3 unit/type/hash unit/type/set unit/type/zset unit/type/stream unit/type/stream-cgroups unit/expire unit/hashexpire unit/keyspace unit/scan unit/bitops unit/bitfield unit/other unit/sort unit/pubsub unit/pubsubshard unit/pause unit/quit unit/auth unit/wait unit/scripting"}
 mkdir -p "$OUT"
 cd /tmp/valkey
 for f in $FILES; do
