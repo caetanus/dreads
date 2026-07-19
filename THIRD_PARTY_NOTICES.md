@@ -21,8 +21,17 @@ DUMP payloads interoperate byte-for-byte with Redis/Valkey. This is an external
 wire specification (like a protocol RFC) reproduced for compatibility — dreads'
 own data structures and architecture are unrelated to Valkey's.
 
-These strings and format constants are the only material derived from Valkey; no
-Valkey source code, structure, or logic was copied into dreads' architecture.
+## Valkey — test scenarios (ported)
+
+`dreads`' test suite (`source/tests/valkey_*_tests.d`) ports the SCENARIOS and
+expected behaviours of Valkey's unit tests (`tests/unit/**/*.tcl`) — the same
+inputs and asserted outputs — re-expressed as native D `unittest`s driving dreads'
+own command dispatch. These validate client-visible behaviour parity; no Valkey
+source code, structure, or logic was copied into dreads' architecture.
+
+These strings, format constants, and test scenarios are the only material derived
+from Valkey; no Valkey source code, structure, or logic was copied into dreads'
+architecture.
 
 Valkey is distributed under the BSD 3-Clause License, which permits this use
 provided the following copyright notice, conditions, and disclaimer are
