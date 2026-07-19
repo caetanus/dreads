@@ -127,11 +127,21 @@ version (unittest)
         auto tplant = ks.evalRun("table.__contam = 1 return 1");
         tplant[0].expect.to.equal('-');
         tplant.expect.to.contain("readonly table");
-        // V5: install a metatable on string ("mudar via {}") — refused because the
-        // proxy's metatable is protected (__metatable), so setmetatable can't touch it
+        // V5: install a metatable on string ("mudar via {}") — the gated setmetatable
+        // refuses it because string is a protected table
         auto smeta = ks.evalRun("setmetatable(string, {__index = function() return 'X' end}) return 1");
         smeta[0].expect.to.equal('-');
-        smeta.expect.to.contain("protected metatable");
+        smeta.expect.to.contain("readonly table");
+        // V8: rawset bypasses __newindex — the gated rawset must still refuse it on
+        // every protected table (this is what defeats the plain read-only proxy)
+        foreach (target; ["_G", "string", "table", "math", "redis", "os"])
+        {
+            auto rs = ks.evalRun("rawset(" ~ target ~ ", 'pwn', 1) return 1");
+            rs[0].expect.to.equal('-');
+            rs.expect.to.contain("readonly table");
+        }
+        // rawset on a script's OWN local table still works (not over-broad)
+        ks.evalRun("local t = {} rawset(t, 'k', 9) return t.k").expect.to.equal(":9\r\n");
 
         // round 2 — a normal script sees pristine stdlib, zero contamination
         ks.evalRun("return tostring(string.__contam)").expect.to.contain("nil");

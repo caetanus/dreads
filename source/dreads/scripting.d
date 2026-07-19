@@ -294,11 +294,28 @@ private static immutable protectGlobalsChunk = q{
     real_setmetatable(_G, mt)
     local protected = real_setmetatable({}, {__mode = "k"})
     protected[_G] = true
+    -- the read-only library proxies must be protected too: without this, a
+    -- script reaches them by their global name and mutates them via setmetatable
+    -- or rawset, and the change leaks into every later script (shared lua_State).
+    for _, t in ipairs({string, table, math, redis, cjson, cmsgpack, bit, os}) do
+        protected[t] = true
+    end
     setmetatable = function(t, m)
         if protected[t] then
             error("Attempt to modify a readonly table", 2)
         end
         return real_setmetatable(t, m)
+    end
+    -- rawset bypasses __newindex (by design), so the read-only metatables alone do
+    -- not stop rawset(redis, "call", evil). Valkey solves this by patching the Lua C
+    -- set path; we link the system lib, so we gate the rawset global instead (Lua
+    -- exposes no other raw-write primitive to scripts).
+    local real_rawset = rawset
+    rawset = function(t, k, v)
+        if protected[t] then
+            error("Attempt to modify a readonly table", 2)
+        end
+        return real_rawset(t, k, v)
     end
 };
 
