@@ -53,34 +53,46 @@ private ptrdiff_t findCRLF(scope const(ubyte)[] buf, size_t from) @nogc nothrow
     return -1;
 }
 
+// SINGLE PASS: parse the digits AND find the terminating CRLF in one scan over the
+// length header — the old version did a separate findCRLF scan then a second digit
+// loop over the same bytes, and this runs ~4x per command (array header + one per
+// bulk), part of parseValue's ~6.9% self on the SET path (perf).
 private ParseStatus parseLineInt(scope const(ubyte)[] buf, ref size_t pos, out long value) @nogc nothrow
 {
-    auto end = findCRLF(buf, pos);
-    if (end < 0)
-        return ParseStatus.incomplete;
     size_t i = pos;
     bool neg = false;
-    if (i < end && (buf[i] == '-' || buf[i] == '+'))
+    if (i < buf.length && (buf[i] == '-' || buf[i] == '+'))
     {
         neg = buf[i] == '-';
         i++;
     }
-    if (i == cast(size_t) end)
-        return ParseStatus.protocolError;
     long v = 0;
-    for (; i < cast(size_t) end; i++)
+    bool anyDigit = false;
+    for (; i < buf.length; i++)
     {
-        ubyte c = buf[i];
-        if (c < '0' || c > '9')
-            return ParseStatus.protocolError;
-        // far above any valid length header; prevents silent wrap-around
-        if (v > 100_000_000_000_000_000)
-            return ParseStatus.protocolError;
-        v = v * 10 + (c - '0');
+        immutable ubyte c = buf[i];
+        if (c >= '0' && c <= '9')
+        {
+            // far above any valid length header; prevents silent wrap-around
+            if (v > 100_000_000_000_000_000)
+                return ParseStatus.protocolError;
+            v = v * 10 + (c - '0');
+            anyDigit = true;
+        }
+        else if (c == '\r')
+        {
+            if (i + 1 >= buf.length)
+                return ParseStatus.incomplete; // partial CRLF: need the '\n'
+            if (buf[i + 1] != '\n' || !anyDigit)
+                return ParseStatus.protocolError;
+            value = neg ? -v : v;
+            pos = i + 2;
+            return ParseStatus.ok;
+        }
+        else
+            return ParseStatus.protocolError; // non-digit before CRLF
     }
-    value = neg ? -v : v;
-    pos = end + 2;
-    return ParseStatus.ok;
+    return ParseStatus.incomplete; // no CRLF yet
 }
 
 /// Parses one RESP value starting at buf[pos]. On ok, advances pos past it.

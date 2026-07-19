@@ -84,6 +84,15 @@ private alias BumpBackend = Segregator!(
             cast(ubyte[]) Mallocator.instance.allocate(max(n, 4072 * 1024))), Mallocator),
         Mallocator);
 
+// NEGATIVE RESULT (2026-07-19, perf-stat A/B, kept as a note not code): replacing the
+// small-range Bucketizer tiers with a fine Segregator of per-size-class FreeLists
+// (same 16B granularity, dispatch by compile-time comparisons, no runtime bucket
+// division and no `roundUpToMultipleOf(s, step)` runtime modulo — that std helper is
+// 0.51% self on the SET path because `step` reaches it as a `uint` runtime arg) was
+// MEASURED SLOWER: ins/op 4310 vs 4226, rps 1.39M vs 1.44M. The 9-way compile-time
+// if-chain costs MORE branches than the Bucketizer's one division saves. The
+// Bucketizer stays; the ~0.5% is not cheaply reclaimable this way.
+
 version (DreadsDataGC)
 {
     import std.experimental.allocator.gc_allocator : GCAllocator;
