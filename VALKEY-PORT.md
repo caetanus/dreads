@@ -11,6 +11,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `type/incr` → `valkey_incr_tests.d` (4 tests: int paths, errors, INCRBYFLOAT ±)
 - [x] `type/string` → `valkey_string_tests.d` (5 tests: set/get/mget/getset, mset/msetnx, extended SET NX/XX/GET, append/strlen/setrange/getrange, LCS)
 - [x] `bitfield` → `valkey_bitfield_tests.d` (4 tests: set/get, #idx, overflow wrap/sat, RO)
+- [x] `keyspace` → `valkey_keyspace_tests.d` (4 tests: del/exists/dbsize, rename edges, copy same-db, type)
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
