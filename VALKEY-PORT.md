@@ -23,6 +23,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `hyperloglog` → `valkey_hll_tests.d` (1 test: pfadd/pfcount/pfmerge) — FOUND+FIXED: PFADD empty-key creation returns 1
 - [x] `type/stream` → `valkey_stream_tests.d` (2 tests: add/len/range/revrange, del/trim)
 - [x] `dump` → `valkey_dump_tests.d` (1 test: DUMP/RESTORE round-trip str/list/hash/zset, BUSYKEY, REPLACE)
+- [x] `type/stream-cgroups` → `valkey_stream_cgroups_tests.d` (1 test: group/read/ack/pending/consumers)
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
@@ -40,3 +41,10 @@ Notes: many "pending" files also have server-only sub-cases (DEBUG RELOAD, refco
 wait_for_condition, deferring clients) — those specific cases go to blackbox; the
 rest port to UT. The blackbox sweep (blackbox/sweep.sh) already validates the whole
 files against a live dreads with Valkey as oracle.
+
+## Not UT-portable (need per-connection state) → blackbox sweep only
+- `multi` (MULTI/EXEC/DISCARD/WATCH — the queue is per-connection)
+- `pubsub` / `pubsubshard` (SUBSCRIBE tracks per-connection channels; sweep 35/0)
+The in-process `ks.run()` harness dispatches single commands against a Keyspace with
+no Conn, so transaction/subscription state can't be exercised — those stay in the
+blackbox sweep where a real server + client drive them.
