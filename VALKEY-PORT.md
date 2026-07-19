@@ -13,6 +13,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `bitfield` → `valkey_bitfield_tests.d` (4 tests: set/get, #idx, overflow wrap/sat, RO)
 - [x] `keyspace` → `valkey_keyspace_tests.d` (4 tests: del/exists/dbsize, rename edges, copy same-db, type)
 - [x] `type/list` → `valkey_list_tests.d` (4 tests: push/range/index/lset/pushx, pop+count, insert/rem/trim, move/lpos)
+- [x] `type/set` → `valkey_set_tests.d` (3 tests: add/card/ismember/rem, pop/move, inter/union/diff + STORE + intercard) [sorted-compare helper]
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
