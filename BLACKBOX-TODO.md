@@ -377,3 +377,27 @@ simply missing from the sweep list.
 Next actions: (1) skip-list the two hanging tests so tracking/introspection can join
 the default; (2) triage the 9 exit=1 files one at a time — each real gap gets an OWN
 unit test (never copy the tcl), each N/A gets a skip line + rationale.
+
+---
+
+## unit/multi → sweep default (2026-07-19)
+
+Sent to the blackbox sweep (the user's "o que não é unit portável mande pro blackbox";
+MULTI/EXEC/WATCH need per-connection state, so not unit-portable). **27 passed, 0
+failed** in the default after skip-listing the N/A tail. Three REAL bugs found+fixed
+en route (see the multi fix commit): nested-MULTI error string, WATCH-in-MULTI error
+string, and EXECABORT-on-queue-time-error (multiDirty flag). Skip-listed in
+`valkey-sync.skip` by category:
+- **Propagation** (attach_to_replication_stream) — N/A: Raft not SYNC.
+- **Per-key WATCH** (FLUSHDB/SWAPDB/multi-DB/stale-key tests) — dreads uses a
+  CONSERVATIVE global write-epoch WATCH by design (DRIFT.md), not per-key.
+- **Server-level** — OOM simulation, busy-script timeout, replication/appendonly
+  configs, SAVE/SHUTDOWN inside MULTI.
+- **TODO (real gaps, not just N/A):** (1) queue-time command validation — an invalid
+  queued command (unknown/arity) must dirty the transaction so EXEC EXECABORTs (dreads
+  validates inside handlers, not at queue time); (2) CLIENT REPLY inside MULTI must be
+  rejected+dirty (needs a CMD_NO_MULTI-style queue-time reject list). Both are the same
+  "reject at queue time + dirty" mechanism already added for nested-MULTI/WATCH.
+
+pubsub + pubsubshard were already in the default (35/0 / 0/0). So the non-unit-portable
+set (multi, pubsub, pubsubshard) is now all in the blackbox sweep.

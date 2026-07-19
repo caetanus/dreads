@@ -208,3 +208,59 @@ GEOSEARCH BYPOLYGON with invalid COUNT
 GEOSEARCH BYPOLYGON standard operations
 GEOSEARCH BYPOLYGON across hemispheres
 GEOSEARCH BYPOLYGON overlapping edges
+
+# --- unit/multi (2026-07-19) ---
+# Queue-time command validation: dreads validates arity/existence INSIDE each command
+# handler, not at MULTI queue time, so an invalid queued command doesn't dirty the
+# transaction (EXEC should EXECABORT). Real gap, catalogued in BLACKBOX-TODO.md.
+EXEC fails if there are errors while queueing commands #1
+EXEC fails if there are errors while queueing commands #2
+If EXEC aborts, the client MULTI state is cleared
+# dreads' WATCH is a CONSERVATIVE global write-epoch (ANY write since WATCH aborts
+# EXEC), NOT Redis's per-key/per-DB tracking — a deliberate design divergence (see
+# DRIFT.md). These require per-key WATCH semantics.
+EXEC fail on lazy expired WATCHed key
+FLUSHDB while watching stale keys should not fail EXEC
+FLUSHALL does not touch non affected keys
+FLUSHDB does not touch non affected keys
+SWAPDB does not touch watched stale keys
+SWAPDB does not touch non-existing key replaced with stale key
+SWAPDB does not touch stale key replaced with another stale key
+WATCH is able to remember the DB a key belongs to
+WATCH will consider touched expired keys
+WATCH same key multiple times should be fine
+WATCH same key name in different DBs
+WATCH with large number of keys
+# unit/multi propagation tests (attach_to_replication_stream) — N/A: dreads
+# replicates via Raft, SYNC/PSYNC is a deliberate noop (see sync-is-noop-raft).
+MULTI / EXEC is not propagated (single write command)
+MULTI / EXEC is propagated correctly (empty transaction)
+MULTI / EXEC is propagated correctly (multiple commands)
+MULTI / EXEC is propagated correctly (multiple commands with SELECT)
+MULTI / EXEC is propagated correctly (read-only commands)
+MULTI / EXEC is propagated correctly (write command, no effect)
+MULTI / EXEC with REPLICAOF
+MULTI propagation of EVAL
+MULTI propagation of PUBLISH
+MULTI propagation of SCRIPT FLUSH
+MULTI propagation of SCRIPT LOAD
+MULTI propagation of XREADGROUP
+# unit/multi server-level (OOM simulation / busy-script timeout via DEBUG) — N/A in
+# the sweep (need maxmemory pressure + Lua timeout injection).
+DISCARD should not fail during OOM
+MULTI and script timeout
+EXEC and script timeout
+MULTI-EXEC body and script timeout
+just EXEC and script timeout
+# unit/multi replication/config tests — N/A (Raft not SYNC; runtime appendonly/repl
+# configs unsupported).
+exec with write commands and state change
+exec with read commands and stale replica state change
+AUTH errored inside MULTI will add the reply
+MULTI with config set appendonly
+EXEC with at least one use-memory command should fail
+MULTI with SAVE
+MULTI with SHUTDOWN
+# CLIENT REPLY inside MULTI should be rejected+dirty (like nested MULTI/WATCH) — dreads
+# queues it. Minor edge, TODO (needs a CMD_NO_MULTI-style queue-time reject list).
+MULTI is rejected when CLIENT REPLY is ON/OFF/SKIP

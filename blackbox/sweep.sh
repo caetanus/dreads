@@ -15,7 +15,7 @@ OUT=${1:?outdir}; shift
 # Files still failing/hanging (multi, dump, hyperloglog, protocol, info-command,
 # introspection[-2], functions, geo, slowlog) are catalogued in BLACKBOX-TODO.md and
 # stay OUT of the default until fixed or skip-listed.
-FILES=${@:-"unit/type/incr unit/type/string unit/type/list unit/type/list-2 unit/type/list-3 unit/type/hash unit/type/set unit/type/zset unit/type/stream unit/type/stream-cgroups unit/expire unit/hashexpire unit/keyspace unit/scan unit/bitops unit/bitfield unit/other unit/sort unit/pubsub unit/pubsubshard unit/pause unit/quit unit/auth unit/wait unit/scripting"}
+FILES=${@:-"unit/type/incr unit/type/string unit/type/list unit/type/list-2 unit/type/list-3 unit/type/hash unit/type/set unit/type/zset unit/type/stream unit/type/stream-cgroups unit/expire unit/hashexpire unit/keyspace unit/scan unit/bitops unit/bitfield unit/other unit/sort unit/pubsub unit/pubsubshard unit/pause unit/quit unit/auth unit/wait unit/scripting unit/multi"}
 mkdir -p "$OUT"
 cd /tmp/valkey
 for f in $FILES; do
