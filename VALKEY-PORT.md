@@ -15,6 +15,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `type/list` → `valkey_list_tests.d` (4 tests: push/range/index/lset/pushx, pop+count, insert/rem/trim, move/lpos)
 - [x] `type/set` → `valkey_set_tests.d` (3 tests: add/card/ismember/rem, pop/move, inter/union/diff + STORE + intercard) [sorted-compare helper]
 - [x] `type/zset` → `valkey_zset_tests.d` (3 tests: add/score/rank/count, incr/rem/pop, ranges by-index/score/lex)
+- [x] `type/hash` → `valkey_hash_tests.d` (3 tests: set/get/del/setnx/mget, getall/keys/vals, hincrby/hincrbyfloat)
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
