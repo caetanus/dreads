@@ -34,7 +34,7 @@ version (unittest)
         propagationOverride.clear();
         auto encoded = respCmd(cmdArgs);
         parseValue(cast(const(ubyte)[]) encoded, pos, arena, v).expect.to.equal(ParseStatus.ok);
-        v.dispatch(ks, o, arena);
+        v.dispatch(ks, o, arena, 1_700_000_000_000UL);
         return (cast(string) o.data).idup;
     }
 

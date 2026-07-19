@@ -770,6 +770,15 @@ public void georadius(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
 // ---------------------------------------------------------------------------
 
 /// Redis prints coordinates with 17 significant digits.
+// WITHCOORD coordinate formatting. Valkey prints the decoded cell-center as a long double
+// with ld2string(LD_STR_HUMAN) ("%.17Lf" + trailing-zero strip), e.g. -73.97334784269332886.
+// dreads deliberately emits the shorter "%.17g" of the same double instead: the decoded
+// value is a plain double and the extra digits Valkey prints (decimal places ~16-20) are
+// pure decode noise of a 52-bit geohash — physically meaningless (sub-micron). Matching
+// them byte-for-byte would emit ~2 more chars per coordinate, and GEORADIUS WITHCOORD is
+// reply-bound: a +6% reply measured a proportional ~6% throughput drop. "%.17g" round-trips
+// the double exactly, so no precision that matters is lost. (Valkey's own output is anyway
+// platform-dependent here: on ARM, long double == double and it prints the short form too.)
 private void repCoord(ref ByteBuffer o, double v) @nogc nothrow
 {
     char[40] b = void;
