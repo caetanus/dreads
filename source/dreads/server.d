@@ -425,6 +425,7 @@ bool replyOff, replySkipNext, replyCmdExempt;
     // MULTI state: queued raw commands, back to back
     bool inMulti;
     bool multiHasWrite; // a queued command writes => EXEC is held by a WRITE pause
+    bool multiDirty; // a queue-time error occurred => EXEC must EXECABORT
     size_t multiCount;
     ByteBuffer multiQueue;
     // WATCH state: conservative — any write since WATCH aborts EXEC
@@ -2209,12 +2210,17 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         }
     case "MULTI":
         if (c.inMulti)
-            repError(o, "ERR MULTI calls can not be nested");
+        {
+            // a command rejected at queue time dirties the transaction: EXEC aborts
+            c.multiDirty = true;
+            repError(o, "ERR Command 'multi' not allowed inside a transaction");
+        }
         else
         {
             c.inMulti = true;
             c.multiCount = 0;
             c.multiHasWrite = false;
+            c.multiDirty = false;
             c.multiQueue.clear();
             repSimple(o, "OK");
         }
@@ -2226,6 +2232,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         {
             c.inMulti = false;
             c.multiHasWrite = false;
+            c.multiDirty = false;
             c.multiQueue.clear();
             c.watching = false;
             repSimple(o, "OK");
@@ -2233,7 +2240,10 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         return true;
     case "WATCH":
         if (c.inMulti)
-            repError(o, "ERR WATCH inside MULTI is not allowed");
+        {
+            c.multiDirty = true; // queue-time rejection dirties the transaction
+            repError(o, "ERR Command 'watch' not allowed inside a transaction");
+        }
         else
         {
             // conservative: EXEC aborts if ANY write happened since WATCH
@@ -2255,6 +2265,17 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             if (!c.inMulti)
             {
                 repError(o, "ERR EXEC without MULTI");
+                return true;
+            }
+            // a command errored while being queued -> abort the whole transaction
+            if (c.multiDirty)
+            {
+                c.inMulti = false;
+                c.multiHasWrite = false;
+                c.multiDirty = false;
+                c.multiQueue.clear();
+                c.watching = false;
+                repError(o, "EXECABORT Transaction discarded because of previous errors.");
                 return true;
             }
             c.inMulti = false;
@@ -2802,6 +2823,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         {
             c.inMulti = false;
             c.multiHasWrite = false;
+            c.multiDirty = false;
             c.multiQueue.clear();
             c.watching = false;
             c.readonlyFlag = false;
