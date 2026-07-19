@@ -19,6 +19,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `expire` → `valkey_expire_tests.d` (4 tests: ttl/persist, setex/errors, past-deletes, NX/XX/GT/LT options)
 - [x] `sort` → `valkey_sort_tests.d` (2 tests: numeric/alpha/limit/desc/nosort, BY weight+hash / GET / STORE)
 - [x] `scan` → `valkey_scan_tests.d` (2 tests: SCAN match/type/count, HSCAN/SSCAN/ZSCAN + NOVALUES) [cursor-loop helper]
+- [x] `geo` → `valkey_geo_tests.d` (2 tests: add/hash/dist, geosearch byradius/frommember)
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
