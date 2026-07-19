@@ -273,80 +273,56 @@ private static immutable lua51CompatChunk = "unpack = table.unpack\n"
 // Scripts run in a curated environment: only base/string/table/math, no
 // io/os/package/debug, escape hatches pruned, and _G protected against
 // global creation (scripts share one state; globals would leak across them).
+// READ shim only: reading an undeclared global raises Valkey's exact error. WRITE
+// protection is NOT here anymore — it comes from the VM-level read-only flag
+// (lua_enablereadonlytable, applied in D right after this runs), which no Lua-level
+// trick (rawset, setmetatable, getmetatable("").__index, ...) can bypass. So this
+// chunk only installs the nonexistent-global read behavior on _G.
 private static immutable protectGlobalsChunk = q{
-    local real_setmetatable = setmetatable
-    local mt = {}
-    mt.__newindex = function(t, n, v)
-        error("Attempt to modify a readonly table", 2)
-    end
-    mt.__index = function(t, n)
-        error("Script attempted to access nonexistent global variable '" .. tostring(n) .. "'", 2)
-    end
-    -- Redis marks _G read-only at the VM level; we run stock Lua, so a script
-    -- could otherwise wipe the protection with setmetatable(_G, {}), which
-    -- also silently poisons every later script sharing this state. Guard it:
-    -- getmetatable(_G) returns a write-protected table (so g.__index = {}
-    -- raises), and setmetatable refuses the tables we registered as protected.
-    local guard = real_setmetatable({}, {__newindex = function()
-        error("Attempt to modify a readonly table", 2)
-    end})
-    mt.__metatable = guard
-    real_setmetatable(_G, mt)
-    local protected = real_setmetatable({}, {__mode = "k"})
-    protected[_G] = true
-    -- the read-only library proxies must be protected too: without this, a
-    -- script reaches them by their global name and mutates them via setmetatable
-    -- or rawset, and the change leaks into every later script (shared lua_State).
-    for _, t in ipairs({string, table, math, redis, cjson, cmsgpack, bit, os}) do
-        protected[t] = true
-    end
-    setmetatable = function(t, m)
-        if protected[t] then
-            error("Attempt to modify a readonly table", 2)
+    setmetatable(_G, {
+        __index = function(t, n)
+            error("Script attempted to access nonexistent global variable '" .. tostring(n) .. "'", 2)
         end
-        return real_setmetatable(t, m)
-    end
-    -- rawset bypasses __newindex (by design), so the read-only metatables alone do
-    -- not stop rawset(redis, "call", evil). Valkey solves this by patching the Lua C
-    -- set path; we link the system lib, so we gate the rawset global instead (Lua
-    -- exposes no other raw-write primitive to scripts).
-    local real_rawset = rawset
-    rawset = function(t, k, v)
-        if protected[t] then
-            error("Attempt to modify a readonly table", 2)
-        end
-        return real_rawset(t, k, v)
-    end
-    -- string VALUES carry a shared metatable whose __index is the REAL string
-    -- library table (that is what makes ("x"):upper() work). getmetatable("")
-    -- hands a script that metatable -> its __index -> the real table (behind the
-    -- read-only proxy), which it could then mutate: getmetatable("").__index.rep =
-    -- evil leaks into every later script. Lock the metatable so getmetatable stops
-    -- exposing it; the VM still dispatches methods through it internally.
-    local smt = getmetatable("")
-    if smt then
-        protected[smt] = true
-        protected[smt.__index] = true
-        smt.__metatable = false
-    end
+    })
 };
 
-/// Make the table on top of the stack read-only: writes raise "Attempt to
-/// modify a readonly table" and the metatable is protected. Leaves the table
-/// on the stack. Used for the library tables scripts must not tamper with.
-private void installReadonlyProxy(lua_State* L, const(char)* name) nothrow @nogc
+/// Seal a table (by top-of-stack) read-only via the VM flag, plus its metatable if
+/// it has one (the _G/os read shims live in a metatable that a script could reach
+/// through getmetatable()). Pops nothing it wasn't given; leaves the stack balanced.
+private void sealTable(lua_State* L) nothrow @nogc
 {
-    lua_createtable(L, 0, 0); // proxy
-    lua_createtable(L, 0, 3); // metatable
-    lua_pushvalue(L, -3); // real table
-    lua_setfield(L, -2, "__index");
-    lua_pushcclosure(L, &luaReadonlyNewIndex, 0);
-    lua_setfield(L, -2, "__newindex");
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "__metatable"); // hide it from get/setmetatable
-    lua_setmetatable(L, -2); // proxy gets the metatable
-    lua_setglobal(L, name); // global = proxy
-    lua_settop(L, lua_gettop(L) - 1); // pop the real table
+    if (lua_getmetatable(L, -1)) // pushes the metatable if present
+    {
+        lua_enablereadonlytable(L, -1, 1);
+        lua_pop(L, 1);
+    }
+    lua_enablereadonlytable(L, -1, 1);
+}
+
+/// Mark every shared sandbox table read-only at the VM level. Reads/calls keep
+/// working; every write path (assignment, rawset, setmetatable, and the
+/// getmetatable("").__index reach into the real string table) is rejected by the
+/// interpreter — no Lua-level metatable trick can bypass it. Called once, last in
+/// ensureState, after the compat shims and read-shim have done their writes.
+private void sealReadonlyTables(lua_State* L) nothrow @nogc
+{
+    static immutable names = ["_G\0", "string\0", "table\0", "math\0", "redis\0",
+        "server\0", "cjson\0", "cmsgpack\0", "bit\0", "os\0"];
+    foreach (n; names)
+    {
+        lua_getglobal(L, n.ptr);
+        sealTable(L);
+        lua_pop(L, 1);
+    }
+    // string VALUES share a metatable whose __index is the real string table
+    // (already sealed via "string"); seal that metatable itself too.
+    lua_pushlstring(L, "".ptr, 0);
+    if (lua_getmetatable(L, -1))
+    {
+        lua_enablereadonlytable(L, -1, 1);
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
 }
 
 private bool ensureState() nothrow
@@ -428,14 +404,6 @@ private bool ensureState() nothrow
     lua_setfield(gL, -2, "__index");
     lua_setmetatable(gL, -2);
     lua_setglobal(gL, "os");
-    // library tables are read-only: scripts may not shadow redis.call, etc.
-    foreach (lib; ["redis\0", "cjson\0", "cmsgpack\0", "bit\0"])
-    {
-        lua_getglobal(gL, lib.ptr);
-        installReadonlyProxy(gL, lib.ptr);
-    }
-    lua_getglobal(gL, "redis"); // server aliases the read-only redis proxy
-    lua_setglobal(gL, "server");
     // loadstring exists but rejects everything (nil): loading dumped bytecode
     // then calling the nil result is Valkey's "attempt to call a nil value"
     lua_pushcclosure(gL, &luaLoadstringStub, 0);
@@ -445,30 +413,26 @@ private bool ensureState() nothrow
     lua_setglobal(gL, "KEYS");
     lua_createtable(gL, 0, 0);
     lua_setglobal(gL, "ARGV");
-    // Lua 5.1 compat aliases, then sandbox layer 3: protect _G
+    // Lua 5.1 compat shims (unpack/table.getn/math.pow/...) — scripts target 5.1.
+    // MUST run before the tables are sealed read-only below: it writes into them.
     if (luaL_loadbuffer(gL, lua51CompatChunk.ptr, lua51CompatChunk.length,
             "@compat51") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
     {
         lua_settop(gL, 0);
         return false;
     }
-    // string/table/math are shared mutable state across every script (one
-    // lua_State). Wrap them read-only too — a field write (string.rep = ...) or a
-    // setmetatable(string, {...}) would otherwise leak into all later scripts, and
-    // _G's guard only stops NEW/reassigned globals, not writes INTO these tables.
-    // MUST run after the compat chunk above (it writes math.pow/table.getn/... to
-    // the real tables); the proxy's __index keeps reads/calls working.
-    foreach (lib; ["string\0", "table\0", "math\0"])
-    {
-        lua_getglobal(gL, lib.ptr);
-        installReadonlyProxy(gL, lib.ptr);
-    }
+    // install the _G nonexistent-global READ shim
     if (luaL_loadbuffer(gL, protectGlobalsChunk.ptr, protectGlobalsChunk.length,
             "@sandbox") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
     {
         lua_settop(gL, 0);
         return false;
     }
+    // Seal every shared table with the VM read-only flag: reads/calls still work,
+    // but ALL writes (=, rawset, setmetatable, getmetatable("").__index, ...) are
+    // rejected by the interpreter itself. This replaces the old metatable-proxy +
+    // rawset/setmetatable gates. Runs last, after every setup write is done.
+    sealReadonlyTables(gL);
     // sandbox layer 4: instruction-count hook enforcing lua-time-limit
     lua_sethook(gL, &luaTimeoutHook, LUA_MASKCOUNT, 100_000);
     // compiled-chunk cache (sha -> function): compiling dominates EVAL cost,
@@ -2060,7 +2024,12 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         return;
     }
 
-    // KEYS / ARGV globals
+    // KEYS / ARGV globals. _G is sealed read-only, so lift the seal for exactly
+    // these two writes (Redis toggles readonly around its KEYS/ARGV setup the same
+    // way). The KEYS/ARGV tables themselves are fresh and writable here.
+    lua_getglobal(gL, "_G");
+    lua_enablereadonlytable(gL, -1, 0);
+    lua_pop(gL, 1);
     auto keys = args[2 .. 2 + cast(size_t) numkeys];
     auto argv = args[2 + cast(size_t) numkeys .. $];
     lua_createtable(gL, cast(int) keys.length, 0);
@@ -2077,6 +2046,9 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
         lua_rawseti(gL, -2, cast(long) i + 1);
     }
     lua_setglobal(gL, "ARGV");
+    lua_getglobal(gL, "_G");
+    lua_enablereadonlytable(gL, -1, 1);
+    lua_pop(gL, 1);
 
     gCtx.arena = &arena;
     gCtx.readOnly = readOnly;

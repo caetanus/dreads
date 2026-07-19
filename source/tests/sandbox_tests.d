@@ -143,10 +143,14 @@ version (unittest)
         // rawset on a script's OWN local table still works (not over-broad)
         ks.evalRun("local t = {} rawset(t, 'k', 9) return t.k").expect.to.equal(":9\r\n");
         // V9: the string VALUE metatable reaches the real string table via its
-        // __index (getmetatable("").__index) — locked so getmetatable can't expose it
-        ks.evalRun("return type(getmetatable(''))").expect.to.contain("boolean");
+        // __index (getmetatable("").__index). The metatable is exposed but the VM
+        // flag makes it AND the real string table read-only, so the reach is inert.
+        ks.evalRun("return type(getmetatable(''))").expect.to.contain("table");
         auto vmeta = ks.evalRun("getmetatable('').__index.rep = function() return 'PWN' end return 1");
-        vmeta[0].expect.to.equal('-'); // indexing the locked (false) metatable errors
+        vmeta[0].expect.to.equal('-'); // real string table is read-only
+        vmeta.expect.to.contain("readonly table");
+        auto vmeta2 = ks.evalRun("getmetatable('').__index = {} return 1");
+        vmeta2[0].expect.to.equal('-'); // the string metatable itself is read-only too
         // and a normal script still sees pristine string methods, both call styles
         ks.evalRun("return ('aa'):rep(2)").expect.to.equal("$4\r\naaaa\r\n");
         ks.evalRun("return string.rep('aa', 2)").expect.to.equal("$4\r\naaaa\r\n");

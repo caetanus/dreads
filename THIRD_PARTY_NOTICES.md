@@ -4,6 +4,18 @@ This project (`dreads`) is an independent, from-scratch implementation. It is
 not a fork of Redis or Valkey and shares no source code with them, with one
 deliberate, narrowly-scoped exception documented below.
 
+## Lua — vendored interpreter (MIT)
+
+`dreads` builds against a locally-patched **Lua 5.4.8** linked statically instead of
+the system `liblua5.4`. The repo does NOT vendor Lua's source; `vendor/lua/build.sh`
+downloads the pristine upstream tarball (sha256-verified) and applies dreads' own
+patch (`vendor/lua/dreads-readonly-5.4.8.patch`) at build time. The patch adds
+VM-level read-only tables (a `readonly` flag on `Table` honored by every set path) —
+the mechanism that makes the script sandbox tamper-proof. Lua is Copyright © 1994–2025
+Lua.org, PUC-Rio, distributed under the MIT license. The patch is dreads' own; the
+idea is common to Redis/Valkey (which patch their vendored Lua 5.1 similarly), but no
+Redis/Valkey Lua source was copied — our patch is derived for Lua 5.4.
+
 ## Valkey — error message strings
 
 For wire-protocol compatibility, `dreads` reproduces a number of client-facing

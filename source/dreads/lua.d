@@ -57,7 +57,9 @@ void lua_pushlightuserdata(lua_State* L, void* p);
 
 void lua_setglobal(lua_State* L, const(char)* name);
 int lua_getglobal(lua_State* L, const(char)* name);
+int lua_getmetatable(lua_State* L, int objindex);
 void lua_settop(lua_State* L, int idx);
+void lua_pop(lua_State* L, int n) { lua_settop(L, -n - 1); }
 int lua_gettop(lua_State* L);
 int lua_type(lua_State* L, int idx);
 
@@ -98,6 +100,11 @@ int lua_checkstack(lua_State* L, int n);
 // per-run environment swap (upvalue 1 of a chunk is its _ENV)
 const(char)* lua_setupvalue(lua_State* L, int funcindex, int n);
 int lua_setmetatable(lua_State* L, int objindex);
+
+// dreads' VM-level read-only tables (vendor/lua/dreads-readonly-5.4.8.patch):
+// mark a table read-only so every set path (VM, rawset, setmetatable) rejects it.
+void lua_enablereadonlytable(lua_State* L, int idx, int enabled);
+int lua_isreadonlytable(lua_State* L, int idx);
 
 // instruction-count hook (script time limit)
 alias lua_Hook = void function(lua_State* L, void* ar) nothrow @nogc;
