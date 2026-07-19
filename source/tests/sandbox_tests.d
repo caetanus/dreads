@@ -92,6 +92,56 @@ version (unittest)
                 "1", "sb").expect.to.equal("$1\r\nv\r\n");
     }
 
+    @("sandbox.stdlib_tables_readonly_no_global_leak")
+    unittest
+    {
+        // JAILBREAK regression: all scripts share ONE lua_State, so string/table/
+        // math are shared mutable state. Redis wraps them read-only; without that,
+        // a badactor mutates them and the change leaks into every later script.
+        // redis/cjson/cmsgpack/bit/os already get read-only proxies; string/table/
+        // math must too. Two escape classes (both closed by the read-only proxy —
+        // __newindex blocks writes, __metatable=false blocks setmetatable):
+        //   V1  field write:   string.x = v   /   math.floor = fn
+        //   V5  setmetatable:  setmetatable(string, {__index = ...})
+        // (Reassigning an existing global — string = {} — is already blocked by _G.)
+        // Targets fields/functions no other test touches, so a pre-fix failure here
+        // can't corrupt the shared state the rest of the suite relies on.
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // round 1 — badactor: every mutation must be refused like os/redis are.
+        // V1: plant a field on string
+        auto plant = ks.evalRun("string.__contam = 'leaked' return 1");
+        plant[0].expect.to.equal('-');
+        plant.expect.to.contain("readonly table");
+        // V1: hijack a stdlib function on string
+        auto hijack = ks.evalRun("string.reverse = function() return 'PWNED' end return 1");
+        hijack[0].expect.to.equal('-');
+        hijack.expect.to.contain("readonly table");
+        // V1: hijack a stdlib function on math
+        auto mhijack = ks.evalRun("math.floor = function() return -1 end return 1");
+        mhijack[0].expect.to.equal('-');
+        mhijack.expect.to.contain("readonly table");
+        // V1: plant a field on table
+        auto tplant = ks.evalRun("table.__contam = 1 return 1");
+        tplant[0].expect.to.equal('-');
+        tplant.expect.to.contain("readonly table");
+        // V5: install a metatable on string ("mudar via {}") — refused because the
+        // proxy's metatable is protected (__metatable), so setmetatable can't touch it
+        auto smeta = ks.evalRun("setmetatable(string, {__index = function() return 'X' end}) return 1");
+        smeta[0].expect.to.equal('-');
+        smeta.expect.to.contain("protected metatable");
+
+        // round 2 — a normal script sees pristine stdlib, zero contamination
+        ks.evalRun("return tostring(string.__contam)").expect.to.contain("nil");
+        ks.evalRun("return string.reverse('abc')").expect.to.equal("$3\r\ncba\r\n");
+        ks.evalRun("return math.floor(3.7)").expect.to.equal(":3\r\n");
+        ks.evalRun("return tostring(table.__contam)").expect.to.contain("nil");
+        // V5 fallout: a metatable __index would answer for a missing field; pristine string returns nil
+        ks.evalRun("return tostring(string.nonexistent_zzz)").expect.to.contain("nil");
+    }
+
     @("sandbox.random")
     unittest
     {

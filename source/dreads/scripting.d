@@ -423,6 +423,17 @@ private bool ensureState() nothrow
         lua_settop(gL, 0);
         return false;
     }
+    // string/table/math are shared mutable state across every script (one
+    // lua_State). Wrap them read-only too — a field write (string.rep = ...) or a
+    // setmetatable(string, {...}) would otherwise leak into all later scripts, and
+    // _G's guard only stops NEW/reassigned globals, not writes INTO these tables.
+    // MUST run after the compat chunk above (it writes math.pow/table.getn/... to
+    // the real tables); the proxy's __index keeps reads/calls working.
+    foreach (lib; ["string\0", "table\0", "math\0"])
+    {
+        lua_getglobal(gL, lib.ptr);
+        installReadonlyProxy(gL, lib.ptr);
+    }
     if (luaL_loadbuffer(gL, protectGlobalsChunk.ptr, protectGlobalsChunk.length,
             "@sandbox") != LUA_OK || lua_pcall(gL, 0, 0, 0) != LUA_OK)
     {
