@@ -22,6 +22,7 @@ each real behaviour diff found becomes a fix, not a skip.
 - [x] `geo` → `valkey_geo_tests.d` (2 tests: add/hash/dist, geosearch byradius/frommember)
 - [x] `hyperloglog` → `valkey_hll_tests.d` (1 test: pfadd/pfcount/pfmerge) — FOUND+FIXED: PFADD empty-key creation returns 1
 - [x] `type/stream` → `valkey_stream_tests.d` (2 tests: add/len/range/revrange, del/trim)
+- [x] `dump` → `valkey_dump_tests.d` (1 test: DUMP/RESTORE round-trip str/list/hash/zset, BUSYKEY, REPLACE)
 
 ## Pending — UT-portable (pure command logic)
 type/string, type/list(+list-2,list-3), type/hash, type/set, type/zset,
