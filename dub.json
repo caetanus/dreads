@@ -68,6 +68,15 @@
 			"mainSourceFile": "bench/lz4_bench.d",
 			"targetName": "lz4_bench",
 			"targetType": "executable"
+		},
+		{
+			"name": "raft-auth-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/raft_auth_bench.d",
+			"targetName": "raft_auth_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
@@ -86,15 +95,24 @@
 	"dflags-ldc": [
 		"-mcpu=x86-64-v3"
 	],
-	"preBuildCommands": [
-		"bash vendor/lua/build.sh"
+	"preBuildCommands-posix": [
+		"bash vendor/lua/build.sh",
+		"bash vendor/lz4/build.sh"
 	],
-	"lflags": [
-		"vendor/lua/build/liblua.a"
+	"preBuildCommands-windows": [
+		"pwsh -NoProfile -File vendor/lua/build.ps1",
+		"pwsh -NoProfile -File vendor/lz4/build.ps1"
+	],
+	"lflags-posix": [
+		"vendor/lua/build/liblua.a",
+		"vendor/lz4/build/liblz4.a"
+	],
+	"lflags-windows": [
+		"vendor/lua/build/liblua.lib",
+		"vendor/lz4/build/liblz4.lib"
 	],
 	"libs": [
-		"sodium",
-		"lz4"
+		"sodium"
 	],
 	"libs-linux": [
 		"jemalloc"
