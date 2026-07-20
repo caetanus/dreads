@@ -22,7 +22,9 @@ CONF="${DREADS_CONFIG_FILE:-/etc/dreads/dreads.conf}"
 FLAGS=""
 for kv in $(env | grep '^DREADS_' || true); do
     key=${kv%%=*}
-    [ "$key" = "DREADS_CONFIG_FILE" ] && continue
+    # DREADS_CONFIG_FILE selects the base file; DREADS_BIN selects the binary —
+    # both are entrypoint controls, not dreads directives, so never flag them.
+    case "$key" in DREADS_CONFIG_FILE|DREADS_BIN) continue ;; esac
     d=$(printf '%s' "${key#DREADS_}" | tr 'A-Z_' 'a-z-')
     FLAGS="$FLAGS --$d ${kv#*=}"
 done
