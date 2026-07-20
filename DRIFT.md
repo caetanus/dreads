@@ -177,6 +177,15 @@ and leader-failover with committed data surviving. The log entry is
 `[u64 clock][raw RESP command]`; the leader logs without executing (Raft only
 mutates state on commit) and every replica applies with the injected clock.
 
+Optional **wire authentication** (`raft-secret <passphrase>`, default off) signs
+every raft frame with a keyed BLAKE2b-128 MAC (libsodium) and drops any frame
+that fails — closing, at the transport layer, the disruption a peer can cause on
+an otherwise unauthenticated wire (term-poisoning, forged snapshots/configs).
+The codec is injected by dreads so the `draft` library stays crypto-free. BLAKE2b
+was picked over HMAC-SHA512 after a microbench (`dub run --config=raft-auth-bench`):
+~5× lower fixed cost, ~3× the bandwidth, and deterministic (no per-frame nonce).
+The secret must match on every node (coordinated, not a rolling change).
+
 Optional **LZ4 wire compression** (`raft-compress yes`, default off) compresses
 AppendEntries log batches and InstallSnapshot chunks — the codec is injected by
 dreads so the `draft` library keeps no compression dependency of its own. A node

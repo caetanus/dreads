@@ -67,6 +67,7 @@ final class RaftLog : Storage
     private Index snapIdx_; // lastIncludedIndex (0 = none)
     private Term snapTerm_;
     private const(char)[] snapData_; // malloc'd
+    private const(char)[] snapConfig_; // malloc'd: membership as of snapIdx_ (encodeConfig form)
     private char[512] base_ = void;
     private size_t baseLen_;
 
@@ -190,6 +191,8 @@ final class RaftLog : Storage
         len = cap = 0;
         snapData_.freeSlice;
         snapData_ = null;
+        snapConfig_.freeSlice;
+        snapConfig_ = null;
         if (logF !is null)
             fclose(logF);
         if (metaF !is null)
@@ -423,6 +426,11 @@ nothrow:
         return cast(const(ubyte)[]) snapData_;
     }
 
+    const(ubyte)[] snapshotConfig()
+    {
+        return cast(const(ubyte)[]) snapConfig_;
+    }
+
     void append(scope const(LogEntry)[] batch)
     {
         foreach (ref e; batch)
@@ -464,10 +472,19 @@ nothrow:
         maybeFsync(logF);
     }
 
-    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data)
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm,
+            scope const(ubyte)[] config, scope const(ubyte)[] data)
     {
         if (lastIncludedIndex <= snapIdx_)
             return;
+        // Capture the config FIRST: it may alias an entry payload in the prefix
+        // we are about to free (the config entry sits at index <= lastIncluded).
+        // Empty config = carry the previous membership forward (don't clobber it).
+        if (config.length)
+        {
+            snapConfig_.freeSlice;
+            snapConfig_ = mallocDup(cast(const(char)[]) config);
+        }
         // drop the covered in-memory prefix, keeping entries after it
         size_t drop = lastIncludedIndex >= snapIdx_ + len ? len
             : cast(size_t)(lastIncludedIndex - snapIdx_);
@@ -493,18 +510,29 @@ nothrow:
         auto f = fopen(zp.ptr, "rb");
         if (f is null)
             return;
-        ubyte[16] hdr;
-        if (fread(hdr.ptr, 1, 16, f) == 16)
+        ubyte[20] hdr; // [u64 idx][u64 term][u32 configLen]
+        if (fread(hdr.ptr, 1, 20, f) == 20)
         {
             snapIdx_ = readLE64(hdr[0 .. 8]);
             snapTerm_ = readLE64(hdr[8 .. 16]);
+            auto clen = cast(size_t) readLE32(hdr[16 .. 20]);
             fseek(f, 0, SEEK_END);
             auto total = ftell(f);
-            auto dlen = total >= 16 ? cast(size_t)(total - 16) : 0;
+            auto body_ = total >= 20 ? cast(size_t)(total - 20) : 0;
+            fseek(f, 20, SEEK_SET);
+            // membership captured with the snapshot (survives compaction)
+            if (clen && clen <= body_)
+            {
+                auto cbuf = cast(char*) crealloc(null, clen);
+                if (fread(cbuf, 1, clen, f) == clen)
+                    snapConfig_ = cbuf[0 .. clen];
+                else
+                    cfree(cbuf);
+            }
+            auto dlen = body_ >= clen ? body_ - clen : 0;
             if (dlen)
             {
                 auto buf = cast(char*) crealloc(null, dlen);
-                fseek(f, 16, SEEK_SET);
                 if (fread(buf, 1, dlen, f) == dlen)
                     snapData_ = buf[0 .. dlen];
                 else
@@ -525,10 +553,13 @@ nothrow:
         auto f = fopen(tmp.ptr, "wb");
         if (f is null)
             return;
-        ubyte[16] hdr;
+        ubyte[20] hdr; // [u64 idx][u64 term][u32 configLen]
         writeLE64(hdr[0 .. 8], snapIdx_);
         writeLE64(hdr[8 .. 16], snapTerm_);
-        fwrite(hdr.ptr, 1, 16, f);
+        writeLE32(hdr[16 .. 20], cast(uint) snapConfig_.length);
+        fwrite(hdr.ptr, 1, 20, f);
+        if (snapConfig_.length)
+            fwrite(snapConfig_.ptr, 1, snapConfig_.length, f);
         if (snapData_.length)
             fwrite(snapData_.ptr, 1, snapData_.length, f);
         fflush(f);

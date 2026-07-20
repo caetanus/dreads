@@ -46,7 +46,7 @@ import raft.vibetransport : PeerAddress, VibeTransport;
 import raft.wire;
 
 import dreads.mem : Arena, ByteBuffer;
-import dreads.obj : Keyspace, gDbs, NUM_DBS;
+import dreads.obj : Keyspace, gApplying, gDbs, NUM_DBS;
 import dreads.raftlog : RaftLog;
 import dreads.raftq : CrossQueue;
 import dreads.resp;
@@ -104,6 +104,15 @@ private struct Pending
 // Main-loop façade
 // ---------------------------------------------------------------------------
 
+/// Hybrid-logical-clock step: the next stamp is the physical clock, floored at
+/// the last stamp so it never regresses. NOT `last+1` — that would inflate the
+/// clock past real time under load and break the real-time meaning of TTLs and
+/// stream IDs. (Raft's log index supplies total order, so no logical counter.)
+ulong hlcNext(ulong last, ulong physicalNow) @nogc nothrow pure
+{
+    return physicalNow < last ? last : physicalNow;
+}
+
 final class Replicator
 {
     // Boot parameters — set in the ctor, read by the raft thread after start().
@@ -117,6 +126,10 @@ final class Replicator
     // Compress outbound raft frames (LZ4). Set from `raft-compress` before
     // start(); read once by the raft thread when it wires the transport codec.
     package bool compress;
+    // Authenticate raft frames (keyed MAC). Set from `raft-secret` before
+    // start() (the key is derived on the main thread first); read once by the
+    // raft thread when it wires the transport.
+    package bool auth;
 
     // Cross-thread FIFOs.
     package CrossQueue propQ; // main -> raft: proposals
@@ -151,6 +164,16 @@ final class Replicator
     // Applier bookkeeping (main loop only).
     private ulong appliedIndex;
     private ulong lastCompactApplied;
+
+    // Hybrid-logical-clock state (main loop only): the highest timestamp seen so
+    // far in the log. Every proposed entry is stamped max(lastClock, wallNow) and
+    // apply advances it, so the injected clock is NON-DECREASING in log order even
+    // if the leader's wall clock jumps backward (NTP) or a freshly-elected leader
+    // has a slightly-behind clock. `max`, not `+1`: it holds flat while real time
+    // catches up instead of inflating under throughput, so TTLs / stream IDs keep
+    // their real-time meaning. Raft's log index already gives total order, so no
+    // logical counter is needed — only this physical monotonic floor.
+    private ulong lastClock;
 
     private shared TaskPool raftPool;
 
@@ -194,7 +217,7 @@ final class Replicator
 
     // --- status (main loop reads) ---
 
-    @property bool isLeader() nothrow
+    @property bool isLeader() @nogc nothrow
     {
         return atomicLoad(leaderFlag);
     }
@@ -265,6 +288,10 @@ final class Replicator
     {
         if (!atomicLoad(leaderFlag))
             return null;
+        // HLC: floor the entry timestamp at the highest we've stamped/applied so
+        // the injected clock never regresses in log order (NTP skew / new leader).
+        clock = hlcNext(lastClock, clock);
+        lastClock = clock;
         auto slot = acquireSlot();
         // entry payload = 8-byte clock header + 2-byte db index + raw command
         // bytes, built into the slot's own buffer so it stays valid across a
@@ -310,6 +337,50 @@ final class Replicator
         if (h is null)
             return false;
         return awaitWrite(h, o);
+    }
+
+    /// Fire-and-forget propose of a SERVER-originated write — an expiry or
+    /// eviction DEL that no client awaits. Only the LEADER proposes; the commit
+    /// applies it on every node, so the deletion is ONE agreed truth in the log
+    /// instead of a per-node decision (no ontological fork). The cross-queue
+    /// copies the payload, so no per-proposal slot is needed (tag=null => the
+    /// apply path just runs it, no reply). No-op on a follower. HLC-stamped like
+    /// proposeAsync so the injected clock stays monotonic.
+    /// Returns true iff the DEL was ENQUEUED (leader + room in the queue). The
+    /// caller (expiry reap) must delete the key locally ONLY when this is true —
+    /// if the propose was dropped, deleting locally without propagating would
+    /// leave followers holding a key the leader removed (a fork). A dropped DEL
+    /// means the key stays (reads nil) and is re-proposed on the next access.
+    bool proposeServerWrite(scope const(ubyte)[] rawCmd, ushort db) @nogc nothrow
+    {
+        if (!atomicLoad(leaderFlag))
+            return false;
+        import dreads.stream : nowMs;
+
+        static ByteBuffer sbuf; // main-loop-only scratch; the queue copies it out
+        sbuf.clear();
+        immutable clock = hlcNext(lastClock, nowMs());
+        lastClock = clock;
+        ubyte[10] hdr = void;
+        foreach (i; 0 .. 8)
+            hdr[i] = cast(ubyte)(clock >> (8 * i));
+        hdr[8] = cast(ubyte) db;
+        hdr[9] = cast(ubyte)(db >> 8);
+        sbuf.append(hdr[]);
+        sbuf.append(rawCmd);
+        // Non-blocking + no consumer wake (both forbidden on the @nogc data path:
+        // yielding would suspend a command mid-lookup; the event emit isn't @nogc).
+        // A full queue drops the DEL (returns false) — the caller then keeps the
+        // key (reads nil) and re-proposes next access. The parked consumer is
+        // woken by nudgeProposals() on the timer. tag=null => no reply slot.
+        return propQ.tryPut(sbuf.data, null, 0, CommitKind.apply);
+    }
+
+    /// Wake the proposal consumer to drain expiry/eviction DELs enqueued via the
+    /// @nogc tryPut path (which skips the wake). Called from the periodic timer.
+    void nudgeProposals() nothrow
+    {
+        propQ.nudge();
     }
 
     /// Leader-only membership change: adds the peer addresses so we can reach
@@ -414,6 +485,9 @@ final class Replicator
         ulong clock = 0;
         foreach (i; 0 .. 8)
             clock |= cast(ulong) p[i] << (8 * i);
+        // HLC: track the highest applied timestamp so a node promoted to leader
+        // keeps stamping monotonically from where the committed log left off.
+        lastClock = hlcNext(lastClock, clock);
         size_t db = cast(size_t)(p[8] | (cast(uint) p[9] << 8));
         if (db >= NUM_DBS)
             db = 0; // corrupt index — never index out of bounds
@@ -431,7 +505,14 @@ final class Replicator
         }
         import dreads.commands : dispatch;
 
+        // Mark the deterministic re-execution window: a lazy expiry fired here
+        // reaps locally on EVERY node (same injected clock), so it must delete
+        // in place and NOT propose a fresh DEL (which would be ordered after this
+        // very command). Live reads run with gApplying=false → the reap hook
+        // routes their expiry through the leader instead.
+        gApplying = true;
         dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
+        gApplying = false;
         if (tag !is null)
         {
             auto slot = cast(Pending*) tag;
@@ -555,6 +636,15 @@ private final class RaftWorker
 
             transport.setCompression(rep.compress ? &lz4Compress : null, &lz4Decompress);
         }
+        // Optional keyed-MAC authentication of the wire (raft-secret). The key
+        // was derived on the main thread before start(); here we just install
+        // the sign/verify hooks. dreads owns libsodium — draft stays crypto-free.
+        if (rep.auth)
+        {
+            import dreads.mac : raftSign, raftVerify;
+
+            transport.setAuth(&raftSign, &raftVerify);
+        }
         nodeMtx = new TaskMutex;
         transport.start(rep.raftPort);
         cast(void) setTimer(20.msecs, () @trusted nothrow { onTick(); }, true);
@@ -586,17 +676,22 @@ private final class RaftWorker
                     while (rep.propQ.take(buf, tag, meta, kind))
                     {
                         auto idx = node.proposeLocal(buf.data);
+                        // tag == null is a SERVER-originated fire-and-forget write
+                        // (an expiry/eviction DEL, proposeServerWrite): no client
+                        // slot to track, reply, or fail — just replicate it.
                         if (idx == 0)
                         {
-                            if (nFail < MSG_CAP)
+                            if (tag !is null && nFail < MSG_CAP)
                                 failed[nFail++] = cast(Pending*) tag;
                         }
-                        else
+                        else if (tag !is null)
                         {
                             auto slot = cast(Pending*) tag;
                             slot.idx = idx; // so a step-down can fail uncommitted ones
                             pendingByIndex[idx % RING] = slot;
                         }
+                        else
+                            pendingByIndex[idx % RING] = null; // no slot: apply gets a null tag
                     }
                     node.flush();
                     auto rd = node.takeReady();
@@ -929,4 +1024,34 @@ private bool decodeMembership(scope const(ubyte)[] d, ref NodeId[64] members, ou
     }
     nPeers = np;
     return true;
+}
+
+version (unittest)
+{
+    import fluent.asserts;
+
+    // HLC monotonic floor: never regresses, never inflates past real time.
+    @("replicator.hlc_is_monotonic_floor")
+    unittest
+    {
+        // normal advance: takes the physical clock when it moves forward
+        hlcNext(1000, 1001).expect.to.equal(1001UL);
+        // regression (NTP backward / behind leader): holds flat at `last`
+        hlcNext(1000, 999).expect.to.equal(1000UL);
+        // equal: stays put (no +1 inflation — same ms is disambiguated by the
+        // raft log index / per-stream seq, not by bumping the physical clock)
+        hlcNext(1000, 1000).expect.to.equal(1000UL);
+        // a long backward jump still only holds flat, never rewinds
+        hlcNext(5_000_000, 4_000_000).expect.to.equal(5_000_000UL);
+
+        // a sequence with a mid-run backward jump stays non-decreasing
+        ulong last = 0;
+        immutable ulong[] wall = [100, 101, 102, 99, 100, 103];
+        immutable ulong[] want = [100, 101, 102, 102, 102, 103];
+        foreach (i, w; wall)
+        {
+            last = hlcNext(last, w);
+            last.expect.to.equal(want[i]);
+        }
+    }
 }

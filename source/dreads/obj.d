@@ -79,6 +79,29 @@ public long gConnectedClients;
 /// it. Null until the server installs it (so obj.d stays independent of tracking).
 public __gshared void function(scope const(char)[] key) nothrow @nogc gTrackInvalidateHook;
 
+/// Master-authoritative expiry (avoids the ontological fork: two nodes with
+/// conflicting truth about whether a key is alive). A key's DELETION is a side
+/// effect that ONLY the master produces — the data layer never reaps a key on
+/// its own initiative under replication. When `lookup`/`activeExpireCycle` find
+/// `key` (in db `db`) past its deadline, they ask this hook how its removal
+/// propagates and whether to delete it locally NOW:
+///   true  = delete locally now (standalone; OR deterministic apply re-execution
+///           where every node reaps identically under the injected clock)
+///   false = do NOT delete — the leader proposed a DEL that will delete it on
+///           commit (the single agreed truth), or this is a follower that must
+///           never self-expire. The key reads as nil meanwhile (the view), but
+///           its physical death waits for the committed DEL.
+/// Null (unit tests / pre-install) = behave as before: delete locally.
+public alias ExpireReapHook = bool function(scope const(char)[] key, ubyte db) @nogc nothrow;
+public __gshared ExpireReapHook gExpireReapHook;
+
+/// Set by the replicator around apply of a committed entry. When true, a lazy
+/// expiry is happening during DETERMINISTIC re-execution (the injected clock is
+/// frozen to the entry's stamp), so every node reaps identically and the delete
+/// is local with no new DEL to propagate — reading it lets the reap hook tell a
+/// deterministic apply apart from a live, node-local read.
+public __gshared bool gApplying;
+
 /// CLIENT PAUSE state (server layer owns the barrier/replay; kept here so INFO in
 /// the data plane can read it without a module cycle). `gPauseUntilMs` is the
 /// absolute deadline (0 = not paused); `gPauseAll` true = pause ALL, false = WRITE
@@ -456,12 +479,23 @@ public struct Keyspace
                 auto obj = d.get(key);
                 if (obj !is null && obj.expireAtMs == e.key) // still the live TTL
                 {
-                    notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
-                    if (gTrackInvalidateHook !is null)
-                        gTrackInvalidateHook(key); // invalidate client-side caches
-                    d.del(key);
+                    // Master-authoritative: standalone reaps locally; a raft
+                    // leader proposes a DEL (the hook) and lets the commit remove
+                    // it on every node. (This cycle only runs on the leader/
+                    // standalone — the server gates the call — so a follower never
+                    // self-expires.) `dropped` counts it either way: the work
+                    // (delete or propose) is done and the index entry consumed.
+                    immutable reapNow = gExpireReapHook is null ? true
+                        : gExpireReapHook(key, cast(ubyte) db);
+                    if (reapNow)
+                    {
+                        notifyKeyspaceEvent(NClass.expired, "expired", key); // copies before d.del frees it
+                        if (gTrackInvalidateHook !is null)
+                            gTrackInvalidateHook(key); // invalidate client-side caches
+                        d.del(key);
+                        gExpiredKeys++;
+                    }
                     dropped++;
-                    gExpiredKeys++;
                 }
                 // key is a non-owning slice into Dict memory — nothing to free
             }
@@ -616,13 +650,22 @@ public struct Keyspace
                 // runtime-only (never logged), so raft replay is unaffected.
                 if (gPauseUntilMs != 0 && detNow() < gPauseUntilMs)
                     return null;
-                disarmExpire(k, o.expireAtMs);
-                disarmSubExpire(k);
-                d.del(k);
-                notifyKeyspaceEvent(NClass.expired, "expired", k);
-                if (gTrackInvalidateHook !is null)
-                    gTrackInvalidateHook(k); // invalidate client-side caches
-                gExpiredKeys++;
+                // Master-authoritative: only the master produces the DELETE side
+                // effect. On a raft follower — or on a leader's live read — the
+                // key reads as nil now but its physical removal waits for the
+                // committed DEL, so no node forks the truth about its life.
+                immutable reapNow = gExpireReapHook is null ? true
+                    : gExpireReapHook(k, cast(ubyte) db);
+                if (reapNow)
+                {
+                    disarmExpire(k, o.expireAtMs);
+                    disarmSubExpire(k);
+                    d.del(k);
+                    notifyKeyspaceEvent(NClass.expired, "expired", k);
+                    if (gTrackInvalidateHook !is null)
+                        gTrackInvalidateHook(k); // invalidate client-side caches
+                    gExpiredKeys++;
+                }
                 return null;
             }
             // Import window: the expired key is physically KEPT (bulk-load
@@ -907,6 +950,57 @@ unittest // every type frees through the union without leaking valgrind-wise
     gClock = 4_000_000; // past the OLD deadline but not the new one
     assert(ks.activeExpireCycle() == 0); // old entry was disarmed
     assert(ks.exists("forever"));
+}
+
+@nogc nothrow unittest // master-authoritative expiry: a follower NEVER self-reaps
+{
+    import dreads.det : gClock;
+
+    Keyspace ks;
+    scope (exit)
+    {
+        ks.d.free();
+        gClock = 0;
+        gExpireReapHook = null;
+    }
+    gClock = 1_000_000;
+    ks.setStr("k", "v");
+    ks.lookup("k").expireAtMs = 900_000; // already past "now"
+    ks.armExpire("k", 900_000);
+
+    // FOLLOWER: the reap hook says "do not delete" — the key reads as nil (the
+    // view) but stays PHYSICALLY present, waiting for the leader's committed DEL.
+    // No node forks the truth about whether the key is alive. (Old behaviour, and
+    // a broken fix, would reap it here — this is the regression guard.)
+    static bool followerHook(scope const(char)[] key, ubyte db) @nogc nothrow
+    {
+        return false;
+    }
+
+    gExpireReapHook = &followerHook;
+    assert(ks.lookup("k") is null); // logically expired -> nil
+    assert(ks.d.get("k") !is null); // but NOT reaped locally (the follower rule)
+
+    // LEADER / standalone: the hook says "delete" — lookup reaps it in place.
+    static bool leaderHook(scope const(char)[] key, ubyte db) @nogc nothrow
+    {
+        return true;
+    }
+
+    gExpireReapHook = &leaderHook;
+    assert(ks.lookup("k") is null); // nil view
+    assert(ks.d.get("k") is null); // and now physically gone
+
+    // active cycle honours the same rule: a follower's cycle drops nothing.
+    gActiveExpire = true; // must be on for armExpire to register the deadline
+    scope (exit)
+        gActiveExpire = false;
+    ks.setStr("k2", "v");
+    ks.lookup("k2").expireAtMs = 900_000;
+    ks.armExpire("k2", 900_000);
+    gExpireReapHook = &followerHook;
+    assert(ks.activeExpireCycle() == 1); // processed (index consumed)...
+    assert(ks.d.get("k2") !is null); // ...but NOT physically reaped (follower)
 }
 
 @nogc nothrow unittest // active-expire budget: a big backlog drains over cycles, not one stall

@@ -41,6 +41,12 @@ public struct Config
     // batches compress well). A node always DECODES compressed frames; this flag
     // only controls whether it COMPRESSES what it sends.
     bool raftCompress = false;
+    // Optional shared secret authenticating the Raft replication wire. Empty =
+    // off (default). When set, every raft frame carries a keyed MAC (BLAKE2b-128)
+    // and unsigned/forged frames are dropped — this is what stops an
+    // unauthenticated peer from disrupting the cluster (term-poisoning, forged
+    // snapshots/configs). Must be the SAME on every node (not a rolling change).
+    string raftSecret;
     // sharding (phase 2a): static slot-range topology. Each node owns a slot
     // range and MOVED-redirects the rest. cluster-nodes lists the whole map:
     // "lo-hi@host:port,lo-hi@host:port,..."; this node is the entry whose
@@ -254,6 +260,9 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.raftCompress = false;
         else
             return false;
+        return true;
+    case "raft-secret":
+        cfg.raftSecret = value.unquote;
         return true;
     case "cluster-enabled":
         if (value == "yes")
@@ -516,5 +525,10 @@ version (unittest)
         applyDirective("raft-compress", "no", cfg).expect.to.equal(true);
         cfg.raftCompress.expect.to.equal(false);
         applyDirective("raft-compress", "maybe", cfg).expect.to.equal(false);
+
+        // raft-secret: default empty (off), stored as-is (unquoted).
+        cfg.raftSecret.length.expect.to.equal(0);
+        applyDirective("raft-secret", "\"s3cr3t pass\"", cfg).expect.to.equal(true);
+        cfg.raftSecret.expect.to.equal("s3cr3t pass");
     }
 }

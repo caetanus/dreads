@@ -138,7 +138,7 @@ version (unittest)
             log.append(e[]);
         }
         log.lastIndex.expect.to.equal(10);
-        log.saveSnapshot(6, 1, pay("STATE@6")); // covers 1..6, keeps 7..10
+        log.saveSnapshot(6, 1, null, pay("STATE@6")); // covers 1..6, keeps 7..10
         log.snapshotIndex.expect.to.equal(6);
         log.lastIndex.expect.to.equal(10);
         (cast(string) log.entriesFrom(7, 10)[0].payload).expect.to.equal("v");
@@ -174,7 +174,7 @@ version (unittest)
             LogEntry[1] e = [LogEntry(1, i, pay("x"))];
             log.append(e[]);
         }
-        log.saveSnapshot(5, 1, pay("STATE@5")); // rotation leaves .raftlog.old
+        log.saveSnapshot(5, 1, null, pay("STATE@5")); // rotation leaves .raftlog.old
         // deliberately DO NOT close(log): mimic a crash — the backup survives.
 
         auto back = RaftLog.open(base);
@@ -195,6 +195,42 @@ version (unittest)
         again.close();
     }
 
+    @("raftlog.snapshot_config_survives_reopen")
+    unittest
+    {
+        // Membership persistence: the config captured with a snapshot must
+        // survive close/reopen (it rides the on-disk snapshot file), else a node
+        // reverts to its bootstrap config after a restart-past-compaction.
+        enum base = "/tmp/dreads_rl_snapcfg";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        foreach (i; 1 .. 8)
+        {
+            LogEntry[1] e = [LogEntry(1, i, pay("v"))];
+            log.append(e[]);
+        }
+        auto conf = pay("\x00raft-conf:members{1,2}"); // opaque config bytes
+        log.saveSnapshot(5, 1, conf, pay("STATE@5"));
+        (cast(string) log.snapshotConfig).expect.to.equal(cast(string) conf);
+        log.close();
+
+        auto back = RaftLog.open(base);
+        back.snapshotIndex.expect.to.equal(5);
+        (cast(string) back.snapshotConfig).expect.to.equal(cast(string) conf);
+        (cast(string) back.snapshotData).expect.to.equal("STATE@5");
+        // an empty config on a later snapshot carries the previous one forward
+        back.saveSnapshot(6, 1, null, pay("STATE@6"));
+        (cast(string) back.snapshotConfig).expect.to.equal(cast(string) conf);
+        back.close();
+
+        auto again = RaftLog.open(base);
+        (cast(string) again.snapshotConfig).expect.to.equal(cast(string) conf);
+        again.close();
+    }
+
     @("raftlog.truncate_after_compaction")
     unittest
     {
@@ -211,7 +247,7 @@ version (unittest)
             LogEntry[1] e = [LogEntry(1, i, pay("a"))];
             log.append(e[]);
         }
-        log.saveSnapshot(6, 1, pay("S")); // keeps 7..10 in a fresh segment
+        log.saveSnapshot(6, 1, null, pay("S")); // keeps 7..10 in a fresh segment
         LogEntry[1] e11 = [LogEntry(1, 11, pay("a"))];
         log.append(e11[]);
         log.truncateFrom(9); // drop 9,10,11 (all in the post-rotation segment)
@@ -256,6 +292,61 @@ version (unittest)
         back.close();
         auto again = RaftLog.open(base);
         again.lastIndex.expect.to.equal(3);
+        again.close();
+    }
+
+    @("raftlog.midlog_index_gap_stops_recovery")
+    unittest
+    {
+        // Red-team: storage is positional but the on-disk frame header records
+        // the (wire-trusted) entry index, so a malformed AppendEntries can put a
+        // NON-CONTIGUOUS index (a gap) on disk. Recovery must be defensive —
+        // replay stops at the gap, keeps the contiguous prefix, drops the rest,
+        // and the log stays writable. It must NEVER build a holed log or crash.
+        enum base = "/tmp/dreads_rl_gap";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        foreach (i; 1 .. 4)
+        {
+            LogEntry[1] e = [LogEntry(1, i, pay("ok"))];
+            log.append(e[]);
+        }
+        log.lastIndex.expect.to.equal(3);
+        log.close();
+
+        // append a raw frame with a GAP index (100) directly to the active log:
+        // header = [u64 term][u64 index][u32 plen], then the payload.
+        static void le(ubyte[] b, ulong v) nothrow
+        {
+            foreach (k; 0 .. b.length)
+                b[k] = cast(ubyte)(v >> (8 * k));
+        }
+
+        auto f = fopen((base ~ ".raftlog\0").ptr, "ab");
+        ubyte[20] hdr;
+        le(hdr[0 .. 8], 1); // term
+        le(hdr[8 .. 16], 100); // index — the gap (expected would be 4)
+        le(hdr[16 .. 20], 2); // plen
+        fwrite(hdr.ptr, 1, 20, f);
+        ubyte[2] pl = ['h', 'i'];
+        fwrite(pl.ptr, 1, 2, f);
+        fclose(f);
+
+        auto back = RaftLog.open(base);
+        back.lastIndex.expect.to.equal(3); // gap frame dropped, prefix intact
+        (cast(string) back.entriesFrom(3, 1)[0].payload).expect.to.equal("ok");
+        // writable again at the right offset (the gap frame was truncated away)
+        LogEntry[1] e = [LogEntry(2, 4, pay("post"))];
+        back.append(e[]);
+        back.lastIndex.expect.to.equal(4);
+        back.close();
+
+        auto again = RaftLog.open(base);
+        again.lastIndex.expect.to.equal(4);
+        (cast(string) again.entriesFrom(4, 1)[0].payload).expect.to.equal("post");
         again.close();
     }
 }

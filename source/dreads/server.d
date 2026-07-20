@@ -233,7 +233,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
     }
     {
-        import dreads.obj : lruClock, gActiveExpire, gActiveEviction, gTrackInvalidateHook;
+        import dreads.obj : lruClock, gActiveExpire, gActiveEviction, gTrackInvalidateHook,
+            gExpireReapHook;
         import dreads.rand : seedRand;
         import dreads.stream : nowMs;
 
@@ -269,6 +270,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 gExpireKeys.set(key, Unit()); // server-caused: exempt from NOLOOP
             }
         };
+        // Master-authoritative expiry: the data layer asks this hook how a
+        // key's DELETE side effect propagates (see expireReap / obj.gExpireReapHook).
+        gExpireReapHook = &expireReap;
         // Active expiry runs on its OWN fast 200ms timer (Valkey sweeps ~10x/s;
         // a 1s cadence left keys logically-expired-but-present far too long). Kept
         // separate from the 1s cron below so the fsync/eviction/lru work does NOT
@@ -283,10 +287,24 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             if (gLazyFree !is null)
                 gLazyFree.drainReclaimed(100_000);
 
+            // Wake the raft proposal consumer for any expiry/eviction DELs that a
+            // @nogc lazy expiry tryPut without waking it. Runs regardless of active
+            // expiry (lazy expiry fires on plain reads). One emit, only when pending.
+            if (gExpireDelPending && gReplicator !is null)
+            {
+                gReplicator.nudgeProposals();
+                gExpireDelPending = false;
+            }
+
             // Cheap early-out: with active expiry off (the default) this fast timer
             // must do NOTHING — no clock read, no db sweep, no flush — so it never
             // costs the hot path a wasted wakeup's worth of work.
             if (!gActiveExpire)
+                return;
+            // Master-authoritative: ONLY the leader actively reaps and propagates
+            // the expiry DELs; a follower applies those from the log and never
+            // self-expires (that would fork the truth about a key's life).
+            if (gReplicator !is null && !gReplicator.isLeader)
                 return;
             freezeClock(0); // pin this cycle's clock to wall time (see below)
             // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
@@ -384,10 +402,27 @@ private void initReplication()
     cfg.electionTimeoutTicks = gConfig.raftElectionTimeoutTicks; // config: raft-election-timeout (default 50)
     cfg.heartbeatTicks = 2; // ~40ms
     cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
+    // Cap an accepted InstallSnapshot's declared size. A follower stages the
+    // whole snapshot in RAM before installing, so an unbounded declared totalLen
+    // is a remote-OOM lever on the (unauthenticated) raft transport. Bound it to
+    // maxmemory when set (a valid snapshot can't exceed the dataset it captures);
+    // 0 (unlimited memory) keeps 0 = no cap, matching the operator's own choice.
+    cfg.maxSnapshotBytes = gConfig.maxmemory;
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
     string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
     gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gDbs[0]);
     gReplicator.compress = gConfig.raftCompress; // LZ4 outbound (raft-compress)
+    if (gConfig.raftSecret.length)
+    {
+        // Derive the frame key here on the main thread, before the raft thread
+        // starts (publication happens-before via thread creation).
+        import dreads.mac : raftAuthInit;
+
+        if (raftAuthInit(gConfig.raftSecret))
+            gReplicator.auth = true;
+        else
+            printf("dreads: raft-secret set but libsodium init failed — auth DISABLED\n");
+    }
     gReplicator.start();
     printf("dreads: raft node %u active on port %u (%zu peers)\n",
             cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);
@@ -1685,7 +1720,16 @@ private void serveClient(TCPConnection tcp) nothrow
                     size_t cmdStart = pos;
                     auto st = parseValue(inb.data, pos, arena, cmd);
                     if (st == ParseStatus.incomplete)
+                    {
+                        // Reclaim this parse's speculative allocations. The parser
+                        // re-parses the whole buffer from scratch on the next read,
+                        // so nothing allocated here is needed. Without this reset a
+                        // slowloris feeding an incomplete multibulk (`*1000000\r\n`
+                        // + trickle) grows the arena ~MAX_ARRAY RVals (~24MB) PER
+                        // read — unbounded, unauthenticated OOM.
+                        arena.reset();
                         break;
+                    }
                     if (st == ParseStatus.protocolError)
                     {
                         repError(outb, "ERR Protocol error");
@@ -4114,9 +4158,55 @@ import dreads.mem : usedMemory; // jemalloc accounting (shared with INFO)
 
 private __gshared size_t gEvictCursor;
 
+// Set when an expiry/eviction DEL was tryPut to the raft proposal queue (which
+// skips the consumer wake to stay @nogc); the periodic timer nudges the consumer
+// to drain them. Avoids waking the raft loop when nothing is pending.
+private __gshared bool gExpireDelPending;
+
 /// Approximate LRU eviction: sample live keys, evict the coldest, repeat.
 /// Returns false when memory stays over the limit (noeviction, or nothing
 /// evictable under volatile-lru).
+// Master-authoritative reap decision — installed as obj.gExpireReapHook. Given an
+// expired `key` in db `db`, it propagates the DELETE side effect and returns
+// whether the data layer should delete `key` locally NOW. This is what keeps a
+// key's death a single agreed truth instead of a per-node clock race.
+private bool expireReap(scope const(char)[] key, ubyte db) @nogc nothrow
+{
+    import dreads.obj : gApplying;
+
+    // Deterministic apply re-execution: every node reaps identically under the
+    // entry's injected clock, so delete in place — no fresh DEL to propagate.
+    if (gApplying)
+        return true;
+    static ByteBuffer del; // main-loop-only scratch (single writer)
+    del.clear();
+    repArrayHeader(del, 2);
+    repBulk(del, "DEL");
+    repBulk(del, key);
+    if (gReplicator is null)
+    {
+        // standalone: the DEL is the master's own — log it, then delete locally.
+        if (gAof.enabled)
+            gAof.append(del.data);
+        return true;
+    }
+    if (gReplicator.isLeader)
+    {
+        // leader (Redis-primary model): propose the DEL so every follower drops
+        // the same key from the log — the removal becomes a single agreed truth —
+        // and delete locally ONLY if it was enqueued. If the propose was dropped
+        // (queue full), KEEP the key (it reads nil, retries next access): deleting
+        // it locally without propagating would fork the truth on the followers.
+        if (gReplicator.proposeServerWrite(del.data, db))
+        {
+            gExpireDelPending = true; // wake the consumer on the next timer tick
+            return true;
+        }
+        return false;
+    }
+    return false; // follower: never self-expire — wait for the leader's DEL
+}
+
 // volatile-* only touches keys with a TTL; *-random picks a sampled key blindly
 // instead of by LRU/LFU (both share obj.lruSecs, lowest = evict-first).
 private void evictionMode(out bool volatileOnly, out bool randomPick) nothrow
@@ -4180,14 +4270,27 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
     gEvictCursor = i + 1;
     if (victim is null)
         return false; // nothing evictable
-    if (gAof.enabled)
+    // Propagate the eviction DEL so every node drops the SAME victim — else a
+    // follower keeps a key the leader evicted (a fork). Under raft the leader
+    // proposes it (commit applies it everywhere); standalone logs it to the AOF.
+    // Built BEFORE ks.d.del below (victim is a non-owning slice freed by del).
     {
-        static ByteBuffer delCmd; // TLS scratch for AOF propagation
+        static ByteBuffer delCmd; // TLS scratch
         delCmd.clear();
         repArrayHeader(delCmd, 2);
         repBulk(delCmd, "DEL");
         repBulk(delCmd, victim);
-        gAof.append(delCmd.data);
+        if (gReplicator !is null)
+        {
+            // Eviction frees memory NOW (leader deletes below regardless), so —
+            // unlike expiry — we propose best-effort and don't gate the local
+            // delete on it: memory pressure can't wait. A dropped eviction DEL is
+            // a rare edge (queue full under load) that self-heals on re-eviction.
+            cast(void) gReplicator.proposeServerWrite(delCmd.data, cast(ushort) ks.db);
+            gExpireDelPending = true; // wake the consumer on the next timer tick
+        }
+        else if (gAof.enabled)
+            gAof.append(delCmd.data);
     }
     notifyKeyspaceEvent(NClass.evicted, "evicted", victim);
     if (gTrackCount) // CLIENT TRACKING: an evicted key invalidates cached copies

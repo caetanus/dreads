@@ -184,6 +184,25 @@ final class CrossQueue
         }
     }
 
+    /// Non-blocking push that does NOT wake the consumer — @nogc-safe for the
+    /// data path (an expiry/eviction DEL proposed from @nogc code, where blocking
+    /// on backpressure OR a non-@nogc event emit is forbidden). Returns false if
+    /// full (the item is DROPPED — only valid where loss is recoverable, e.g. an
+    /// expiry DEL re-proposed next access; NEVER a client write). A parked
+    /// consumer is woken separately by `nudge()` on the periodic timer, so a
+    /// tryPut'd item is drained within one timer tick if no other put wakes first.
+    bool tryPut(scope const(ubyte)[] payload, void* tag, ulong meta, uint kind = 0) @nogc nothrow
+    {
+        return ring.push(payload, tag, meta, kind);
+    }
+
+    /// Wake a parked consumer (non-@nogc: event emit). Called from a timer to
+    /// drain items enqueued by tryPut, which intentionally skips the wake.
+    void nudge() nothrow
+    {
+        wakeConsumer();
+    }
+
     // Wake the consumer iff it has parked. The fence orders push()'s release of
     // tail before this load of consumerParked, mirroring the consumer's
     // park-then-recheck, so a wakeup is never lost.
