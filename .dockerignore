@@ -1,0 +1,16 @@
+# keep the build context small; the release build only needs source + vendor + dub
+.git
+.github
+bin
+.dub
+*.o
+*.a
+vendor/lua/build
+vendor/lua/cache
+blackbox
+assets
+docs
+*.log
+.reggae
+build.ninja
+rules.ninja

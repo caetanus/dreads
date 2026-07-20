@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# musl/Alpine build — a ~13 MB image. Alpine's LDC (edge) matches the dev toolchain
+# (1.42). druntime omits fdatasync for musl (declared locally in raftlog.d/syncer.d).
+
+FROM alpine:edge AS builder
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories \
+    && apk add --no-cache \
+        ldc dub gcc musl-dev linux-headers \
+        curl git make bash patch tar xz \
+        jemalloc-dev libsodium-dev zlib-dev
+WORKDIR /src
+COPY . .
+# vendor/lua/build.sh downloads + patches Lua 5.4.8 -> static liblua.a (needs network)
+RUN dub build -b release --compiler=ldc2 && strip bin/dreads
+
+FROM alpine:edge AS runtime
+RUN apk add --no-cache jemalloc libsodium zlib \
+    && adduser -S -u 10001 dreads
+COPY --from=builder /src/bin/dreads /usr/local/bin/dreads
+WORKDIR /data
+USER dreads
+EXPOSE 6379
+ENTRYPOINT ["dreads"]
+CMD ["6379"]

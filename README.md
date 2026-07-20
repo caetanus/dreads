@@ -6,6 +6,15 @@
 
 <p align="center"><b>A fast, reliable, in-memory data store — written in D.</b></p>
 
+<p align="center">
+  <a href="https://github.com/caetanus/dreads/actions/workflows/ci.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI — 548 tests + native Valkey parity sweep"></a>
+  <a href="https://github.com/caetanus/dreads/actions/workflows/docker.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/docker.yml/badge.svg" alt="docker publish"></a>
+  <a href="https://github.com/caetanus/dreads/pkgs/container/dreads"><img src="https://img.shields.io/badge/ghcr.io-caetanus%2Fdreads-2496ED?logo=docker&logoColor=white" alt="container image"></a>
+  <a href="https://github.com/caetanus/dreads/releases"><img src="https://img.shields.io/github/v/tag/caetanus/dreads?label=release&sort=semver" alt="latest release"></a>
+</p>
+
+<p align="center"><sub>The CI badge is green only when the full test suite passes — the native Valkey parity sweep (<code>source/tests/valkey_*</code>), the Lua sandbox tests, and every unit test, on each push.</sub></p>
+
 Redis-compatible, built with D/dub, vibe-core fibers, and the `draft` Raft
 package. The day-to-day build uses reggae+ninja; the runtime is built around
 three commitments: zero GC in the data plane, arena memory, and one purpose —
@@ -239,8 +248,10 @@ for only at the boundaries where another service or shard is involved.
 
 ## Build & run
 
-Requirements: a D compiler (LDC recommended for release), dub, liblua 5.4, and
-on Linux jemalloc (linked automatically).
+Requirements: a D compiler (LDC recommended for release), dub, a C toolchain +
+`curl` (the build fetches the upstream Lua 5.4.8 tarball, applies dreads' own
+read-only-sandbox patch, and links it statically — see `vendor/lua/build.sh`; this
+step needs network), and on Linux jemalloc (linked automatically).
 
 Requirements also include libsodium (Argon2id password hashing for AUTH/ACL),
 linked automatically via the `libsodiumd` dependency.
@@ -263,6 +274,30 @@ Day-to-day builds go through [reggae](https://github.com/atilaneves/reggae)
 ```sh
 reggae -b ninja && ninja
 ```
+
+### Docker
+
+Two images are published to GHCR on each release, like Redis/Valkey ship a Debian
+and an Alpine variant:
+
+| tag | base | size | notes |
+| --- | --- | --- | --- |
+| `ghcr.io/caetanus/dreads:latest` (and `:X.Y.Z`) | distroless (glibc) | ~29 MB | the default — fastest |
+| `ghcr.io/caetanus/dreads:X.Y.Z-alpine` | Alpine (musl) | ~16 MB | slim; ~6–14 % slower on GET/SET (musl's string ops), still ahead of `valkey:*-alpine` |
+
+Both are smaller than `valkey:9.1.0-alpine` (45 MB) and `redis:7-alpine` (39 MB).
+
+```sh
+docker run -d --name dreads -p 6379:6379 ghcr.io/caetanus/dreads:latest
+redis-cli -p 6379 PING
+
+# persist the AOF by mounting a volume and enabling it
+docker run -d --name dreads -p 6379:6379 -v dreads-data:/data \
+  ghcr.io/caetanus/dreads:latest 6379 --appendonly
+```
+
+Build locally with `docker build -t dreads .` (glibc) or
+`docker build -f Dockerfile.alpine -t dreads:alpine .` (musl).
 
 ## Tests
 

@@ -14,7 +14,13 @@ import core.stdc.stdlib : crealloc = realloc, cfree = free;
 
 // POSIX-first by project decision; Windows is not a target for the server.
 import core.sys.posix.stdio : fileno;
-import core.sys.posix.unistd : fdatasync, ftruncate, fsync;
+import core.sys.posix.unistd : ftruncate, fsync;
+// druntime binds fdatasync only for glibc; it exists in musl libc too, so declare
+// it directly there (lets dreads build against musl for small static images).
+version (CRuntime_Musl)
+    extern (C) int fdatasync(int) @nogc nothrow;
+else
+    import core.sys.posix.unistd : fdatasync;
 
 import raft.storage : Storage;
 import raft.types;

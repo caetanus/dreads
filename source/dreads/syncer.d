@@ -17,7 +17,9 @@ import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
 import core.thread : Thread;
 
-version (Posix)
+version (CRuntime_Musl)
+    extern (C) int fdatasync(int) @nogc nothrow; // druntime omits it for musl
+else version (Posix)
     import core.sys.posix.unistd : fdatasync;
 
 version (linux)

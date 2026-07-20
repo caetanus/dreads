@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: test + release build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # .gitmodules uses SSH URLs (dev convenience); emplace + draft are public,
+      # so fetch them over HTTPS with no credentials.
+      - name: Fetch submodules (HTTPS)
+        run: |
+          git config url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.42.0
+
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libjemalloc-dev libsodium-dev
+
+      # Native parity sweep (source/tests/valkey_*), sandbox, and unit tests — no
+      # server, no tcl, no Valkey. The lua build.sh (download + patch + liblua.a)
+      # runs as a preBuildCommand.
+      - name: Test
+        run: dub test --compiler=ldc2
+
+      - name: Release build
+        run: dub build -b release --compiler=ldc2
+
+      - name: Smoke test the binary
+        run: |
+          ./bin/dreads 7911 &
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/7911) 2>/dev/null && break; sleep 0.2; done
+          printf 'PING\r\n' | timeout 3 nc -q1 127.0.0.1 7911 | grep -q PONG
+          printf 'SET k v\r\nGET k\r\n' | timeout 3 nc -q1 127.0.0.1 7911 | grep -q '\$1'
