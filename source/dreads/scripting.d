@@ -20,7 +20,13 @@ import dreads.obj : Keyspace;
 import dreads.resp;
 
 private __gshared lua_State* gL;
-private __gshared Dict!StrVal gScripts; // sha1 (lowercase hex) -> script body
+private __gshared Dict!StrVal gScripts; // sha1 (lowercase hex) -> script SOURCE
+// sha1 -> compiled BYTECODE (lua_dump of the source). A local fast-reload cache:
+// after a state recycle, chunks reload from bytecode (no reparse) instead of
+// recompiling the source. Rebuilt from source, never exported — the source is the
+// portable/version-independent form for export/import (RDB/replication); Lua
+// bytecode is bound to this exact interpreter build.
+private __gshared Dict!StrVal gScriptBc;
 
 // The event loop is single-threaded, but the unit-threaded test runner is
 // not; serialize every use of the shared Lua state. druntime's Mutex is
@@ -443,6 +449,50 @@ private bool ensureState() nothrow
     // from gLibCode, the D-side source of truth)
     lua_createtable(gL, 0, 8);
     lua_setfield(gL, LUA_REGISTRYINDEX, "dreads_functions");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// compiled-bytecode cache (sha -> lua_dump): source is the canonical, exportable
+// form; bytecode is a local fast-reload cache so a chunk skips the parser after a
+// state recycle.
+// ---------------------------------------------------------------------------
+
+extern (C) private int luaBcWriter(lua_State* L, const(void)* p, size_t sz, void* ud) nothrow @nogc
+{
+    (cast(ByteBuffer*) ud).append((cast(const(ubyte)*) p)[0 .. sz]);
+    return 0;
+}
+
+/// Dump the compiled function on top of the stack into gScriptBc[sha]; the function
+/// stays on the stack. Keeps debug info (strip=0) so runtime errors still carry line
+/// numbers. Best-effort — a dump failure just leaves the entry unpopulated.
+private void captureBytecode(lua_State* L, const(char)[] sha) nothrow
+{
+    ByteBuffer buf;
+    if (lua_dump(L, &luaBcWriter, &buf, 0) == 0)
+        gScriptBc.set(sha, StrVal.ofRaw(cast(const(char)[]) buf.data));
+}
+
+/// Leave the compiled function for (sha, source) on the stack, or return false on a
+/// compile error (nothing pushed). Reloads from the bytecode cache when present (no
+/// reparse); otherwise compiles the source as TEXT ONLY — a body that is actually
+/// Lua bytecode is refused, closing the untrusted-bytecode load vector — and captures
+/// its bytecode for next time.
+private bool loadUserChunk(lua_State* L, const(char)[] sha, const(char)[] source,
+        const(char)* chunkname) nothrow
+{
+    if (auto bc = gScriptBc.get(sha))
+    {
+        auto b = bc.rawView();
+        if (luaL_loadbufferx(L, b.ptr, b.length, chunkname, "b") == LUA_OK)
+            return true;
+        lua_pop(L, 1); // drop the load error; fall back to the source
+    }
+    if (luaL_loadbufferx(L, source.ptr, source.length, chunkname, "t") != LUA_OK)
+        return false;
+    if (gScriptBc.get(sha) is null)
+        captureBytecode(L, sha);
     return true;
 }
 
@@ -2092,7 +2142,8 @@ public void evalCommand(const(RVal)[] args, ref Keyspace ks, ref ByteBuffer o,
     if (lua_type(gL, -1) != LUA_TFUNCTION)
     {
         lua_settop(gL, lua_gettop(gL) - 1); // drop the miss
-        if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
+        // reload from cached bytecode (fast) or compile the source, caching bytecode
+        if (!loadUserChunk(gL, sha[], body_, "@user_script"))
         {
             luaErrToResp(o, "ERR Error compiling script: ");
             return;
@@ -2286,15 +2337,16 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
             bool nw, ao, hs;
             if (!parseEvalShebang(body_, o, nw, ao, hs))
                 return; // parseEvalShebang wrote the error reply
-            if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_script") != LUA_OK)
+            char[40] sha = void;
+            sha1Hex(args[1].str, sha);
+            // compile (text only) to validate + capture the bytecode for fast reload
+            if (!loadUserChunk(gL, sha[], body_, "@user_script"))
             {
                 luaErrToResp(o, "ERR Error compiling script: ");
                 lua_settop(gL, 0);
                 return;
             }
             lua_settop(gL, 0);
-            char[40] sha = void;
-            sha1Hex(args[1].str, sha);
             if (gScripts.get(sha[]) is null)
                 gScripts.set(sha[], StrVal.ofRaw(args[1].str));
             repBulk(o, sha[]);
@@ -2320,6 +2372,7 @@ public void scriptCommand(const(RVal)[] args, ref ByteBuffer o) nothrow
         {
             // optional ASYNC/SYNC mode: dreads flushes synchronously either way
             gScripts.clear();
+            gScriptBc.clear(); // drop the cached bytecode alongside the source
             if (gL !is null) // drop the compiled-chunk cache too
             {
                 lua_createtable(gL, 0, 16);
@@ -2494,7 +2547,8 @@ private bool runLibraryBody(scope const(char)[] lib, scope const(char)[] body_,
             nl++;
         body_ = nl < body_.length ? body_[nl + 1 .. $] : null;
     }
-    if (luaL_loadbuffer(gL, body_.ptr, body_.length, "@user_function") != LUA_OK)
+    // text only: a FUNCTION library body that is actually Lua bytecode is refused
+    if (luaL_loadbufferx(gL, body_.ptr, body_.length, "@user_function", "t") != LUA_OK)
     {
         if (emitError)
             luaErrToResp(o, "ERR Error compiling function: ");

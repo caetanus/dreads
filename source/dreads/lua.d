@@ -46,6 +46,10 @@ int luaL_loadbuffer(lua_State* L, const(char)* buff, size_t sz, const(char)* nam
     return luaL_loadbufferx(L, buff, sz, name, null);
 }
 
+// dump a compiled function (top of stack) to bytecode via a writer callback.
+alias lua_Writer = int function(lua_State* L, const(void)* p, size_t sz, void* ud) nothrow @nogc;
+int lua_dump(lua_State* L, lua_Writer writer, void* data, int strip);
+
 void lua_pushcclosure(lua_State* L, lua_CFunction fn, int n);
 void lua_createtable(lua_State* L, int narr, int nrec);
 void lua_pushlstring(lua_State* L, const(char)* s, size_t len);

@@ -164,6 +164,38 @@ version (unittest)
         ks.evalRun("return tostring(string.nonexistent_zzz)").expect.to.contain("nil");
     }
 
+    @("sandbox.bytecode_cache")
+    unittest
+    {
+        // Scripts are stored as SOURCE (the portable, exportable form) plus a local
+        // compiled-BYTECODE cache; a chunk reloads from bytecode after a state
+        // recycle instead of reparsing. Two things to guarantee:
+        import dreads.config : gConfig;
+
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // 1) a body that is actually Lua bytecode is refused — scripts compile TEXT
+        // ONLY, so a caller can't smuggle unverified bytecode into the VM (RCE vector)
+        auto inj = ks.evalRun("\x1bLua");
+        inj[0].expect.to.equal('-');
+        inj.expect.to.contain("binary chunk");
+
+        // 2) a script behaves identically across a state recycle (the reload-from-
+        // bytecode path): run it, force a rebuild by growing the Lua heap past the
+        // 32MB threshold, then run it again — the in-state function cache is gone, so
+        // the second run comes back through the bytecode cache.
+        auto savedMem = gConfig.luaMemoryLimit;
+        gConfig.luaMemoryLimit = 0; // unlimited: don't cap the recycle allocation
+        scope (exit)
+            gConfig.luaMemoryLimit = savedMem;
+        ks.evalRun("return 40 + 2").expect.to.equal(":42\r\n");
+        ks.evalRun("local t = {} for i = 1, 900000 do t[i] = string.rep('x', 48) end return 1")
+            .expect.to.equal(":1\r\n"); // ~43MB > 32MB -> recycles the state
+        ks.evalRun("return 40 + 2").expect.to.equal(":42\r\n"); // served post-recycle
+    }
+
     @("sandbox.random")
     unittest
     {
