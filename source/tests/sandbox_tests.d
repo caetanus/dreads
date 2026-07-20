@@ -56,6 +56,8 @@ version (unittest)
         ks.evalRun("return table.concat({'a','b'}, '-')").expect.to.equal("$3\r\na-b\r\n");
         ks.evalRun("return math.floor(3.7)").expect.to.equal(":3\r\n");
         ks.evalRun("return tostring(1) .. type({})").expect.to.equal("$6\r\n1table\r\n");
+        // string.dump (bytecode serialization, an escape-vector primitive) is removed
+        ks.evalRun("return type(string.dump)").expect.to.equal("$3\r\nnil\r\n");
     }
 
     // helper: probe a global by name

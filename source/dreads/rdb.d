@@ -361,7 +361,11 @@ struct RdbReader
             else // RDB_ENC_LZF
                 return false; // phase 2
         }
-        if (pos + len > data.length)
+        // overflow-safe: `len` is an attacker-controlled 64-bit RDB length, so
+        // `pos + len` can wrap past data.length and bypass the guard (a crafted
+        // RESTORE then slices OOB -> crash/RCE). `pos <= data.length` holds after
+        // loadLen, so subtract instead of add.
+        if (len > data.length - pos)
             return false;
         s = cast(const(char)[]) data[pos .. pos + cast(size_t) len];
         pos += cast(size_t) len;

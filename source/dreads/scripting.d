@@ -350,6 +350,13 @@ private bool ensureState() nothrow
         lua_pushnil(gL);
         lua_setglobal(gL, name.ptr);
     }
+    // string.dump serializes a function to bytecode — a bytecode-escape primitive
+    // (Redis strips it too), pointless once load/loadstring reject bytecode. Remove
+    // it here, before the string table is sealed read-only.
+    lua_getglobal(gL, "string");
+    lua_pushnil(gL);
+    lua_setfield(gL, -2, "dump");
+    lua_pop(gL, 1);
     // global `redis` table with the call bridge (before _G gets protected)
     lua_createtable(gL, 0, 4);
     lua_pushcclosure(gL, &luaRedisCall, 0);

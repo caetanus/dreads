@@ -102,4 +102,32 @@ version (unittest)
         // DUMP of a missing key -> nil
         ks.run("DUMP", "missing").expect.to.equal("$-1\r\n");
     }
+
+    @("valkey.dump.restore_rejects_overflow_length")
+    unittest
+    {
+        // SECURITY (found by red-teaming the RESTORE parser): a crafted DUMP with a
+        // 64-bit RDB length near 2^64 made `pos + len` wrap past the buffer guard in
+        // loadString, producing a giant OOB slice -> crash (RCE-class; a 20-byte
+        // payload killed the server). RESTORE must now reject it cleanly. That the
+        // test runs to completion (no segfault) is itself the assertion. A zero CRC
+        // footer is "not checked", so no valid CRC is even needed by the attacker.
+        Keyspace ks;
+        scope (exit)
+            ks.d.free();
+
+        // [string 0x00][0x81 RDB_64BITLEN][len=0xFFFFFFFFFFFFFFFF][ver 11][crc 0]
+        ks.run("RESTORE", "k", "0",
+            "\x00\x81\xff\xff\xff\xff\xff\xff\xff\xff\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .startsWith("-").should.equal(true);
+        // another wrap boundary (len = 2^64-10)
+        ks.run("RESTORE", "k2", "0",
+            "\x00\x81\xff\xff\xff\xff\xff\xff\xff\xf6\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .startsWith("-").should.equal(true);
+        // a large but non-wrapping 32-bit length must also be rejected (len > remaining)
+        ks.run("RESTORE", "k3", "0", "\x00\x80\xff\xff\xff\xff\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .startsWith("-").should.equal(true);
+        // the server is still healthy after the rejected payloads
+        ks.run("SET", "ok", "1").expect.to.equal("+OK\r\n");
+    }
 }
