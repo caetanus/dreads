@@ -361,10 +361,17 @@ struct RdbReader
             else // RDB_ENC_LZF
                 return false; // phase 2
         }
-        // overflow-safe: `len` is an attacker-controlled 64-bit RDB length, so
-        // `pos + len` can wrap past data.length and bypass the guard (a crafted
-        // RESTORE then slices OOB -> crash/RCE). `pos <= data.length` holds after
-        // loadLen, so subtract instead of add.
+        // `len` is an attacker-controlled 64-bit RDB length, so any `pos + len`
+        // against the buffer can wrap past the guard (crafted RESTORE -> OOB slice
+        // -> crash/RCE). Two guards, robust even if the optimizer rewrites the
+        // remaining-space check back into an overflowing `pos + len` (LDC/LLVM does
+        // that — visible only in the disassembly): FIRST bound `len` by the whole
+        // buffer with a plain comparison (no arithmetic to wrap); a dumped string
+        // can't exceed the payload it lives in. That makes the following `pos + len`
+        // un-wrappable (len, pos both <= data.length), so the exact remaining-space
+        // check is safe regardless of how it compiles.
+        if (len > data.length)
+            return false;
         if (len > data.length - pos)
             return false;
         s = cast(const(char)[]) data[pos .. pos + cast(size_t) len];
