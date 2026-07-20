@@ -375,13 +375,13 @@ private void initReplication()
     foreach (ref p; peers)
         cfg.peers ~= p.id;
     cfg.seed = gConfig.raftNodeId * 2_654_435_761UL;
-    // Election timeout must dwarf the heartbeat: the single-threaded event
-    // loop can starve the tick timer under heavy write load (measured
-    // heartbeat gaps of 120-370ms during a 5000-command burst), so a tight
-    // 200ms timeout triggers spurious elections and drops in-flight writes.
-    // 50 ticks -> ~1-2s randomized (etcd/Redis-Raft use ~1s) leaves ample
-    // margin for a busy leader; heartbeat stays at 40ms so ~25 fit per window.
-    cfg.electionTimeoutTicks = 50; // 20ms tick -> ~1000-2000ms randomized
+    // Election timeout must dwarf the heartbeat. Raft runs on its own dedicated
+    // event-loop thread, so client write load no longer starves the tick timer
+    // (that was the reason for the conservative 50-tick default: heartbeat gaps
+    // of 120-370ms during a 5000-command burst would trip a tight timeout into
+    // spurious elections). Default 50 ticks -> ~1-2s randomized; tunable down via
+    // raft-election-timeout for faster failover now that the thread is isolated.
+    cfg.electionTimeoutTicks = gConfig.raftElectionTimeoutTicks; // config: raft-election-timeout (default 50)
     cfg.heartbeatTicks = 2; // ~40ms
     cfg.joinMode = gConfig.raftJoin; // passive learner until a config adds us
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);

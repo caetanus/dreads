@@ -29,6 +29,11 @@ public struct Config
     string raftPeers; // "2@host:port,3@host:port"
     ushort raftPort = 0; // 0 = port + 10000
     bool raftJoin = false; // start as a passive learner (joining an existing cluster)
+    // Raft election timeout in ticks (20ms each): a follower that hears no
+    // heartbeat for electionTimeout..2*electionTimeout ticks starts an election.
+    // Lower = faster failover. Safe to lower now that raft runs on its own
+    // dedicated event-loop thread (no client-load-induced spurious elections).
+    uint raftElectionTimeoutTicks = 50; // ~1000-2000ms randomized
     // sharding (phase 2a): static slot-range topology. Each node owns a slot
     // range and MOVED-redirects the rest. cluster-nodes lists the whole map:
     // "lo-hi@host:port,lo-hi@host:port,..."; this node is the entry whose
@@ -222,6 +227,17 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         else if (value == "no")
             cfg.raftJoin = false;
         else
+            return false;
+        return true;
+    case "raft-election-timeout":
+        try
+        {
+            immutable t = value.to!uint;
+            if (t == 0)
+                return false; // 0 would mean instant, self-defeating elections
+            cfg.raftElectionTimeoutTicks = t;
+        }
+        catch (Exception)
             return false;
         return true;
     case "cluster-enabled":
@@ -469,5 +485,13 @@ version (unittest)
         applyDirective("appendonly", "talvez", cfg).expect.to.equal(false);
         applyDirective("maxmemory-policy", "yolo", cfg).expect.to.equal(false);
         applyDirective("nope", "x", cfg).expect.to.equal(false);
+
+        // raft-election-timeout: default 50, tunable, rejects 0 / non-numeric.
+        cfg.raftElectionTimeoutTicks.expect.to.equal(50U);
+        applyDirective("raft-election-timeout", "15", cfg).expect.to.equal(true);
+        cfg.raftElectionTimeoutTicks.expect.to.equal(15U);
+        applyDirective("raft-election-timeout", "0", cfg).expect.to.equal(false);
+        applyDirective("raft-election-timeout", "abc", cfg).expect.to.equal(false);
+        cfg.raftElectionTimeoutTicks.expect.to.equal(15U); // unchanged on error
     }
 }
