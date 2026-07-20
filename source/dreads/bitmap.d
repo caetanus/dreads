@@ -624,8 +624,8 @@ public void bitfield(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
         bool signed;
         uint width;
         ulong off;
-        parseFieldType(args[i + 1].str, signed, width);
-        parseFieldOffset(args[i + 2].str, width, off);
+        cast(void) parseFieldType(args[i + 1].str, signed, width);
+        cast(void) parseFieldOffset(args[i + 2].str, width, off);
 
         auto raw = readField(bytes, off, width);
         auto cur = signed ? signExtend(raw, width) : cast(long) raw;

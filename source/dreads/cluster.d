@@ -278,7 +278,7 @@ private void appendNodesText(ref ByteBuffer o) nothrow
         t.appendByte(':');
         appendUint(t, n.port);
         t.appendByte('@');
-        appendUint(t, cast(ushort)(n.port + 10000));
+        appendUint(t, cast(ushort)(n.port + 10_000));
         t.append(cast(int) i == gSelfIndex ? " myself,master - 0 0 0 connected " : " master - 0 0 0 connected ");
         appendUint(t, n.lo);
         t.appendByte('-');

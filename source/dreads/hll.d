@@ -13,7 +13,7 @@ import dreads.mem : ByteBuffer;
 import dreads.obj : Keyspace, ObjType, RObj;
 import dreads.resp;
 
-private enum REGISTERS = 16384; // 2^14
+private enum REGISTERS = 16_384; // 2^14
 private enum HDR = 16;
 private enum DENSE_BYTES = HDR + (REGISTERS * 6 + 7) / 8;
 
@@ -221,12 +221,12 @@ public void pfmerge(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc
     foreach (ref a; args[1 .. $])
     {
         bool err;
-        hllFor(ks, a.str, false, o, err);
+        cast(void) hllFor(ks, a.str, false, o, err);
         if (err)
             return;
     }
     bool err;
-    hllFor(ks, args[0].str, true, o, err); // ensure dest exists
+    cast(void) hllFor(ks, args[0].str, true, o, err); // ensure dest exists
     if (err)
         return;
     foreach (ref a; args[1 .. $])

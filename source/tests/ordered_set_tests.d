@@ -195,8 +195,8 @@ version (unittest)
     @safe unittest
     {
         OrderedSet!int a;
-        a.add(1000000);
-        a.add(5000000);
+        a.add(1_000_000);
+        a.add(5_000_000);
         a.toString().shouldEqual("{1000000, 5000000}");
     }
 
@@ -299,9 +299,9 @@ version (unittest)
     @safe unittest
     {
         OrderedSet!int a;
-        a.add(-1000000);
-        a.add(1000000);
-        a.add(-500000);
+        a.add(-1_000_000);
+        a.add(1_000_000);
+        a.add(-500_000);
         a.toString().shouldEqual("{-1000000, -500000, 1000000}");
     }
 

@@ -185,10 +185,10 @@ struct LpBuilder
         size_t n;
         if (elemLen <= 127)
             t[0] = cast(ubyte) elemLen, n = 1;
-        else if (elemLen <= 16383)
+        else if (elemLen <= 16_383)
             t[0] = cast(ubyte)(elemLen >> 7),
                 t[1] = cast(ubyte)((elemLen & 127) | 128), n = 2;
-        else if (elemLen <= 2097151)
+        else if (elemLen <= 2_097_151)
             t[0] = cast(ubyte)(elemLen >> 14),
                 t[1] = cast(ubyte)(((elemLen >> 7) & 127) | 128),
                 t[2] = cast(ubyte)((elemLen & 127) | 128), n = 3;
@@ -247,7 +247,7 @@ struct LpBuilder
         d[start + 1] = cast(ubyte)(total >> 8);
         d[start + 2] = cast(ubyte)(total >> 16);
         d[start + 3] = cast(ubyte)(total >> 24);
-        immutable nel = count > 65535 ? 65535 : count;
+        immutable nel = count > 65_535 ? 65_535 : count;
         d[start + 4] = cast(ubyte) nel;
         d[start + 5] = cast(ubyte)(nel >> 8);
     }
@@ -901,7 +901,7 @@ private size_t lpBacklenSize(size_t l) @nogc nothrow pure
 {
     if (l < 128)
         return 1;
-    if (l < 16384)
+    if (l < 16_384)
         return 2;
     if (l < 2_097_152)
         return 3;

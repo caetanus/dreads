@@ -212,7 +212,7 @@ version (unittest)
         // u63 max round-trips (u64 is not supported, i64/u63 are the ceilings)
         ks.run("DEL", "u");
         ks.run("BITFIELD", "u", "set", "u63", "0", "9223372036854775807",
-                "get", "u63", "0").expect.to.equal(arr(0, 9223372036854775807L));
+                "get", "u63", "0").expect.to.equal(arr(0, 9_223_372_036_854_775_807L));
     }
 
     @("valkey.bitfield.regressions")

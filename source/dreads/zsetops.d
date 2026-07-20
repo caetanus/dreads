@@ -779,7 +779,7 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     {
         foreach (k; 0 .. srcs.length)
         {
-            eachMemberScore(srcs[k], weights[k], (m, s) {
+            cast(void) eachMemberScore(srcs[k], weights[k], (m, s) {
                 double cur;
                 if (acc.zset.score(m, cur))
                     acc.zset.add(aggregate(agg, cur, s), m);
@@ -792,7 +792,7 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     else if (op == 'I')
     {
         long found = 0;
-        eachMemberScore(srcs[0], weights[0], (m, s) {
+        cast(void) eachMemberScore(srcs[0], weights[0], (m, s) {
             double total = s;
             foreach (k; 1 .. srcs.length)
             {
@@ -819,7 +819,7 @@ public void zsetCombine(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o,
     }
     else // 'D'
     {
-        eachMemberScore(srcs[0], 1, (m, s) {
+        cast(void) eachMemberScore(srcs[0], 1, (m, s) {
             foreach (k; 1 .. srcs.length)
             {
                 double other;

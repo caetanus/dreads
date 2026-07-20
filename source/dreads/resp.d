@@ -534,7 +534,7 @@ unittest // inline commands (Redis inline protocol): non-'*' line -> whitespace 
     assert(v.type == RType.Array && v.arr.length == 0);
 
     // no terminator yet -> incomplete, not a protocol error
-    parseOne("SET k v", a, ParseStatus.incomplete);
+    cast(void) parseOne("SET k v", a, ParseStatus.incomplete);
 }
 
 unittest // pipelined inline commands parse one at a time; inline + RESP interleave
@@ -568,7 +568,7 @@ unittest // every proper prefix of a valid message is incomplete, never an error
     foreach (full; vectors)
     {
         foreach (cut; 0 .. full.length)
-            parseOne(full[0 .. cut], a, ParseStatus.incomplete);
+            cast(void) parseOne(full[0 .. cut], a, ParseStatus.incomplete);
         a.reset();
     }
 }
@@ -578,15 +578,15 @@ unittest // protocol errors
     Arena a;
     // a bare non-'*' token with no newline is now an incomplete INLINE command
     // (wait for the line terminator), not a protocol error
-    parseOne("x", a, ParseStatus.incomplete);
+    cast(void) parseOne("x", a, ParseStatus.incomplete);
     auto x = parseOne("x\r\n", a);
     assert(x.type == RType.Array && x.arr.length == 1 && x.arr[0].str == "x");
-    parseOne("$abc\r\n", a, ParseStatus.protocolError);
-    parseOne(":\r\n", a, ParseStatus.protocolError);
-    parseOne(":12x\r\n", a, ParseStatus.protocolError);
-    parseOne("$-2\r\n", a, ParseStatus.protocolError);
+    cast(void) parseOne("$abc\r\n", a, ParseStatus.protocolError);
+    cast(void) parseOne(":\r\n", a, ParseStatus.protocolError);
+    cast(void) parseOne(":12x\r\n", a, ParseStatus.protocolError);
+    cast(void) parseOne("$-2\r\n", a, ParseStatus.protocolError);
     // bulk payload not terminated by CRLF
-    parseOne("$3\r\nfooxy", a, ParseStatus.protocolError);
+    cast(void) parseOne("$3\r\nfooxy", a, ParseStatus.protocolError);
 }
 
 unittest // pos advances past one value and leaves the rest (pipelining)

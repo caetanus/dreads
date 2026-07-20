@@ -331,9 +331,9 @@ extern (C) private int hitCmpAsc(scope const void* a, scope const void* b) nothr
     return x.dist < y.dist ? -1 : (x.dist > y.dist ? 1 : 0);
 }
 
-extern (C) private int hitCmpDesc(scope const void* a, scope const void* b) nothrow @nogc
+extern (C) private int hitCmpDesc(scope const void* l, scope const void* r) nothrow @nogc
 {
-    return hitCmpAsc(b, a);
+    return hitCmpAsc(r, l); // descending = ascending with the operands reversed
 }
 
 private struct SearchSpec

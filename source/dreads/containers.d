@@ -125,6 +125,20 @@ public struct OrderedSet(T)
         return a == b;
     }
 
+    // Kept consistent with opEquals: iteration is in sorted order, so two equal
+    // sets yield the same element sequence and therefore the same hash.
+    @safe size_t toHash() const nothrow
+    {
+        size_t h = 0;
+        try
+            foreach (item; this)
+                h = h * 31 + hashOf(item);
+        catch (Exception)
+        {
+        }
+        return h;
+    }
+
     @safe auto range()
     {
         return tree.instance[];

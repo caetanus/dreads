@@ -1490,7 +1490,7 @@ private int poolRoundTrip(scope const(RVal)[] arr, bool isWrite, ref ByteBuffer 
             ec = gCmdSlot.done.emitCount;
             if (gCmdSlot.ready)
                 break;
-            gCmdSlot.done.waitUninterruptible(ec);
+            cast(void) gCmdSlot.done.waitUninterruptible(ec);
         }
     }
     catch (Exception)

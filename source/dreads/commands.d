@@ -2457,8 +2457,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             // validate every score before touching the keyspace
             for (size_t j = 0; j < pairs.length; j += 2)
             {
-                double s;
-                if (!parseDouble(pairs[j].str, s))
+                double score;
+                if (!parseDouble(pairs[j].str, score))
                 {
                     repError(o, "ERR value is not a valid float");
                     return true;
@@ -2496,8 +2496,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             bool incrReplied = false;
             for (size_t j = 0; j < pairs.length; j += 2)
             {
-                double s;
-                parseDouble(pairs[j].str, s);
+                double score;
+                cast(void) parseDouble(pairs[j].str, score);
                 auto member = pairs[j + 1].str;
                 double cur;
                 bool exists = obj.zset.score(member, cur);
@@ -2510,7 +2510,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     }
                     continue;
                 }
-                double newScore = (incr && exists) ? cur + s : s;
+                double newScore = (incr && exists) ? cur + score : score;
                 if (incr && exists && isnan(newScore))
                 {
                     repError(o, "ERR resulting score is not a number (NaN)");
@@ -6260,7 +6260,7 @@ private void applyRebuild(scope const(ubyte)[] cmds, ref Keyspace ks, ref Arena 
         if (parseValue(cmds, p, arena, sub) != ParseStatus.ok)
             break;
         scratch.clear();
-        dispatch(sub, ks, scratch, arena, now);
+        cast(void) dispatch(sub, ks, scratch, arena, now);
     }
     propagationOverride.clear();
 }

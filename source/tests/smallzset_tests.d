@@ -61,7 +61,7 @@ version (unittest)
         foreach (i; 0 .. 10)
             z.add(cast(double) i, "m" ~ i.to!string);
         size_t n;
-        z.walkScoreRange(3, false, 6, false, (const(char)[] m, double s) @nogc nothrow{
+        z.walkScoreRange(3, false, 6, false, (const(char)[], double) @nogc nothrow{
             n++;
             return 0;
         });

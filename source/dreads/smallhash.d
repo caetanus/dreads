@@ -247,7 +247,7 @@ struct SmallHash
         if (fieldTTL is null)
             return 0;
         ulong m = 0;
-        (cast(FieldTTLMap*) fieldTTL).opApply((const(char)[] _f, ref ulong at) @nogc nothrow {
+        (cast(FieldTTLMap*) fieldTTL).opApply((const(char)[], ref ulong at) @nogc nothrow {
             if (m == 0 || at < m)
                 m = at;
             return 0;
@@ -271,7 +271,7 @@ struct SmallHash
             return 0;
         });
         foreach (f; due[])
-            remove(f); // removes field+value AND its TTL entry (remove() clears it)
+            cast(void) remove(f); // removes field+value AND its TTL entry (remove() clears it)
         minDeadline = minFieldTTL(); // refresh the bound (self-heals a stale-small min)
         return due.length;
     }

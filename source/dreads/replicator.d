@@ -530,7 +530,7 @@ private final class RaftWorker
         transport.setHandler(&onWire);
         nodeMtx = new TaskMutex;
         transport.start(rep.raftPort);
-        setTimer(20.msecs, () @trusted nothrow { onTick(); }, true);
+        cast(void) setTimer(20.msecs, () @trusted nothrow { onTick(); }, true);
         runTask(() nothrow { ctlLoop(); });
         proposalLoop(); // never returns: this fiber IS the group-commit drainer
     }

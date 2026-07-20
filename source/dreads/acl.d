@@ -895,7 +895,7 @@ size_t getCommandKeys(scope const(char)[] name, scope const(RVal)[] arr, scope K
         @trusted nothrow @nogc
 {
     size_t n = 0;
-    forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
+    cast(void) forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
         if (n < buf.length)
             buf[n++] = KeyRef(key, needR, needW);
         return true;
@@ -910,7 +910,7 @@ const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope co
     if (u.root.allKeys)
         return null;
     const(char)[] denied = null;
-    forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
+    cast(void) forEachCommandKey!((scope const(char)[] key, bool needR, bool needW) {
         if (!aclCanAccessKey(u, key, needR, needW))
         {
             denied = key;
@@ -1273,7 +1273,7 @@ void aclApplyCanonical(const(RVal)[] args) @trusted nothrow
         foreach (ref r; args[2 .. $])
         {
             try
-                aclApplyRule(u, r.str, err); // canonical never uses `>` (no hashing)
+                cast(void) aclApplyRule(u, r.str, err); // canonical never uses `>` (no hashing)
             catch (Exception)
             {
             }
@@ -1283,7 +1283,7 @@ void aclApplyCanonical(const(RVal)[] args) @trusted nothrow
     else if (eqIC(args[0].str, "deluser"))
     {
         foreach (ref a; args[1 .. $])
-            aclDelUser(a.str);
+            cast(void) aclDelUser(a.str);
     }
 }
 
@@ -1292,7 +1292,7 @@ void aclApplyCanonical(const(RVal)[] args) @trusted nothrow
 /// (default included: its line re-affirms the seeded state, or carries changes.)
 void aclDumpUsers(ref ByteBuffer buf) @trusted nothrow @nogc
 {
-    aclEachUser((AclUser* u) @nogc nothrow {
+    cast(void) aclEachUser((AclUser* u) @nogc nothrow {
         aclEncodeCanonicalSetuser(u, buf);
         return 0;
     });
@@ -1340,7 +1340,7 @@ AclUser* aclUserById(ulong id) @nogc nothrow
     if (id == 0)
         return null;
     AclUser* found;
-    aclEachUser((AclUser* u) @nogc nothrow {
+    cast(void) aclEachUser((AclUser* u) @nogc nothrow {
         if (u.id == id)
         {
             found = u;
@@ -1411,7 +1411,7 @@ bool aclDelUser(scope const(char)[] name) @trusted nothrow
 /// stop early.
 int aclEachUser(scope int delegate(AclUser* u) @nogc nothrow dg) @nogc nothrow
 {
-    return gUsers.opApply((const(char)[] k, ref AclUser* u) => dg(u));
+    return gUsers.opApply((const(char)[], ref AclUser* u) => dg(u));
 }
 
 /// Number of registered users.
@@ -1825,7 +1825,7 @@ unittest // registry: default user, get/create/del, unrestricted predicate
     assert(alice !is null && aclUser("alice") is alice);
     assert(!aclUnrestricted(alice)); // fresh user is disabled + empty
     foreach (r; ["on", "+@all", "allkeys", "allchannels"])
-        aclApplyRule(alice, r, err);
+        cast(void) aclApplyRule(alice, r, err);
     assert(aclUnrestricted(alice)); // now full
 
     assert(aclDelUser("alice") && aclUser("alice") is null);
@@ -1837,7 +1837,7 @@ unittest // per-subcommand ACL: +@all -client +client|id
     const(char)[] err;
     auto u = aclGetOrCreate("subtest");
     scope (exit)
-        aclDelUser("subtest");
+        cast(void) aclDelUser("subtest");
     foreach (r; ["on", "+@all", "-client", "+client|id", "+client|setname"])
         assert(aclApplyRule(u, r, err), cast(string) err);
 
@@ -1866,7 +1866,7 @@ unittest // subcommand catalog: validation + first-arg rules + container check
     const(char)[] err;
     auto u = aclGetOrCreate("subval");
     scope (exit)
-        aclDelUser("subval");
+        cast(void) aclDelUser("subval");
     assert(aclApplyRule(u, "on", err));
     // container: valid subcommand ok; unknown sub / first-arg-of-sub rejected
     assert(aclApplyRule(u, "+config|get", err));
@@ -1894,7 +1894,7 @@ unittest // long command names (>16 chars) are catalogued and gated
     const(char)[] err;
     auto u = aclGetOrCreate("geotest");
     scope (exit)
-        aclDelUser("geotest");
+        cast(void) aclDelUser("geotest");
     foreach (r; ["on", "~*", "+get", "+geoadd"]) // no geo-read perms
         assert(aclApplyRule(u, r, err), cast(string) err);
     assert(aclCanRunCmd(u, aclCmdIndex("geoadd")));
@@ -1929,7 +1929,7 @@ unittest // ACL GETUSER rule description echoes the applied rules (Valkey format
     const(char)[] err;
     auto u = aclGetOrCreate("descr");
     scope (exit)
-        aclDelUser("descr");
+        cast(void) aclDelUser("descr");
     foreach (r; ["on", "+@list", "+get", "-lpush", "~k*", "%R~ro:*", "&news"])
         assert(aclApplyRule(u, r, err), cast(string) err);
     // base "-@all" + verbatim delta tokens, in order
@@ -1954,7 +1954,7 @@ unittest // canonical propagation: encode a user, apply it back, state matches
     const(char)[] err;
     auto src = aclGetOrCreate("canon_src");
     scope (exit)
-        aclDelUser("canon_src");
+        cast(void) aclDelUser("canon_src");
     // give it a password by hash (no Argon2 in the test), keys, channels, commands
     enum h64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     foreach (r; ["on", "#" ~ h64, "~app:*", "%R~ro:*", "&news", "+@read", "+set", "-get"])
@@ -1971,11 +1971,11 @@ unittest // canonical propagation: encode a user, apply it back, state matches
 
     // apply it to a DIFFERENT registry name and confirm the rebuilt user matches
     // (rename the target in the parsed command)
-    aclDelUser("canon_dst");
+    cast(void) aclDelUser("canon_dst");
     cmd.arr[2].str = "canon_dst";
     aclApplyCanonical(cmd.arr[1 .. $]);
     scope (exit)
-        aclDelUser("canon_dst");
+        cast(void) aclDelUser("canon_dst");
     auto dst = aclUser("canon_dst");
     assert(dst !is null && dst.enabled);
     assert(aclCanRunCmd(dst, aclCmdIndex("set")) && aclCanRunCmd(dst, aclCmdIndex("mget")));

@@ -273,7 +273,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // a 1s cadence left keys logically-expired-but-present far too long). Kept
         // separate from the 1s cron below so the fsync/eviction/lru work does NOT
         // also run 5x more often.
-        setTimer(200.msecs, delegate() @trusted nothrow {
+        cast(void) setTimer(200.msecs, delegate() @trusted nothrow {
             import dreads.det : freezeClock;
             import dreads.obj : gActiveExpire, gLazyFree;
 
@@ -304,7 +304,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
                 flushTrackingInval(0);
         }, true);
-        setTimer(1.seconds, delegate() @trusted nothrow {
+        cast(void) setTimer(1.seconds, delegate() @trusted nothrow {
             // Pin THIS cycle's clock to wall time. detNow() otherwise returns the
             // last command's frozen gClock (never reset to 0 after dispatch), which
             // is stale here — so a background eviction cycle would compare against a
@@ -325,7 +325,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     // SO_REUSEADDR + SO_REUSEPORT: without reusePort a restarted server can
     // find the port stuck in TIME_WAIT for a long while (vibe's default only
     // sets reuseAddress). Both let a fresh instance rebind immediately.
-    listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
+    cast(void) listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
         serveClient(conn);
     }, TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
     printf("dreads listening on port %u\n", cast(uint) port);
@@ -940,7 +940,7 @@ private void trackAfterCommand(ref Conn c, scope const(char)[] uname,
         }
         static Vector!(const(char)[]) wk; // TLS: slices into `arr`, used within call
         wk.clear();
-        forEachCommandKey!((scope const(char)[] key, bool nr, bool nw) @nogc nothrow @trusted {
+        forEachCommandKey!((scope const(char)[] key, bool, bool nw) @nogc nothrow @trusted {
             if (nw)
                 wk.put(key);
             return true;
@@ -952,7 +952,7 @@ private void trackAfterCommand(ref Conn c, scope const(char)[] uname,
     {
         static Vector!(const(char)[]) rk;
         rk.clear();
-        forEachCommandKey!((scope const(char)[] key, bool nr, bool nw) @nogc nothrow @trusted {
+        forEachCommandKey!((scope const(char)[] key, bool nr, bool) @nogc nothrow @trusted {
             if (nr)
                 rk.put(key);
             return true;
@@ -1603,7 +1603,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     gPauseUntilMs = gPausePendingEnd;
                     gPauseAll = gPausePendingAll;
                     gPauseIssuer = gPausePendingIssuer;
-                    gPauseEvt.emit();
+                    cast(void) gPauseEvt.emit();
                 }
             }
         }
@@ -1638,7 +1638,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     immutable rem = gPauseUntilMs - now;
                     immutable cap = rem < PAUSE_POLL_MS ? rem : PAUSE_POLL_MS;
                     immutable ec = gPauseEvt.emitCount;
-                    gPauseEvt.waitUninterruptible(msecs(cap), ec);
+                    cast(void) gPauseEvt.waitUninterruptible(msecs(cap), ec);
                 }
                 if (c.pausedBuf.length && (gPauseUntilMs == 0 || nowMs() >= gPauseUntilMs))
                     replayPaused();
@@ -3382,7 +3382,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             if (gScriptWrote)
             {
                 gWriteEpoch++;
-                gKeyActivity.emit();
+                cast(void) gKeyActivity.emit();
                 signalReadyKeys(c.dbp.db, *c.dbp);
             }
             return true;
@@ -3484,7 +3484,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         if (isW)
         {
             gWriteEpoch++; // WATCH visibility
-            gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
+            cast(void) gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
             signalReadyKeys(c.dbp.db, *c.dbp); // wake pop-family fronts
         }
         if (gAof.enabled)
@@ -5027,7 +5027,7 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
                 if (gAof.enabled)
                     gAof.append(synth.data);
                 gWriteEpoch++;
-                gKeyActivity.emit();
+                cast(void) gKeyActivity.emit();
                 return;
             }
         }
@@ -5228,7 +5228,7 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             if (gAof.enabled)
                 gAof.append(synth.data);
             gWriteEpoch++;
-            gKeyActivity.emit();
+            cast(void) gKeyActivity.emit();
             return;
         }
         if (!waitForActivity(ec, remaining, timeoutMs))
@@ -5243,7 +5243,7 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
 private void logEffect(string verb, scope const(char)[] key) nothrow
 {
     gWriteEpoch++;
-    gKeyActivity.emit();
+    cast(void) gKeyActivity.emit();
     if (!gAof.enabled)
         return;
     static ByteBuffer eff; // TLS
@@ -5613,7 +5613,7 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
                     if (!active || newEnd > gPauseUntilMs)
                         gPauseUntilMs = newEnd; // never shorten a running window
                     gPauseIssuer = c.id; // the pauser's own connection is exempt
-                    gPauseEvt.emit(); // re-arm any fiber parked on a prior window
+                    cast(void) gPauseEvt.emit(); // re-arm any fiber parked on a prior window
                 }
                 repSimple(o, "OK");
             }
@@ -5622,7 +5622,7 @@ private bool clientCmd(ref Conn c, const(RVal)[] args, ref ByteBuffer o) nothrow
     else if (eqICDebug(sub, "UNPAUSE") && args.length == 1)
     {
         gPauseUntilMs = 0; // lift the barrier
-        gPauseEvt.emit(); // wake parked fibers to replay their held commands
+        cast(void) gPauseEvt.emit(); // wake parked fibers to replay their held commands
         repSimple(o, "OK");
     }
     else if (eqICDebug(sub, "NO-EVICT") || eqICDebug(sub, "NO-TOUCH"))

@@ -109,7 +109,7 @@ version (unittest)
     enum NIL = "$-1\r\n";
 
     // Fresh dense HLL object size in dreads (16-byte header + 16384 six-bit regs).
-    enum DENSE_BYTES = 16 + (16384 * 6 + 7) / 8; // == 12304
+    enum DENSE_BYTES = 16 + (16_384 * 6 + 7) / 8; // == 12304
 
     // ---- PFADD create / return semantics ---------------------------------
     @("valkey.hll.pfadd_create")

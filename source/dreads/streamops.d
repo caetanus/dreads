@@ -920,7 +920,7 @@ public void xreadgroup(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o, re
         else
         {
             StreamID after;
-            parseId(spec, 0, after);
+            cast(void) parseId(spec, 0, after);
             // history: this consumer's pending entries with id > after. Entries
             // deleted from the stream (XDEL/trim) still appear — with a nil field
             // list — so the client can see which pending ids are now gone (#5570).
@@ -994,7 +994,7 @@ public void xack(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc no
     foreach (ref a; args[2 .. $])
     {
         StreamID id;
-        parseId(a.str, 0, id);
+        cast(void) parseId(a.str, 0, id);
         n += g.pelRemove(id) ? 1 : 0;
     }
     repInt(o, n);
@@ -1380,7 +1380,7 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     foreach (ref a; ids)
     {
         StreamID id;
-        parseId(a.str, 0, id);
+        cast(void) parseId(a.str, 0, id);
         if (willClaim(id))
             n++;
     }
@@ -1391,7 +1391,7 @@ public void xclaim(ref Keyspace ks, const(RVal)[] args, ref ByteBuffer o) @nogc 
     foreach (ref a; ids)
     {
         StreamID id;
-        parseId(a.str, 0, id);
+        cast(void) parseId(a.str, 0, id);
         auto pi = g.pelFind(id);
         if (pi < 0 && !force)
             continue;

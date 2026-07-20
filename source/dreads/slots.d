@@ -8,7 +8,7 @@ module dreads.slots;
 // correctly. CRC16 is CCITT (poly 0x1021, MSB-first) — the same table Redis
 // uses; we compute it at compile time so the 256 constants can't be mistyped.
 
-enum SLOTS = 16384;
+enum SLOTS = 16_384;
 
 private immutable ushort[256] crc16tab = () {
     ushort[256] t;
@@ -76,10 +76,10 @@ version (unittest)
     unittest
     {
         // Values from Redis CLUSTER KEYSLOT.
-        keyToSlot("foo").expect.to.equal(cast(ushort) 12182);
+        keyToSlot("foo").expect.to.equal(cast(ushort) 12_182);
         keyToSlot("bar").expect.to.equal(cast(ushort) 5061);
         keyToSlot("").expect.to.equal(cast(ushort) 0);
-        keyToSlot("123456789").expect.to.equal(cast(ushort)(0x31C3 & 16383));
+        keyToSlot("123456789").expect.to.equal(cast(ushort)(0x31C3 & 16_383));
     }
 
     @("slots.hash_tags")
