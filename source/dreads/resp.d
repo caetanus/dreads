@@ -97,11 +97,20 @@ private ParseStatus parseLineInt(scope const(ubyte)[] buf, ref size_t pos, out l
 
 /// Parses one RESP value starting at buf[pos]. On ok, advances pos past it.
 /// On incomplete/protocolError, pos is left untouched.
+// Max nesting for a request. Real commands are a FLAT array of bulk strings
+// (depth 1); this bounds the recursion so a crafted deeply-nested multibulk
+// (`*1\r\n*1\r\n*1\r\n...`) can neither overflow the native stack nor allocate an
+// RVal array per level without limit (an unauthenticated remote DoS). 16 leaves
+// ample margin over any legitimate use.
+private enum MAX_DEPTH = 16;
+
 public ParseStatus parseValue(scope const(ubyte)[] buf, ref size_t pos,
-        ref Arena arena, out RVal val) @nogc nothrow
+        ref Arena arena, out RVal val, int depth = 0) @nogc nothrow
 {
     if (pos >= buf.length)
         return ParseStatus.incomplete;
+    if (depth > MAX_DEPTH)
+        return ParseStatus.protocolError; // nesting bomb: reject, don't recurse
 
     char t = cast(char) buf[pos];
     switch (t)
@@ -171,7 +180,7 @@ public ParseStatus parseValue(scope const(ubyte)[] buf, ref size_t pos,
             auto items = arena.allocArray!RVal(cast(size_t) n);
             foreach (i; 0 .. cast(size_t) n)
             {
-                st = parseValue(buf, p, arena, items[i]);
+                st = parseValue(buf, p, arena, items[i], depth + 1);
                 if (st != ParseStatus.ok)
                     return st;
             }
@@ -510,6 +519,20 @@ unittest // arrays
         v = v.arr[0];
     }
     assert(v.arr.length == 2 && v.arr[0].str == "hello\n" && v.arr[1].integer == -1);
+
+    // Red-team (DoS): nesting past MAX_DEPTH is REJECTED, not recursed — a
+    // `*1\r\n*1\r\n...` bomb must never overflow the native stack or allocate an
+    // RVal array per level. ~40 levels (well past MAX_DEPTH) + a leaf.
+    {
+        string bomb;
+        foreach (_; 0 .. 40)
+            bomb ~= "*1\r\n";
+        bomb ~= ":1\r\n";
+        cast(void) parseOne(bomb, a, ParseStatus.protocolError);
+    }
+    // and a legitimately-shallow multibulk (a real command) still parses fine
+    v = parseOne("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", a);
+    assert(v.type == RType.Array && v.arr.length == 2 && v.arr[0].str == "GET");
 }
 
 unittest // inline commands (Redis inline protocol): non-'*' line -> whitespace split

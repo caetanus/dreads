@@ -244,6 +244,12 @@ version (unittest)
         ks.evalRun(`return cjson.decode('{oops')`)[0].expect.to.equal('-');
         ks.evalRun(`return cjson.decode('[1,')`)[0].expect.to.equal('-');
         ks.evalRun(`return cjson.decode('1 trailing')`)[0].expect.to.equal('-');
+        // Red-team (DoS): decode_max_depth is CLAMPED to a safe ceiling, so a
+        // script can't raise it and blow the native stack with deep nesting.
+        ks.evalRun("return cjson.decode_max_depth(2000000000)").expect.to.equal(":64\r\n");
+        // deeply-nested input past the ceiling errors CLEANLY (no stack overflow
+        // / SIGSEGV): the parser recurses only to the capped depth, then errors.
+        ks.evalRun("return cjson.decode(string.rep('[', 5000))")[0].expect.to.equal('-');
     }
 
     @("sandbox.cmsgpack")
@@ -278,6 +284,19 @@ version (unittest)
         ks.evalRun(`return cmsgpack.unpack(string.char(0xc1))`)[0].expect.to.equal('-');
         ks.evalRun(`return cmsgpack.unpack('')`)[0].expect.to.equal('-');
         ks.evalRun(`return cmsgpack.pack()`)[0].expect.to.equal('-');
+        // Red-team (DoS): an array32 header declaring a huge element count must
+        // NOT drive a multi-GB lua_createtable preallocation — the count is only
+        // a hint (capped); the decode errors cleanly on input exhaustion. Test
+        // completing (no OOM/hang) is the assertion. 0xdd = array32, len 0x7ffffffe.
+        ks.evalRun(`return cmsgpack.unpack(string.char(0xdd, 0x7f, 0xff, 0xff, 0xfe))`)[0]
+            .expect.to.equal('-');
+        // same for map32 (0xdf)
+        ks.evalRun(`return cmsgpack.unpack(string.char(0xdf, 0x7f, 0xff, 0xff, 0xfe))`)[0]
+            .expect.to.equal('-');
+        // Red-team (DoS): deep nesting (0x91 = fixarray-of-1, repeated) must error
+        // at the depth cap CLEANLY, not overflow the native fiber stack (SIGSEGV).
+        ks.evalRun(`return cmsgpack.unpack(string.rep(string.char(0x91), 5000))`)[0]
+            .expect.to.equal('-');
     }
 
     @("sandbox.sha1hex_and_bit")

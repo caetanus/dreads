@@ -13,8 +13,14 @@ import dreads.lua;
 import dreads.mem : ByteBuffer;
 
 // lua-cjson runtime configuration (the Redis suite flips these)
-private __gshared long gEncodeMaxDepth = 1000;
-private __gshared long gDecodeMaxDepth = 1000;
+// Default nesting limit. Lowered from 1000: the decoder/encoder recurse one
+// native stack frame per level, and scripts run on a small vibe FIBER stack
+// (gLuaPool.runTaskH), which overflows (real SIGSEGV) after a few hundred
+// frames — a crash DoS reachable from a plain cjson.decode of deep JSON, no
+// config change needed. 64 is well beyond any real document and safe on the
+// fiber stack with wide margin.
+private __gshared long gEncodeMaxDepth = 64;
+private __gshared long gDecodeMaxDepth = 64;
 private __gshared bool gEncodeInvalidNumbers = false;
 
 public void registerCjson(lua_State* L) nothrow @nogc
@@ -49,12 +55,20 @@ extern (C) private int jsonConfigStub(lua_State* L) nothrow @nogc
     return lua_gettop(L);
 }
 
+// Hard ceiling on the configurable JSON nesting depth. encode/decode recurse
+// one native (D/C) stack frame per level, so an unclamped depth lets a script
+// set a huge limit and blow the worker-thread stack with a deeply-nested input
+// (e.g. cjson.decode(string.rep("[", 2e6))) — a crash DoS. This bounds it.
+private enum JSON_MAX_DEPTH_CEIL = 64;
+
 extern (C) private int jsonEncodeMaxDepth(lua_State* L) nothrow @nogc
 {
     int isnum;
     auto v = lua_tointegerx(L, 1, &isnum);
     if (isnum == 0 || v < 1)
         return luaL_error(L, "expected positive integer");
+    if (v > JSON_MAX_DEPTH_CEIL)
+        v = JSON_MAX_DEPTH_CEIL; // clamp: never honor a stack-overflowing depth
     gEncodeMaxDepth = v;
     lua_pushinteger(L, v);
     return 1;
@@ -66,6 +80,8 @@ extern (C) private int jsonDecodeMaxDepth(lua_State* L) nothrow @nogc
     auto v = lua_tointegerx(L, 1, &isnum);
     if (isnum == 0 || v < 1)
         return luaL_error(L, "expected positive integer");
+    if (v > JSON_MAX_DEPTH_CEIL)
+        v = JSON_MAX_DEPTH_CEIL; // clamp: never honor a stack-overflowing depth
     gDecodeMaxDepth = v;
     lua_pushinteger(L, v);
     return 1;

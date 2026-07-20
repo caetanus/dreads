@@ -10,7 +10,12 @@ module dreads.cmsgpack;
 import dreads.lua;
 import dreads.mem : ByteBuffer;
 
-private enum MAX_DEPTH = 100;
+// Nesting cap. Scripts run on a small vibe fiber stack, and `value()` recurses
+// one native frame per level — ~100+ frames overflow it (real SIGSEGV, not
+// Lua's catchable C-call guard). 64 matches cjson's proven-safe limit with wide
+// margin over any real document. (lua_checkstack guards the LUA stack, which is
+// a separate, larger limit — it does NOT bound the native fiber stack.)
+private enum MAX_DEPTH = 64;
 
 public void registerCmsgpack(lua_State* L) nothrow @nogc
 {
@@ -276,9 +281,17 @@ private struct Decoder
         i += len;
     }
 
+    // The declared element count is a PREALLOCATION hint only: the table grows
+    // as elements are actually decoded, and each decoded element consumes >=1
+    // input byte (need()), so the real work is bounded by the input length.
+    // Cap the hint — an attacker's 32-bit array/map length (up to ~4.29e9) would
+    // otherwise make lua_createtable preallocate multi-GB of TValue slots from a
+    // few input bytes (OOM crash) before a single element is read.
+    private enum PREALLOC_HINT_CAP = 256;
+
     void array(long n, int depth) nothrow @nogc
     {
-        lua_createtable(L, cast(int)(n < int.max ? n : 0), 0);
+        lua_createtable(L, cast(int)(n < PREALLOC_HINT_CAP ? n : PREALLOC_HINT_CAP), 0);
         foreach (k; 1 .. n + 1)
         {
             value(depth + 1);
@@ -288,7 +301,7 @@ private struct Decoder
 
     void map(long n, int depth) nothrow @nogc
     {
-        lua_createtable(L, 0, cast(int)(n < int.max ? n : 0));
+        lua_createtable(L, 0, cast(int)(n < PREALLOC_HINT_CAP ? n : PREALLOC_HINT_CAP));
         foreach (_; 0 .. n)
         {
             value(depth + 1); // key
