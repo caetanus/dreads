@@ -44,6 +44,20 @@ struct SyncState
             requested_ = seq;
     }
 
+    /// Seed the baseline at startup: everything up to `seq` is ALREADY durable
+    /// (it was recovered by reading the on-disk log), so awaitDurable(<= seq)
+    /// returns immediately and no spurious re-sync of recovered entries is
+    /// requested. Without this, the first awaitDurable(recoveredLastIndex) after
+    /// a restart blocks forever (durable_ starts at 0 and those entries are never
+    /// re-synced), deadlocking the raft loop — no tick, no election, no leader.
+    void seed(ulong seq) @safe nothrow @nogc
+    {
+        if (seq > durable_)
+            durable_ = seq;
+        if (seq > requested_)
+            requested_ = seq;
+    }
+
     /// Claims the next batch to sync, or 0 when idle-with-nothing or busy.
     /// Because it always claims up to the latest request, requests that
     /// arrived during the previous fsync are covered by the next single one.
@@ -97,9 +111,11 @@ final class Durability
     version (linux) private Uring ring;
     private bool ringReady;
 
-    this(int fd, bool ioUring = false)
+    this(int fd, ulong durableBaseline, bool ioUring = false)
     {
         atomicStore(this.fd, fd);
+        // Recovered entries (already on disk) are durable from the first tick.
+        st.seed(durableBaseline);
         this.useIoUring = ioUring;
         mtx = new Mutex;
         cond = new Condition(mtx);
@@ -220,6 +236,16 @@ final class Durability
         }
     }
 
+    /// Highest seq currently considered durable (seeded baseline + synced work).
+    /// Package-visible so RaftLog can assert the recovery baseline in tests.
+    package ulong durableSeq() nothrow
+    {
+        mtx.lock_nothrow();
+        auto d = st.durable;
+        mtx.unlock_nothrow();
+        return d;
+    }
+
     private void loop() nothrow
     {
         version (linux)
@@ -252,5 +278,58 @@ final class Durability
             mtx.unlock_nothrow();
             fiberEvent.emit(); // wake fibers whose seq is now durable
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+version (unittest)
+{
+    import fluent.asserts;
+
+    // Regression (the "restart deadlock"): async durability was added after the
+    // raft loop already worked, and it introduced a starvation that only fires
+    // deterministically on the log-replay path. On restart, the recovered log
+    // entries were durable BEFORE the crash but are never re-synced this session,
+    // so with a fresh baseline of 0 the FIRST awaitDurable(recoveredLastIndex)
+    // waits for a sync that never comes — forever — holding the node lock and
+    // wedging the whole cluster (no tick -> no election -> no leader -> data
+    // never re-applied). seed() fixes it: recovered entries are durable at once.
+    @("syncer.seed_marks_recovered_durable")
+    unittest
+    {
+        SyncState st;
+        // fresh: nothing is durable yet (this is what deadlocked on restart)
+        st.isDurable(1).expect.to.equal(false);
+
+        // seed the recovered baseline (e.g. the reopened log's lastIndex)
+        st.seed(100);
+        st.durable.expect.to.equal(100UL);
+        st.isDurable(1).expect.to.equal(true); // <= baseline -> awaitDurable returns
+        st.isDurable(100).expect.to.equal(true);
+        st.isDurable(101).expect.to.equal(false); // beyond baseline still waits
+
+        // and NO spurious re-sync of the already-durable recovered prefix
+        st.claim().expect.to.equal(0UL);
+
+        // a real new append past the baseline still syncs normally
+        st.request(150);
+        st.claim().expect.to.equal(150UL);
+        st.complete();
+        st.isDurable(150).expect.to.equal(true);
+    }
+
+    // seed never moves the baseline backwards (idempotent / monotonic).
+    @("syncer.seed_is_monotonic")
+    unittest
+    {
+        SyncState st;
+        st.seed(50);
+        st.seed(10); // lower — ignored
+        st.durable.expect.to.equal(50UL);
+        st.seed(80); // higher — advances
+        st.durable.expect.to.equal(80UL);
     }
 }

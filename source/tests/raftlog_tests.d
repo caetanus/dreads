@@ -61,6 +61,37 @@ version (unittest)
         back.close();
     }
 
+    // Regression (the "restart deadlock" the chaos test would have caught): after
+    // recovery, async durability MUST treat the reopened log's entries as already
+    // durable. Otherwise the first awaitDurable(recoveredLastIndex) waits for a
+    // sync that never happens — deadlocking the raft loop (no tick/election/leader)
+    // and leaving the recovered data un-applied. The baseline must == lastIndex.
+    @("raftlog.recovery_seeds_durable_baseline")
+    unittest
+    {
+        enum base = "/tmp/dreads_rl_durbase";
+        rm(base);
+        scope (exit)
+            rm(base);
+
+        auto log = RaftLog.open(base);
+        LogEntry[3] batch = [
+            LogEntry(1, 1, pay("a")), LogEntry(1, 2, pay("b")), LogEntry(2, 3, pay("c")),
+        ];
+        log.append(batch[]);
+        log.close();
+
+        // Reopen (recovery) and turn on async durability, exactly as the server
+        // does at boot (gConfig.synchronous defaults to "full").
+        auto back = RaftLog.open(base);
+        back.lastIndex.expect.to.equal(3);
+        back.enableAsyncDurability();
+        // The whole recovered prefix is durable from the first tick — so
+        // awaitDurable(3) returns immediately instead of blocking forever.
+        back.testDurableBaseline().expect.to.equal(3UL);
+        back.close();
+    }
+
     @("raftlog.truncate_survives_reopen")
     unittest
     {

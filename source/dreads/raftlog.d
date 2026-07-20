@@ -124,7 +124,12 @@ final class RaftLog : Storage
         if (gConfig.synchronous != "full")
             return;
         if (durability_ is null && logF !is null)
-            durability_ = new Durability(fileno(logF), gConfig.fsyncBackend == "io_uring");
+            // Seed the durable baseline with the recovered lastIndex: those
+            // entries were just read off disk, so they are already durable. Else
+            // the first awaitDurable(recoveredLastIndex) blocks forever (durable_
+            // starts at 0) and deadlocks the raft loop on restart.
+            durability_ = new Durability(fileno(logF), snapIdx_ + len,
+                    gConfig.fsyncBackend == "io_uring");
     }
 
     /// Fiber-side: yield until `index` is on disk (no-op when synchronous).
@@ -140,6 +145,15 @@ final class RaftLog : Storage
             return;
         if (durability_ !is null)
             durability_.awaitDurable(index);
+    }
+
+    /// Test hook: the durable baseline the async layer was seeded with (0 if
+    /// async durability is off). After a recovery+enableAsyncDurability this MUST
+    /// equal the recovered lastIndex, else awaitDurable(lastIndex) deadlocks the
+    /// raft loop on restart (see the syncer regression test).
+    version (unittest) ulong testDurableBaseline() nothrow
+    {
+        return durability_ is null ? 0 : durability_.durableSeq;
     }
 
     void close() nothrow
