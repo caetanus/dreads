@@ -9,8 +9,9 @@ module dreads.raftlog;
 // Meta file:  [u64 currentTerm][u32 votedFor]
 
 import core.stdc.stdio : FILE, fclose, fflush, fopen, fread, fseek, ftell, fwrite,
-    remove, rename, SEEK_END, SEEK_SET;
-import core.stdc.stdlib : crealloc = realloc, cfree = free;
+    remove, rename, SEEK_END, SEEK_SET, stderr, fprintf;
+import core.stdc.stdlib : crealloc = realloc, cfree = free, abort;
+import core.stdc.errno : errno;
 
 // POSIX-first by project decision; Windows is not a target for the server.
 import core.sys.posix.stdio : fileno;
@@ -29,6 +30,23 @@ import dreads.mem : freeSlice, mallocDup;
 import dreads.syncer : Durability;
 
 private enum FRAME_HDR = 20; // term(8) + index(8) + len(4)
+
+// A failed fdatasync must NEVER be swallowed: it means the bytes the caller is
+// about to acknowledge as committed are not on stable storage, which breaks the
+// module invariant "persistence precedes the RPC reply". There is no safe retry
+// — the kernel may have already discarded the writeback error and cleared it on
+// the next call (the "fsyncgate" behaviour, matched by Postgres/Redis) — so the
+// only correct response is fail-stop: crash before we ack or drop a backup.
+private void fsyncOrDie(int fd) nothrow @nogc
+{
+    if (fdatasync(fd) != 0)
+    {
+        cast(void) fprintf(stderr,
+            "dreads: FATAL: fdatasync failed (errno=%d) — refusing to acknowledge a non-durable raft write\n",
+            errno);
+        abort();
+    }
+}
 
 final class RaftLog : Storage
 {
@@ -136,7 +154,7 @@ final class RaftLog : Storage
         if (logF !is null)
         {
             fflush(logF);
-            fdatasync(fileno(logF));
+            fsyncOrDie(fileno(logF));
         }
         if (oldLogF !is null)
         {
@@ -273,7 +291,7 @@ final class RaftLog : Storage
             off += FRAME_HDR + entries[i].payload.length;
         }
         fflush(logF);
-        fdatasync(fileno(logF));
+        fsyncOrDie(fileno(logF));
         fseek(logF, 0, SEEK_END);
     }
 
@@ -563,7 +581,7 @@ nothrow:
         if (logF !is null)
         {
             fflush(logF);
-            fdatasync(fileno(logF));
+            fsyncOrDie(fileno(logF));
         }
     }
 
@@ -588,7 +606,7 @@ nothrow:
         import dreads.config : gConfig;
 
         if (gConfig.synchronous == "full")
-            fdatasync(fileno(f));
+            fsyncOrDie(fileno(f));
     }
 }
 

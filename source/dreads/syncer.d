@@ -13,6 +13,9 @@ module dreads.syncer;
 // wait does not block the loop, and one fsync amortizes many appends.
 
 import core.atomic : atomicLoad, atomicStore;
+import core.stdc.errno : errno;
+import core.stdc.stdio : stderr, fprintf;
+import core.stdc.stdlib : abort;
 import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
 import core.thread : Thread;
@@ -124,8 +127,16 @@ final class Durability
                     sqe.fd = d;
                     sqe.fsync_flags = FsyncFlags.DATASYNC; // fdatasync semantics
                     ring.submit(1); // submit + wait for the completion
+                    // A negative completion result is a real fsync error (not a
+                    // ring problem) — the data the fibers are about to be told is
+                    // durable is NOT on disk. Never swallow it: fail-stop.
                     if (!ring.empty)
+                    {
+                        immutable res = ring.front.res;
                         ring.popFront();
+                        if (res < 0)
+                            syncFailedOrDie(-res);
+                    }
                     return;
                 }
                 catch (Exception)
@@ -135,7 +146,22 @@ final class Durability
             }
         }
         version (Posix)
-            fdatasync(d);
+        {
+            if (fdatasync(d) != 0)
+                syncFailedOrDie(errno);
+        }
+    }
+
+    // Same rationale as raftlog.fsyncOrDie: acknowledging a write as durable when
+    // the fsync failed silently loses committed data (fsyncgate — the kernel may
+    // clear the writeback error on the next call). The only safe response is to
+    // crash before any fiber's awaitDurable() returns success.
+    private static void syncFailedOrDie(int err) nothrow @nogc
+    {
+        cast(void) fprintf(stderr,
+            "dreads: FATAL: fdatasync failed (errno=%d) — refusing to acknowledge a non-durable raft write\n",
+            err);
+        abort();
     }
 
     /// Point the fsync thread at a new fd after the log file was rotated
