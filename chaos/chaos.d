@@ -309,6 +309,12 @@ final class Cluster
         if (r.kind == '+')
         {
             nd.member = true;
+            // Now that it IS a committed member, rewrite its config WITHOUT
+            // raft-join: joinMode is a first-boot-only thing (start as a passive
+            // learner). A later restart must boot it as a NORMAL member and
+            // recover its config/log — else it comes back a learner and never
+            // rejoins/applies, stranding it behind forever.
+            writeConf(*nd, false);
             return nd.id;
         }
         return 0; // ADDNODE rejected (leader changed / in flight); leave it spare
@@ -948,8 +954,11 @@ int main(string[] args)
     }
     lc.close();
 
-    // (2) convergence: every current MEMBER agrees on DBSIZE
+    // (2) convergence: every current MEMBER agrees on DBSIZE. Also capture each
+    // node's view of the leader, so a divergence can be diagnosed (a stuck
+    // follower behind on replication vs. a confused/partitioned node).
     long[] sizes;
+    string[] diag;
     foreach (ref nd; gCluster.nodes)
     {
         if (!nd.member)
@@ -958,11 +967,17 @@ int main(string[] args)
         if (!c.ok)
         {
             sizes ~= -1;
+            diag ~= format("n%d=DOWN", nd.id);
             continue;
         }
-        auto r = c.cmd("DBSIZE");
+        auto sz = c.cmd("DBSIZE");
+        auto ldr = c.cmd("RAFT", "LEADER"); // int: which node this one thinks leads
         c.close();
-        sizes ~= (r.kind == ':') ? r.num : -1;
+        auto s = (sz.kind == ':') ? sz.num : -1;
+        sizes ~= s;
+        diag ~= format("n%d(%s) dbsize=%d sees-leader=%s", nd.id,
+            nd.founding ? "founding" : "joined", s,
+            ldr.kind == ':' ? ldr.num.to!string : "?");
     }
     bool converged = true;
     long ref0 = -1;
@@ -985,6 +1000,8 @@ int main(string[] args)
     writeln(" LOST acked writes          : ", lost, lost == 0 ? "  OK" : "  <-- SAFETY VIOLATION");
     writeln(" per-node DBSIZE            : ", sizes);
     writeln(" final members              : ", gCluster.memberCount());
+    foreach (d; diag)
+        writeln("   ", d);
     writeln(" convergence                : ", converged ? "OK" : "DIVERGED  <-- SAFETY VIOLATION");
     // Availability DURING chaos: what fraction of seconds made write progress,
     // and the longest stall (a majority loss / failover gap). "Keeps working
