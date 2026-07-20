@@ -114,6 +114,9 @@ final class Replicator
     package ushort raftPort;
     package string logBase;
     package Keyspace* keys;
+    // Compress outbound raft frames (LZ4). Set from `raft-compress` before
+    // start(); read once by the raft thread when it wires the transport codec.
+    package bool compress;
 
     // Cross-thread FIFOs.
     package CrossQueue propQ; // main -> raft: proposals
@@ -543,6 +546,15 @@ private final class RaftWorker
         node = new RaftNode(rep.bootCfg, log);
         transport = new VibeTransport(rep.bootCfg.self, rep.bootPeers);
         transport.setHandler(&onWire);
+        // Optional LZ4 wire compression. Always install the decompressor so we
+        // understand a compressing peer even when our own outbound is plaintext
+        // (rolling config change); the compressor is installed only when the
+        // `raft-compress` flag is on. dreads owns liblz4 — draft stays codec-free.
+        {
+            import dreads.lz4 : lz4Compress, lz4Decompress;
+
+            transport.setCompression(rep.compress ? &lz4Compress : null, &lz4Decompress);
+        }
         nodeMtx = new TaskMutex;
         transport.start(rep.raftPort);
         cast(void) setTimer(20.msecs, () @trusted nothrow { onTick(); }, true);

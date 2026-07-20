@@ -59,6 +59,15 @@
 			"mainSourceFile": "bench/lazyfree_bench.d",
 			"targetName": "lazyfree_bench",
 			"targetType": "executable"
+		},
+		{
+			"name": "lz4-bench",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/lz4_bench.d",
+			"targetName": "lz4_bench",
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2025, Marcelo Aires Caetano",
@@ -84,7 +93,8 @@
 		"vendor/lua/build/liblua.a"
 	],
 	"libs": [
-		"sodium"
+		"sodium",
+		"lz4"
 	],
 	"libs-linux": [
 		"jemalloc"

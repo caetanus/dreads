@@ -387,6 +387,7 @@ private void initReplication()
     auto raftPort = gConfig.raftPort != 0 ? gConfig.raftPort : cast(ushort)(gConfig.port + 10_000);
     string base = gConfig.appendfilename.length ? gConfig.appendfilename : "dreads";
     gReplicator = new Replicator(cfg, peers, raftPort, base ~ ".raft", &gDbs[0]);
+    gReplicator.compress = gConfig.raftCompress; // LZ4 outbound (raft-compress)
     gReplicator.start();
     printf("dreads: raft node %u active on port %u (%zu peers)\n",
             cast(uint) gConfig.raftNodeId, cast(uint) raftPort, peers.length);

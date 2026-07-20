@@ -177,6 +177,15 @@ and leader-failover with committed data surviving. The log entry is
 `[u64 clock][raw RESP command]`; the leader logs without executing (Raft only
 mutates state on commit) and every replica applies with the injected clock.
 
+Optional **LZ4 wire compression** (`raft-compress yes`, default off) compresses
+AppendEntries log batches and InstallSnapshot chunks — the codec is injected by
+dreads so the `draft` library keeps no compression dependency of its own. A node
+always decodes compressed frames (understands a compressing peer regardless), so
+the flag can be rolled out one node at a time. Measured gain on realistic
+group-commit batches: ~2.6–4× smaller (60–75% bandwidth saved) at >1 GB/s
+compress / >3 GB/s decompress (`dub run --config=lz4-bench`). Sub-256-byte
+frames (heartbeats, votes, replies, single-command batches) are sent plaintext.
+
 **Remaining Raft / Redis-surface gaps:**
 
 - **No ReadIndex.** Leader reads are served locally; a just-partitioned leader

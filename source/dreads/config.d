@@ -34,6 +34,13 @@ public struct Config
     // Lower = faster failover. Safe to lower now that raft runs on its own
     // dedicated event-loop thread (no client-load-induced spurious elections).
     uint raftElectionTimeoutTicks = 50; // ~1000-2000ms randomized
+    // Optional LZ4 compression of the Raft replication wire (AppendEntries log
+    // batches + InstallSnapshot chunks). Off by default: on a loopback/LAN link
+    // the bytes are cheap and the codec is pure overhead, but on a constrained
+    // or cross-AZ link it cuts replication bandwidth substantially (RESP command
+    // batches compress well). A node always DECODES compressed frames; this flag
+    // only controls whether it COMPRESSES what it sends.
+    bool raftCompress = false;
     // sharding (phase 2a): static slot-range topology. Each node owns a slot
     // range and MOVED-redirects the rest. cluster-nodes lists the whole map:
     // "lo-hi@host:port,lo-hi@host:port,..."; this node is the entry whose
@@ -238,6 +245,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.raftElectionTimeoutTicks = t;
         }
         catch (Exception)
+            return false;
+        return true;
+    case "raft-compress":
+        if (value == "yes")
+            cfg.raftCompress = true;
+        else if (value == "no")
+            cfg.raftCompress = false;
+        else
             return false;
         return true;
     case "cluster-enabled":
@@ -493,5 +508,13 @@ version (unittest)
         applyDirective("raft-election-timeout", "0", cfg).expect.to.equal(false);
         applyDirective("raft-election-timeout", "abc", cfg).expect.to.equal(false);
         cfg.raftElectionTimeoutTicks.expect.to.equal(15U); // unchanged on error
+
+        // raft-compress: default off, yes/no only.
+        cfg.raftCompress.expect.to.equal(false);
+        applyDirective("raft-compress", "yes", cfg).expect.to.equal(true);
+        cfg.raftCompress.expect.to.equal(true);
+        applyDirective("raft-compress", "no", cfg).expect.to.equal(true);
+        cfg.raftCompress.expect.to.equal(false);
+        applyDirective("raft-compress", "maybe", cfg).expect.to.equal(false);
     }
 }
