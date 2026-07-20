@@ -13,10 +13,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # .gitmodules uses SSH URLs (dev convenience); emplace + draft are public,
-      # so fetch them over HTTPS with no credentials.
+      # so fetch them over HTTPS with no credentials. The rewrite MUST be --global:
+      # `git submodule update` spawns its clone as a subprocess that does not read
+      # the superproject's local config, so a repo-local insteadOf is ignored and
+      # the clone falls back to SSH (publickey denied on the runner).
       - name: Fetch submodules (HTTPS)
         run: |
-          git config url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
 
       - uses: dlang-community/setup-dlang@v2

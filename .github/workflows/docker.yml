@@ -18,9 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # --global: `git submodule update` clones in a subprocess that ignores the
+      # superproject's local config, so a repo-local insteadOf falls back to SSH
+      # (publickey denied on the runner). emplace + draft are public → HTTPS, no creds.
       - name: Fetch submodules (HTTPS)
         run: |
-          git config url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
 
       - uses: docker/setup-buildx-action@v3
