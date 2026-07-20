@@ -1523,6 +1523,22 @@ public void startLuaScriptPool() nothrow
     }
 }
 
+/// Stop and join the Lua worker thread. The pool's worker is a NON-daemon thread
+/// running an infinite drain loop, so without this druntime blocks on it when
+/// main() returns — the server appears to hang for seconds on SIGTERM. Call once
+/// at shutdown, after the event loop has returned.
+public void shutdownLuaScriptPool() nothrow
+{
+    if (!gLuaPoolUp || gLuaPool is null)
+        return;
+    gLuaPoolUp = false;
+    try
+        (cast(TaskPool) gLuaPool).terminate(); // stops the pool loop and joins the thread
+    catch (Exception)
+    {
+    }
+}
+
 /// Main-side: hand a script request to the Lua thread and await its reply.
 public void luaExecOnPool(LuaReqKind kind, scope const(RVal)[] args, bool bySha,
         bool readOnly, ushort db, ulong clock, ulong userId, ref ByteBuffer o) nothrow

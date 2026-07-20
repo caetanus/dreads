@@ -329,7 +329,17 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         serveClient(conn);
     }, TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
     printf("dreads listening on port %u\n", cast(uint) port);
-    return runEventLoop();
+    auto rc = runEventLoop();
+    // Clean shutdown: stop the non-daemon worker-pool threads (Lua, raft) so
+    // druntime doesn't block joining their infinite loops when main() returns —
+    // otherwise SIGTERM appears to hang for seconds. Daemon threads (lazyfree,
+    // syncer) don't need this.
+    import dreads.scripting : shutdownLuaScriptPool;
+
+    shutdownLuaScriptPool();
+    if (gReplicator !is null)
+        gReplicator.stop();
+    return rc;
 }
 
 /// Builds the Replicator from config when raft-node-id is set. Peers list:

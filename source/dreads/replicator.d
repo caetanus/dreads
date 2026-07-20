@@ -174,6 +174,21 @@ final class Replicator
         raftPool.runTaskH(&raftEntry);
     }
 
+    /// Stop and join the raft worker thread. Like the Lua pool, this is a
+    /// NON-daemon thread running an infinite event loop, so without terminating
+    /// it druntime blocks on it when main() returns (slow/hung SIGTERM). Call
+    /// once at shutdown, after the main event loop has returned.
+    void stop() nothrow
+    {
+        if (raftPool is null)
+            return;
+        try
+            (cast(TaskPool) raftPool).terminate();
+        catch (Exception)
+        {
+        }
+    }
+
     // --- status (main loop reads) ---
 
     @property bool isLeader() nothrow
