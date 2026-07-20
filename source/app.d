@@ -8,7 +8,7 @@ else
         import core.memory : GC;
         import core.stdc.stdio : fwrite, stdout;
 
-        import dreads.config : gConfig, loadConfig;
+        import dreads.config : gConfig, loadConfig, applyDirective;
         import dreads.logo : logo;
         import dreads.server : runServer;
 
@@ -16,50 +16,79 @@ else
         import std.conv : to, ConvException;
         import std.file : exists;
         import std.stdio : stderr;
+        import std.string : indexOf;
 
-        // like redis-server: a non-flag, non-numeric argument is the config file
-        string confPath;
-        string cliAof;
-        string cliLock; // --lockfile= override (default /var/run/dreads-<port>.lck)
-        ushort cliPort = 0;
-        foreach (arg; args[1 .. $])
+        // redis/valkey-compatible CLI: a positional non-flag arg is either the
+        // config file (an existing path) or the port (numeric); every config
+        // directive is also settable as `--<directive> <value>` (dashes kept,
+        // e.g. `--maxmemory 256mb`, `--maxmemory-policy allkeys-lru`). Processed
+        // left-to-right so later args override earlier — a `--flag` after the
+        // config file overrides the file, exactly like redis-server.
+        string cliLock; // --lockfile= : a CLI-only knob, NOT a config directive
+        auto argv = args[1 .. $];
+        for (size_t i = 0; i < argv.length; i++)
         {
-            if (arg == "--appendonly")
-                cliAof = "dreads.aof";
-            else if (arg.startsWith("--appendonly="))
-                cliAof = arg["--appendonly=".length .. $];
-            else if (arg.startsWith("--lockfile="))
-                cliLock = arg["--lockfile=".length .. $];
+            auto arg = argv[i];
+            if (arg.startsWith("--"))
+            {
+                auto b = arg[2 .. $];
+                string name, value;
+                immutable eq = b.indexOf('=');
+                if (eq >= 0)
+                {
+                    name = b[0 .. eq];
+                    value = b[eq + 1 .. $];
+                }
+                else
+                {
+                    name = b;
+                    // value = the next arg, unless it's another flag / absent
+                    // (a bare `--appendonly` then means the boolean `yes`)
+                    if (i + 1 < argv.length && !argv[i + 1].startsWith("--"))
+                        value = argv[++i];
+                    else
+                        value = "yes";
+                }
+                if (name == "lockfile") // CLI-only, not a directive
+                {
+                    cliLock = value;
+                    continue;
+                }
+                // `--appendonly <path>` convenience: a non-boolean value is the
+                // AOF filename (turns it on + names it), matching the old flag.
+                if (name == "appendonly" && value != "yes" && value != "no")
+                {
+                    gConfig.appendonly = true;
+                    gConfig.appendfilename = value;
+                    continue;
+                }
+                if (!applyDirective(name, value, gConfig))
+                    stderr.writeln("dreads: ignoring unknown/invalid option: --", name, " ", value);
+            }
             else
             {
+                // positional: numeric => port, existing file => config file
                 try
-                    cliPort = arg.to!ushort;
+                    gConfig.port = arg.to!ushort;
                 catch (ConvException)
                 {
                     if (arg.exists)
-                        confPath = arg;
+                    {
+                        if (!loadConfig(arg, gConfig,
+                                (line) { stderr.writeln("dreads: ignoring config line: ", line); }))
+                        {
+                            stderr.writeln("dreads: cannot read config: ", arg);
+                            return 1;
+                        }
+                    }
                     else
                     {
-                        stderr.writeln("usage: dreads [conf-file] [port] [--appendonly[=path]] [--lockfile=path]");
+                        stderr.writeln(
+                            "usage: dreads [conf-file] [port] [--<directive> <value> ...] [--lockfile=path]");
                         return 1;
                     }
                 }
             }
-        }
-
-        if (confPath.length && !loadConfig(confPath, gConfig,
-                (line) { stderr.writeln("dreads: ignoring config line: ", line); }))
-        {
-            stderr.writeln("dreads: cannot read config: ", confPath);
-            return 1;
-        }
-        // CLI overrides the file
-        if (cliPort)
-            gConfig.port = cliPort;
-        if (cliAof.length)
-        {
-            gConfig.appendonly = true;
-            gConfig.appendfilename = cliAof;
         }
         if (gConfig.dir.length)
         {

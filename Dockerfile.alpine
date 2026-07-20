@@ -13,12 +13,21 @@ COPY . .
 # vendor/lua/build.sh downloads + patches Lua 5.4.8 -> static liblua.a (needs network)
 RUN dub build -b release --compiler=ldc2 && strip bin/dreads
 
+# Alpine IS busybox — a real /bin/sh for the entrypoint AND a shell for a
+# sysadmin to exec into. lz4 is statically linked (vendored), so the runtime
+# needs only jemalloc + libsodium.
 FROM alpine:edge AS runtime
 RUN apk add --no-cache jemalloc libsodium zlib \
-    && adduser -S -u 10001 dreads
+    && adduser -S -u 10001 dreads \
+    && mkdir -p /etc/dreads /data && chown dreads /data
 COPY --from=builder /src/bin/dreads /usr/local/bin/dreads
+COPY docker/dreads.conf /etc/dreads/dreads.conf
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 WORKDIR /data
 USER dreads
 EXPOSE 6379
-ENTRYPOINT ["dreads"]
-CMD ["6379"]
+# redis/valkey-compatible config: mounted/COPYed file, DREADS_* env (k8s), or
+# `--<directive> value` args — all via the entrypoint. See docker/dreads.conf.
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD []
