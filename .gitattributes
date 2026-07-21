@@ -1,0 +1,7 @@
+# The vendored Lua read-only patch is applied (via `git apply`) against the LF
+# source extracted from the upstream tarball. On Windows, git's autocrlf would
+# check the patch out as CRLF, so its context lines no longer match the LF
+# source and `git apply` fails ("patch does not apply"). Pin it — and the POSIX
+# build scripts — to LF everywhere.
+*.patch text eol=lf
+*.sh    text eol=lf

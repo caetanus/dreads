@@ -44,7 +44,10 @@ if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
 tar xzf $Tarball -C $Build
 Push-Location (Join-Path $Src 'src')
 try {
-    & git apply -p1 --unsafe-paths $Patch
+    # -c core.autocrlf=false + --ignore-whitespace: belt-and-suspenders against
+    # a CRLF-converted patch/source EOL mismatch on Windows (the .patch is also
+    # pinned to LF via .gitattributes).
+    & git -c core.autocrlf=false apply --ignore-whitespace -p1 --unsafe-paths $Patch
     if ($LASTEXITCODE -ne 0) { throw 'patch (git apply) failed' }
 } finally { Pop-Location }
 
