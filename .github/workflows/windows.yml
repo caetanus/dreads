@@ -15,6 +15,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so `git describe` resolves the version
 
       - name: Fetch submodules (HTTPS)
         run: |
@@ -42,10 +44,18 @@ jobs:
       - name: Build
         run: dub build --compiler=ldc2
 
+      # Name the exe by version (git describe): dreads-<ver>.exe.
+      - name: Package versioned exe
+        shell: bash
+        run: |
+          VER=$(git describe --tags --always)
+          cp bin/dreads.exe "bin/dreads-${VER}.exe"
+          echo "DREADS_VER=${VER}" >> "$GITHUB_ENV"
+
       # Publish the .exe so it can be pulled down and smoke-tested (e.g. under Wine).
       - name: Upload dreads.exe
         uses: actions/upload-artifact@v4
         with:
-          name: dreads-windows-x64
-          path: bin/dreads.exe
+          name: dreads-${{ env.DREADS_VER }}
+          path: bin/dreads-${{ env.DREADS_VER }}.exe
           if-no-files-found: error
