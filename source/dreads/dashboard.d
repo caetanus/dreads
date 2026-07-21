@@ -25,6 +25,7 @@ import std.conv : to; // CTFE only (Content-Length of the embedded bundle)
 
 import dreads.config : gConfig;
 import dreads.stream : nowMs;
+import dreads.resp : RVal;
 
 private shared TaskPool gDashPool;
 private __gshared bool gDashUp;
@@ -157,6 +158,69 @@ public void startDashCmdBridge() nothrow
     }
 }
 
+// The dashboard gate. Reads are always allowed (inspectors). Writes need
+// dashboard-write; ACL admin and CONFIG SET need the higher dashboard-admin.
+// Returns null to allow, else the RESP-less error message to reply with.
+private const(char)[] dashDeny(scope const(RVal)[] arr) @nogc nothrow
+{
+    import dreads.commands : isWriteCommand;
+
+    static char[32] ub = void;
+    auto name = arr[0].str;
+    if (name.length == 0 || name.length > ub.length)
+        return "ERR dashboard: bad command";
+    foreach (i, c; name)
+        ub[i] = (c >= 'a' && c <= 'z') ? cast(char)(c - 32) : c;
+    auto U = ub[0 .. name.length];
+
+    if (U == "ACL")
+        return gConfig.dashboardAdmin ? null
+            : "ERR dashboard: ACL admin disabled (set dashboard-admin yes)";
+    if (U == "CONFIG" && arr.length >= 2)
+    {
+        auto sub = arr[1].str;
+        immutable isSet = sub.length == 3
+            && (sub[0] | 32) == 's' && (sub[1] | 32) == 'e' && (sub[2] | 32) == 't';
+        if (isSet && !gConfig.dashboardAdmin)
+            return "ERR dashboard: CONFIG SET needs dashboard-admin yes";
+    }
+    if (isWriteCommand(U) && !gConfig.dashboardWrite)
+        return "ERR dashboard: writes disabled (set dashboard-write yes)";
+    return null;
+}
+
+// CONFIG SET is control-plane (not in the keyspace dispatch), so handle the one
+// admin knob the dashboard needs — the maxmemory bump — directly. Value is bytes.
+// Returns true if it consumed the command (reply written).
+private bool dashApplyConfig(scope const(RVal)[] arr, ref ByteBuffer reply) @nogc nothrow
+{
+    import dreads.resp : repError;
+
+    if (arr.length < 4 || !ciEq(arr[0].str, "config") || !ciEq(arr[1].str, "set"))
+        return false;
+    if (!ciEq(arr[2].str, "maxmemory"))
+        return false; // other params fall through to the normal path
+    ulong v = 0;
+    bool ok = arr[3].str.length > 0;
+    foreach (c; arr[3].str)
+    {
+        if (c < '0' || c > '9')
+        {
+            ok = false;
+            break;
+        }
+        v = v * 10 + (c - '0');
+    }
+    if (!ok)
+    {
+        repError(reply, "ERR dashboard: maxmemory bump takes a byte count");
+        return true;
+    }
+    gConfig.maxmemory = v;
+    reply.append("+OK\r\n");
+    return true;
+}
+
 // Main-thread drain: execute each queued command on its db and reply. Mirrors the
 // Lua bridge's cmdDrainLoop.
 private void dashCmdDrainLoop() nothrow
@@ -189,10 +253,18 @@ private void dashCmdDrainLoop() nothrow
                 if (parseValue(slot.bytes.data, pos, arena, cmd) == ParseStatus.ok
                         && cmd.type == RType.Array && cmd.arr.length > 0)
                 {
-                    auto dbi = slot.db < NUM_DBS ? slot.db : 0;
-                    immutable isWrite = true; // dashboard may write; the gate is upstream
-                    slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr, isWrite,
-                        cast(ulong) nowMs(), 0 /*userId: admin*/, gRespProto, arena, slot.reply, eff);
+                    if (auto reason = dashDeny(cmd.arr))
+                        repError(slot.reply, reason);
+                    else if (dashApplyConfig(cmd.arr, slot.reply))
+                    {
+                        // handled in-place (maxmemory bump)
+                    }
+                    else
+                    {
+                        auto dbi = slot.db < NUM_DBS ? slot.db : 0;
+                        slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr, true,
+                            cast(ulong) nowMs(), 0 /*userId: admin*/, gRespProto, arena, slot.reply, eff);
+                    }
                 }
                 else
                     repError(slot.reply, "ERR malformed dashboard command");
@@ -306,6 +378,84 @@ private void dashThreadEntry() nothrow
     }
 }
 
+private size_t parseContentLength(scope const(char)[] req) @safe @nogc nothrow
+{
+    auto v = httpHeader(req, "Content-Length");
+    size_t r = 0;
+    foreach (c; v)
+    {
+        if (c < '0' || c > '9')
+            break;
+        r = r * 10 + (c - '0');
+    }
+    return r;
+}
+
+// POST /api/exec: the body is a RESP command (the client builds it, so it is
+// binary-safe — values/scripts with spaces or newlines just work). Optional
+// password gate (X-Dashboard-Auth). Runs it through the writer bridge (which
+// applies the read/write/admin gate) and returns the raw RESP reply.
+private void handleExec(TCPConnection conn, scope ubyte[] buf, size_t n, scope const(char)[] req) @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    enum R401 = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    enum R400 = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    if (gConfig.dashboardPassword.length)
+    {
+        if (httpHeader(req, "X-Dashboard-Auth") != gConfig.dashboardPassword)
+        {
+            conn.write(cast(const(ubyte)[]) R401);
+            return;
+        }
+    }
+
+    // locate the body (after CRLF CRLF) and its declared length
+    size_t hend = 0;
+    if (n >= 4)
+        foreach (i; 0 .. n - 3)
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            {
+                hend = i + 4;
+                break;
+            }
+    immutable clen = parseContentLength(req);
+    if (hend == 0 || clen == 0 || clen > 256 * 1024)
+    {
+        conn.write(cast(const(ubyte)[]) R400);
+        return;
+    }
+
+    ByteBuffer body_;
+    size_t have = n - hend;
+    if (have > clen)
+        have = clen;
+    body_.append(buf[hend .. hend + have]);
+    ubyte[4096] tmp = void;
+    while (body_.data.length < clen)
+    {
+        if (!conn.waitForData(5.seconds))
+            break;
+        immutable r = conn.read(tmp[], IOMode.once);
+        if (r <= 0)
+            break;
+        immutable need = clen - body_.data.length;
+        body_.append(tmp[0 .. (r > need ? need : r)]);
+    }
+
+    ByteBuffer reply;
+    immutable ok = runCommand(body_.data, 0, reply);
+    auto payload = ok ? reply.data : cast(const(ubyte)[]) "-ERR dashboard bridge unavailable\r\n";
+    char[128] hdr = void;
+    immutable hn = snprintf(hdr.ptr, hdr.length,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        payload.length);
+    if (hn > 0)
+        conn.write(cast(const(ubyte)[]) hdr[0 .. hn]);
+    conn.write(payload);
+}
+
 private void onDashConn(TCPConnection conn) @trusted nothrow
 {
     try
@@ -323,14 +473,9 @@ private void onDashConn(TCPConnection conn) @trusted nothrow
             if (key.length && wsHandshake(conn, key))
                 wsLoop(conn);
         }
-        else if (path == "/api/dbsize") // TEMP: validates the command round-trip
+        else if (path == "/api/exec")
         {
-            ByteBuffer reply;
-            immutable ok = runCommand(cast(const(ubyte)[]) "*1\r\n$6\r\nDBSIZE\r\n", 0, reply);
-            auto body_ = ok ? reply.data : cast(const(ubyte)[]) "-ERR bridge down\r\n";
-            conn.write(cast(const(ubyte)[])(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"));
-            conn.write(body_);
+            handleExec(conn, buf[], n, req);
         }
         else
         {
