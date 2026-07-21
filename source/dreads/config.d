@@ -82,6 +82,14 @@ public struct Config
     ulong protoMaxBulkLen = 512UL * 1024 * 1024;
     ulong clientQueryBufferLimit = 1024UL * 1024 * 1024;
     bool lazyfreeLazyServerDel = false;
+    // Built-in web dashboard (off by default). Runs on its OWN thread, serves an
+    // embedded React UI + a live WebSocket metrics stream over a hand-rolled HTTP
+    // layer (no vibe-d, so no GC that could stop-the-world the data plane).
+    // Localhost-bound by default; optional password gate.
+    bool dashboard = false;
+    ushort dashboardPort = 6479;
+    string dashboardBind = "127.0.0.1";
+    string dashboardPassword = null; // empty/null = no auth (localhost only)
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -252,6 +260,26 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         }
         catch (Exception)
             return false;
+        return true;
+    case "dashboard":
+        if (value == "yes")
+            cfg.dashboard = true;
+        else if (value == "no")
+            cfg.dashboard = false;
+        else
+            return false;
+        return true;
+    case "dashboard-port":
+        try
+            cfg.dashboardPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "dashboard-bind":
+        cfg.dashboardBind = value;
+        return true;
+    case "dashboard-password":
+        cfg.dashboardPassword = value;
         return true;
     case "raft-compress":
         if (value == "yes")
