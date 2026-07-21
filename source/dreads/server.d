@@ -268,10 +268,22 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }
         // built-in web dashboard — opt-in (`dashboard yes`), its own isolated
         // event-loop thread; a no-op when disabled (no thread, no port bound).
+        // Defaults to the RESP port + 1. A main-loop timer publishes a metrics
+        // snapshot every dashboard-interval, but only while a client is watching.
         {
-            import dreads.dashboard : startDashboard;
+            import dreads.dashboard : startDashboard, dashboardPort, snapshotMetrics;
 
-            startDashboard();
+            startDashboard(port);
+            if (gConfig.dashboard)
+            {
+                setTimer(gConfig.dashboardIntervalMs.msecs, () nothrow {
+                    snapshotMetrics(gPubSub.channelCount(), gPubSub.patternCount());
+                }, true);
+                if (auto dp = dashboardPort())
+                    printf("dreads dashboard on http://%.*s:%u\n",
+                        cast(int) gConfig.dashboardBind.length, gConfig.dashboardBind.ptr,
+                        cast(uint) dp);
+            }
         }
         // Wire the expiry->tracking-invalidation hook (a key removed by expiry
         // queues a CLIENT TRACKING invalidation, gated by gTrackCount).

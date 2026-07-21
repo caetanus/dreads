@@ -87,7 +87,7 @@ public struct Config
     // layer (no vibe-d, so no GC that could stop-the-world the data plane).
     // Localhost-bound by default; optional password gate.
     bool dashboard = false;
-    ushort dashboardPort = 6479;
+    ushort dashboardPort = 0; // 0 = auto: the RESP port + 1
     string dashboardBind = "127.0.0.1";
     string dashboardPassword = null; // empty/null = no auth (localhost only)
     // The dashboard is read-only (metrics + inspect list/stream/keys) unless these

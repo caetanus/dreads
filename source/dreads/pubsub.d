@@ -885,6 +885,12 @@ public struct PubSub
     {
         return patCounts.length;
     }
+
+    /// Number of channels with at least one subscriber (for the dashboard).
+    size_t channelCount() const @nogc nothrow
+    {
+        return channels.length;
+    }
 }
 
 // ---------------------------------------------------------------------------

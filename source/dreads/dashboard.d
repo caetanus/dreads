@@ -13,7 +13,7 @@ module dreads.dashboard;
 // come next; the "no client, no watch" rule means the main loop only snapshots
 // metrics while at least one dashboard client is connected.
 
-import core.atomic : atomicOp, atomicLoad;
+import core.atomic : atomicOp, atomicLoad, atomicFence;
 import core.time : seconds, msecs;
 
 import vibe.core.net : listenTCP, TCPConnection, TCPListener;
@@ -32,26 +32,171 @@ private shared ManualEvent gDashStop; // emitted at shutdown to end the listener
 // honour "no client, no watch": it only snapshots + pushes metrics while > 0.
 package shared int gDashClients;
 
-// A complete, static HTTP/1.0 response (headers + body). Being a CTFE-folded string
-// literal it is read-only program data — writing it allocates nothing.
+// Resolved dashboard listen port (dashboard-port, or the RESP port + 1 by default).
+private __gshared ushort gDashPort;
+
+// ---- metrics seqlock: single writer (main-loop timer) -> many readers (WS conns) ----
+// A latest-value snapshot. The writer bumps gMSeq odd before writing and even after;
+// a reader copies the buffer and retries if the seq moved (torn read). No ManualEvent
+// (its emit isn't @nogc — an alloc under GC.disable would never be collected).
+private __gshared ubyte[8192] gMBuf;
+private __gshared size_t gMLen;
+private shared uint gMSeq;
+
+// Command-group call counts, summed from gCmdStats (indexed by aclCmdIndex). Grouped
+// so the dashboard can chart strings/lists/streams/pubsub rates, not just SET/GET.
+private immutable string[] STR_CMDS = ["set", "get", "setex", "psetex", "getset", "append",
+        "incr", "decr", "incrby", "decrby", "mset", "mget", "setnx", "getdel", "getex"];
+private immutable string[] LIST_CMDS = ["lpush", "rpush", "lpop", "rpop", "lset", "lrem",
+        "linsert", "ltrim", "lpushx", "rpushx", "rpoplpush", "lmove", "blpop", "brpop"];
+private immutable string[] STREAM_CMDS = ["xadd", "xdel", "xread", "xrange", "xrevrange",
+        "xlen", "xtrim", "xreadgroup", "xack", "xclaim", "xautoclaim"];
+private immutable string[] PUB_CMDS = ["publish", "spublish"];
+
+private ulong sumCalls(const(string)[] names) @nogc nothrow
+{
+    import dreads.stats : gCmdStats;
+    import dreads.acl : aclCmdIndex;
+
+    ulong t = 0;
+    foreach (n; names)
+    {
+        immutable i = aclCmdIndex(n);
+        if (i >= 0 && i < cast(int) gCmdStats.length)
+            t += gCmdStats[i].calls;
+    }
+    return t;
+}
+
+// Build the compact metrics JSON into `dst`; returns bytes written (0 on error).
+private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patterns) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+    import dreads.stats : gCmdStats;
+    import dreads.obj : gDbs, NUM_DBS, gExpiredKeys, gEvictedKeys, gConnectedClients,
+        gBlockedClients;
+    import dreads.mem : usedMemory;
+
+    ulong total = 0;
+    foreach (ref s; gCmdStats)
+        total += s.calls;
+    ulong keys = 0;
+    foreach (ref db; gDbs)
+        keys += db.length;
+
+    int n = snprintf(dst.ptr, dst.length,
+        `{"t":%llu,"mem":%llu,"maxmem":%llu,"clients":%lld,"blocked":%lld,`
+        ~ `"expired":%llu,"evicted":%llu,"cmds":%llu,"keys":%llu,"str":%llu,`
+        ~ `"list":%llu,"stream":%llu,"pub":%llu,"channels":%zu,"patterns":%zu,"db":[`,
+        cast(ulong) nowMs(), cast(ulong) usedMemory(), cast(ulong) gConfig.maxmemory,
+        cast(long) gConnectedClients, cast(long) gBlockedClients, cast(ulong) gExpiredKeys,
+        cast(ulong) gEvictedKeys, total, keys, sumCalls(STR_CMDS), sumCalls(LIST_CMDS),
+        sumCalls(STREAM_CMDS), sumCalls(PUB_CMDS), channels, patterns);
+    if (n < 0)
+        return 0;
+    size_t p = n;
+    foreach (i; 0 .. NUM_DBS)
+    {
+        int m = snprintf(dst.ptr + p, dst.length - p, i == 0 ? "%zu" : ",%zu", gDbs[i].length);
+        if (m < 0 || p + m >= dst.length)
+            break;
+        p += m;
+    }
+    int e = snprintf(dst.ptr + p, dst.length - p, "]}");
+    if (e > 0)
+        p += e;
+    return p;
+}
+
+/// Publish a metrics snapshot (called by the main-loop timer, so gConnectedClients
+/// and the keyspace are read on the writer thread). Skips entirely when nobody is
+/// watching. Pub/sub counts are passed in (gPubSub is private to the server module).
+package void snapshotMetrics(size_t channels, size_t patterns) @nogc nothrow
+{
+    if (atomicLoad(gDashClients) <= 0)
+        return; // no client, no watch
+    char[8192] tmp = void;
+    immutable n = buildMetricsJson(tmp[], channels, patterns);
+    if (n == 0 || n > gMBuf.length)
+        return;
+    atomicOp!"+="(gMSeq, 1); // -> odd: writing
+    atomicFence();
+    gMBuf[0 .. n] = cast(const(ubyte)[]) tmp[0 .. n];
+    gMLen = n;
+    atomicFence();
+    atomicOp!"+="(gMSeq, 1); // -> even: done
+}
+
+// A complete, static HTTP response (headers + body). CTFE-folded => read-only
+// program data, writing it allocates nothing. Phase-1 interim UI: a self-contained
+// page that opens the /ws stream and shows live counters + rates + a memory bar —
+// so the dashboard is usable NOW, before the embedded Preact build (Phase 2).
 private immutable string DASH_PLACEHOLDER =
-    "HTTP/1.1 200 OK\r\n"
-    ~ "Content-Type: text/html; charset=utf-8\r\n"
-    ~ "Connection: close\r\n"
-    ~ "\r\n"
-    ~ "<!doctype html><html><head><meta charset=\"utf-8\"><title>dreads dashboard</title></head>"
-    ~ "<body style=\"font-family:system-ui,sans-serif;background:#0b0e14;color:#c9d1d9;margin:2rem\">"
-    ~ "<h1>dreads &#9889; dashboard</h1>"
-    ~ "<p>Phase&nbsp;1 scaffold &mdash; the isolated dashboard event loop is live. "
-    ~ "Live metrics (WebSocket) and the React UI are next.</p>"
-    ~ "</body></html>";
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+    ~ DASH_HTML;
+
+private immutable string DASH_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<title>dreads dashboard</title><style>
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0b0e14;color:#c9d1d9;margin:0;padding:1.4rem}
+h1{font-weight:600;margin:0 0 .3rem;font-size:1.3rem}.sub{color:#5c6b82;font-size:.8rem;margin-bottom:1.1rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.7rem}
+.card{background:#141b26;border:1px solid #1f2a3a;border-radius:10px;padding:.7rem .9rem}
+.k{font-size:.68rem;color:#7d8aa0;text-transform:uppercase;letter-spacing:.05em}
+.v{font-size:1.5rem;font-weight:600;margin-top:.15rem;font-variant-numeric:tabular-nums}
+.r{font-size:.72rem;color:#3fb950;margin-top:.1rem;font-variant-numeric:tabular-nums}
+.bar{height:9px;border-radius:5px;background:#1f2a3a;overflow:hidden;margin-top:.5rem}
+.fill{height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950)}
+.off{color:#f85149}#st{float:right;font-size:.75rem;color:#7d8aa0}</style></head><body>
+<h1>dreads &#9889; dashboard <span id=st>connecting&hellip;</span></h1>
+<div class=sub>live metrics &mdash; rates are per second</div>
+<div class=grid>
+<div class=card><div class=k>commands/s</div><div class=v id=cmds>0</div><div class=r id=cmdsR>&nbsp;</div></div>
+<div class=card><div class=k>strings/s</div><div class=v id=str>0</div><div class=r id=strR>&nbsp;</div></div>
+<div class=card><div class=k>lists/s</div><div class=v id=list>0</div><div class=r id=listR>&nbsp;</div></div>
+<div class=card><div class=k>streams/s</div><div class=v id=stream>0</div><div class=r id=streamR>&nbsp;</div></div>
+<div class=card><div class=k>publish/s</div><div class=v id=pub>0</div><div class=r id=pubR>&nbsp;</div></div>
+<div class=card><div class=k>keys</div><div class=v id=keys>0</div><div class=r id=keysR>&nbsp;</div></div>
+<div class=card><div class=k>clients</div><div class=v id=clients>0</div></div>
+<div class=card><div class=k>pubsub ch / pat</div><div class=v id=chpat>0 / 0</div></div>
+<div class=card><div class=k>expired / evicted</div><div class=v id=exev>0 / 0</div></div>
+<div class=card style="grid-column:1/-1"><div class=k>memory used / max</div>
+<div class=v id=mem>0</div><div class=bar><div class=fill id=memfill style="width:0%"></div></div></div>
+</div>
+<script>
+var $=function(i){return document.getElementById(i)},prev=null;
+function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+'G';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return''+n}
+function bytes(n){var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?1:0)+u[i]}
+function conn(){
+ var ws=new WebSocket((location.protocol=='https:'?'wss':'ws')+'://'+location.host+'/ws');
+ ws.onopen=function(){$('st').textContent='live';$('st').className=''};
+ ws.onclose=function(){$('st').textContent='disconnected';$('st').className='off';setTimeout(conn,1000)};
+ ws.onmessage=function(e){
+  var m=JSON.parse(e.data);if(!m.t)return;
+  var dt=prev?(m.t-prev.t)/1000:0;
+  function rate(id,cur,pv){var el=$(id);el.textContent=fmt(cur);var rEl=$(id+'R');if(rEl&&dt>0){var rr=Math.max(0,Math.round((cur-pv)/dt));rEl.textContent='+'+fmt(rr)+'/s'}}
+  rate('cmds',m.cmds,prev?prev.cmds:0);rate('str',m.str,prev?prev.str:0);
+  rate('list',m.list,prev?prev.list:0);rate('stream',m.stream,prev?prev.stream:0);
+  rate('pub',m.pub,prev?prev.pub:0);rate('keys',m.keys,prev?prev.keys:0);
+  $('clients').textContent=m.clients;$('chpat').textContent=m.channels+' / '+m.patterns;
+  $('exev').textContent=fmt(m.expired)+' / '+fmt(m.evicted);
+  var mm=m.maxmem>0?m.maxmem:0,pc=mm?Math.min(100,m.mem/mm*100):0;
+  $('mem').textContent=bytes(m.mem)+(mm?' / '+bytes(mm):' / ∞');
+  $('memfill').style.width=(mm?pc:6)+'%';
+  prev=m;
+ };
+}
+conn();
+</script></body></html>`;
 
 /// Start the dashboard thread — a no-op unless `dashboard yes` is configured.
-/// Called once at server boot, right after the Lua pool.
-public void startDashboard() nothrow
+/// Called once at server boot, right after the Lua pool. `respPort` is the RESP
+/// listen port; the dashboard defaults to `respPort + 1` (override: dashboard-port).
+public void startDashboard(ushort respPort) nothrow
 {
     if (!gConfig.dashboard)
         return; // OPT-IN: nothing runs, no port bound, no thread, when off
+    gDashPort = gConfig.dashboardPort != 0
+        ? gConfig.dashboardPort : cast(ushort)(respPort + 1);
     try
     {
         gDashStop = createSharedManualEvent();
@@ -64,6 +209,12 @@ public void startDashboard() nothrow
     }
 }
 
+/// The resolved dashboard port (0 if the dashboard is disabled) — for logging.
+public ushort dashboardPort() @nogc nothrow
+{
+    return gDashUp ? gDashPort : 0;
+}
+
 // Runs on the dashboard worker thread: bind the listener on THIS thread's event
 // loop, then park until shutdown. Accepted connections are handled as fibers on the
 // same worker loop, fully isolated from the data-plane loop.
@@ -71,7 +222,7 @@ private void dashThreadEntry() nothrow
 {
     try
     {
-        listenTCP(gConfig.dashboardPort,
+        listenTCP(gDashPort,
             delegate(TCPConnection conn) @trusted nothrow { onDashConn(conn); },
             gConfig.dashboardBind);
         gDashStop.wait(); // keep the task alive; yields so the loop handles accepts
@@ -249,20 +400,34 @@ private bool wsSendText(TCPConnection conn, scope const(char)[] payload) @truste
 // drained from the main loop's CrossQueue. Tracks gDashClients for "no watch".
 private void wsLoop(TCPConnection conn) @trusted nothrow
 {
-    import core.stdc.stdio : snprintf;
-
     atomicOp!"+="(gDashClients, 1);
     scope (exit)
         atomicOp!"-="(gDashClients, 1);
 
     auto ivl = gConfig.dashboardIntervalMs.msecs;
     ubyte[256] scratch = void;
+    ubyte[8192] local = void;
     while (true)
     {
-        char[96] j = void;
-        immutable n = snprintf(j.ptr, j.length,
-            `{"t":%llu,"clients":%d}`, cast(ulong) nowMs(), atomicLoad(gDashClients));
-        if (n <= 0 || !wsSendText(conn, j[0 .. n]))
+        // read the latest published snapshot (seqlock: retry on a torn read)
+        size_t ln = 0;
+        foreach (_; 0 .. 16)
+        {
+            immutable s1 = atomicLoad(gMSeq);
+            if (s1 & 1)
+                continue; // writer mid-update
+            auto L = gMLen;
+            if (L > local.length)
+                L = local.length;
+            local[0 .. L] = gMBuf[0 .. L];
+            if (atomicLoad(gMSeq) == s1)
+            {
+                ln = L;
+                break;
+            }
+        }
+        const(char)[] payload = ln > 0 ? cast(const(char)[]) local[0 .. ln] : "{}";
+        if (!wsSendText(conn, payload))
             break;
         try
         {
