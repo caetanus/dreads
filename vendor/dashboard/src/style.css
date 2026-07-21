@@ -102,6 +102,35 @@ header .st { margin-left: auto; }
   font-size: .82rem; font-family: ui-monospace, monospace; }
 .qstat b { color: #c9d1d9; font-size: 1.05rem; }
 .qstat .up { color: #3fb950; } .qstat .down { color: #db6d28; }
+
+/* keys inspector — two-pane browse + detail */
+.kwrap { display: flex; gap: 1rem; align-items: flex-start; }
+.kside { flex: 0 0 300px; }
+.kmain { flex: 1; min-width: 0; }
+.ktypes { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .6rem; }
+.ktf { background: #0d1219; border: 1px solid #1f2a3a; color: #7d8aa0; border-radius: 6px;
+  padding: .2rem .5rem; font-size: .72rem; cursor: pointer; }
+.ktf.on { background: #101c2e; color: #c9d1d9; border-color: #2f5480; }
+.klist { border: 1px solid #1f2a3a; border-radius: 10px; overflow: auto; max-height: 62vh; }
+.krow { display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+  padding: .4rem .7rem; border-bottom: 1px solid #131c28; cursor: pointer; }
+.krow:hover { background: #101722; } .krow.on { background: #101c2e; }
+.krow .kn { font-family: ui-monospace, monospace; font-size: .82rem; color: #c9d1d9;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kcount { padding: .4rem .2rem; }
+.kt { font-size: .64rem; text-transform: uppercase; letter-spacing: .04em; padding: .08rem .4rem;
+  border-radius: 5px; background: #1f2a3a; color: #adbac7; flex: none; }
+.kt-string { background: #17313e; color: #56c1e0; } .kt-list { background: #1c2c1e; color: #6bd07a; }
+.kt-hash { background: #2c2340; color: #b392f0; } .kt-set { background: #3a2a17; color: #e0a458; }
+.kt-zset { background: #3a1730; color: #e05fb0; } .kt-stream { background: #17303a; color: #58c8d0; }
+.khead { display: flex; align-items: center; gap: .7rem; margin-bottom: .7rem; flex-wrap: wrap; }
+.ktitle { font-family: ui-monospace, monospace; font-weight: 600; color: #c9d1d9; }
+.kstr { background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; padding: .7rem .9rem;
+  font-family: ui-monospace, monospace; font-size: .84rem; color: #c9d1d9; white-space: pre-wrap;
+  word-break: break-all; max-height: 40vh; overflow: auto; }
+.del { margin-left: auto; background: #3d1418; color: #f85149; border: 1px solid #5c1b20;
+  border-radius: 7px; padding: .3rem .8rem; font: inherit; font-size: .78rem; cursor: pointer; }
+.del:hover { background: #5c1b20; }
 .pgmain { display: flex; flex-direction: column; }
 .editor { min-height: 260px; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 10px;
   padding: .7rem .9rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .84rem;

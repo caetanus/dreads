@@ -105,6 +105,11 @@ function kvNums(v) {
   return o
 }
 
+// small reply accessors used by the Keys inspector
+const rarr = (v) => (v && (v.t === 'array' || v.t === 'map') ? v.v : [])
+const rval = (v) => (v && v.v != null ? v.v : v && v.t === 'nil' ? null : '')
+const rpairs = (a) => { const o = []; for (let i = 0; i + 1 < a.length; i += 2) o.push({ f: rval(a[i]), v: rval(a[i + 1]) }); return o }
+
 function replyText(v, depth = 0) {
   if (!v) return ''
   switch (v.t) {
@@ -463,6 +468,144 @@ function Queues() {
   )
 }
 
+// ---------- Keys: type-aware inspector (browse + view content + edit/delete) ----------
+const SIZECMD = { string: 'STRLEN', list: 'LLEN', hash: 'HLEN', set: 'SCARD', zset: 'ZCARD', stream: 'XLEN' }
+const ttlText = (pttl) => (pttl === -1 ? 'no expiry' : pttl === -2 ? 'expired' : pttl >= 1000 ? (pttl / 1000).toFixed(pttl < 10000 ? 1 : 0) + 's' : pttl + 'ms')
+
+function Keys() {
+  const [rows, setRows] = useState([])
+  const [sel, setSel] = useState(null)
+  const [det, setDet] = useState(null)     // { type, enc, pttl, size, items }
+  const [nameQ, setNameQ] = useState('')
+  const [typeQ, setTypeQ] = useState('')   // '' = all
+  const [a, setA] = useState(''); const [b, setB] = useState('')  // add-value inputs
+  const [err, setErr] = useState('')
+  const nameQR = useRef(nameQ), typeQR = useRef(typeQ)
+  nameQR.current = nameQ; typeQR.current = typeQ
+
+  const scan = useCallback(async () => {
+    let cursor = '0', keys = []
+    do {
+      const q = ['SCAN', cursor, 'COUNT', '400']
+      const nq = nameQR.current.trim(); if (nq) q.push('MATCH', '*' + nq + '*')
+      if (typeQR.current) q.push('TYPE', typeQR.current)
+      const v = await exec(q)
+      if (v.t !== 'array') break
+      cursor = rval(rarr(v)[0])
+      for (const k of rarr(rarr(v)[1])) keys.push(rval(k))
+    } while (cursor !== '0' && keys.length < 400)
+    const types = typeQR.current ? keys.map(() => typeQR.current)
+      : (await Promise.all(keys.map((k) => exec(['TYPE', k])))).map((v) => rval(v) || '?')
+    setRows(keys.map((k, i) => ({ key: k, type: types[i] })))
+  }, [])
+  useEffect(() => { scan() }, [])
+
+  const open = async (key, type) => {
+    setSel(key); setA(''); setB(''); setErr('')
+    const [encR, ttlR] = await Promise.all([exec(['OBJECT', 'ENCODING', key]), exec(['PTTL', key])])
+    let size = 0, items = []
+    if (SIZECMD[type]) { const r = await exec([SIZECMD[type], key]); size = r.t === 'int' ? r.v : 0 }
+    if (type === 'string') { items = [rval(await exec(['GET', key]))] }
+    else if (type === 'list') { items = rarr(await exec(['LRANGE', key, '0', '199'])).map(rval) }
+    else if (type === 'hash') { items = rpairs(rarr(await exec(['HGETALL', key]))) }
+    else if (type === 'set') { items = rarr(rarr(await exec(['SSCAN', key, '0', 'COUNT', '400']))[1]).map(rval) }
+    else if (type === 'zset') { items = rpairs(rarr(await exec(['ZRANGE', key, '0', '199', 'WITHSCORES']))) }
+    else if (type === 'stream') {
+      items = rarr(await exec(['XRANGE', key, '-', '+', 'COUNT', '100']))
+        .map((e) => ({ id: rval(rarr(e)[0]), fields: rpairs(rarr(rarr(e)[1])) }))
+    }
+    setDet({ type, enc: rval(encR), pttl: ttlR.t === 'int' ? ttlR.v : -1, size, items })
+  }
+
+  const write = async (args) => {
+    const v = await exec(args)
+    if (v.t === 'error') { setErr(v.v); return false }
+    setErr(''); setA(''); setB(''); await open(sel, det.type); scan(); return true
+  }
+  const del = async () => { if (await write(['DEL', sel])) { setSel(null); setDet(null) } }
+  const add = () => {
+    const t = det.type
+    if (t === 'string') write(['SET', sel, a])
+    else if (t === 'list') write(['RPUSH', sel, a])
+    else if (t === 'set') write(['SADD', sel, a])
+    else if (t === 'hash') write(['HSET', sel, a, b])
+    else if (t === 'zset') write(['ZADD', sel, a, b])
+    else if (t === 'stream') write(['XADD', sel, '*', a, b])
+  }
+  const addPlaceholder = { string: ['value (SET)'], list: ['value (RPUSH)'], set: ['member (SADD)'],
+    hash: ['field', 'value'], zset: ['score', 'member'], stream: ['field', 'value'] }
+
+  const shown = [...rows].sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0))
+  const two = det && ['hash', 'zset', 'stream'].includes(det.type)
+
+  return (
+    <div class="kwrap">
+      <div class="kside">
+        <div class="qbar">
+          <input class="qsearch" spellcheck={false} placeholder="filter keys…" value={nameQ}
+            onInput={(e) => setNameQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && scan()} />
+          <button class="mini" title="scan" onClick={scan}>⟳</button>
+        </div>
+        <div class="ktypes">
+          {['', 'string', 'list', 'hash', 'set', 'zset', 'stream'].map((t) => (
+            <button key={t} class={'ktf ' + (typeQ === t ? 'on' : '')}
+              onClick={() => { setTypeQ(t); setTimeout(scan, 0) }}>{t || 'all'}</button>
+          ))}
+        </div>
+        <div class="klist">
+          {shown.map((r) => (
+            <div key={r.key} class={'krow ' + (sel === r.key ? 'on' : '')} onClick={() => open(r.key, r.type)}>
+              <span class="kn">{r.key}</span><span class={'kt kt-' + r.type}>{r.type}</span>
+            </div>
+          ))}
+          {rows.length === 0 && <div class="dim small" style="padding:.8rem">no keys</div>}
+        </div>
+        <div class="dim small kcount">{rows.length} keys</div>
+      </div>
+
+      <div class="kmain">
+        {!sel && <div class="dim" style="padding:2rem">select a key to inspect its value</div>}
+        {sel && det && (
+          <div class="panel">
+            <div class="khead">
+              <span class="ktitle">{sel}</span>
+              <span class={'kt kt-' + det.type}>{det.type}</span>
+              <span class="dim small">{det.enc} · {fmt(det.size)} {det.type === 'string' ? 'bytes' : 'items'} · {ttlText(det.pttl)}</span>
+              <button class="del" title="DEL key" onClick={del}>Delete</button>
+            </div>
+
+            {det.type === 'string' && <pre class="kstr">{det.items[0] == null ? '(nil)' : det.items[0]}</pre>}
+            {det.type === 'list' && <div class="msgs">
+              {det.items.map((m, i) => <pre class="msg" key={i}><span class="mi">{i}</span>{m}</pre>)}</div>}
+            {det.type === 'set' && <div class="msgs">
+              {det.items.map((m, i) => <pre class="msg" key={i}>{m}</pre>)}</div>}
+            {(det.type === 'hash' || det.type === 'zset') && <table class="qtable"><thead><tr>
+              <th>{det.type === 'zset' ? 'member' : 'field'}</th><th class="num">{det.type === 'zset' ? 'score' : 'value'}</th>
+            </tr></thead><tbody>
+              {det.items.map((p, i) => (
+                <tr key={i}><td class="qname">{p.f}</td>
+                  <td class={det.type === 'zset' ? 'num' : ''}>{p.v}</td></tr>
+              ))}
+            </tbody></table>}
+            {det.type === 'stream' && <div class="msgs">
+              {det.items.map((e, i) => <pre class="msg" key={i}><span class="mi">{e.id}</span>
+                {e.fields.map((f) => f.f + '=' + f.v).join('  ')}</pre>)}</div>}
+
+            <div class="pgargs">
+              <input value={a} placeholder={addPlaceholder[det.type][0]} onInput={(e) => setA(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && !two && add()} style="flex:1" />
+              {two && <input value={b} placeholder={addPlaceholder[det.type][1]} onInput={(e) => setB(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && add()} style="flex:1" />}
+              <button class="run" onClick={add}>Add ▶</button>
+            </div>
+            {err && <div class="err small" style="padding:.2rem .1rem">{err}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const snap = useMetrics()
   const [tab, setTab] = useState('overview')
@@ -471,7 +614,7 @@ function App() {
       <header>
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
-          {['overview', 'console', 'queues', 'playground'].map((t) => (
+          {['overview', 'console', 'keys', 'queues', 'playground'].map((t) => (
             <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>{t}</button>
           ))}
         </nav>
@@ -479,6 +622,7 @@ function App() {
       </header>
       {tab === 'overview' && <Overview snap={snap} />}
       {tab === 'console' && <Console />}
+      {tab === 'keys' && <Keys />}
       {tab === 'queues' && <Queues />}
       {tab === 'playground' && <Playground />}
     </div>
