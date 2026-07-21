@@ -516,7 +516,7 @@ private void onDashConn(TCPConnection conn) @trusted nothrow
 // ---- minimal HTTP request parsing (over the already-read head, @nogc) ----
 
 // The request-target from the first line: "GET <path> HTTP/1.1".
-private const(char)[] httpPath(scope const(char)[] req) @safe @nogc nothrow
+private const(char)[] httpPath(return scope const(char)[] req) @safe @nogc nothrow
 {
     size_t s = 0;
     while (s < req.length && req[s] != ' ')
@@ -529,7 +529,7 @@ private const(char)[] httpPath(scope const(char)[] req) @safe @nogc nothrow
 }
 
 // Value of a header by (case-insensitive) name, trimmed. Empty if absent.
-private const(char)[] httpHeader(scope const(char)[] req, scope const(char)[] name) @safe @nogc nothrow
+private const(char)[] httpHeader(return scope const(char)[] req, scope const(char)[] name) @safe @nogc nothrow
 {
     size_t i = 0;
     while (i < req.length)
