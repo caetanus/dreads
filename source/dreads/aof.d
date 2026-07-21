@@ -15,11 +15,10 @@ version (Posix)
 }
 version (Windows)
 {
-    import core.stdc.stdio : _fileno;
+    import core.stdc.stdio : fileno; // druntime exposes fileno (not _fileno) here
 
     extern (C) int _commit(int fd) nothrow @nogc;
 
-    private alias fileno = _fileno;
     private alias fsync = _commit;
 }
 

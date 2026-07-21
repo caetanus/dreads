@@ -20,7 +20,12 @@ import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
 import core.thread : Thread;
 
-version (CRuntime_Musl)
+version (Windows)
+{
+    extern (C) int _commit(int) @nogc nothrow;
+    alias fdatasync = _commit; // best-effort durability on Windows
+}
+else version (CRuntime_Musl)
     extern (C) int fdatasync(int) @nogc nothrow; // druntime omits it for musl
 else version (Posix)
     import core.sys.posix.unistd : fdatasync;

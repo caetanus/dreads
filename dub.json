@@ -95,6 +95,9 @@
 	"dflags-ldc": [
 		"-mcpu=x86-64-v3"
 	],
+	"dflags-windows-ldc": [
+		"-mscrtlib=libcmt"
+	],
 	"preBuildCommands-posix": [
 		"bash vendor/lua/build.sh",
 		"bash vendor/lz4/build.sh"
@@ -111,8 +114,12 @@
 		"vendor/lua/build/liblua.lib",
 		"vendor/lz4/build/liblz4.lib"
 	],
-	"libs": [
+	"libs-posix": [
 		"sodium"
+	],
+	"libs-windows": [
+		"libsodium",
+		"advapi32"
 	],
 	"libs-linux": [
 		"jemalloc"

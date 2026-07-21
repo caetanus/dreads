@@ -57,7 +57,8 @@ if ($IsWindows) {
     Push-Location $srcdir
     try {
         $objs = Get-ChildItem *.c | Where-Object { $_.Name -notin @('lua.c', 'luac.c') }
-        & cl /nologo /c /O2 /DNDEBUG @($objs.Name)
+        # /MT = static CRT, to match dreads' -mscrtlib=libcmt (fully static .exe)
+        & cl /nologo /c /O2 /MT /DNDEBUG @($objs.Name)
         if ($LASTEXITCODE -ne 0) { throw 'cl compile failed' }
         & lib /nologo "/OUT:$Lib" *.obj
         if ($LASTEXITCODE -ne 0) { throw 'lib archive failed' }

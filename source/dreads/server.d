@@ -137,6 +137,8 @@ private __gshared int gPortLockFd = -1;
 /// root) by default, overridable with `--lockfile=`. Always kill servers by PORT.
 private bool acquirePortLock(ushort port, scope const(char)[] lockPath) @trusted nothrow
 {
+    version (Posix)
+    {
     import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
     import core.sys.posix.unistd : close;
     import core.stdc.stdio : snprintf;
@@ -172,6 +174,9 @@ private bool acquirePortLock(ushort port, scope const(char)[] lockPath) @trusted
     }
     gPortLockFd = fd; // held for the process lifetime (auto-unlocks on exit)
     return true;
+    }
+    else
+        return true; // Windows: best-effort standalone, no advisory port lock
 }
 
 public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lockPath = null)
@@ -343,9 +348,15 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     // SO_REUSEADDR + SO_REUSEPORT: without reusePort a restarted server can
     // find the port stuck in TIME_WAIT for a long while (vibe's default only
     // sets reuseAddress). Both let a fresh instance rebind immediately.
+    // Windows has no SO_REUSEPORT (SO_REUSEADDR there already permits rebind),
+    // so drop the flag rather than rely on vibe's Windows handling of it.
+    version (Windows)
+        enum listenOpts = TCPListenOptions.reuseAddress;
+    else
+        enum listenOpts = TCPListenOptions.reuseAddress | TCPListenOptions.reusePort;
     cast(void) listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
         serveClient(conn);
-    }, TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
+    }, listenOpts);
     printf("dreads listening on port %u\n", cast(uint) port);
     auto rc = runEventLoop();
     // Clean shutdown: stop the non-daemon worker-pool threads (Lua, raft) so

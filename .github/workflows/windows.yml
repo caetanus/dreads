@@ -28,13 +28,16 @@ jobs:
       # cl/lib for the vendored lua+lz4 PowerShell builds (preBuildCommands-windows).
       - uses: ilammy/msvc-dev-cmd@v1
 
-      # libsodium.lib for the link (jemalloc is libs-linux, skipped here). vcpkg is
-      # preinstalled on windows-latest.
-      - name: Install libsodium (vcpkg)
+      # Static libsodium.lib for the link (jemalloc is libs-linux, skipped here).
+      # x64-windows-static builds with the static CRT (/MT), matching dreads'
+      # -mscrtlib=libcmt and the /MT lua+lz4 objects → a fully static .exe. Put its
+      # lib dir on LIB so link.exe finds libsodium.lib (msvc-dev-cmd set LIB first).
+      - name: Install libsodium (vcpkg, static)
         shell: pwsh
         run: |
           vcpkg install libsodium:x64-windows-static
-          "SODIUM_LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $lib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib"
+          "LIB=$lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build
         run: dub build --compiler=ldc2

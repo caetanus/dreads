@@ -43,7 +43,8 @@ if ($IsWindows) {
     # MSVC: compile the block/frame sources into one static archive.
     Push-Location $libdir
     try {
-        & cl /nologo /c /O2 /DNDEBUG lz4.c lz4hc.c lz4frame.c xxhash.c
+        # /MT = static CRT, to match dreads' -mscrtlib=libcmt (fully static .exe)
+        & cl /nologo /c /O2 /MT /DNDEBUG lz4.c lz4hc.c lz4frame.c xxhash.c
         if ($LASTEXITCODE -ne 0) { throw 'cl compile failed' }
         & lib /nologo "/OUT:$Lib" *.obj
         if ($LASTEXITCODE -ne 0) { throw 'lib archive failed' }

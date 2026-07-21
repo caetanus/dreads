@@ -13,15 +13,28 @@ import core.stdc.stdio : FILE, fclose, fflush, fopen, fread, fseek, ftell, fwrit
 import core.stdc.stdlib : crealloc = realloc, cfree = free, abort;
 import core.stdc.errno : errno;
 
-// POSIX-first by project decision; Windows is not a target for the server.
-import core.sys.posix.stdio : fileno;
-import core.sys.posix.unistd : ftruncate, fsync;
-// druntime binds fdatasync only for glibc; it exists in musl libc too, so declare
-// it directly there (lets dreads build against musl for small static images).
-version (CRuntime_Musl)
-    extern (C) int fdatasync(int) @nogc nothrow;
+// POSIX-first; Windows is a best-effort standalone target, so the durability
+// syscalls get static-CRT shims: _commit == fsync/fdatasync, _chsize_s == ftruncate.
+version (Windows)
+{
+    import core.stdc.stdio : fileno;
+    extern (C) int _commit(int) @nogc nothrow;
+    extern (C) int _chsize_s(int, long) @nogc nothrow;
+    alias fsync = _commit;
+    alias fdatasync = _commit;
+    int ftruncate(int fd, long len) @nogc nothrow { return _chsize_s(fd, len) == 0 ? 0 : -1; }
+}
 else
-    import core.sys.posix.unistd : fdatasync;
+{
+    import core.sys.posix.stdio : fileno;
+    import core.sys.posix.unistd : ftruncate, fsync;
+    // druntime binds fdatasync only for glibc; it exists in musl libc too, so declare
+    // it directly there (lets dreads build against musl for small static images).
+    version (CRuntime_Musl)
+        extern (C) int fdatasync(int) @nogc nothrow;
+    else
+        import core.sys.posix.unistd : fdatasync;
+}
 
 import raft.storage : Storage;
 import raft.types;
