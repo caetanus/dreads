@@ -127,9 +127,17 @@ function replyText(v, depth = 0) {
   }
 }
 
+// dashboard password (set via the login gate); sent on every request. Persisted in
+// sessionStorage so a reload within the tab stays logged in.
+let AUTH = sessionStorage.getItem('dash-auth') || ''
+let onAuthFail = null // App registers this to flip to the login screen on a 401
+
 async function exec(args) {
-  const res = await fetch('/api/exec', { method: 'POST', body: toResp(args) })
-  if (res.status === 401) return { t: 'error', v: 'ERR unauthorized (set X-Dashboard-Auth)' }
+  const res = await fetch('/api/exec', {
+    method: 'POST', body: toResp(args),
+    headers: AUTH ? { 'X-Dashboard-Auth': AUTH } : {},
+  })
+  if (res.status === 401) { if (onAuthFail) onAuthFail(); return { t: 'error', v: 'ERR unauthorized' } }
   const buf = new Uint8Array(await res.arrayBuffer())
   const [v] = parseResp(buf, 0)
   return v
@@ -168,7 +176,8 @@ function useMetrics() {
     let ws, stop = false
     const push = (a, v) => { a.push(v); if (a.length > WINDOW) a.shift() }
     const connect = () => {
-      ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws')
+      ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws'
+        + (AUTH ? '?auth=' + AUTH : ''))
       ws.onclose = () => { setSnap((s) => ({ ...s, live: false })); if (!stop) setTimeout(connect, 1000) }
       ws.onmessage = (e) => {
         let m; try { m = JSON.parse(e.data) } catch { return }
@@ -913,9 +922,47 @@ function Streams() {
   )
 }
 
+function Login({ onOk }) {
+  const [pw, setPw] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async () => {
+    setBusy(true); setErr(''); AUTH = pw
+    const v = await exec(['PING'])
+    setBusy(false)
+    if (v.t === 'error') { AUTH = ''; setErr('wrong password') }
+    else { sessionStorage.setItem('dash-auth', pw); onOk() }
+  }
+  return (
+    <div class="login">
+      <div class="loginbox">
+        <h1>dreads <span class="zap">⚡</span></h1>
+        <div class="dim small" style="margin-bottom:1rem">dashboard is password protected</div>
+        <input type="password" autofocus placeholder="password" value={pw}
+          onInput={(e) => setPw(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submit()} />
+        <button class="run" style="width:100%;margin:.6rem 0 0" onClick={submit} disabled={busy}>
+          {busy ? '…' : 'Sign in'}</button>
+        {err && <div class="err small" style="margin-top:.5rem">{err}</div>}
+      </div>
+    </div>
+  )
+}
+
 function App() {
+  const [authed, setAuthed] = useState(null) // null=probing · false=login · true=ok
+  useEffect(() => {
+    onAuthFail = () => setAuthed(false)
+    exec(['PING']).then((v) => { if (v.t !== 'error') setAuthed(true) })
+  }, [])
+  if (authed === null) return null
+  if (!authed) return <Login onOk={() => setAuthed(true)} />
+  return <Dashboard />
+}
+
+function Dashboard() {
   const snap = useMetrics()
   const [tab, setTab] = useState('overview')
+  const logout = () => { AUTH = ''; sessionStorage.removeItem('dash-auth'); location.reload() }
   return (
     <div class="wrap">
       <header>
@@ -927,6 +974,7 @@ function App() {
           ))}
         </nav>
         <span class={'st ' + (snap.live ? 'live' : 'off')}>{snap.live ? 'live' : 'offline'}</span>
+        {AUTH && <button class="mini big" style="margin-left:.6rem" onClick={logout}>logout</button>}
       </header>
       {tab === 'overview' && <Overview snap={snap} />}
       {tab === 'console' && <Console />}

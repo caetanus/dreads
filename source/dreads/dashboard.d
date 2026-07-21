@@ -567,12 +567,26 @@ private void onDashConn(TCPConnection conn) @trusted nothrow
             n = conn.read(buf[], IOMode.once);
         auto req = cast(const(char)[]) buf[0 .. n];
 
-        auto path = httpPath(req);
+        auto target = httpPath(req);
+        size_t qpos = 0;
+        while (qpos < target.length && target[qpos] != '?')
+            qpos++;
+        auto path = target[0 .. qpos];
+        auto query = qpos < target.length ? target[qpos + 1 .. $] : null;
         if (path == "/ws")
         {
-            auto key = httpHeader(req, "Sec-WebSocket-Key");
-            if (key.length && wsHandshake(conn, key))
-                wsLoop(conn);
+            // Live metrics are gated behind the password too. Browsers can't set
+            // headers on a WebSocket, so the frontend passes ?auth=<password>.
+            enum WS401 = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if (gConfig.dashboardPassword.length
+                    && queryParam(query, "auth") != gConfig.dashboardPassword)
+                conn.write(cast(const(ubyte)[]) WS401);
+            else
+            {
+                auto key = httpHeader(req, "Sec-WebSocket-Key");
+                if (key.length && wsHandshake(conn, key))
+                    wsLoop(conn);
+            }
         }
         else if (path == "/api/exec")
         {
@@ -590,6 +604,27 @@ private void onDashConn(TCPConnection conn) @trusted nothrow
 }
 
 // ---- minimal HTTP request parsing (over the already-read head, @nogc) ----
+
+// Value of a query-string parameter (raw, undecoded — dashboard passwords are simple
+// tokens with no &/space/? so no percent-decoding is needed). Null if absent.
+private const(char)[] queryParam(return scope const(char)[] query, scope const(char)[] name) @safe @nogc nothrow
+{
+    size_t i = 0;
+    while (i < query.length)
+    {
+        size_t amp = i;
+        while (amp < query.length && query[amp] != '&')
+            amp++;
+        auto pair = query[i .. amp];
+        size_t eq = 0;
+        while (eq < pair.length && pair[eq] != '=')
+            eq++;
+        if (pair[0 .. eq] == name)
+            return eq < pair.length ? pair[eq + 1 .. $] : null;
+        i = amp + 1;
+    }
+    return null;
+}
 
 // The request-target from the first line: "GET <path> HTTP/1.1".
 private const(char)[] httpPath(return scope const(char)[] req) @safe @nogc nothrow
