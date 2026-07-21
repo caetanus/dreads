@@ -41,3 +41,11 @@ jobs:
 
       - name: Build
         run: dub build --compiler=ldc2
+
+      # Publish the .exe so it can be pulled down and smoke-tested (e.g. under Wine).
+      - name: Upload dreads.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: dreads-windows-x64
+          path: bin/dreads.exe
+          if-no-files-found: error
