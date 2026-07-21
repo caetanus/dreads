@@ -271,11 +271,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // Defaults to the RESP port + 1. A main-loop timer publishes a metrics
         // snapshot every dashboard-interval, but only while a client is watching.
         {
-            import dreads.dashboard : startDashboard, dashboardPort, snapshotMetrics;
+            import dreads.dashboard : startDashboard, dashboardPort, snapshotMetrics,
+                startDashCmdBridge;
 
             startDashboard(port);
             if (gConfig.dashboard)
             {
+                startDashCmdBridge(); // main-side drain for dashboard write/admin ops
                 setTimer(gConfig.dashboardIntervalMs.msecs, () nothrow {
                     snapshotMetrics(gPubSub.channelCount(), gPubSub.patternCount());
                 }, true);

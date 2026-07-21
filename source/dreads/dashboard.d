@@ -110,6 +110,130 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
     return p;
 }
 
+// ---- command bridge: run a command on the MAIN (writer) thread ----
+// The dashboard thread can't touch the keyspace directly (single-writer model), so
+// admin/write actions round-trip to the main loop, exactly like a script's redis.call:
+// post the RESP command to gDashCmdQ, the main-side drain executes it via
+// executeScriptCommand (ACL bypassed — userId 0 — because the dashboard is already
+// gated by opt-in + password + dashboard-write/-admin) and signals the reply back.
+// A TaskMutex serializes the dashboard's single reused slot (admin ops are rare).
+import dreads.mem : ByteBuffer, Arena;
+import vibe.core.sync : TaskMutex;
+
+private struct DashCmdSlot
+{
+    ByteBuffer bytes; // RESP command in
+    ushort db;
+    ByteBuffer reply; // RESP reply out
+    int status;
+    shared(ManualEvent) done;
+    bool ready;
+}
+
+private __gshared void* gDashCmdQ; // dreads.raftq.CrossQueue (opaque here to avoid a cycle)
+private __gshared DashCmdSlot gDashSlot;
+private __gshared TaskMutex gDashCmdMutex;
+private __gshared bool gDashBridgeUp;
+
+/// Start the command bridge (called on the MAIN thread at boot when the dashboard
+/// is enabled): creates the queue and runs the drain fiber on the main event loop.
+public void startDashCmdBridge() nothrow
+{
+    import dreads.raftq : CrossQueue;
+    import vibe.core.core : runTask;
+
+    if (!gConfig.dashboard)
+        return;
+    try
+    {
+        gDashCmdQ = cast(void*) new CrossQueue(256);
+        gDashSlot.done = createSharedManualEvent();
+        gDashCmdMutex = new TaskMutex;
+        gDashBridgeUp = true;
+        runTask(() nothrow { dashCmdDrainLoop(); });
+    }
+    catch (Exception)
+    {
+    }
+}
+
+// Main-thread drain: execute each queued command on its db and reply. Mirrors the
+// Lua bridge's cmdDrainLoop.
+private void dashCmdDrainLoop() nothrow
+{
+    import dreads.raftq : CrossQueue;
+    import dreads.resp : RVal, RType, parseValue, ParseStatus, repError, gRespProto;
+    import dreads.obj : gDbs, NUM_DBS;
+    import dreads.scripting : executeScriptCommand;
+
+    auto q = cast(CrossQueue) gDashCmdQ;
+    static ByteBuffer payload;
+    static Arena arena;
+    static ByteBuffer eff;
+    while (true)
+    {
+        try
+        {
+            q.waitData();
+            void* tag;
+            ulong meta;
+            uint kind;
+            while (q.take(payload, tag, meta, kind))
+            {
+                auto slot = cast(DashCmdSlot*) tag;
+                arena.reset();
+                slot.reply.clear();
+                slot.status = 0;
+                RVal cmd;
+                size_t pos = 0;
+                if (parseValue(slot.bytes.data, pos, arena, cmd) == ParseStatus.ok
+                        && cmd.type == RType.Array && cmd.arr.length > 0)
+                {
+                    auto dbi = slot.db < NUM_DBS ? slot.db : 0;
+                    immutable isWrite = true; // dashboard may write; the gate is upstream
+                    slot.status = executeScriptCommand(gDbs[dbi], cmd, cmd.arr, isWrite,
+                        cast(ulong) nowMs(), 0 /*userId: admin*/, gRespProto, arena, slot.reply, eff);
+                }
+                else
+                    repError(slot.reply, "ERR malformed dashboard command");
+                slot.ready = true;
+                slot.done.emit();
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+}
+
+/// Run a RESP command on the writer thread and copy its RESP reply into `reply`.
+/// Called from the dashboard thread (HTTP handlers). Blocking round-trip, serialized.
+package bool runCommand(scope const(ubyte)[] respCmd, ushort db, ref ByteBuffer reply) nothrow
+{
+    import dreads.raftq : CrossQueue;
+
+    if (!gDashBridgeUp || gDashCmdQ is null)
+        return false;
+    try
+    {
+        gDashCmdMutex.lock();
+        scope (exit)
+            gDashCmdMutex.unlock();
+        gDashSlot.bytes.clear();
+        gDashSlot.bytes.append(respCmd);
+        gDashSlot.db = db;
+        gDashSlot.ready = false;
+        (cast(CrossQueue) gDashCmdQ).put(gDashSlot.bytes.data, cast(void*)&gDashSlot, 0);
+        while (!gDashSlot.ready)
+            gDashSlot.done.wait();
+        reply.clear();
+        reply.append(gDashSlot.reply.data);
+        return true;
+    }
+    catch (Exception)
+        return false;
+}
+
 /// Publish a metrics snapshot (called by the main-loop timer, so gConnectedClients
 /// and the keyspace are read on the writer thread). Skips entirely when nobody is
 /// watching. Pub/sub counts are passed in (gPubSub is private to the server module).
@@ -192,11 +316,21 @@ private void onDashConn(TCPConnection conn) @trusted nothrow
             n = conn.read(buf[], IOMode.once);
         auto req = cast(const(char)[]) buf[0 .. n];
 
-        if (httpPath(req) == "/ws")
+        auto path = httpPath(req);
+        if (path == "/ws")
         {
             auto key = httpHeader(req, "Sec-WebSocket-Key");
             if (key.length && wsHandshake(conn, key))
                 wsLoop(conn);
+        }
+        else if (path == "/api/dbsize") // TEMP: validates the command round-trip
+        {
+            ByteBuffer reply;
+            immutable ok = runCommand(cast(const(ubyte)[]) "*1\r\n$6\r\nDBSIZE\r\n", 0, reply);
+            auto body_ = ok ? reply.data : cast(const(ubyte)[]) "-ERR bridge down\r\n";
+            conn.write(cast(const(ubyte)[])(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"));
+            conn.write(body_);
         }
         else
         {
