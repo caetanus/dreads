@@ -84,6 +84,29 @@ for day-to-day dev against the common command surface, it's a drop-in.
 See **[Docker](#docker)** for the image matrix, the dashboard, and the
 redis/valkey-style config interface.
 
+## Built-in dashboard
+
+A web dashboard lives **inside the binary** — opt-in, its own thread, hand-rolled
+`@nogc` HTTP/WebSocket (no vibe-d GC to stop-the-world the data plane). It's a
+developer-debug tool: live rates, key/stream/queue inspectors, a Lua playground, and
+ACL admin. **Off by default, and it costs nothing when off** — no thread, no port, no
+per-command work; it can even be [compiled out](DASHBOARD.md#compile-it-out).
+
+<p align="center">
+  <img src="assets/dashboard/overview.png" alt="dreads dashboard — overview" width="800">
+</p>
+
+```sh
+dreads --port 6379 --dashboard yes            # http://127.0.0.1:6380
+```
+
+Tabs: **overview** (live per-command rates + memory), **console**, **keys** (inspect any
+key by type), **pubsub** (channels + a batched live tail), **queues** (lists as RabbitMQ-
+style queues with real in/out rates), **streams** (groups / consumers / PEL), **lua
+playground** (examples + save-by-SHA), and **admin** (an ACL *builder* — no hand-writing
+rules — plus memory bump/shrink). Themeable (desert / solarized / mocha / dracula, or
+upload your own — stored in the keyspace). Full guide + screenshots: **[DASHBOARD.md](DASHBOARD.md)**.
+
 ## Compatibility, stated honestly
 
 **The goal is to be as close to 100% Redis-compatible as possible — the only
