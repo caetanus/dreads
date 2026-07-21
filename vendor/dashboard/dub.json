@@ -1,0 +1,5 @@
+{
+	"name": "dreads-dashboard-ui",
+	"comment": "Not a real dub package — a shim so dub does not parse the npm package.json (which it treats as a legacy recipe and fails to resolve its npm deps as dub packages). The UI is built by build.sh via the root preBuildCommand.",
+	"targetType": "none"
+}
