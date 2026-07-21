@@ -1,0 +1,55 @@
+# docker-compose.yml — drop-in Redis replacement for local dev.
+#
+# dreads speaks RESP2/RESP3 on 6379, so your app and tooling (redis-cli, ioredis,
+# redis-py, go-redis, Sidekiq, …) talk to it UNCHANGED — just point them at 6379.
+# The built-in web dashboard (keys/streams/pubsub/queues inspectors, a Lua
+# playground, ACL admin) is on 6380.
+#
+#   docker compose up -d
+#   redis-cli -p 6379 ping                 # PONG
+#   open http://localhost:6380             # dashboard  (login: DREADS_DASHBOARD_PASSWORD)
+#
+# Migrating an existing stack? Delete your `redis:`/`valkey:` service and point the
+# app at this one (REDIS_URL=redis://dreads:6379). See the commented `app:` below.
+
+services:
+  dreads:
+    image: ghcr.io/caetanus/dreads:latest          # multi-arch: amd64 + arm64 (Apple Silicon / Graviton)
+    # image: ghcr.io/caetanus/dreads:latest-alpine  # smaller (~16 MB), slightly slower
+    ports:
+      - "6379:6379"          # RESP — REDIS_URL=redis://localhost:6379
+      - "6380:6380"          # built-in dashboard
+    volumes:
+      - dreads-data:/data    # AOF persistence (survives restarts)
+    environment:
+      # config is redis/valkey-style: DREADS_<DIRECTIVE>=value -> --<directive> value
+      # ---- persistence ----
+      DREADS_APPENDONLY: "yes"
+      # ---- built-in dashboard (opt-in; costs nothing when off) ----
+      DREADS_DASHBOARD: "yes"
+      DREADS_DASHBOARD_BIND: "0.0.0.0"             # reachable through the port mapping
+      DREADS_DASHBOARD_PASSWORD: "changeme"        # REQUIRED once bound off localhost
+      # DREADS_DASHBOARD_WRITE: "yes"              # allow writes from the dashboard (LPUSH/DEL/…)
+      # DREADS_DASHBOARD_ADMIN: "yes"              # allow ACL-user + CONFIG admin from the dashboard
+      # ---- optional: run it as a bounded cache ----
+      # DREADS_MAXMEMORY: "256mb"
+      # DREADS_MAXMEMORY_POLICY: "allkeys-lru"
+    restart: unless-stopped
+    healthcheck:
+      # the image bundles a busybox shell; nc opens the RESP port to prove it is up
+      test: ["CMD-SHELL", "nc -w1 127.0.0.1 6379 </dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Your app just points at dreads like it would Redis — no code change:
+  # app:
+  #   build: .
+  #   environment:
+  #     REDIS_URL: redis://dreads:6379
+  #   depends_on:
+  #     dreads:
+  #       condition: service_healthy
+
+volumes:
+  dreads-data:

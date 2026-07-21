@@ -52,13 +52,13 @@ Graviton. Want the smaller one? Use `ghcr.io/caetanus/dreads:latest-alpine`
 
 ```sh
 docker run -d --name dreads -p 6379:6379 -v dreads-data:/data \
-  ghcr.io/caetanus/dreads:latest 6379 --appendonly
+  ghcr.io/caetanus/dreads:latest 6379 --appendonly yes
 ```
 
 **Swap it in for Redis in dev.** dreads speaks RESP2/RESP3 on port 6379, so your
 existing clients and tooling — `redis-cli`, `ioredis`, `redis-py`, `go-redis`,
 `Sidekiq`, … — talk to it **unchanged**. Just point them at the dreads port; no
-code changes. In a Compose stack, swap the image:
+code changes. The quickest migration is a one-line image swap in your Compose stack:
 
 ```diff
  services:
@@ -68,12 +68,21 @@ code changes. In a Compose stack, swap the image:
      ports: ["6379:6379"]
 ```
 
+For a fuller dev setup — AOF persistence plus the built-in web dashboard — a
+ready-made [`docker-compose.yml`](docker-compose.yml) ships in the repo:
+
+```sh
+docker compose up -d
+redis-cli -p 6379 ping        # PONG — point REDIS_URL=redis://localhost:6379 here
+open http://localhost:6380    # the built-in dashboard (keys/streams/pubsub inspectors)
+```
+
 Or point your app straight at it via its usual env: `REDIS_URL=redis://localhost:6379`.
 Anything dreads doesn't yet implement identically is tracked in **[DRIFT.md](DRIFT.md)** —
 for day-to-day dev against the common command surface, it's a drop-in.
 
-See **[Docker](#docker)** for the full image matrix and the redis/valkey-style
-config interface.
+See **[Docker](#docker)** for the image matrix, the dashboard, and the
+redis/valkey-style config interface.
 
 ## Compatibility, stated honestly
 
@@ -343,8 +352,30 @@ redis-cli -p 6379 PING
 
 # persist the AOF by mounting a volume and enabling it
 docker run -d --name dreads -p 6379:6379 -v dreads-data:/data \
-  ghcr.io/caetanus/dreads:latest 6379 --appendonly
+  ghcr.io/caetanus/dreads:latest 6379 --appendonly yes
 ```
+
+**Config — three redis/valkey-style layers, later overrides earlier:** the baked
+`/etc/dreads/dreads.conf` (mount your own over it), `DREADS_<DIRECTIVE>=value` env
+(kubernetes-native — underscores become dashes, e.g. `DREADS_MAXMEMORY=256mb` →
+`--maxmemory 256mb`), and plain `--<directive> value` args. Both images run the same
+[`docker/docker-entrypoint.sh`](docker/docker-entrypoint.sh); see
+[`docker/dreads.conf`](docker/dreads.conf).
+
+**Dashboard in a container.** The built-in web dashboard is opt-in and binds
+`127.0.0.1` by default, so to reach it through a port mapping bind it off localhost
+and set a password:
+
+```sh
+docker run -d --name dreads -p 6379:6379 -p 6380:6380 \
+  -e DREADS_DASHBOARD=yes -e DREADS_DASHBOARD_BIND=0.0.0.0 \
+  -e DREADS_DASHBOARD_PASSWORD=changeme \
+  ghcr.io/caetanus/dreads:latest
+# then open http://localhost:6380
+```
+
+A full dev stack (AOF persistence + dashboard) is in
+[`docker-compose.yml`](docker-compose.yml) — `docker compose up -d`.
 
 Build locally with `docker build -t dreads .` (glibc) or
 `docker build -f Dockerfile.alpine -t dreads:alpine .` (musl).
