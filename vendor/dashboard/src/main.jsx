@@ -86,7 +86,23 @@ function parseResp(buf, pos) {
     for (let i = 0; i < n; i++) { const [v, q] = parseResp(buf, p); arr.push(v); p = q }
     return [{ t: 'array', v: arr }, p]
   }
+  if (t === 0x25) {                                          // % map (RESP3)
+    const n = Number(head)
+    const arr = []
+    let p = np
+    for (let i = 0; i < n * 2; i++) { const [v, q] = parseResp(buf, p); arr.push(v); p = q }
+    return [{ t: 'map', v: arr }, p]
+  }
   return [{ t: 'raw', v: head }, np]
+}
+
+// Flatten a k/v reply (RESP2 flat array *2n OR RESP3 map %n) to a {key: number}.
+// QSTATS returns {enqueued, dequeued, depth} either way depending on the proto.
+function kvNums(v) {
+  const a = v && (v.t === 'map' || v.t === 'array') ? v.v : []
+  const o = {}
+  for (let i = 0; i + 1 < a.length; i += 2) o[a[i].v] = Number(a[i + 1].v)
+  return o
 }
 
 function replyText(v, depth = 0) {
@@ -332,38 +348,46 @@ function Queues() {
   const [pub, setPub] = useState('')
   const [chart, setChart] = useState(null)
   const hist = useRef({})
-  const selH = useRef({ name: null, t: [], d: [] })
+  const selH = useRef({ name: null, t: [], in: [], out: [] })
   const nameQR = useRef(nameQ), selR = useRef(sel)
   nameQR.current = nameQ; selR.current = sel
 
   const poll = useCallback(async () => {
     const keys = await scanList(nameQR.current.trim())
     const now = Date.now() / 1000
-    const lens = await Promise.all(keys.map((k) => exec(['LLEN', k])))
+    // QSTATS gives {enqueued, dequeued, depth} in ONE call — real incoming/deliver
+    // rates (RabbitMQ-style), not the net LLEN delta that hides in≈out throughput.
+    const stats = await Promise.all(keys.map((k) => exec(['QSTATS', k])))
     const next = keys.map((k, i) => {
-      const depth = lens[i] && lens[i].t === 'int' ? lens[i].v : 0
-      const h = hist.current[k] || (hist.current[k] = { last: depth, lastT: now })
-      const dt = now - h.lastT
-      const rate = dt > 0.1 ? (depth - h.last) / dt : (h.rate || 0)
-      h.last = depth; h.lastT = now; h.rate = rate
-      return { name: k, depth, rate }
+      const s = kvNums(stats[i])
+      const depth = s.depth || 0, enq = s.enqueued || 0, deq = s.dequeued || 0
+      let h = hist.current[k]
+      // first sight, or counters reset (key recreated ⇒ enq/deq drop): rebaseline
+      if (!h || enq < h.enq || deq < h.deq) h = hist.current[k] = { enq, deq, t: now, inR: 0, outR: 0 }
+      const dt = now - h.t
+      if (dt > 0.1) {
+        h.inR = (enq - h.enq) / dt
+        h.outR = (deq - h.deq) / dt
+        h.enq = enq; h.deq = deq; h.t = now
+      }
+      return { name: k, depth, enq, deq, inR: h.inR, outR: h.outR }
     })
     setRows(next)
-    const s = selR.current
-    if (s) {
-      const d = next.find((r) => r.name === s)
+    const sname = selR.current
+    if (sname) {
+      const d = next.find((r) => r.name === sname)
       const sh = selH.current
-      if (sh.name !== s) { sh.name = s; sh.t = []; sh.d = [] }
-      sh.t.push(now); sh.d.push(d ? d.depth : 0)
-      if (sh.t.length > 120) { sh.t.shift(); sh.d.shift() }
-      setChart([sh.t.slice(), sh.d.slice()])
+      if (sh.name !== sname) { sh.name = sname; sh.t = []; sh.in = []; sh.out = [] }
+      sh.t.push(now); sh.in.push(d ? d.inR : 0); sh.out.push(d ? d.outR : 0)
+      if (sh.t.length > 120) { sh.t.shift(); sh.in.shift(); sh.out.shift() }
+      setChart([sh.t.slice(), sh.in.slice(), sh.out.slice()])
     }
   }, [])
 
   useEffect(() => { poll(); const id = setInterval(poll, 2000); return () => clearInterval(id) }, [poll])
 
   const open = async (name) => {
-    setSel(name); selR.current = name; selH.current = { name, t: [], d: [] }
+    setSel(name); selR.current = name; selH.current = { name, t: [], in: [], out: [] }
     const v = await exec(['LRANGE', name, '0', '199'])
     setMsgs(v.t === 'array' ? v.v.map((x) => (x.v == null ? '(nil)' : x.v)) : [])
   }
@@ -375,6 +399,8 @@ function Queues() {
   const sorted = [...rows].sort((a, b) => (a[sort.k] < b[sort.k] ? -1 : a[sort.k] > b[sort.k] ? 1 : 0) * sort.dir)
   const shown = msgs.filter((m) => !msgQ || m.includes(msgQ))
   const arrow = (k) => (sort.k === k ? (sort.dir > 0 ? ' ▲' : ' ▼') : '')
+  const selRow = sel && rows.find((r) => r.name === sel)
+  const rate = (v) => (v ? v.toFixed(v < 10 ? 1 : 0) : '0')
 
   return (
     <div>
@@ -388,27 +414,37 @@ function Queues() {
         <table class="qtable">
           <thead><tr>
             <th onClick={() => sortBy('name')}>Name{arrow('name')}</th>
-            <th class="num" onClick={() => sortBy('depth')}>Messages{arrow('depth')}</th>
-            <th class="num" onClick={() => sortBy('rate')}>Δ/s{arrow('rate')}</th>
+            <th class="num" onClick={() => sortBy('depth')}>Ready{arrow('depth')}</th>
+            <th class="num" onClick={() => sortBy('inR')}>incoming/s{arrow('inR')}</th>
+            <th class="num" onClick={() => sortBy('outR')}>deliver/s{arrow('outR')}</th>
           </tr></thead>
           <tbody>
             {sorted.map((q) => (
               <tr key={q.name} class={sel === q.name ? 'on' : ''} onClick={() => open(q.name)}>
                 <td class="qname">{q.name}</td>
                 <td class="num strong">{fmt(q.depth)}</td>
-                <td class={'num ' + (q.rate > 0 ? 'up' : q.rate < 0 ? 'down' : 'dim')}>
-                  {q.rate > 0 ? '+' : ''}{q.rate ? q.rate.toFixed(1) : '0'}</td>
+                <td class={'num ' + (q.inR > 0.05 ? 'up' : 'dim')}>{q.inR > 0.05 ? '+' + rate(q.inR) : '0'}</td>
+                <td class={'num ' + (q.outR > 0.05 ? 'down' : 'dim')}>{q.outR > 0.05 ? '−' + rate(q.outR) : '0'}</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colspan="3" class="dim small" style="padding:1rem">no list keys</td></tr>}
+            {rows.length === 0 && <tr><td colspan="4" class="dim small" style="padding:1rem">no list keys</td></tr>}
           </tbody>
         </table>
       </div>
 
       {sel && (
         <div class="panel">
-          <div class="title">{sel} <span class="dim">— queued messages over time</span></div>
-          {chart && <Chart data={chart} height={130} series={[{}, line('depth', '#2f81f7')]} />}
+          <div class="title">{sel} <span class="dim">— message rates</span></div>
+          {selRow && (
+            <div class="qstat">
+              <span><b>{fmt(selRow.depth)}</b> ready</span>
+              <span class="up">▲ {rate(selRow.inR)}/s in</span>
+              <span class="down">▼ {rate(selRow.outR)}/s out</span>
+              <span class="dim">{fmt(selRow.enq)} enq · {fmt(selRow.deq)} deq lifetime</span>
+            </div>
+          )}
+          {chart && <Chart data={chart} height={130}
+            series={[{}, line('incoming', '#3fb950'), line('deliver', '#db6d28')]} />}
           <div class="pgargs">
             <label style="flex:1">publish <input value={pub} placeholder="message body (RPUSH)"
               onInput={(e) => setPub(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && publish()} style="flex:1" /></label>

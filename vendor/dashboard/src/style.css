@@ -96,7 +96,12 @@ header .st { margin-left: auto; }
 .qtable .num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
 .qtable .qname { color: #c9d1d9; font-family: ui-monospace, monospace; }
 .qtable .strong { font-weight: 600; }
-.qtable .up { color: #3fb950; } .qtable .down { color: #f85149; }
+.qtable .up { color: #3fb950; } .qtable .down { color: #db6d28; }
+/* selected-queue stat strip: ready + incoming/deliver rates + lifetime totals */
+.qstat { display: flex; align-items: baseline; gap: 1.2rem; flex-wrap: wrap; margin: .2rem 0 .7rem;
+  font-size: .82rem; font-family: ui-monospace, monospace; }
+.qstat b { color: #c9d1d9; font-size: 1.05rem; }
+.qstat .up { color: #3fb950; } .qstat .down { color: #db6d28; }
 .pgmain { display: flex; flex-direction: column; }
 .editor { min-height: 260px; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 10px;
   padding: .7rem .9rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .84rem;
