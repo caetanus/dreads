@@ -131,6 +131,17 @@ header .st { margin-left: auto; }
 .del { margin-left: auto; background: #3d1418; color: #f85149; border: 1px solid #5c1b20;
   border-radius: 7px; padding: .3rem .8rem; font: inherit; font-size: .78rem; cursor: pointer; }
 .del:hover { background: #5c1b20; }
+
+/* pubsub live tail */
+.tailbar { display: flex; align-items: center; gap: .7rem; margin-bottom: .7rem; }
+.run.stop { background: #db6d28; } .run.stop:hover { background: #f0813a; }
+.feed { border: 1px solid #1f2a3a; border-radius: 8px; background: #0d1219; max-height: 44vh;
+  overflow: auto; font-family: ui-monospace, monospace; font-size: .8rem; }
+.fmsg { display: flex; align-items: baseline; gap: .6rem; padding: .25rem .7rem; border-bottom: 1px solid #131c28; }
+.fmsg:first-child { background: #101c2e33; }
+.ft { color: #5c6b82; font-size: .72rem; flex: none; }
+.fch { color: #56c1e0; flex: none; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fm { color: #c9d1d9; word-break: break-all; }
 .pgmain { display: flex; flex-direction: column; }
 .editor { min-height: 260px; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 10px;
   padding: .7rem .9rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .84rem;

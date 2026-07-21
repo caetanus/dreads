@@ -366,6 +366,90 @@ private struct PtrBucket
 /// reaches gCmdStats; this counter is the reliable source.
 public __gshared ulong gPubMessages;
 
+// --- message tap (dashboard live-ish tail) ---------------------------------------
+// Buffer published (channel,payload) pairs while ARMED, drained in batches by
+// PUBSUB TAP (dreads-native). The publish hot path pays only ONE bool load when
+// disarmed (gTapArmed). The frontend polls PUBSUB TAP every ~1-2s: each poll rearms
+// the deadline and drains the ring, so the tap self-expires when polling stops (the
+// 1s server cron disarms + frees the ring). Bounded ring drops the oldest message.
+// Owned copies via KeyspaceAllocator (StrVal) — no raw malloc, freed by the Deque.
+import dreads.dict : StrVal;
+import dreads.alloc : KeyspaceAllocator;
+import emplace.deque : Deque;
+
+private struct TapMsg
+{
+    StrVal ch;
+    StrVal msg;
+    void free() @nogc nothrow @trusted { ch.free(); msg.free(); }
+}
+
+private enum size_t TAP_CAP = 1024; // ring capacity; oldest dropped past this
+public __gshared bool gTapArmed;
+private __gshared long gTapDeadlineMs;
+private __gshared Deque!(TapMsg, KeyspaceAllocator) gTapRing;
+
+/// Arm/refresh the tap for `windowMs` from `nowMs` (called by each PUBSUB TAP poll).
+void pubsubTapArm(long nowMs, long windowMs = 12_000) @nogc nothrow @trusted
+{
+    gTapArmed = true;
+    gTapDeadlineMs = nowMs + windowMs;
+}
+
+/// Capture one published message. Called on the publish path ONLY when armed.
+void pubsubTapNote(scope const(char)[] channel, scope const(char)[] payload) @nogc nothrow @trusted
+{
+    gTapRing.pushBack(TapMsg(StrVal.ofRaw(channel), StrVal.ofRaw(payload)));
+    while (gTapRing.length > TAP_CAP)
+        gTapRing.popFront(); // disposes the oldest via TapMsg.free()
+}
+
+/// Number of buffered messages (for the reply array header before draining).
+size_t pubsubTapPending() @nogc nothrow @trusted { return gTapRing.length; }
+
+/// Emit every buffered (channel,payload) then clear the ring (frees the copies).
+void pubsubTapDrain(scope void delegate(const(char)[] ch, const(char)[] msg) @nogc nothrow emit) @nogc nothrow @trusted
+{
+    foreach (i; 0 .. gTapRing.length)
+        emit(gTapRing[i].ch.rawView(), gTapRing[i].msg.rawView());
+    gTapRing.clear(); // disposes each TapMsg via .free()
+}
+
+/// Disarm + free the ring if no poll arrived within the window. Called by the 1s cron.
+void pubsubTapExpire(long nowMs) @nogc nothrow @trusted
+{
+    if (gTapArmed && nowMs >= gTapDeadlineMs)
+    {
+        gTapArmed = false;
+        gTapRing.clearShrink();
+    }
+}
+
+unittest // message tap: arm / capture / drain / bounded / expire
+{
+    assert(!gTapArmed);
+    pubsubTapArm(1000, 5000); // armed until 6000
+    assert(gTapArmed);
+    pubsubTapNote("ch1", "a");
+    pubsubTapNote("ch2", "bb");
+    assert(pubsubTapPending() == 2);
+    size_t n, chLen;
+    char[8] firstCh;
+    pubsubTapDrain((const(char)[] c, const(char)[] m) @nogc nothrow{
+        if (n == 0) { firstCh[0 .. c.length] = c[]; chLen = c.length; }
+        n++;
+    });
+    assert(n == 2 && firstCh[0 .. chLen] == "ch1"); // FIFO order preserved
+    assert(pubsubTapPending() == 0); // drained + freed
+    // bounded ring drops the oldest past TAP_CAP
+    foreach (i; 0 .. TAP_CAP + 10)
+        pubsubTapNote("c", "x");
+    assert(pubsubTapPending() == TAP_CAP);
+    // expire disarms + frees when the deadline passes with no poll
+    pubsubTapExpire(6000); // now >= deadline (6000)
+    assert(!gTapArmed && pubsubTapPending() == 0);
+}
+
 public struct PubSub
 {
     private Dict!SubList channels; // channel -> subscribers
@@ -675,6 +759,8 @@ public struct PubSub
             scope const(char)[] verb = "message") nothrow
     {
         gPubMessages++; // dashboard: total messages published (every publish path)
+        if (gTapArmed) // dashboard message tap: one bool load when nobody is tailing
+            pubsubTapNote(channel, payload);
         long receivers = 0;
         auto list = channels.get(channel);
         if (list !is null && list.len > 0)

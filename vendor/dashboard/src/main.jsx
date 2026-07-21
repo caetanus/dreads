@@ -613,6 +613,10 @@ function Pubsub() {
   const [npat, setNpat] = useState(0)
   const [nameQ, setNameQ] = useState('')
   const [pch, setPch] = useState(''); const [pmsg, setPmsg] = useState(''); const [pres, setPres] = useState('')
+  const [tailing, setTailing] = useState(false)
+  const [feed, setFeed] = useState([])
+  const [tailQ, setTailQ] = useState('')
+  const feedR = useRef([])
   const nameQR = useRef(nameQ); nameQR.current = nameQ
 
   const poll = useCallback(async () => {
@@ -627,6 +631,24 @@ function Pubsub() {
     setShard(shs.map((p) => ({ ch: p.f, subs: Number(p.v) })))
   }, [])
   useEffect(() => { poll(); const id = setInterval(poll, 2000); return () => clearInterval(id) }, [poll])
+
+  // Live-ish tail: poll PUBSUB TAP (dreads-native) — the server buffers published
+  // messages while armed and returns them in a batch each poll (each poll rearms;
+  // the tap self-expires when we stop). Newest-first, capped client-side.
+  useEffect(() => {
+    if (!tailing) return
+    const tick = async () => {
+      const pairs = rpairs(rarr(await exec(['PUBSUB', 'TAP'])))
+      if (pairs.length) {
+        const ts = new Date().toLocaleTimeString()
+        feedR.current = [...pairs.map((p) => ({ ts, ch: p.f, msg: p.v })), ...feedR.current].slice(0, 500)
+        setFeed(feedR.current)
+      }
+    }
+    tick(); const id = setInterval(tick, 1500); return () => clearInterval(id)
+  }, [tailing])
+  const clearFeed = () => { feedR.current = []; setFeed([]) }
+  const shownFeed = feed.filter((f) => !tailQ || f.ch.includes(tailQ) || (f.msg || '').includes(tailQ))
 
   const publish = async () => {
     if (!pch) return
@@ -653,6 +675,27 @@ function Pubsub() {
           <button class="run" onClick={publish}>Publish ▶</button>
         </div>
         {pres && <div class="dim small" style="padding:.1rem">{pres}</div>}
+      </div>
+
+      <div class="panel">
+        <div class="tailbar">
+          <button class={'run ' + (tailing ? 'stop' : '')} style="margin:0"
+            onClick={() => setTailing((t) => !t)}>{tailing ? '⏸ Stop tail' : '▶ Live tail'}</button>
+          <input class="qsearch" spellcheck={false} placeholder="filter messages…" value={tailQ}
+            onInput={(e) => setTailQ(e.target.value)} style="margin:0;flex:1" />
+          <span class="dim small">{feed.length} captured{tailing ? ' · buffering' : ''}</span>
+          <button class="mini" title="clear" onClick={clearFeed}>✕</button>
+        </div>
+        <div class="feed">
+          {shownFeed.map((f, i) => (
+            <div class="fmsg" key={i}>
+              <span class="ft">{f.ts}</span><span class="fch">{f.ch}</span>
+              <span class="fm">{f.msg == null ? '(nil)' : f.msg}</span>
+            </div>
+          ))}
+          {shownFeed.length === 0 && <div class="dim small" style="padding:.6rem">
+            {tailing ? 'waiting for messages…' : 'press Live tail to capture published messages'}</div>}
+        </div>
       </div>
 
       <div class="panel nopad">

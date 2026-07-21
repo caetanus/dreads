@@ -56,7 +56,8 @@ import dreads.stream : nowMs;
 import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients, gConnectedClients,
     gImportSourceActive;
 import dreads.dict : Dict, Unit;
-import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush;
+import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush,
+    pubsubTapArm, pubsubTapDrain, pubsubTapExpire, pubsubTapPending;
 import dreads.replicator : gReplicator;
 import dreads.resp;
 import dreads.scripting : cachedScript, evalCommand, scriptCommand, scriptSetPendingUser;
@@ -362,6 +363,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             flushPendingNotify(); // deliver any events the eviction cycle queued
             if (gTrackCount)
                 flushTrackingInval(0);
+            pubsubTapExpire(nowMs()); // disarm the dashboard message tap if polling stopped
             gAof.fsyncNow();
         }, true);
     }
@@ -6671,6 +6673,18 @@ package void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
                 repBulk(o, a.str);
                 repInt(o, cast(long) gShardPubSub.channelSubCount(a.str));
             }
+            break;
+        }
+    case "TAP":
+        {
+            // dreads-native: dashboard message tail. Arm/refresh the tap and drain
+            // everything buffered since the last poll as a flat [ch, msg, …] array.
+            // Self-expiring — the 1s cron disarms when polling stops.
+            import dreads.stream : nowMs;
+
+            pubsubTapArm(nowMs());
+            repArrayHeader(o, pubsubTapPending() * 2);
+            pubsubTapDrain((ch, msg) { repBulk(o, ch); repBulk(o, msg); });
             break;
         }
     case "HELP":
