@@ -70,6 +70,33 @@ header .st { margin-left: auto; }
 .mini { float: right; background: #1a2230; border: 1px solid #1f2a3a; color: #7d8aa0; border-radius: 6px;
   cursor: pointer; font-size: .85rem; line-height: 1; padding: .1rem .35rem; }
 .mini:hover { color: #c9d1d9; }
+.script.sel .sbody { border-color: #2f81f7; background: #101c2e; }
+.qsearch { width: 100%; margin: .5rem 0; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 7px;
+  color: #c9d1d9; padding: .4rem .55rem; font-size: .8rem; font-family: ui-monospace, monospace; outline: none; }
+.qsearch:focus { border-color: #2b3a52; }
+.qsearch.wide { max-width: 420px; }
+.msgs { margin-top: .7rem; display: flex; flex-direction: column; gap: .4rem; max-height: calc(100vh - 230px); overflow-y: auto; }
+.msg { margin: 0; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; padding: .5rem .7rem;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .8rem; color: #c9d1d9;
+  white-space: pre-wrap; word-break: break-word; }
+.mi { display: inline-block; min-width: 2.2rem; color: #5c6b82; user-select: none; }
+
+/* queues (RabbitMQ-style table) */
+.qbar { display: flex; align-items: center; gap: .8rem; margin-bottom: .8rem; }
+.qbar .qsearch { margin: 0; }
+.panel.nopad { padding: 0; overflow: hidden; }
+.qtable { width: 100%; border-collapse: collapse; font-size: .84rem; }
+.qtable th { text-align: left; color: #7d8aa0; font-weight: 500; font-size: .72rem; text-transform: uppercase;
+  letter-spacing: .04em; padding: .6rem .9rem; border-bottom: 1px solid #1f2a3a; cursor: pointer; user-select: none; }
+.qtable th:hover { color: #c9d1d9; }
+.qtable td { padding: .5rem .9rem; border-bottom: 1px solid #131c28; }
+.qtable tbody tr { cursor: pointer; }
+.qtable tbody tr:hover { background: #101722; }
+.qtable tbody tr.on { background: #101c2e; }
+.qtable .num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+.qtable .qname { color: #c9d1d9; font-family: ui-monospace, monospace; }
+.qtable .strong { font-weight: 600; }
+.qtable .up { color: #3fb950; } .qtable .down { color: #f85149; }
 .pgmain { display: flex; flex-direction: column; }
 .editor { min-height: 260px; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 10px;
   padding: .7rem .9rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .84rem;

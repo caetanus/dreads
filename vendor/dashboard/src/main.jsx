@@ -307,6 +307,126 @@ function Playground() {
   )
 }
 
+// ---------- Queues: Redis lists as message queues (Celery/RQ/Sidekiq), RabbitMQ-style ----------
+async function scanList(pattern) {
+  let cursor = '0', keys = []
+  do {
+    const args = ['SCAN', cursor]
+    if (pattern) args.push('MATCH', '*' + pattern + '*')
+    args.push('COUNT', '500', 'TYPE', 'list')
+    const v = await exec(args)
+    if (v.t !== 'array') break
+    cursor = v.v[0].v
+    for (const k of (v.v[1].v || [])) keys.push(k.v)
+  } while (cursor !== '0' && keys.length < 5000)
+  return keys
+}
+
+function Queues() {
+  const [rows, setRows] = useState([])
+  const [sel, setSel] = useState(null)
+  const [msgs, setMsgs] = useState([])
+  const [nameQ, setNameQ] = useState('')
+  const [msgQ, setMsgQ] = useState('')
+  const [sort, setSort] = useState({ k: 'depth', dir: -1 })
+  const [pub, setPub] = useState('')
+  const [chart, setChart] = useState(null)
+  const hist = useRef({})
+  const selH = useRef({ name: null, t: [], d: [] })
+  const nameQR = useRef(nameQ), selR = useRef(sel)
+  nameQR.current = nameQ; selR.current = sel
+
+  const poll = useCallback(async () => {
+    const keys = await scanList(nameQR.current.trim())
+    const now = Date.now() / 1000
+    const lens = await Promise.all(keys.map((k) => exec(['LLEN', k])))
+    const next = keys.map((k, i) => {
+      const depth = lens[i] && lens[i].t === 'int' ? lens[i].v : 0
+      const h = hist.current[k] || (hist.current[k] = { last: depth, lastT: now })
+      const dt = now - h.lastT
+      const rate = dt > 0.1 ? (depth - h.last) / dt : (h.rate || 0)
+      h.last = depth; h.lastT = now; h.rate = rate
+      return { name: k, depth, rate }
+    })
+    setRows(next)
+    const s = selR.current
+    if (s) {
+      const d = next.find((r) => r.name === s)
+      const sh = selH.current
+      if (sh.name !== s) { sh.name = s; sh.t = []; sh.d = [] }
+      sh.t.push(now); sh.d.push(d ? d.depth : 0)
+      if (sh.t.length > 120) { sh.t.shift(); sh.d.shift() }
+      setChart([sh.t.slice(), sh.d.slice()])
+    }
+  }, [])
+
+  useEffect(() => { poll(); const id = setInterval(poll, 2000); return () => clearInterval(id) }, [poll])
+
+  const open = async (name) => {
+    setSel(name); selR.current = name; selH.current = { name, t: [], d: [] }
+    const v = await exec(['LRANGE', name, '0', '199'])
+    setMsgs(v.t === 'array' ? v.v.map((x) => (x.v == null ? '(nil)' : x.v)) : [])
+  }
+  const publish = async () => {
+    if (!pub || !sel) return
+    await exec(['RPUSH', sel, pub]); setPub(''); open(sel); poll()
+  }
+  const sortBy = (k) => setSort((s) => ({ k, dir: s.k === k ? -s.dir : (k === 'name' ? 1 : -1) }))
+  const sorted = [...rows].sort((a, b) => (a[sort.k] < b[sort.k] ? -1 : a[sort.k] > b[sort.k] ? 1 : 0) * sort.dir)
+  const shown = msgs.filter((m) => !msgQ || m.includes(msgQ))
+  const arrow = (k) => (sort.k === k ? (sort.dir > 0 ? ' ▲' : ' ▼') : '')
+
+  return (
+    <div>
+      <div class="qbar">
+        <input class="qsearch wide" spellcheck={false} placeholder="filter queues (regex-ish)…"
+          value={nameQ} onInput={(e) => setNameQ(e.target.value)} />
+        <span class="dim small">{rows.length} queues · auto-refresh 2s</span>
+        <button class="mini" title="refresh now" onClick={poll}>⟳</button>
+      </div>
+      <div class="panel nopad">
+        <table class="qtable">
+          <thead><tr>
+            <th onClick={() => sortBy('name')}>Name{arrow('name')}</th>
+            <th class="num" onClick={() => sortBy('depth')}>Messages{arrow('depth')}</th>
+            <th class="num" onClick={() => sortBy('rate')}>Δ/s{arrow('rate')}</th>
+          </tr></thead>
+          <tbody>
+            {sorted.map((q) => (
+              <tr key={q.name} class={sel === q.name ? 'on' : ''} onClick={() => open(q.name)}>
+                <td class="qname">{q.name}</td>
+                <td class="num strong">{fmt(q.depth)}</td>
+                <td class={'num ' + (q.rate > 0 ? 'up' : q.rate < 0 ? 'down' : 'dim')}>
+                  {q.rate > 0 ? '+' : ''}{q.rate ? q.rate.toFixed(1) : '0'}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colspan="3" class="dim small" style="padding:1rem">no list keys</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {sel && (
+        <div class="panel">
+          <div class="title">{sel} <span class="dim">— queued messages over time</span></div>
+          {chart && <Chart data={chart} height={130} series={[{}, line('depth', '#2f81f7')]} />}
+          <div class="pgargs">
+            <label style="flex:1">publish <input value={pub} placeholder="message body (RPUSH)"
+              onInput={(e) => setPub(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && publish()} style="flex:1" /></label>
+            <button class="run" onClick={publish}>Publish ▶</button>
+          </div>
+          <div class="title">get messages <span class="dim">— head 200</span></div>
+          <input class="qsearch wide" spellcheck={false} placeholder="search in messages…"
+            value={msgQ} onInput={(e) => setMsgQ(e.target.value)} />
+          <div class="msgs">
+            {shown.map((m, i) => <pre class="msg" key={i}><span class="mi">{i}</span>{m}</pre>)}
+            {shown.length === 0 && <div class="dim small">no messages</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const snap = useMetrics()
   const [tab, setTab] = useState('overview')
@@ -315,7 +435,7 @@ function App() {
       <header>
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
-          {['overview', 'console', 'playground'].map((t) => (
+          {['overview', 'console', 'queues', 'playground'].map((t) => (
             <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>{t}</button>
           ))}
         </nav>
@@ -323,6 +443,7 @@ function App() {
       </header>
       {tab === 'overview' && <Overview snap={snap} />}
       {tab === 'console' && <Console />}
+      {tab === 'queues' && <Queues />}
       {tab === 'playground' && <Playground />}
     </div>
   )
