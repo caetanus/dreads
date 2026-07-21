@@ -49,11 +49,13 @@ public ulong nowMs() @nogc nothrow
 {
     version (Posix)
     {
-        import core.sys.posix.time : CLOCK_REALTIME, clock_gettime, timespec;
+        // gettimeofday (µs) is declared by druntime for every POSIX incl. Darwin,
+        // unlike core.sys.posix.time.clock_gettime (Linux-only in druntime).
+        import core.sys.posix.sys.time : gettimeofday, timeval;
 
-        timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        return cast(ulong) ts.tv_sec * 1000 + cast(ulong) ts.tv_nsec / 1_000_000;
+        timeval tv;
+        gettimeofday(&tv, null);
+        return cast(ulong) tv.tv_sec * 1000 + cast(ulong) tv.tv_usec / 1000;
     }
     else
     {
