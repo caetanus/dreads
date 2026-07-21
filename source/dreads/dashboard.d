@@ -26,6 +26,8 @@ import std.conv : to; // CTFE only (Content-Length of the embedded bundle)
 import dreads.config : gConfig;
 import dreads.stream : nowMs;
 import dreads.resp : RVal;
+import dreads.obj : Keyspace;
+import dreads.mem : Arena;
 
 private shared TaskPool gDashPool;
 private __gshared bool gDashUp;
@@ -205,6 +207,49 @@ private bool dashPubsub(scope const(RVal)[] arr, ref ByteBuffer reply) nothrow
     return true;
 }
 
+// EVAL/EVALSHA are server-layer scripting commands (not in the commands.d dispatch
+// the bridge uses), so the Lua playground's EVAL returned "unknown command" over
+// /api/exec. Run it in-place via evalCommand on the main thread (same call the normal
+// EVAL path makes). A writing script needs dashboard-write; the _RO forms are always
+// allowed. Effects propagate through the redis.call sink inside the script, as usual.
+private bool dashEval(scope const(RVal)[] arr, ref Keyspace ks, ref ByteBuffer reply, ref Arena arena) nothrow
+{
+    import dreads.scripting : evalCommand;
+    import dreads.resp : repError;
+
+    if (arr.length == 0)
+        return false;
+    auto n = arr[0].str;
+    bool bySha, readOnly, isEval;
+    if (ciEq(n, "eval"))
+        isEval = true;
+    else if (ciEq(n, "evalsha"))
+    {
+        isEval = true;
+        bySha = true;
+    }
+    else if (ciEq(n, "eval_ro"))
+    {
+        isEval = true;
+        readOnly = true;
+    }
+    else if (ciEq(n, "evalsha_ro"))
+    {
+        isEval = true;
+        bySha = true;
+        readOnly = true;
+    }
+    if (!isEval)
+        return false;
+    if (!readOnly && !gConfig.dashboardWrite)
+    {
+        repError(reply, "ERR dashboard: writes disabled (set dashboard-write yes)");
+        return true;
+    }
+    evalCommand(arr[1 .. $], ks, reply, arena, bySha, readOnly);
+    return true;
+}
+
 private bool dashApplyConfig(scope const(RVal)[] arr, ref ByteBuffer reply) @nogc nothrow
 {
     import dreads.resp : repError;
@@ -300,6 +345,10 @@ private void dashCmdDrainLoop() nothrow
                     else if (dashPubsub(cmd.arr, slot.reply))
                     {
                         // PUBSUB introspection (server-layer command, served in-place)
+                    }
+                    else if (dashEval(cmd.arr, gDbs[slot.db < NUM_DBS ? slot.db : 0], slot.reply, arena))
+                    {
+                        // EVAL/EVALSHA (server-layer scripting command, run in-place)
                     }
                     else
                     {
