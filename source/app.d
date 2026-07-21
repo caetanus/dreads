@@ -9,7 +9,7 @@ else
         import core.stdc.stdio : fwrite, stdout;
 
         import dreads.config : gConfig, loadConfig, applyDirective;
-        import dreads.logo : logo;
+        import dreads.logo : logo, enableAnsi;
         import dreads.server : runServer;
 
         import std.algorithm : startsWith;
@@ -103,6 +103,7 @@ else
             }
         }
 
+        enableAnsi(); // Windows: interpret the banner's ANSI escapes (no-op on POSIX)
         fwrite(logo.ptr, 1, logo.length, stdout);
 
         // Neither the data plane (malloc'd arenas) nor the Raft path (automem
