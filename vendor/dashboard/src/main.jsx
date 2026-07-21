@@ -932,12 +932,133 @@ function Streams() {
   )
 }
 
+// ---- ACL rule model: parse a canonical rule string <-> a form model, build tokens ----
+function parseAcl(rulesStr) {
+  const m = { enabled: false, nopass: false, pwHashes: [], newpw: '', allkeys: false, keys: [],
+    allchannels: false, channels: [], cmdBase: 'none', cats: {}, cmds: {} }
+  for (const t of rulesStr.split(/\s+/).filter(Boolean)) {
+    if (t === 'on') m.enabled = true
+    else if (t === 'off') m.enabled = false
+    else if (t === 'nopass') m.nopass = true
+    else if (t[0] === '#' || t[0] === '>') m.pwHashes.push(t) // keep existing hash (or literal) tokens
+    else if (t === '~*' || t === 'allkeys') m.allkeys = true
+    else if (t === '&*' || t === 'allchannels') m.allchannels = true
+    else if (t === 'resetchannels' || t === 'nochannels') m.allchannels = false
+    else if (t[0] === '~') m.keys.push({ pat: t.slice(1), mode: 'RW' })
+    else if (t[0] === '%') { const mm = t.match(/^%(RW|R|W)~(.*)$/); if (mm) m.keys.push({ pat: mm[2], mode: mm[1] }) }
+    else if (t[0] === '&') m.channels.push(t.slice(1))
+    else if (t === '+@all' || t === 'allcommands') m.cmdBase = 'all'
+    else if (t === '-@all' || t === 'nocommands') m.cmdBase = 'none'
+    else if (t.startsWith('+@')) m.cats[t.slice(2)] = '+'
+    else if (t.startsWith('-@')) m.cats[t.slice(2)] = '-'
+    else if (t[0] === '+') m.cmds[t.slice(1)] = '+'
+    else if (t[0] === '-') m.cmds[t.slice(1)] = '-'
+    // reset / resetkeys / resetpass / resetdbs / clearselectors: ignored (the form is authoritative)
+  }
+  return m
+}
+function buildAcl(m) {
+  const t = ['reset'] // form is the full spec — start clean, then apply
+  t.push(m.enabled ? 'on' : 'off')
+  if (m.nopass) t.push('nopass')
+  else { m.pwHashes.forEach((h) => t.push(h)); if (m.newpw.trim()) t.push('>' + m.newpw.trim()) }
+  if (m.allkeys) t.push('~*')
+  else m.keys.forEach((k) => t.push(k.mode === 'RW' ? '~' + k.pat : '%' + k.mode + '~' + k.pat))
+  if (m.allchannels) t.push('&*')
+  else m.channels.forEach((c) => t.push('&' + c))
+  t.push(m.cmdBase === 'all' ? '+@all' : '-@all')
+  for (const [c, s] of Object.entries(m.cats)) if (s) t.push(s + '@' + c)
+  for (const [c, s] of Object.entries(m.cmds)) if (s) t.push(s + c)
+  return t
+}
+
+// ---- the ACL builder form (no hand-writing of rule tokens) ----
+function AclForm({ m, set, cats }) {
+  const [k, setK] = useState(''); const [ch, setCh] = useState(''); const [cmd, setCmd] = useState('')
+  const up = (p) => set({ ...m, ...p })
+  const addKey = () => { const v = k.trim(); if (v) { up({ keys: [...m.keys, { pat: v, mode: 'RW' }] }); setK('') } }
+  const addChan = () => { const v = ch.trim(); if (v) { up({ channels: [...m.channels, v] }); setCh('') } }
+  const setKeyMode = (i, mode) => { const ks = m.keys.slice(); ks[i] = { ...ks[i], mode }; up({ keys: ks }) }
+  const cycCat = (c) => { const s = m.cats[c], nx = s === '+' ? '-' : s === '-' ? undefined : '+'
+    const cc = { ...m.cats }; if (nx) cc[c] = nx; else delete cc[c]; up({ cats: cc }) }
+  const addCmd = (sign) => { const v = cmd.trim().toLowerCase(); if (v) { up({ cmds: { ...m.cmds, [v]: sign } }); setCmd('') } }
+  const rmCmd = (c) => { const cc = { ...m.cmds }; delete cc[c]; up({ cmds: cc }) }
+
+  return (
+    <div class="aclform">
+      <div class="arow"><span class="alabel">status</span>
+        <button class={'toggle ' + (m.enabled ? 'on' : '')} onClick={() => up({ enabled: !m.enabled })}>
+          {m.enabled ? 'enabled' : 'disabled'}</button></div>
+
+      <div class="arow"><span class="alabel">password</span>
+        <label class="chk"><input type="checkbox" checked={m.nopass}
+          onInput={(e) => up({ nopass: e.target.checked })} /> nopass</label>
+        {!m.nopass && <input class="ain" type="password" placeholder={m.pwHashes.length ? 'set a new password' : 'password'}
+          value={m.newpw} onInput={(e) => up({ newpw: e.target.value })} />}
+        {!m.nopass && m.pwHashes.length > 0 && <span class="up small">✓ {m.pwHashes.length} set</span>}</div>
+
+      <div class="arow"><span class="alabel">keys</span>
+        <label class="chk"><input type="checkbox" checked={m.allkeys}
+          onInput={(e) => up({ allkeys: e.target.checked })} /> all keys (~*)</label></div>
+      {!m.allkeys && <div class="chips">
+        {m.keys.map((kk, i) => (
+          <span class="chip" key={i}>{kk.pat}
+            <select value={kk.mode} onChange={(e) => setKeyMode(i, e.target.value)}>
+              <option>RW</option><option>R</option><option>W</option></select>
+            <button class="cx" onClick={() => up({ keys: m.keys.filter((_, j) => j !== i) })}>×</button></span>
+        ))}
+        <span class="chipadd"><input placeholder="key:pattern:*" value={k}
+          onInput={(e) => setK(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addKey()} />
+          <button onClick={addKey}>+</button></span>
+      </div>}
+
+      <div class="arow"><span class="alabel">channels</span>
+        <label class="chk"><input type="checkbox" checked={m.allchannels}
+          onInput={(e) => up({ allchannels: e.target.checked })} /> all channels (&amp;*)</label></div>
+      {!m.allchannels && <div class="chips">
+        {m.channels.map((cc, i) => (
+          <span class="chip" key={i}>{cc}
+            <button class="cx" onClick={() => up({ channels: m.channels.filter((_, j) => j !== i) })}>×</button></span>
+        ))}
+        <span class="chipadd"><input placeholder="channel:*" value={ch}
+          onInput={(e) => setCh(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addChan()} />
+          <button onClick={addChan}>+</button></span>
+      </div>}
+
+      <div class="arow"><span class="alabel">commands</span>
+        <div class="seg">
+          <button class={m.cmdBase === 'none' ? 'on' : ''} onClick={() => up({ cmdBase: 'none' })}>deny all</button>
+          <button class={m.cmdBase === 'all' ? 'on' : ''} onClick={() => up({ cmdBase: 'all' })}>allow all</button></div>
+        <span class="dim small">base {m.cmdBase === 'all' ? '+@all' : '-@all'} — click categories to override</span></div>
+      <div class="cats">
+        {cats.map((c) => (
+          <button key={c} class={'cat ' + (m.cats[c] === '+' ? 'allow' : m.cats[c] === '-' ? 'deny' : '')}
+            onClick={() => cycCat(c)} title="click: neutral → allow → deny">
+            <span class="cs">{m.cats[c] === '+' ? '+' : m.cats[c] === '-' ? '−' : '·'}</span>{c}</button>
+        ))}
+      </div>
+      {Object.keys(m.cmds).length > 0 && <div class="chips">
+        {Object.entries(m.cmds).map(([c, s]) => (
+          <span class={'chip ' + (s === '+' ? 'callow' : 'cdeny')} key={c}>{s}{c}
+            <button class="cx" onClick={() => rmCmd(c)}>×</button></span>
+        ))}</div>}
+      <div class="chipadd solo"><input placeholder="individual command (e.g. flushdb)" value={cmd}
+        onInput={(e) => setCmd(e.target.value)} />
+        <button onClick={() => addCmd('+')}>allow</button><button onClick={() => addCmd('-')}>deny</button></div>
+
+      <div class="apreview"><span class="dim small">rule preview</span>
+        <code>{buildAcl(m).slice(1).join(' ')}</code></div>
+    </div>
+  )
+}
+
 // ---------- Admin: ACL users + memory + a saveable command log (needs dashboard-admin) ----------
 function Admin({ snap }) {
   const [users, setUsers] = useState([])
   const [sel, setSel] = useState(null)      // editing username, or '' for new, or null
   const [name, setName] = useState('')
-  const [rules, setRules] = useState('')
+  const [m, setM] = useState(null)          // parsed ACL model for the form
+  const [cats, setCats] = useState([])      // ACL CAT categories
   const [msg, setMsg] = useState('')
   const [gate, setGate] = useState('')      // set if dashboard-admin is off
   const [log, setLog] = useState([])        // emitted commands, saveable
@@ -960,13 +1081,13 @@ function Admin({ snap }) {
       return { name: a[2], on: a.includes('on'), rules: a.slice(3).join(' ') }
     }))
   }, [])
-  useEffect(() => { refresh() }, [])
+  useEffect(() => { refresh(); exec(['ACL', 'CAT']).then((v) => setCats(rarr(v).map(rval).sort())) }, [])
 
-  const editUser = (u) => { setSel(u.name); setName(u.name); setRules(u.rules); setMsg('') }
-  const newUser = () => { setSel(''); setName(''); setRules('on >changeme ~* +@read'); setMsg('') }
+  const editUser = (u) => { setSel(u.name); setName(u.name); setM(parseAcl(u.rules)); setMsg('') }
+  const newUser = () => { setSel(''); setName(''); setM(parseAcl('on -@all')); setMsg('') }
   const save = async () => {
     if (!name.trim()) { setMsg('username required'); return }
-    const toks = rules.split(/\s+/).filter(Boolean)
+    const toks = buildAcl(m)
     const v = await runLogged(['ACL', 'SETUSER', name.trim(), ...toks])
     setMsg(v.t === 'error' ? v.v : '✓ saved ' + name.trim())
     if (v.t !== 'error') setSel(name.trim())
@@ -1035,13 +1156,12 @@ function Admin({ snap }) {
                 <span class="ktitle">{sel === '' ? 'new user' : sel}</span>
                 {sel && sel !== 'default' && <button class="del" onClick={() => del(sel)}>Delete</button>}
               </div>
-              <label class="dim small">username</label>
-              <input class="qsearch wide" spellcheck={false} value={name} onInput={(e) => setName(e.target.value)}
-                placeholder="username" disabled={sel !== '' && sel !== name} />
-              <label class="dim small" style="margin-top:.6rem;display:block">ACL rules
-                <span class="dim"> — space-separated tokens (e.g. on &gt;pass ~key:* +@read -@dangerous)</span></label>
-              <textarea class="aclrules" spellcheck={false} value={rules}
-                onInput={(e) => setRules(e.target.value)} />
+              {sel === '' && <div>
+                <label class="dim small">username</label>
+                <input class="qsearch wide" spellcheck={false} value={name}
+                  onInput={(e) => setName(e.target.value)} placeholder="username" />
+              </div>}
+              {m && <AclForm m={m} set={setM} cats={cats} />}
               <div class="pgargs">
                 <button class="run" onClick={save}>{sel === '' ? 'Create ▶' : 'Save ▶'}</button>
                 {msg && <span class={'small ' + (msg[0] === '✓' ? 'up' : 'err')}>{msg}</span>}

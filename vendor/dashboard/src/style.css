@@ -85,11 +85,44 @@ header .st { margin-left: auto; }
 .loginbox input { width: 100%; background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 8px;
   color: #c9d1d9; padding: .55rem .7rem; font-size: .9rem; box-sizing: border-box; }
 
-/* admin: ACL rules editor */
-.aclrules { width: 100%; box-sizing: border-box; min-height: 90px; margin-top: .3rem; resize: vertical;
-  background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; color: #c9d1d9;
-  font-family: ui-monospace, monospace; font-size: .82rem; padding: .6rem .8rem; line-height: 1.5; }
-.small.up { color: #3fb950; }
+/* admin: ACL builder form */
+.small.up, .up.small { color: #3fb950; }
+.aclform { margin: .6rem 0; }
+.arow { display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; margin: .55rem 0; }
+.alabel { flex: 0 0 74px; color: #7d8aa0; font-size: .74rem; text-transform: uppercase; letter-spacing: .04em; }
+.ain { background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 7px; color: #c9d1d9;
+  padding: .32rem .5rem; font-size: .82rem; font-family: ui-monospace, monospace; }
+.chk { display: inline-flex; align-items: center; gap: .35rem; font-size: .82rem; color: #c9d1d9; cursor: pointer; }
+.toggle { background: #2a1518; border: 1px solid #5c1b20; color: #f85149; border-radius: 7px;
+  padding: .3rem .8rem; font: inherit; font-size: .8rem; cursor: pointer; }
+.toggle.on { background: #12241a; border-color: #1c4429; color: #3fb950; }
+.chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 .5rem 74px; }
+.chip { display: inline-flex; align-items: center; gap: .3rem; background: #17233a; border: 1px solid #24406b;
+  color: #c9d1d9; border-radius: 6px; padding: .15rem .2rem .15rem .5rem; font-size: .78rem;
+  font-family: ui-monospace, monospace; }
+.chip.callow { background: #12241a; border-color: #1c4429; } .chip.cdeny { background: #2a1518; border-color: #5c1b20; }
+.chip select { background: #0b0f16; border: 1px solid #24406b; color: #adbac7; border-radius: 4px; font-size: .7rem; }
+.chip .cx { background: none; border: none; color: #7d8aa0; cursor: pointer; font-size: .95rem; line-height: 1; padding: 0 .2rem; }
+.chip .cx:hover { color: #f85149; }
+.chipadd { display: inline-flex; gap: .25rem; }
+.chipadd.solo { margin-left: 74px; }
+.chipadd input { background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 6px; color: #c9d1d9;
+  padding: .22rem .45rem; font-size: .78rem; font-family: ui-monospace, monospace; }
+.chipadd button { background: #1a2230; border: 1px solid #1f2a3a; color: #adbac7; border-radius: 6px;
+  padding: .22rem .55rem; font-size: .75rem; cursor: pointer; }
+.chipadd button:hover { color: #c9d1d9; }
+.seg { display: inline-flex; border: 1px solid #1f2a3a; border-radius: 7px; overflow: hidden; }
+.seg button { background: #0d1219; border: none; color: #7d8aa0; padding: .3rem .7rem; font-size: .78rem; cursor: pointer; }
+.seg button.on { background: #101c2e; color: #c9d1d9; }
+.cats { display: flex; flex-wrap: wrap; gap: .3rem; margin: 0 0 .6rem 74px; }
+.cat { background: #0d1219; border: 1px solid #1f2a3a; color: #7d8aa0; border-radius: 6px;
+  padding: .2rem .5rem; font-size: .74rem; cursor: pointer; font-family: ui-monospace, monospace; }
+.cat .cs { display: inline-block; width: .8em; color: #5c6b82; margin-right: .15rem; }
+.cat.allow { background: #12241a; border-color: #1c4429; color: #6bd07a; } .cat.allow .cs { color: #3fb950; }
+.cat.deny { background: #2a1518; border-color: #5c1b20; color: #e0736e; } .cat.deny .cs { color: #f85149; }
+.apreview { margin: .7rem 0 0 74px; }
+.apreview code { display: block; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 7px;
+  padding: .5rem .7rem; color: #79b8ff; font-size: .78rem; word-break: break-all; margin-top: .2rem; }
 .membar { height: 10px; background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 6px; overflow: hidden; margin: .3rem 0 .2rem; }
 .memfill { height: 100%; background: linear-gradient(90deg, #2f81f7, #db6d28); transition: width .4s; }
 .cmdlog { background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; padding: .7rem .9rem;
