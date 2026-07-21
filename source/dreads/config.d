@@ -90,6 +90,12 @@ public struct Config
     ushort dashboardPort = 6479;
     string dashboardBind = "127.0.0.1";
     string dashboardPassword = null; // empty/null = no auth (localhost only)
+    // The dashboard is read-only (metrics + inspect list/stream/keys) unless these
+    // are opted in. Writes (LPUSH/LPOP, XADD/XDEL, PUBLISH, DEL, SPOP, …) need
+    // `dashboard-write`; ACL user administration needs the higher-privilege
+    // `dashboard-admin`. Both default OFF.
+    bool dashboardWrite = false;
+    bool dashboardAdmin = false;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -280,6 +286,22 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "dashboard-password":
         cfg.dashboardPassword = value;
+        return true;
+    case "dashboard-write":
+        if (value == "yes")
+            cfg.dashboardWrite = true;
+        else if (value == "no")
+            cfg.dashboardWrite = false;
+        else
+            return false;
+        return true;
+    case "dashboard-admin":
+        if (value == "yes")
+            cfg.dashboardAdmin = true;
+        else if (value == "no")
+            cfg.dashboardAdmin = false;
+        else
+            return false;
         return true;
     case "raft-compress":
         if (value == "yes")
