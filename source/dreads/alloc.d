@@ -200,18 +200,36 @@ else
 
 alias ConnAllocatorT = StatsCollector!(ConnBackend, Options.bytesUsed);
 
-// Always stateful now (the collectors hold counters), so one global instance per
-// plane with an `instance` accessor — drops straight into the `Allocator.instance`
-// pattern. Single event-loop thread ⇒ the __gshared instances are race-free.
-private __gshared DataAllocator gDataAlloc;
-private __gshared ConnAllocatorT gConnAlloc;
+/// Max shards the per-shard allocator arrays serve (thread-per-shard ⇒ ~= cores; a
+/// fixed __gshared array, never resized, so a live allocator's freelist state is never
+/// moved). shardInit clamps the shard count to this.
+public enum size_t MAX_SHARDS = 128;
+
+// SHARE-NOTHING allocators, WITHOUT tripping DMD's @safe inference. Each shard gets its
+// OWN DataAllocator/ConnAllocatorT (its own freelists + counters); a shard only ever
+// allocates/frees on its own thread, so no lock, no false sharing on the hot path.
+//
+// These are a __gshared ARRAY indexed by a THREAD-LOCAL shard id (gAllocShard), NOT a
+// thread-local instance. That is deliberate: a `DataAllocator gDataAlloc;` TLS variable
+// makes `instance()` a @safe (TLS) access, and that @safe-ness propagates through the
+// keyspace/dispatch/serveClient chain and trips a latent vibe-core 2.14.0 @safe/@system
+// bug (waitForDataEx / ManualEvent.wait fail to instantiate). Indexing a __gshared array
+// stays @system inside the @trusted accessor, so no @safe leaks out — same codegen the
+// single-thread build always had. Each thread touches only its own slot (share-nothing).
+private __gshared DataAllocator[MAX_SHARDS] gDataAllocs;
+private __gshared ConnAllocatorT[MAX_SHARDS] gConnAllocs;
+
+/// This thread's shard slot for both allocator planes. Thread-local, default 0 (the
+/// main thread and every unsharded/test build use slot 0). A shard worker sets it to
+/// its shard id when it starts, so all its allocations route to its own slot.
+public uint gAllocShard = 0;
 
 /// Keyspace (data) plane — every RObj value routes here; drives maxmemory.
 struct KeyspaceAllocator
 {
     static @property ref DataAllocator instance() @nogc nothrow @trusted
     {
-        return gDataAlloc;
+        return gDataAllocs[gAllocShard];
     }
 }
 
@@ -221,22 +239,23 @@ struct ConnAllocator
 {
     static @property ref ConnAllocatorT instance() @nogc nothrow @trusted
     {
-        return gConnAlloc;
+        return gConnAllocs[gAllocShard];
     }
 }
 
 /// Live bytes currently held by the keyspace data allocator — the real,
-/// build-portable figure that drives maxmemory (replaces the jemalloc-only mallctl).
+/// build-portable figure that drives maxmemory. Per-shard (this thread's slot); global
+/// aggregation across shards is a follow-up (peripheral path).
 ulong keyspaceBytesUsed() @nogc nothrow @trusted
 {
-    return cast(ulong) gDataAlloc.bytesUsed;
+    return cast(ulong) gDataAllocs[gAllocShard].bytesUsed;
 }
 
 /// Live bytes currently held by the connection-plane allocator (network/reply
 /// buffers, scratch, write queue) — the basis for client-buffer accounting.
 ulong connBytesUsed() @nogc nothrow @trusted
 {
-    return cast(ulong) gConnAlloc.bytesUsed;
+    return cast(ulong) gConnAllocs[gAllocShard].bytesUsed;
 }
 
 // Feasibility probe: the data plane is @nogc nothrow, so the backend must

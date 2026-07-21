@@ -903,6 +903,69 @@ size_t getCommandKeys(scope const(char)[] name, scope const(RVal)[] arr, scope K
     return n;
 }
 
+// --- fast routing-key lookup (sharding hot path) -----------------------------
+// forEachCommandKey linearly scans EVERY key spec by name per call — ~7% of cycles
+// under sharded load (perf). Routing only needs the FIRST key, so precompute, per
+// command index, the arg position of its first key: a compile-time table indexed by
+// aclCmdIndex (a compiler-hashed string switch). O(1) for the common static-single-key
+// commands (SET/GET/HSET/...); anything dynamic (numkeys, keyword-positioned) or
+// unknown falls back to the full extractor — rare, off the hot path.
+private enum int ROUTE_KEYLESS = 0; // command touches no key → runs locally
+private enum int ROUTE_FALLBACK = -1; // first key is dynamic → use forEachCommandKey
+
+private immutable int[gCmdCats.length] gRouteFirstKey = buildRouteFirstKey();
+
+private int[gCmdCats.length] buildRouteFirstKey()
+{
+    import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
+
+    int[gCmdCats.length] t = ROUTE_KEYLESS;
+    foreach (ref ks; gCmdKeySpecs) // static specs: first key at a fixed position
+    {
+        immutable i = aclCmdIndex(ks.name);
+        if (i >= 0)
+            t[i] = ks.first >= 1 ? ks.first : ROUTE_KEYLESS;
+    }
+    foreach (ref ks; gCmdKeyNumSpecs) // numkeys specs: dynamic → fall back
+    {
+        immutable i = aclCmdIndex(ks.name);
+        if (i >= 0)
+            t[i] = ROUTE_FALLBACK;
+    }
+    // keyword-positioned keys (SORT/GEORADIUS/XREAD/MIGRATE) live only in the switch
+    // inside forEachCommandKey, not the spec tables → mark them dynamic (fall back).
+    foreach (nm; ["sort", "sort_ro", "georadius", "georadiusbymember",
+            "xread", "xreadgroup", "migrate"])
+    {
+        immutable i = aclCmdIndex(nm);
+        if (i >= 0)
+            t[i] = ROUTE_FALLBACK;
+    }
+    return t;
+}
+
+/// The first routing key of a command (LOWERCASE name), or null if keyless. O(1) for
+/// the common static commands; a rare dynamic command falls back to forEachCommandKey.
+/// Multi-key commands route by their FIRST key (cross-slot spanning is a later phase).
+const(char)[] commandRouteKey(scope const(char)[] lname, scope const(RVal)[] arr) @trusted nothrow @nogc
+{
+    immutable i = aclCmdIndex(lname);
+    if (i < 0)
+        return null; // unknown command → run locally, let dispatch error it
+    immutable pos = gRouteFirstKey[i];
+    if (pos == ROUTE_KEYLESS)
+        return null;
+    if (pos >= 1)
+        return pos < arr.length ? arr[pos].str : null;
+    // ROUTE_FALLBACK: extract the first key the slow-but-rare way
+    const(char)[] first = null;
+    cast(void) forEachCommandKey!((scope const(char)[] key, bool r, bool w) {
+        first = key;
+        return false; // stop at the first
+    })(lname, arr);
+    return first;
+}
+
 /// The first key this command touches that the user CANNOT access, or null if
 /// all are allowed (used both for enforcement and for the ACL LOG object name).
 const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
