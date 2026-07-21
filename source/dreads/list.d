@@ -1,42 +1,33 @@
 module dreads.list;
 
-// Redis LIST backed by an emplace ring Deque (no hand-rolled node malloc/free).
-// The element is StrVal (owns its bytes via .free() convention, KeyspaceAllocator);
-// the Deque disposes each element with .free() and manages its ONE ring block with
-// RAII — so there is NO per-node manual free. Copy semantics MATCH SmallHash exactly
-// (shallow value copy, safe because an RObj is never copied, only moved); free() is
-// the union's manual dispatch. LINSERT/LREM rebuild (Deque has no middle ops) — rare,
-// non-hot — using MOVES (no shallow-copy hazard). See list-deque-refactor-plan.
+// Redis LIST backed by a listpack-lite packed Segment (dreads.packedlist): the
+// element BYTES live INLINE in one contiguous block — no per-element node/malloc and
+// no pointer-to-heap per value. This is the Phase-2 win the cache-miss A/B pinned
+// (see list-deque-refactor-plan): the old linked list and the Deque!StrVal both paid
+// one value-cache-miss per element because the value sat OUTSIDE the container;
+// packing it inline makes LRANGE stream in cache-line order and drops the per-element
+// allocation. Push/pop stay O(1) amortized at both ends (a head byte-cursor makes
+// popFront allocation-free; a front gap feeds pushFront). LINSERT/LREM/LSET-resize
+// rebuild (O(n), rare — accepted). free()/gatherBlocks touch ONE block, not N.
+//
+// PHASE 2a: a single Segment is the whole list (small/medium — the 90% case). PHASE
+// 2b (follow-up) promotes huge lists to a Deque!Segment quicklist so a giant list
+// isn't one giant contiguous block; the Segment is reused as the node there.
 
 import std.algorithm.mutation : swap;
-import dreads.alloc : KeyspaceAllocator;
-import dreads.dict : StrVal;
-import emplace.deque : Deque;
-
-private alias Ring = Deque!(StrVal, KeyspaceAllocator);
-
-// Transfer ownership of a StrVal out of a slot: hand back its bytes and NULL the
-// source so it is never disposed twice. core.lifetime.move can't do this — StrVal
-// is __traits(isPOD) (no dtor) yet owns memory via .free(), so `move` shallow-copies
-// WITHOUT nulling the source, aliasing the pointer ⇒ use-after-free on the rebuild.
-private StrVal takeOut(ref StrVal s) @nogc nothrow
-{
-    StrVal r = s; // bitwise copy (shares the pointer for an instant)
-    s = StrVal.init; // null the source: it now owns nothing, disposes to a no-op
-    return r; // the caller (the new ring) is the sole owner
-}
+import dreads.packedlist : Segment;
 
 public struct DList
 {
-    private Ring q;
+    private Segment seg;
     // Lifetime queue counters (native queue metrics; free — DList still fits the
-    // RObj union's SmallZSet-sized slack). `q.length` is the live depth.
+    // RObj union's SmallZSet-sized slack). `seg.length` is the live depth.
     private ulong enq_;
     private ulong deq_;
 
     @property size_t length() const @nogc nothrow @trusted
     {
-        return q.length;
+        return seg.length;
     }
 
     @property ulong enqueued() const @nogc nothrow
@@ -49,64 +40,64 @@ public struct DList
         return deq_;
     }
 
-    /// Release the ring + every element. The RObj union free() dispatch calls this
-    /// (the Deque's ~this is never auto-run for a union member). clearShrink disposes
-    /// each StrVal (.free()) then frees the ring block; leaves `q` empty + reusable.
+    /// Release the packed block. The RObj union free() dispatch calls this (the
+    /// Segment's ~this is never auto-run for a union member). Leaves seg empty +
+    /// reusable (the next push re-allocates).
     void free() @nogc nothrow @trusted
     {
-        q.clearShrink();
+        seg.free();
     }
 
-    /// Off-loop lazyfree: record the ring block + each element's bytes, freeing
-    /// NOTHING. The RObj shell is discarded by the caller, so ~this never runs.
+    /// Off-loop lazyfree: record the one backing block, freeing NOTHING. The RObj
+    /// shell is discarded by the caller, so ~this never runs.
     void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow @trusted
     {
-        q.gatherBlocks(add);
+        seg.gatherBlocks(add);
     }
 
     void pushFront(scope const(char)[] v) @nogc nothrow @trusted
     {
-        q.pushFront(StrVal.ofRaw(v)); // ofRaw: byte-exact + stable rawView (no int-encode)
+        seg.pushFront(v);
         enq_++;
     }
 
     void pushBack(scope const(char)[] v) @nogc nothrow @trusted
     {
-        q.pushBack(StrVal.ofRaw(v));
+        seg.pushBack(v);
         enq_++;
     }
 
-    /// Valid only while the element stays in the list.
+    /// Valid only while the element stays in the list (until the next mutation).
     const(char)[] front() const @nogc nothrow @trusted
     {
-        assert(q.length > 0);
-        return q.front.rawView();
+        assert(seg.length > 0);
+        return seg.front;
     }
 
     const(char)[] back() const @nogc nothrow @trusted
     {
-        assert(q.length > 0);
-        return q.back.rawView();
+        assert(seg.length > 0);
+        return seg.back;
     }
 
     void popFront() @nogc nothrow @trusted
     {
-        assert(q.length > 0);
-        q.popFront(); // disposeElem -> StrVal.free()
+        assert(seg.length > 0);
+        seg.popFront();
         deq_++;
     }
 
     void popBack() @nogc nothrow @trusted
     {
-        assert(q.length > 0);
-        q.popBack();
+        assert(seg.length > 0);
+        seg.popBack();
         deq_++;
     }
 
     // Redis index (negative counts from the tail) -> logical [0, len); -1 if OOB.
     private long logical(long idx) const @nogc nothrow @trusted
     {
-        immutable n = cast(long) q.length;
+        immutable n = cast(long) seg.length;
         if (idx < 0)
             idx += n;
         return (idx < 0 || idx >= n) ? -1 : idx;
@@ -118,27 +109,31 @@ public struct DList
         if (i < 0)
             return null;
         ok = true;
-        return q[cast(size_t) i].rawView();
+        return seg[cast(size_t) i];
     }
 
+    /// LSET: same-length values overwrite in place; a resize rebuilds (O(n), rare).
     bool setAt(long idx, scope const(char)[] v) @nogc nothrow @trusted
     {
         immutable i = logical(idx);
         if (i < 0)
             return false;
-        q[cast(size_t) i].free(); // release the old bytes
-        q[cast(size_t) i] = StrVal.ofRaw(v); // bitwise-assign the new (owns fresh bytes)
+        immutable ii = cast(size_t) i;
+        Segment ns;
+        foreach (j; 0 .. seg.length)
+            ns.pushBack(j == ii ? v : seg[j]);
+        swap(seg, ns); // ns (old block) freed at scope exit
         return true;
     }
 
-    /// LINSERT: insert v before/after the first element equal to pivot. Deque has no
-    /// middle insert -> rebuild (O(n), rare). Returns the new length, or -1 if absent.
+    /// LINSERT: insert v before/after the first element equal to pivot. Packed rep
+    /// has no middle insert -> rebuild (O(n), rare). Returns the new length, or -1.
     long insertAround(scope const(char)[] pivot, scope const(char)[] v, bool before) @nogc nothrow @trusted
     {
-        immutable n = q.length;
+        immutable n = seg.length;
         long idx = -1;
         foreach (i; 0 .. n)
-            if (q[i].rawView() == pivot)
+            if (seg[i] == pivot)
             {
                 idx = cast(long) i;
                 break;
@@ -146,50 +141,49 @@ public struct DList
         if (idx < 0)
             return -1;
         immutable size_t insertAt = before ? cast(size_t) idx : cast(size_t)(idx + 1);
-        Ring nq;
+        Segment ns;
         foreach (i; 0 .. n)
         {
             if (i == insertAt)
-                nq.pushBack(StrVal.ofRaw(v));
-            nq.pushBack(takeOut(q[i])); // transfer ownership; q[i] becomes StrVal.init
+                ns.pushBack(v);
+            ns.pushBack(seg[i]);
         }
         if (insertAt == n)
-            nq.pushBack(StrVal.ofRaw(v));
-        swap(q, nq); // q gets the new ring; nq (old content: dropped elems + ring) dies at scope exit
+            ns.pushBack(v);
+        swap(seg, ns);
         return cast(long)(n + 1);
     }
 
     /// LREM: rcount > 0 removes from head, < 0 from tail, 0 all. Rebuild keeping the
-    /// survivors (moved); the DROPPED elements stay in `q` and are freed by q.~this
-    /// during the swap — so no explicit per-element free.
+    /// survivors; a from-tail pass builds reversed then the swap restores order.
     long remove(long rcount, scope const(char)[] v) @nogc nothrow @trusted
     {
-        immutable n = q.length;
+        immutable n = seg.length;
         immutable long limit = rcount == 0 ? long.max : (rcount > 0 ? rcount : -rcount);
         immutable fromTail = rcount < 0;
         long removed = 0;
-        Ring nq;
+        Segment ns;
         if (fromTail)
         {
             foreach_reverse (i; 0 .. n)
             {
-                if (removed < limit && q[i].rawView() == v)
-                    removed++; // drop: leave in q (freed by q.~this at swap)
+                if (removed < limit && seg[i] == v)
+                    removed++; // drop
                 else
-                    nq.pushFront(takeOut(q[i])); // pushFront preserves original order
+                    ns.pushFront(seg[i]); // pushFront preserves original order
             }
         }
         else
         {
             foreach (i; 0 .. n)
             {
-                if (removed < limit && q[i].rawView() == v)
+                if (removed < limit && seg[i] == v)
                     removed++;
                 else
-                    nq.pushBack(takeOut(q[i]));
+                    ns.pushBack(seg[i]);
             }
         }
-        swap(q, nq);
+        swap(seg, ns);
         return removed;
     }
 
@@ -197,31 +191,16 @@ public struct DList
     int walkRange(long start, size_t cnt,
             scope int delegate(const(char)[] v) @nogc nothrow dg) const @nogc nothrow @trusted
     {
-        immutable n = cast(long) q.length;
+        immutable n = cast(long) seg.length;
         long s = start < 0 ? start + n : start;
         if (s < 0 || s >= n)
             return 0;
-        foreach (k; 0 .. cnt)
-        {
-            immutable size_t i = cast(size_t) s + k;
-            if (i >= q.length)
-                break;
-            auto r = dg(q[i].rawView());
-            if (r)
-                return r;
-        }
-        return 0;
+        return seg.walkRange(cast(size_t) s, cnt, dg);
     }
 
     int opApply(scope int delegate(const(char)[] v) @nogc nothrow dg) const @nogc nothrow @trusted
     {
-        foreach (i; 0 .. q.length)
-        {
-            auto r = dg(q[i].rawView());
-            if (r)
-                return r;
-        }
-        return 0;
+        return seg.opApply(dg);
     }
 }
 
@@ -265,6 +244,21 @@ unittest // indexing, negative indexes, setAt
     assert(l.setAt(-1, "THREE"));
     assert(l.back == "THREE");
     assert(!l.setAt(10, "nope"));
+}
+
+unittest // LSET resize (new value a different length) keeps order + bytes
+{
+    DList l;
+    scope (exit)
+        l.free();
+    foreach (v; ["a", "bb", "ccc"])
+        l.pushBack(v);
+    assert(l.setAt(1, "LONGER-VALUE"));
+    bool ok;
+    assert(l.at(0, ok) == "a");
+    assert(l.at(1, ok) == "LONGER-VALUE");
+    assert(l.at(2, ok) == "ccc");
+    assert(l.length == 3);
 }
 
 unittest // LREM semantics
@@ -316,6 +310,10 @@ unittest // walkRange
     size_t n;
     l.walkRange(1, 3, (v) { got[n++] = v[0]; return 0; });
     assert(got[0 .. n] == "123");
+    // negative start + over-long count clamps
+    n = 0;
+    l.walkRange(-2, 10, (v) { got[n++] = v[0]; return 0; });
+    assert(got[0 .. n] == "34");
 }
 
 unittest // queue counters + reuse after free
@@ -328,4 +326,33 @@ unittest // queue counters + reuse after free
     l.pushFront("c");
     l.popFront();
     assert(l.enqueued == 3 && l.dequeued == 1 && l.length == 2);
+}
+
+unittest // large round-trip preserves order and drains clean
+{
+    DList l;
+    scope (exit)
+        l.free();
+    foreach (i; 0 .. 1000)
+    {
+        char[8] b;
+        import core.stdc.stdio : snprintf;
+
+        auto n = snprintf(b.ptr, b.length, "%d", i);
+        l.pushBack(cast(const(char)[]) b[0 .. n]);
+    }
+    assert(l.length == 1000);
+    size_t k;
+    foreach (v; l)
+    {
+        char[8] b;
+        import core.stdc.stdio : snprintf;
+
+        auto n = snprintf(b.ptr, b.length, "%d", cast(int) k);
+        assert(v == cast(const(char)[]) b[0 .. n]);
+        k++;
+    }
+    foreach (i; 0 .. 1000)
+        l.popFront();
+    assert(l.length == 0);
 }

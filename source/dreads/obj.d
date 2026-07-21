@@ -1073,8 +1073,9 @@ unittest // UNLINK hands a big list to the free-thread; small ones free inline
     assert(ks.lookup("big") is null);
     assert(gLazyFree.statSubmitted == 1); // went off-loop
 
-    // the Deque-backed list frees NEL element blocks + its ONE ring buffer.
-    enum size_t NBLK = NEL + 1;
+    // the packed-Segment list stores every element INLINE in ONE block, so the
+    // whole list is a single reclaimed block regardless of element count.
+    enum size_t NBLK = 1;
     // drain what the free-thread gathered, as the server tick would
     foreach (_; 0 .. 3000)
     {
@@ -1084,7 +1085,7 @@ unittest // UNLINK hands a big list to the free-thread; small ones free inline
             break;
         Thread.sleep(1.msecs);
     }
-    assert(gLazyFree.statReclaimedBlocks == NBLK); // every element block + the ring, freed on the loop
+    assert(gLazyFree.statReclaimedBlocks == NBLK); // the single packed block, freed on the loop
 }
 
 @("obj.unlink_offloads_big_zset_no_leak")
