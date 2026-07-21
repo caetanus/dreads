@@ -98,9 +98,13 @@
 	"dflags-windows-ldc": [
 		"-mscrtlib=libcmt"
 	],
+	"stringImportPaths": [
+		"vendor/dashboard/dist"
+	],
 	"preBuildCommands-posix": [
 		"bash vendor/lua/build.sh",
-		"bash vendor/lz4/build.sh"
+		"bash vendor/lz4/build.sh",
+		"bash vendor/dashboard/build.sh"
 	],
 	"preBuildCommands-windows": [
 		"pwsh -NoProfile -File vendor/lua/build.ps1",

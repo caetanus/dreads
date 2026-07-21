@@ -21,6 +21,8 @@ import vibe.core.stream : IOMode;
 import vibe.core.sync : createSharedManualEvent, ManualEvent;
 import vibe.core.taskpool : TaskPool;
 
+import std.conv : to; // CTFE only (Content-Length of the embedded bundle)
+
 import dreads.config : gConfig;
 import dreads.stream : nowMs;
 
@@ -127,66 +129,14 @@ package void snapshotMetrics(size_t channels, size_t patterns) @nogc nothrow
     atomicOp!"+="(gMSeq, 1); // -> even: done
 }
 
-// A complete, static HTTP response (headers + body). CTFE-folded => read-only
-// program data, writing it allocates nothing. Phase-1 interim UI: a self-contained
-// page that opens the /ws stream and shows live counters + rates + a memory bar —
-// so the dashboard is usable NOW, before the embedded Preact build (Phase 2).
+// The dashboard UI: a Preact + uPlot app built to ONE self-contained index.html
+// (vendor/dashboard, via its build.sh preBuildCommand) and embedded at compile time
+// with a string import — no external files, served as one static HTTP response.
+private immutable string DASH_BODY = import("index.html.gz"); // gzipped bundle
 private immutable string DASH_PLACEHOLDER =
-    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
-    ~ DASH_HTML;
-
-private immutable string DASH_HTML = `<!doctype html><html><head><meta charset="utf-8">
-<title>dreads dashboard</title><style>
-*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0b0e14;color:#c9d1d9;margin:0;padding:1.4rem}
-h1{font-weight:600;margin:0 0 .3rem;font-size:1.3rem}.sub{color:#5c6b82;font-size:.8rem;margin-bottom:1.1rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.7rem}
-.card{background:#141b26;border:1px solid #1f2a3a;border-radius:10px;padding:.7rem .9rem}
-.k{font-size:.68rem;color:#7d8aa0;text-transform:uppercase;letter-spacing:.05em}
-.v{font-size:1.5rem;font-weight:600;margin-top:.15rem;font-variant-numeric:tabular-nums}
-.r{font-size:.72rem;color:#3fb950;margin-top:.1rem;font-variant-numeric:tabular-nums}
-.bar{height:9px;border-radius:5px;background:#1f2a3a;overflow:hidden;margin-top:.5rem}
-.fill{height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950)}
-.off{color:#f85149}#st{float:right;font-size:.75rem;color:#7d8aa0}</style></head><body>
-<h1>dreads &#9889; dashboard <span id=st>connecting&hellip;</span></h1>
-<div class=sub>live metrics &mdash; rates are per second</div>
-<div class=grid>
-<div class=card><div class=k>commands/s</div><div class=v id=cmds>0</div><div class=r id=cmdsR>&nbsp;</div></div>
-<div class=card><div class=k>strings/s</div><div class=v id=str>0</div><div class=r id=strR>&nbsp;</div></div>
-<div class=card><div class=k>lists/s</div><div class=v id=list>0</div><div class=r id=listR>&nbsp;</div></div>
-<div class=card><div class=k>streams/s</div><div class=v id=stream>0</div><div class=r id=streamR>&nbsp;</div></div>
-<div class=card><div class=k>publish/s</div><div class=v id=pub>0</div><div class=r id=pubR>&nbsp;</div></div>
-<div class=card><div class=k>keys</div><div class=v id=keys>0</div><div class=r id=keysR>&nbsp;</div></div>
-<div class=card><div class=k>clients</div><div class=v id=clients>0</div></div>
-<div class=card><div class=k>pubsub ch / pat</div><div class=v id=chpat>0 / 0</div></div>
-<div class=card><div class=k>expired / evicted</div><div class=v id=exev>0 / 0</div></div>
-<div class=card style="grid-column:1/-1"><div class=k>memory used / max</div>
-<div class=v id=mem>0</div><div class=bar><div class=fill id=memfill style="width:0%"></div></div></div>
-</div>
-<script>
-var $=function(i){return document.getElementById(i)},prev=null;
-function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+'G';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return''+n}
-function bytes(n){var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?1:0)+u[i]}
-function conn(){
- var ws=new WebSocket((location.protocol=='https:'?'wss':'ws')+'://'+location.host+'/ws');
- ws.onopen=function(){$('st').textContent='live';$('st').className=''};
- ws.onclose=function(){$('st').textContent='disconnected';$('st').className='off';setTimeout(conn,1000)};
- ws.onmessage=function(e){
-  var m=JSON.parse(e.data);if(!m.t)return;
-  var dt=prev?(m.t-prev.t)/1000:0;
-  function rate(id,cur,pv){var el=$(id);el.textContent=fmt(cur);var rEl=$(id+'R');if(rEl&&dt>0){var rr=Math.max(0,Math.round((cur-pv)/dt));rEl.textContent='+'+fmt(rr)+'/s'}}
-  rate('cmds',m.cmds,prev?prev.cmds:0);rate('str',m.str,prev?prev.str:0);
-  rate('list',m.list,prev?prev.list:0);rate('stream',m.stream,prev?prev.stream:0);
-  rate('pub',m.pub,prev?prev.pub:0);rate('keys',m.keys,prev?prev.keys:0);
-  $('clients').textContent=m.clients;$('chpat').textContent=m.channels+' / '+m.patterns;
-  $('exev').textContent=fmt(m.expired)+' / '+fmt(m.evicted);
-  var mm=m.maxmem>0?m.maxmem:0,pc=mm?Math.min(100,m.mem/mm*100):0;
-  $('mem').textContent=bytes(m.mem)+(mm?' / '+bytes(mm):' / ∞');
-  $('memfill').style.width=(mm?pc:6)+'%';
-  prev=m;
- };
-}
-conn();
-</script></body></html>`;
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+    ~ "Content-Encoding: gzip\r\nContent-Length: "
+    ~ DASH_BODY.length.to!string ~ "\r\nConnection: close\r\n\r\n" ~ DASH_BODY;
 
 /// Start the dashboard thread — a no-op unless `dashboard yes` is configured.
 /// Called once at server boot, right after the Lua pool. `respPort` is the RESP
