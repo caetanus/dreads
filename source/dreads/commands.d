@@ -1195,6 +1195,32 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.list.length);
             break;
         }
+    case "QSTATS":
+        {
+            // dreads-native: per-queue counters for a list — total items ever
+            // enqueued/dequeued (push/pop) + current depth. Feeds the dashboard's
+            // real incoming/deliver rates (and, later, an AMQP frontend).
+            if (args.length != 1)
+            {
+                arityErr(o, "qstats");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.list, wrong);
+            if (wrong)
+            {
+                repWrongType(o);
+                break;
+            }
+            repMapHeader(o, 3);
+            repBulk(o, "enqueued");
+            repInt(o, obj is null ? 0 : cast(long) obj.list.enqueued);
+            repBulk(o, "dequeued");
+            repInt(o, obj is null ? 0 : cast(long) obj.list.dequeued);
+            repBulk(o, "depth");
+            repInt(o, obj is null ? 0 : cast(long) obj.list.length);
+            break;
+        }
     case "LRANGE":
         {
             if (args.length != 3)

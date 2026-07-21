@@ -43,10 +43,26 @@ public struct DList
     private Node* head;
     private Node* tail;
     private size_t count;
+    // Lifetime queue counters (native queue metrics for the dashboard / a future
+    // AMQP frontend): total items ever pushed / popped on THIS list. Free memory —
+    // they fit the RObj union's existing slack (DList is 40B; SmallZSet sizes the
+    // union at 128B). `count` is the live depth. Reset when the key is recreated.
+    private ulong enq_;
+    private ulong deq_;
 
     @property size_t length() const @nogc nothrow
     {
         return count;
+    }
+
+    @property ulong enqueued() const @nogc nothrow
+    {
+        return enq_;
+    }
+
+    @property ulong dequeued() const @nogc nothrow
+    {
+        return deq_;
     }
 
     void free() @nogc nothrow
@@ -88,6 +104,7 @@ public struct DList
         if (tail is null)
             tail = n;
         count++;
+        enq_++;
     }
 
     void pushBack(scope const(char)[] v) @nogc nothrow
@@ -100,6 +117,7 @@ public struct DList
         if (head is null)
             head = n;
         count++;
+        enq_++;
     }
 
     /// Valid only while the element stays in the list.
@@ -126,6 +144,7 @@ public struct DList
             tail = null;
         freeNode(n);
         count--;
+        deq_++;
     }
 
     void popBack() @nogc nothrow
@@ -139,6 +158,7 @@ public struct DList
             head = null;
         freeNode(n);
         count--;
+        deq_++;
     }
 
     /// Redis index: negative counts from the tail. Null when out of range.
