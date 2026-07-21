@@ -109,6 +109,8 @@ function kvNums(v) {
 const rarr = (v) => (v && (v.t === 'array' || v.t === 'map') ? v.v : [])
 const rval = (v) => (v && v.v != null ? v.v : v && v.t === 'nil' ? null : '')
 const rpairs = (a) => { const o = []; for (let i = 0; i + 1 < a.length; i += 2) o.push({ f: rval(a[i]), v: rval(a[i + 1]) }); return o }
+// a flat RESP2 map (*2n) or RESP3 map -> {key: rawValue} (strings preserved, unlike kvNums)
+const kvObj = (v) => { const a = rarr(v), o = {}; for (let i = 0; i + 1 < a.length; i += 2) o[rval(a[i])] = rval(a[i + 1]); return o }
 
 function replyText(v, depth = 0) {
   if (!v) return ''
@@ -729,6 +731,151 @@ function Pubsub() {
   )
 }
 
+// ---------- Streams: entries + consumer groups + consumers + PEL (XINFO/XPENDING) ----------
+function Streams() {
+  const [rows, setRows] = useState([])
+  const [sel, setSel] = useState(null)
+  const [info, setInfo] = useState(null)     // XINFO STREAM header
+  const [groups, setGroups] = useState([])   // XINFO GROUPS
+  const [entries, setEntries] = useState([]) // XREVRANGE
+  const [selG, setSelG] = useState(null)
+  const [cons, setCons] = useState([])       // XINFO CONSUMERS (of selG)
+  const [pel, setPel] = useState(null)       // XPENDING summary (of selG)
+  const [nameQ, setNameQ] = useState('')
+  const [af, setAf] = useState(''); const [av, setAv] = useState(''); const [err, setErr] = useState('')
+  const nameQR = useRef(nameQ); nameQR.current = nameQ
+
+  const scan = useCallback(async () => {
+    let cursor = '0', names = []
+    do {
+      const q = ['SCAN', cursor, 'COUNT', '400', 'TYPE', 'stream']
+      const nq = nameQR.current.trim(); if (nq) q.push('MATCH', '*' + nq + '*')
+      const v = await exec(q)
+      if (v.t !== 'array') break
+      cursor = rval(rarr(v)[0])
+      for (const k of rarr(rarr(v)[1])) names.push(rval(k))
+    } while (cursor !== '0' && names.length < 400)
+    const lens = await Promise.all(names.map((k) => exec(['XLEN', k])))
+    setRows(names.map((k, i) => ({ name: k, len: lens[i] && lens[i].t === 'int' ? lens[i].v : 0 })))
+  }, [])
+  useEffect(() => { scan() }, [])
+
+  const open = async (name) => {
+    setSel(name); setSelG(null); setCons([]); setPel(null); setErr(''); setAf(''); setAv('')
+    const [inf, grp, ent] = await Promise.all([
+      exec(['XINFO', 'STREAM', name]), exec(['XINFO', 'GROUPS', name]),
+      exec(['XREVRANGE', name, '+', '-', 'COUNT', '50']),
+    ])
+    setInfo(kvObj(inf))
+    setGroups(rarr(grp).map((g) => kvObj(g)))
+    setEntries(rarr(ent).map((e) => ({ id: rval(rarr(e)[0]), fields: rpairs(rarr(rarr(e)[1])) })))
+  }
+  const openGroup = async (g) => {
+    setSelG(g)
+    const [c, p] = await Promise.all([exec(['XINFO', 'CONSUMERS', sel, g]), exec(['XPENDING', sel, g])])
+    setCons(rarr(c).map((x) => kvObj(x)))
+    const pa = rarr(p) // [count, min, max, [[consumer,count],…]]
+    setPel({ count: rval(pa[0]), min: rval(pa[1]), max: rval(pa[2]),
+      byC: rarr(pa[3]).map((x) => ({ c: rval(rarr(x)[0]), n: rval(rarr(x)[1]) })) })
+  }
+  const addEntry = async () => {
+    if (!af) return
+    const v = await exec(['XADD', sel, '*', af, av])
+    if (v.t === 'error') { setErr(v.v); return }
+    setErr(''); setAf(''); setAv(''); open(sel); scan()
+  }
+
+  const sorted = [...rows].sort((x, y) => y.len - x.len)
+  return (
+    <div class="kwrap">
+      <div class="kside">
+        <div class="qbar">
+          <input class="qsearch" spellcheck={false} placeholder="filter streams…" value={nameQ}
+            onInput={(e) => setNameQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && scan()} />
+          <button class="mini" title="scan" onClick={scan}>⟳</button>
+        </div>
+        <div class="klist">
+          {sorted.map((r) => (
+            <div key={r.name} class={'krow ' + (sel === r.name ? 'on' : '')} onClick={() => open(r.name)}>
+              <span class="kn">{r.name}</span><span class="num dim small">{fmt(r.len)}</span>
+            </div>
+          ))}
+          {rows.length === 0 && <div class="dim small" style="padding:.8rem">no streams</div>}
+        </div>
+        <div class="dim small kcount">{rows.length} streams</div>
+      </div>
+
+      <div class="kmain">
+        {!sel && <div class="dim" style="padding:2rem">select a stream</div>}
+        {sel && info && (
+          <div>
+            <div class="panel">
+              <div class="khead"><span class="ktitle">{sel}</span><span class="kt kt-stream">stream</span></div>
+              <div class="qstat">
+                <span><b>{fmt(Number(info.length))}</b> entries</span>
+                <span class="dim">last id {info['last-generated-id']}</span>
+                <span class="dim">{info.groups} group{info.groups === '1' ? '' : 's'}</span>
+                <span class="dim">{info['entries-added']} added · {info['max-deleted-entry-id']} max-deleted</span>
+              </div>
+              <div class="pgargs">
+                <input value={af} placeholder="field" onInput={(e) => setAf(e.target.value)} style="flex:0 0 30%" />
+                <input value={av} placeholder="value" onInput={(e) => setAv(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && addEntry()} style="flex:1" />
+                <button class="run" onClick={addEntry}>XADD ▶</button>
+              </div>
+              {err && <div class="err small">{err}</div>}
+            </div>
+
+            <div class="panel nopad">
+              <div class="title" style="padding:.6rem .9rem 0">consumer groups</div>
+              <table class="qtable"><thead><tr>
+                <th>Group</th><th class="num">Consumers</th><th class="num">Pending</th>
+                <th class="num">Lag</th><th>Last delivered</th>
+              </tr></thead><tbody>
+                {groups.map((g) => (
+                  <tr key={g.name} class={selG === g.name ? 'on' : ''} onClick={() => openGroup(g.name)}>
+                    <td class="qname">{g.name}</td><td class="num">{g.consumers}</td>
+                    <td class={'num ' + (Number(g.pending) > 0 ? 'down' : 'dim')}>{g.pending}</td>
+                    <td class="num">{g.lag == null ? '?' : g.lag}</td>
+                    <td class="dim small">{g['last-delivered-id']}</td>
+                  </tr>
+                ))}
+                {groups.length === 0 && <tr><td colspan="5" class="dim small" style="padding:.8rem">no consumer groups</td></tr>}
+              </tbody></table>
+            </div>
+
+            {selG && (
+              <div class="panel nopad">
+                <div class="title" style="padding:.6rem .9rem 0">group <b>{selG}</b> — consumers
+                  {pel && <span class="dim small"> · PEL {pel.count} ({pel.min}…{pel.max})</span>}</div>
+                <table class="qtable"><thead><tr>
+                  <th>Consumer</th><th class="num">Pending</th><th class="num">Idle (ms)</th>
+                </tr></thead><tbody>
+                  {cons.map((c) => (
+                    <tr key={c.name}><td class="qname">{c.name}</td>
+                      <td class={'num ' + (Number(c.pending) > 0 ? 'down' : 'dim')}>{c.pending}</td>
+                      <td class="num dim">{c.idle}</td></tr>
+                  ))}
+                  {cons.length === 0 && <tr><td colspan="3" class="dim small" style="padding:.8rem">no consumers</td></tr>}
+                </tbody></table>
+              </div>
+            )}
+
+            <div class="panel nopad">
+              <div class="title" style="padding:.6rem .9rem 0">recent entries <span class="dim">— newest 50</span></div>
+              <div class="msgs" style="padding:.5rem .9rem">
+                {entries.map((e, i) => <pre class="msg" key={i}><span class="mi">{e.id}</span>
+                  {e.fields.map((f) => f.f + '=' + f.v).join('  ')}</pre>)}
+                {entries.length === 0 && <div class="dim small">empty</div>}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const snap = useMetrics()
   const [tab, setTab] = useState('overview')
@@ -737,7 +884,7 @@ function App() {
       <header>
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
-          {['overview', 'console', 'keys', 'pubsub', 'queues', 'playground'].map((t) => (
+          {['overview', 'console', 'keys', 'pubsub', 'queues', 'streams', 'playground'].map((t) => (
             <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>{t}</button>
           ))}
         </nav>
@@ -748,6 +895,7 @@ function App() {
       {tab === 'keys' && <Keys />}
       {tab === 'pubsub' && <Pubsub />}
       {tab === 'queues' && <Queues />}
+      {tab === 'streams' && <Streams />}
       {tab === 'playground' && <Playground />}
     </div>
   )

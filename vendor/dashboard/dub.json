@@ -1,7 +1,0 @@
-{
-	"name": "dreads-dashboard-ui",
-	"comment": "Shim so dub does not parse the npm package.json as a legacy recipe (it would try to resolve codejar/preact/etc as dub packages). Not built into dreads — the UI is produced by build.sh via the root preBuildCommand and embedded as dist/index.html.gz.",
-	"targetType": "sourceLibrary",
-	"sourcePaths": [],
-	"sourceFiles": []
-}
