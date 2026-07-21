@@ -10,6 +10,7 @@ import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
+import dreads.aclcat : gCmdCats;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass, gNotifyDb;
@@ -6609,6 +6610,41 @@ public bool isPausedByWrite(scope const(char)[] uname) @nogc nothrow
     default:
         return false;
     }
+}
+
+// --- index-keyed classification -------------------------------------------------
+// Resolve a command name ONCE (aclCmdIndex -> cidx), then look these up by index
+// instead of re-running a string-switch on the same name. Both tables are built in
+// CTFE FROM the string-switch classifiers above (gCmdCats is the same array that
+// defines the index), so they can never drift from them — the 13 cases where
+// isWriteCommand differs from AclCat.write are captured for free. One array load
+// replaces a binary-searched __switch on every command (reads included).
+private bool[gCmdCats.length] buildCmdFlags(alias pred)() @nogc nothrow
+{
+    bool[gCmdCats.length] t;
+    foreach (i, c; gCmdCats)
+    {
+        char[32] up = void; // longest command name (georadiusbymember_ro) is 20
+        foreach (j, ch; c.name)
+            up[j] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+        t[i] = pred(cast(const(char)[]) up[0 .. c.name.length]);
+    }
+    return t;
+}
+
+private immutable bool[gCmdCats.length] gCmdWriteByIdx = buildCmdFlags!isWriteCommand();
+private immutable bool[gCmdCats.length] gCmdDenyOomByIdx = buildCmdFlags!isDenyOomCommand();
+
+/// isWriteCommand keyed by a pre-resolved aclCmdIndex (idx < 0 ⇒ unknown ⇒ false).
+public bool cmdWriteByIdx(int idx) @nogc nothrow
+{
+    return idx >= 0 && gCmdWriteByIdx[idx];
+}
+
+/// isDenyOomCommand keyed by a pre-resolved aclCmdIndex.
+public bool cmdDenyOomByIdx(int idx) @nogc nothrow
+{
+    return idx >= 0 && gCmdDenyOomByIdx[idx];
 }
 
 /// Set by the scripting module: true if this EVAL/EVALSHA/FCALL invocation may

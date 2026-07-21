@@ -33,7 +33,7 @@ import dreads.aclcat : gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
-    isDenyOomCommand, gScriptWritesHook, propagationOverride, parseLong, gWriteNoOp;
+    cmdWriteByIdx, cmdDenyOomByIdx, gScriptWritesHook, propagationOverride, parseLong, gWriteNoOp;
 import dreads.stats : gTotalErrorReplies, statErrorReply, resetErrorStats,
     gCmdStats, CmdStat, statCall, statRejected, resetCmdStats;
 
@@ -3490,6 +3490,16 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         break;
     }
 
+    // Resolve the command's ACL index ONCE for the whole tail: write/OOM
+    // classification and commandstats all key off cidx instead of re-running a
+    // binary-searched string-switch (isWriteCommand / isDenyOomCommand /
+    // aclCmdIndex) on the same name two or three times per command.
+    char[24] lc = void; // nbuf is char[24]; longest command name is 20
+    foreach (i, ch; name)
+        lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    immutable cidx = aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]);
+    immutable cmdIsWrite = cmdWriteByIdx(cidx); // one array load; used across the tail
+
     // Raft policy gate — only when replication is configured; standalone
     // (gReplicator is null) falls straight through with zero added cost.
     if (gReplicator !is null)
@@ -3498,7 +3508,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         // AOF stays clean via the PEXPIREAT/PERSIST override), but under raft
         // its TTL mutation must still reach followers: propose it and let the
         // injected clock keep the replay deterministic.
-        if (isWriteCommand(uname) || uname == "GETEX")
+        if (cmdIsWrite || uname == "GETEX")
         {
             import dreads.stream : nowMs;
 
@@ -3533,13 +3543,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         // reads are served locally (leader or follower); no AOF in raft mode
     }
 
-    if (gConfig.maxmemory && isDenyOomCommand(uname) && !freeMemoryIfNeeded())
+    if (gConfig.maxmemory && cmdDenyOomByIdx(cidx) && !freeMemoryIfNeeded())
     {
         // refused before running: a rejected_call (not a call) + a leaf OOM error
-        char[16] lc = void;
-        foreach (i, ch; name)
-            lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-        statRejected(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]));
+        statRejected(cidx);
         enum oom = "OOM command not allowed when used memory > 'maxmemory'.";
         statErrorReply(oom);
         repError(o, oom);
@@ -3555,21 +3562,16 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // outer command must not re-count its propagated error).
     if (errored && gTotalErrorReplies == errPrev)
         statErrorReply(cast(const(char)[]) o.data[outBefore .. $]);
-    // INFO commandstats: count the executed data command (name.length <= 16 here,
-    // guaranteed by the nbuf check above). Blocking/pubsub/connection commands
-    // handled before this point are not counted — see BLACKBOX-TODO.md.
-    {
-        char[16] lc = void;
-        foreach (i, ch; name)
-            lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-        statCall(aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]), errored);
-    }
+    // INFO commandstats: count the executed data command. Blocking/pubsub/connection
+    // commands handled before this point are not counted — see BLACKBOX-TODO.md.
+    statCall(cidx, errored);
     // A write that flagged itself a no-op (no data changed) neither dirties, wakes,
     // nor propagates — matches Redis's dirty-delta model (SETBIT/BITFIELD SET only
     // count when the bit/field actually changed).
     if (o.length > outBefore && o.data[outBefore] != '-' && !gWriteNoOp)
     {
-        immutable isW = isWriteCommand(uname) || !propagationOverride.empty;
+        immutable pureWrite = cmdIsWrite; // resolved once at the tail head
+        immutable isW = pureWrite || !propagationOverride.empty;
         if (isW)
         {
             gWriteEpoch++; // WATCH visibility
@@ -3580,7 +3582,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             if (!propagationOverride.empty)
                 gAof.append(propagationOverride.data);
-            else if (isWriteCommand(uname))
+            else if (pureWrite)
                 gAof.append(rawCmd);
         }
         // CLIENT TRACKING: a write invalidates the cached copies of its keys; a
