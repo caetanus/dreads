@@ -258,23 +258,31 @@ function Playground() {
   const [keys, setKeys] = useState('mykey')
   const [argv, setArgv] = useState('hello')
   const [out, setOut] = useState({ out: '', cls: 'muted' })
-  const [scripts, setScripts] = useState(() => { try { return JSON.parse(localStorage.getItem('dreads.scripts') || '[]') } catch { return [] } })
-  const save = (list) => { setScripts(list); localStorage.setItem('dreads.scripts', JSON.stringify(list)) }
+  const [scripts, setScripts] = useState([])
+  // pull EVERY cached script from the server (SCRIPT LIST -> [ [sha, src], ... ])
+  const refresh = useCallback(async () => {
+    const v = await exec(['SCRIPT', 'LIST'])
+    if (v.t !== 'array') { setScripts([]); return }
+    setScripts(v.v.map((p) => {
+      const sha = p.v?.[0]?.v || '', src = p.v?.[1]?.v || ''
+      return { sha, code: src, preview: src.split('\n')[0].slice(0, 42) }
+    }))
+  }, [])
+  useEffect(() => { refresh() }, [])
   const run = async () => {
     const ks = keys.split(/\s+/).filter(Boolean), as = argv.split(/\s+/).filter(Boolean)
-    const args = ['EVAL', code, '' + ks.length, ...ks, ...as]
-    const v = await exec(args)
+    const v = await exec(['EVAL', code, '' + ks.length, ...ks, ...as])
     setOut({ out: replyText(v), cls: v.t === 'error' ? 'err' : '' })
-    const sha = await sha1hex(code)
-    if (!scripts.find((s) => s.sha === sha)) save([{ sha, code, preview: code.split('\n')[0].slice(0, 42) }, ...scripts].slice(0, 40))
+    refresh() // the script is now cached server-side
   }
   const load = (s) => setCode(s.code)
-  const remove = (sha) => save(scripts.filter((s) => s.sha !== sha))
+  const remove = async (sha) => { await exec(['SCRIPT', 'REMOVE', sha]); refresh() }
   return (
     <div class="pg">
       <aside class="scripts">
-        <div class="title">scripts <span class="dim">(by sha1)</span></div>
-        {scripts.length === 0 && <div class="dim small">run a script to save it here</div>}
+        <div class="title">scripts <span class="dim">({scripts.length})</span>
+          <button class="mini" title="refresh" onClick={refresh}>⟳</button></div>
+        {scripts.length === 0 && <div class="dim small">no cached scripts</div>}
         {scripts.map((s) => (
           <div class="script" key={s.sha}>
             <div class="sbody" onClick={() => load(s)} title={s.code}>

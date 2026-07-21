@@ -145,6 +145,54 @@ public size_t cachedScriptCount() nothrow @nogc
     return gScripts.length;
 }
 
+/// Remove one cached script by its (lowercase) sha1 — for the dashboard. Redis
+/// only has SCRIPT FLUSH (all); this drops a single entry. Returns true if present.
+public bool scriptRemove(scope const(char)[] shaLower) nothrow @nogc
+{
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    immutable had = gScripts.get(shaLower) !is null;
+    gScripts.remove(shaLower);
+    gScriptBc.remove(shaLower);
+    return had;
+}
+
+/// Append every cached script as a RESP array of [sha1, source] pairs — for the
+/// dashboard's "list all scripts" (guarded by gLuaLock, so it is thread-safe).
+public void appendScriptsResp(ref ByteBuffer o) nothrow @nogc
+{
+    import core.stdc.stdio : snprintf;
+
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+
+    char[24] h = void;
+    size_t n = 0;
+    foreach (i; 0 .. gScripts.capacity)
+        if (gScripts.slotLive(i))
+            n++;
+    int hn = snprintf(h.ptr, h.length, "*%zu\r\n", n);
+    o.append(h[0 .. hn]);
+    foreach (i; 0 .. gScripts.capacity)
+    {
+        if (!gScripts.slotLive(i))
+            continue;
+        auto sha = gScripts.keyAt(i);
+        auto src = gScripts.valAt(i).rawView();
+        o.append("*2\r\n");
+        hn = snprintf(h.ptr, h.length, "$%zu\r\n", sha.length);
+        o.append(h[0 .. hn]);
+        o.append(sha);
+        o.append("\r\n");
+        hn = snprintf(h.ptr, h.length, "$%zu\r\n", src.length);
+        o.append(h[0 .. hn]);
+        o.append(src);
+        o.append("\r\n");
+    }
+}
+
 // Bridge context for the duration of one EVAL. In INLINE mode (unit tests,
 // standalone-without-pool) the bridge dispatches directly against `ks`. In
 // POOL mode the script runs on the dedicated Lua thread and the bridge

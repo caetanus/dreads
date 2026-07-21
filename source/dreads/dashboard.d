@@ -228,7 +228,7 @@ private void dashCmdDrainLoop() nothrow
     import dreads.raftq : CrossQueue;
     import dreads.resp : RVal, RType, parseValue, ParseStatus, repError, gRespProto;
     import dreads.obj : gDbs, NUM_DBS;
-    import dreads.scripting : executeScriptCommand;
+    import dreads.scripting : executeScriptCommand, appendScriptsResp, scriptRemove;
 
     auto q = cast(CrossQueue) gDashCmdQ;
     static ByteBuffer payload;
@@ -253,7 +253,32 @@ private void dashCmdDrainLoop() nothrow
                 if (parseValue(slot.bytes.data, pos, arena, cmd) == ParseStatus.ok
                         && cmd.type == RType.Array && cmd.arr.length > 0)
                 {
-                    if (auto reason = dashDeny(cmd.arr))
+                    if (cmd.arr.length >= 2 && ciEq(cmd.arr[0].str, "script")
+                            && ciEq(cmd.arr[1].str, "list"))
+                        appendScriptsResp(slot.reply); // dashboard: list all cached scripts
+                    else if (cmd.arr.length >= 3 && ciEq(cmd.arr[0].str, "script")
+                            && ciEq(cmd.arr[1].str, "remove"))
+                    {
+                        if (!gConfig.dashboardWrite)
+                            repError(slot.reply, "ERR dashboard: writes disabled (set dashboard-write yes)");
+                        else
+                        {
+                            char[64] lo = void;
+                            auto s = cmd.arr[2].str;
+                            if (s.length > lo.length)
+                                repError(slot.reply, "ERR bad sha");
+                            else
+                            {
+                                foreach (i, c; s)
+                                    lo[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
+                                if (scriptRemove(lo[0 .. s.length]))
+                                    slot.reply.append("+OK\r\n");
+                                else
+                                    repError(slot.reply, "NOSCRIPT No matching script.");
+                            }
+                        }
+                    }
+                    else if (auto reason = dashDeny(cmd.arr))
                         repError(slot.reply, reason);
                     else if (dashApplyConfig(cmd.arr, slot.reply))
                     {

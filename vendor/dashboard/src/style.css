@@ -67,6 +67,9 @@ header .st { margin-left: auto; }
 .x { background: #1a2230; border: 1px solid #1f2a3a; color: #f85149; border-radius: 7px; cursor: pointer; width: 28px; font-size: 1rem; }
 .x:hover { background: #3a1418; }
 .dim { color: #5c6b82; } .small { font-size: .75rem; }
+.mini { float: right; background: #1a2230; border: 1px solid #1f2a3a; color: #7d8aa0; border-radius: 6px;
+  cursor: pointer; font-size: .85rem; line-height: 1; padding: .1rem .35rem; }
+.mini:hover { color: #c9d1d9; }
 .pgmain { display: flex; flex-direction: column; }
 .editor { min-height: 260px; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 10px;
   padding: .7rem .9rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .84rem;
