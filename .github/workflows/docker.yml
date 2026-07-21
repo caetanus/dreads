@@ -26,6 +26,8 @@ jobs:
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init --recursive
 
+      # QEMU so buildx can cross-build linux/arm64 (AWS Graviton) on the amd64 runner.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -50,6 +52,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -70,6 +73,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.alpine
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta_alpine.outputs.tags }}
           labels: ${{ steps.meta_alpine.outputs.labels }}

@@ -23,28 +23,24 @@ COPY . .
 #
 # distroless/cc-debian12 already ships glibc + libstdc++ + libgcc_s + ca-certs
 # (all debian12, matching this builder), so we copy ONLY the two libs it lacks:
-# jemalloc + sodium. lz4/lua are statically linked (vendored).
+# jemalloc + sodium. lz4/lua are statically linked (vendored). The libs go to an
+# arch-independent dir (on LD_LIBRARY_PATH in the runtime) so ONE Dockerfile
+# builds both amd64 and arm64 — `gcc -dumpmachine` yields the right multiarch
+# triplet (x86_64-linux-gnu / aarch64-linux-gnu) on whichever arch buildx targets.
 RUN dub build -b release --compiler=ldc2 \
     && strip bin/dreads \
-    && mkdir /libs \
-    && cp -L /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-             /usr/lib/x86_64-linux-gnu/libsodium.so.* \
-             /libs/
+    && LIBDIR="/usr/lib/$(gcc -dumpmachine)" \
+    && mkdir -p /dist/lib \
+    && cp -L "$LIBDIR"/libjemalloc.so.2 "$LIBDIR"/libsodium.so.* /dist/lib/
 
-# A shell for the otherwise-shell-less distroless runtime: a static (musl) busybox
-# — vendored INLINE at build time (not in the repo), sha256-pinned like lua/lz4.
-# Being fully static it runs under distroless' glibc unchanged. We stage a /rootfs
-# with busybox + every applet symlinked to the FINAL /bin/busybox path, and a
-# /data owned by distroless' nonroot uid — because the runtime stage has no shell
-# to mkdir/chown/ln itself.
-ARG BUSYBOX_VERSION=1.35.0
-ARG BUSYBOX_SHA256=6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348
-RUN curl -fsSL -o /tmp/busybox \
-      "https://busybox.net/downloads/binaries/${BUSYBOX_VERSION}-x86_64-linux-musl/busybox" \
-    && echo "${BUSYBOX_SHA256}  /tmp/busybox" | sha256sum -c - \
-    && chmod +x /tmp/busybox \
-    && mkdir -p /rootfs/bin /rootfs/data \
-    && cp /tmp/busybox /rootfs/bin/busybox \
+# A shell for the otherwise-shell-less distroless runtime: a static (musl) busybox.
+# COPY --from=busybox:musl is multi-arch-native — buildx pulls the busybox matching
+# the target platform (x86_64 or aarch64), fully static so it runs under distroless'
+# glibc unchanged. Stage /rootfs here (the runtime has no shell to ln/chown itself):
+# busybox + every applet symlinked to the final /bin/busybox, and /data owned by
+# distroless' nonroot uid.
+COPY --from=busybox:musl /bin/busybox /rootfs/bin/busybox
+RUN mkdir -p /rootfs/data \
     && for applet in $(/rootfs/bin/busybox --list); do \
            ln -sf /bin/busybox "/rootfs/bin/$applet"; \
        done \
@@ -52,12 +48,14 @@ RUN curl -fsSL -o /tmp/busybox \
 
 # ---- runtime: distroless/cc-debian12 (nonroot) + a static busybox shell --------
 # distroless/cc gives the exact debian12 glibc/libstdc++/libgcc_s/ca-certs the
-# binary needs, with no package manager and no attack surface; the vendored
-# busybox adds `sh` + coreutils so a sysadmin can `docker exec -it … sh`. Both
-# images (this and the alpine one) run the SAME docker-entrypoint.sh, so they
+# binary needs (for the matching arch), with no package manager and no attack
+# surface; the busybox adds `sh` + coreutils so a sysadmin can `docker exec -it … sh`.
+# Both images (this and the alpine one) run the SAME docker-entrypoint.sh, so they
 # share ONE redis/valkey-style config interface (file + DREADS_* env + args).
+# Multi-arch: amd64 + arm64 (AWS Graviton) from this one Dockerfile.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
-COPY --from=builder /libs/ /usr/lib/x86_64-linux-gnu/
+ENV LD_LIBRARY_PATH=/opt/dreads/lib
+COPY --from=builder /dist/lib /opt/dreads/lib
 COPY --from=builder /rootfs/bin/ /bin/
 COPY --from=builder --chown=65532:65532 /rootfs/data /data
 COPY --from=builder /src/bin/dreads /usr/local/bin/dreads
