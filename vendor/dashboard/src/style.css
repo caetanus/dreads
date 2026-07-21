@@ -84,6 +84,12 @@ header .st { margin-left: auto; }
 .loginbox h1 { font-size: 1.4rem; margin: 0 0 .2rem; }
 .loginbox input { width: 100%; background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 8px;
   color: #c9d1d9; padding: .55rem .7rem; font-size: .9rem; box-sizing: border-box; }
+
+/* admin: ACL rules editor */
+.aclrules { width: 100%; box-sizing: border-box; min-height: 90px; margin-top: .3rem; resize: vertical;
+  background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; color: #c9d1d9;
+  font-family: ui-monospace, monospace; font-size: .82rem; padding: .6rem .8rem; line-height: 1.5; }
+.small.up { color: #3fb950; }
 .script.sel .sbody { border-color: #2f81f7; background: #101c2e; }
 .qsearch { width: 100%; margin: .5rem 0; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 7px;
   color: #c9d1d9; padding: .4rem .55rem; font-size: .8rem; font-family: ui-monospace, monospace; outline: none; }

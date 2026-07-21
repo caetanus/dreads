@@ -6696,3 +6696,143 @@ package void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
         repUnknownSubcommand(o, "PUBSUB", sub);
     }
 }
+
+// Focused ACL handler for the dashboard bridge. ACL is a server-layer command (not in
+// the commands.d dispatch the bridge uses), so it was unreachable via /api/exec. This
+// reuses the SAME primitives the client path uses (aclGetOrCreate / aclApplyRule /
+// aclEncodeCanonicalSetuser / propagateAclLog / aclDelUser / aclEachUser) — writes
+// propagate identically — minus the client-session self-delete logic (the dashboard is
+// admin, has no ACL session). Gated upstream by dashboard-admin. LIST/GETUSER return
+// each user as its canonical "ACL SETUSER …" array (dashboard-friendly, editable).
+package void aclDashboardCommand(scope const(RVal)[] arr, scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
+{
+    if (arr.length < 2)
+    {
+        repError(o, "ERR wrong number of arguments for 'acl' command");
+        return;
+    }
+    char[12] sbuf = void;
+    auto sub = arr[1].str;
+    const(char)[] su = sub;
+    if (sub.length <= sbuf.length)
+    {
+        foreach (i, ch; sub)
+            sbuf[i] = (ch >= 'a' && ch <= 'z') ? cast(char)(ch - 32) : ch;
+        su = sbuf[0 .. sub.length];
+    }
+    switch (su)
+    {
+    case "WHOAMI":
+        repBulk(o, "default");
+        return;
+    case "CAT":
+        repArrayHeader(o, aclCatNames.length);
+        foreach (name; aclCatNames)
+            repBulk(o, name);
+        return;
+    case "USERS":
+        size_t nu = 0;
+        aclEachUser((u) { nu++; return 0; });
+        repArrayHeader(o, nu);
+        aclEachUser((u) { repBulk(o, u.name); return 0; });
+        return;
+    case "LIST":
+        size_t nl = 0;
+        aclEachUser((u) { nl++; return 0; });
+        repArrayHeader(o, nl);
+        aclEachUser((u) { aclEncodeCanonicalSetuser(u, o); return 0; });
+        return;
+    case "GETUSER":
+        if (arr.length < 3)
+        {
+            repError(o, "ERR wrong number of arguments for 'acl|getuser' command");
+            return;
+        }
+        AclUser* found;
+        aclEachUser((u) { if (u.name == arr[2].str) { found = u; return 1; } return 0; });
+        if (found is null)
+            repNullArray(o);
+        else
+            aclEncodeCanonicalSetuser(found, o);
+        return;
+    case "SETUSER":
+        if (arr.length < 3)
+        {
+            repError(o, "ERR wrong number of arguments for 'acl|setuser' command");
+            return;
+        }
+        if (gReplicator !is null && !gReplicator.isLeader)
+        {
+            repError(o, "READONLY You can't write against a read only replica.");
+            return;
+        }
+        auto u = aclGetOrCreate(arr[2].str);
+        const(char)[] err;
+        try
+        {
+            foreach (ref r; arr[3 .. $])
+                if (!aclApplyRule(u, r.str, err))
+                {
+                    repError(o, err);
+                    return;
+                }
+        }
+        catch (Exception)
+        {
+            repError(o, "ERR ACL SETUSER failed to hash a password");
+            return;
+        }
+        gAclActive = true;
+        aclKillRevokedSubscribers(u);
+        static ByteBuffer canon;
+        canon.clear();
+        aclEncodeCanonicalSetuser(u, canon);
+        if (!propagateAclLog(canon.data, o))
+            return;
+        repSimple(o, "OK");
+        return;
+    case "DELUSER":
+        if (arr.length < 3)
+        {
+            repError(o, "ERR wrong number of arguments for 'acl|deluser' command");
+            return;
+        }
+        if (gReplicator !is null && !gReplicator.isLeader)
+        {
+            repError(o, "READONLY You can't write against a read only replica.");
+            return;
+        }
+        foreach (ref a; arr[2 .. $])
+            if (a.str == "default")
+            {
+                repError(o, "ERR The 'default' user cannot be removed");
+                return;
+            }
+        // disconnect any live session authed as a deleted user (security)
+        {
+            Vector!ulong ids;
+            snapshotConnIds(ids);
+            foreach (ref a; arr[2 .. $])
+                foreach (id; ids[])
+                {
+                    auto s = connById(id);
+                    if (s.isNull)
+                        continue;
+                    auto p = &s.get();
+                    if (p.user !is null && p.user.name == a.str)
+                        killConn(p);
+                }
+        }
+        long n = 0;
+        foreach (ref a; arr[2 .. $])
+            if (aclDelUser(a.str))
+                n++;
+        if (!propagateAclLog(rawCmd, o)) // ACL DELUSER is already canonical + idempotent
+            return;
+        repInt(o, n);
+        return;
+    default:
+        repError(o, "ERR unknown ACL subcommand or wrong number of arguments");
+        return;
+    }
+}

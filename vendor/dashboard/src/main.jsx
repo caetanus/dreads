@@ -922,6 +922,87 @@ function Streams() {
   )
 }
 
+// ---------- Admin: ACL user management (needs dashboard-admin) ----------
+function Admin() {
+  const [users, setUsers] = useState([])
+  const [sel, setSel] = useState(null)      // editing username, or '' for new, or null
+  const [name, setName] = useState('')
+  const [rules, setRules] = useState('')
+  const [msg, setMsg] = useState('')
+  const [gate, setGate] = useState('')      // set if dashboard-admin is off
+
+  const refresh = useCallback(async () => {
+    const v = await exec(['ACL', 'LIST'])
+    if (v.t === 'error') { setGate(v.v); setUsers([]); return }
+    setGate('')
+    setUsers(rarr(v).map((u) => {
+      const a = rarr(u).map(rval) // ["ACL","SETUSER",name,"reset","on",...rules]
+      return { name: a[2], on: a.includes('on'), rules: a.slice(3).join(' ') }
+    }))
+  }, [])
+  useEffect(() => { refresh() }, [])
+
+  const editUser = (u) => { setSel(u.name); setName(u.name); setRules(u.rules); setMsg('') }
+  const newUser = () => { setSel(''); setName(''); setRules('on >changeme ~* +@read'); setMsg('') }
+  const save = async () => {
+    if (!name.trim()) { setMsg('username required'); return }
+    const toks = rules.split(/\s+/).filter(Boolean)
+    const v = await exec(['ACL', 'SETUSER', name.trim(), ...toks])
+    setMsg(v.t === 'error' ? v.v : '✓ saved ' + name.trim())
+    if (v.t !== 'error') setSel(name.trim())
+    refresh()
+  }
+  const del = async (n) => {
+    const v = await exec(['ACL', 'DELUSER', n])
+    setMsg(v.t === 'error' ? v.v : '✓ deleted ' + n)
+    if (sel === n) { setSel(null); setName(''); setRules('') }
+    refresh()
+  }
+
+  if (gate) return <div class="panel"><div class="dim" style="padding:1rem">{gate}</div></div>
+  return (
+    <div class="kwrap">
+      <div class="kside">
+        <div class="qbar">
+          <span class="dim small">{users.length} users</span>
+          <button class="mini" title="new user" onClick={newUser}>＋</button>
+          <button class="mini" title="refresh" onClick={refresh}>⟳</button>
+        </div>
+        <div class="klist">
+          {users.map((u) => (
+            <div key={u.name} class={'krow ' + (sel === u.name ? 'on' : '')} onClick={() => editUser(u)}>
+              <span class="kn">{u.name}</span>
+              <span class={'kt ' + (u.on ? 'kt-list' : '')}>{u.on ? 'on' : 'off'}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div class="kmain">
+        {sel === null && <div class="dim" style="padding:2rem">select a user, or ＋ to create one</div>}
+        {sel !== null && (
+          <div class="panel">
+            <div class="khead">
+              <span class="ktitle">{sel === '' ? 'new user' : sel}</span>
+              {sel && sel !== 'default' && <button class="del" onClick={() => del(sel)}>Delete</button>}
+            </div>
+            <label class="dim small">username</label>
+            <input class="qsearch wide" spellcheck={false} value={name} onInput={(e) => setName(e.target.value)}
+              placeholder="username" disabled={sel !== '' && sel !== name} />
+            <label class="dim small" style="margin-top:.6rem;display:block">ACL rules
+              <span class="dim"> — space-separated tokens (e.g. on &gt;pass ~key:* +@read -@dangerous)</span></label>
+            <textarea class="aclrules" spellcheck={false} value={rules}
+              onInput={(e) => setRules(e.target.value)} />
+            <div class="pgargs">
+              <button class="run" onClick={save}>{sel === '' ? 'Create ▶' : 'Save ▶'}</button>
+              {msg && <span class={'small ' + (msg[0] === '✓' ? 'up' : 'err')}>{msg}</span>}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function Login({ onOk }) {
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
@@ -968,7 +1049,7 @@ function Dashboard() {
       <header>
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
-          {['overview', 'console', 'keys', 'pubsub', 'queues', 'streams', 'playground'].map((t) => (
+          {['overview', 'console', 'keys', 'pubsub', 'queues', 'streams', 'playground', 'admin'].map((t) => (
             <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>
               {t === 'playground' ? 'lua playground' : t}</button>
           ))}
@@ -983,6 +1064,7 @@ function Dashboard() {
       {tab === 'queues' && <Queues />}
       {tab === 'streams' && <Streams />}
       {tab === 'playground' && <Playground />}
+      {tab === 'admin' && <Admin />}
     </div>
   )
 }

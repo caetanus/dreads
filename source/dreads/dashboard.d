@@ -250,6 +250,18 @@ private bool dashEval(scope const(RVal)[] arr, ref Keyspace ks, ref ByteBuffer r
     return true;
 }
 
+// ACL is a server-layer command (not in commands.d dispatch), so route it to the
+// focused dashboard handler. Gating (dashboard-admin) already happened in dashDeny.
+private bool dashAcl(scope const(RVal)[] arr, scope const(ubyte)[] rawCmd, ref ByteBuffer reply) nothrow
+{
+    import dreads.server : aclDashboardCommand;
+
+    if (arr.length == 0 || !ciEq(arr[0].str, "acl"))
+        return false;
+    aclDashboardCommand(arr, rawCmd, reply);
+    return true;
+}
+
 private bool dashApplyConfig(scope const(RVal)[] arr, ref ByteBuffer reply) @nogc nothrow
 {
     import dreads.resp : repError;
@@ -359,6 +371,10 @@ private void dashCmdDrainLoop() nothrow
                     else if (dashEval(cmd.arr, gDbs[slot.db < NUM_DBS ? slot.db : 0], slot.reply, arena))
                     {
                         // EVAL/EVALSHA (server-layer scripting command, run in-place)
+                    }
+                    else if (dashAcl(cmd.arr, slot.bytes.data, slot.reply))
+                    {
+                        // ACL (server-layer command, served in-place — dashboard-admin gated)
                     }
                     else
                     {
