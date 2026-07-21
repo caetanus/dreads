@@ -286,7 +286,7 @@ private void dashCmdDrainLoop() nothrow
     import dreads.raftq : CrossQueue;
     import dreads.resp : RVal, RType, parseValue, ParseStatus, repError, gRespProto;
     import dreads.obj : gDbs, NUM_DBS;
-    import dreads.scripting : executeScriptCommand, appendScriptsResp, scriptRemove;
+    import dreads.scripting : executeScriptCommand, appendScriptsResp, scriptRemove, scriptCommand;
 
     auto q = cast(CrossQueue) gDashCmdQ;
     static ByteBuffer payload;
@@ -335,6 +335,16 @@ private void dashCmdDrainLoop() nothrow
                                     repError(slot.reply, "NOSCRIPT No matching script.");
                             }
                         }
+                    }
+                    else if (cmd.arr.length >= 2 && ciEq(cmd.arr[0].str, "script"))
+                    {
+                        // other SCRIPT subcommands (LOAD to create/cache a script,
+                        // EXISTS, FLUSH) — server-layer, run in-place. They touch the
+                        // script cache, so gate behind dashboard-write.
+                        if (!gConfig.dashboardWrite)
+                            repError(slot.reply, "ERR dashboard: writes disabled (set dashboard-write yes)");
+                        else
+                            scriptCommand(cmd.arr[1 .. $], slot.reply);
                     }
                     else if (auto reason = dashDeny(cmd.arr))
                         repError(slot.reply, reason);

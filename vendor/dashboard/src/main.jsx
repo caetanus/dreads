@@ -298,12 +298,23 @@ function Playground() {
     setOut({ out: replyText(v), cls: v.t === 'error' ? 'err' : '' })
     refresh() // the script is now cached server-side
   }
-  const load = (s) => setCode(s.code)
+  const load = (s) => { setCode(s.code); setOut({ out: '', cls: 'muted' }) }
   const remove = async (sha) => { await exec(['SCRIPT', 'REMOVE', sha]); refresh() }
+  const newScript = () => {
+    setCode("-- new script — KEYS[] and ARGV[] are available\nreturn 'ok'")
+    setKeys(''); setArgv(''); setOut({ out: '', cls: 'muted' })
+  }
+  const save = async () => {
+    // SCRIPT LOAD caches the script by SHA WITHOUT running it (create a new script)
+    const v = await exec(['SCRIPT', 'LOAD', code])
+    setOut({ out: v.t === 'error' ? v.v : 'cached as ' + (v.v || ''), cls: v.t === 'error' ? 'err' : '' })
+    refresh()
+  }
   return (
     <div class="pg">
       <aside class="scripts">
         <div class="title">scripts <span class="dim">({scripts.length})</span>
+          <button class="mini" title="new script" onClick={newScript}>＋</button>
           <button class="mini" title="refresh" onClick={refresh}>⟳</button></div>
         {scripts.length === 0 && <div class="dim small">no cached scripts</div>}
         {scripts.map((s) => (
@@ -322,6 +333,8 @@ function Playground() {
         <div class="pgargs">
           <label>KEYS <input value={keys} onInput={(e) => setKeys(e.target.value)} placeholder="space-separated" /></label>
           <label>ARGV <input value={argv} onInput={(e) => setArgv(e.target.value)} placeholder="space-separated" /></label>
+          <button class="mini big" title="new script" onClick={newScript}>New</button>
+          <button class="mini big" title="cache without running (SCRIPT LOAD)" onClick={save}>Save</button>
           <button class="run" onClick={run}>Run ▶</button>
         </div>
         <pre class={'reply ' + (out.cls || '')}>{out.out || 'reply appears here'}</pre>
@@ -885,7 +898,8 @@ function App() {
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
           {['overview', 'console', 'keys', 'pubsub', 'queues', 'streams', 'playground'].map((t) => (
-            <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>{t}</button>
+            <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>
+              {t === 'playground' ? 'lua playground' : t}</button>
           ))}
         </nav>
         <span class={'st ' + (snap.live ? 'live' : 'off')}>{snap.live ? 'live' : 'offline'}</span>

@@ -70,6 +70,7 @@ header .st { margin-left: auto; }
 .mini { float: right; background: #1a2230; border: 1px solid #1f2a3a; color: #7d8aa0; border-radius: 6px;
   cursor: pointer; font-size: .85rem; line-height: 1; padding: .1rem .35rem; }
 .mini:hover { color: #c9d1d9; }
+.mini.big { float: none; padding: .4rem .8rem; font-size: .8rem; font-weight: 600; }
 .script.sel .sbody { border-color: #2f81f7; background: #101c2e; }
 .qsearch { width: 100%; margin: .5rem 0; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 7px;
   color: #c9d1d9; padding: .4rem .55rem; font-size: .8rem; font-family: ui-monospace, monospace; outline: none; }
