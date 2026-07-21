@@ -231,6 +231,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     }
     {
         import dreads.cluster : initCluster;
+        import dreads.shard : shardInit, gShardCount;
+
+        // thread-per-shard: no-op when shards<=1 (single-thread path untouched).
+        shardInit(gConfig.shards);
+        if (gShardCount > 1)
+            printf("dreads: %u shards\n", gShardCount);
 
         if (gConfig.clusterEnabled)
         {
