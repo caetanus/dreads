@@ -1,2 +1,6 @@
 node_modules/
-dist/
+dist/*
+# but DO track the built bundle dreads embeds — so building never needs Node
+# (and survives the npm/vite toolchain breaking). build.sh only rebuilds it when
+# sources change and Node is present. (dist/* not dist/ so this negation works.)
+!dist/index.html.gz

@@ -5,6 +5,14 @@
 	"configurations": [
 		{
 			"name": "executable",
+			"targetType": "executable",
+			"versions": [
+				"DreadsDashboard"
+			]
+		},
+		{
+			"comment": "same as executable but WITHOUT the built-in web dashboard — no dashboard.d code, no embedded UI bundle, no Node needed. `dub build --config=no-dashboard`.",
+			"name": "no-dashboard",
 			"targetType": "executable"
 		},
 		{
@@ -17,11 +25,32 @@
 			],
 			"mainSourceFile": "bin/ut.d",
 			"name": "unittest",
+			"versions": [
+				"DreadsDashboard"
+			],
 			"preBuildCommands": [
 				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB",
 				"sed -i -e 's/mixin runTestsMain!(/int main(string[] args) { import unit_threaded.runner.runner : runTests; return runTests!(/' -e 's/\");$$/\")(args ~ \"-s\"); }/' bin/ut.d"
 			],
 			"targetName": "dreads_tests",
+			"targetType": "executable"
+		},
+		{
+			"comment": "the unittest suite compiled WITHOUT the dashboard (no DreadsDashboard version) — proves the core still builds + passes when the dashboard is dropped. `dub test --config=unittest-no-dashboard`.",
+			"dependencies": {
+				"fluent-asserts": "*",
+				"unit-threaded": "*"
+			},
+			"excludedSourceFiles": [
+				"src/main.d"
+			],
+			"mainSourceFile": "bin/ut.d",
+			"name": "unittest-no-dashboard",
+			"preBuildCommands": [
+				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB",
+				"sed -i -e 's/mixin runTestsMain!(/int main(string[] args) { import unit_threaded.runner.runner : runTests; return runTests!(/' -e 's/\");$$/\")(args ~ \"-s\"); }/' bin/ut.d"
+			],
+			"targetName": "dreads_tests_nd",
 			"targetType": "executable"
 		},
 		{

@@ -271,6 +271,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // event-loop thread; a no-op when disabled (no thread, no port bound).
         // Defaults to the RESP port + 1. A main-loop timer publishes a metrics
         // snapshot every dashboard-interval, but only while a client is watching.
+        // Compile-time optional: `version(DreadsDashboard)` (on by default; the
+        // `no-dashboard` dub config drops the module + the embedded UI entirely).
+        version (DreadsDashboard)
         {
             import dreads.dashboard : startDashboard, dashboardPort, snapshotMetrics,
                 startDashCmdBridge;
@@ -387,10 +390,14 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     // otherwise SIGTERM appears to hang for seconds. Daemon threads (lazyfree,
     // syncer) don't need this.
     import dreads.scripting : shutdownLuaScriptPool;
-    import dreads.dashboard : shutdownDashboard;
 
     shutdownLuaScriptPool();
-    shutdownDashboard();
+    version (DreadsDashboard)
+    {
+        import dreads.dashboard : shutdownDashboard;
+
+        shutdownDashboard();
+    }
     if (gReplicator !is null)
         gReplicator.stop();
     return rc;

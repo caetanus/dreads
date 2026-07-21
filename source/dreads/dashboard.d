@@ -1,5 +1,11 @@
 module dreads.dashboard;
 
+// Compile-time optional: everything below is under `version(DreadsDashboard)` (on by
+// default; the `no-dashboard` dub config leaves this module EMPTY — no code, and the
+// embedded UI bundle is never imported). server.d's dashboard calls are gated by the
+// same version, so a no-dashboard build has zero dashboard bytes.
+version (DreadsDashboard):
+
 // Built-in web dashboard — OPT-IN (`dashboard yes`, off by default). Runs on its
 // OWN thread with an isolated vibe event loop, so it never shares fibers with the
 // data-plane loop. Because the server runs under GC.disable (a collection would
