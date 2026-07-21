@@ -34,6 +34,8 @@ import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
     cmdWriteByIdx, cmdDenyOomByIdx, gScriptWritesHook, propagationOverride, parseLong, gWriteNoOp;
+import dreads.shard : sharded, myKeyspace;
+import vibe.core.taskpool : TaskPool;
 import dreads.stats : gTotalErrorReplies, statErrorReply, resetErrorStats,
     gCmdStats, CmdStat, statCall, statRejected, resetCmdStats;
 
@@ -390,6 +392,11 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         serveClient(conn);
     }, listenOpts);
     printf("dreads listening on port %u\n", cast(uint) port);
+    // sharded: main thread becomes shard 0 (this listener is its router); spawn the
+    // other N-1 shard threads, each its own SO_REUSEPORT listener + drain. No-op when
+    // shards==1. The listenTCP above already opened shard 0's listener on `port`.
+    if (sharded())
+        startShards(port);
     auto rc = runEventLoop();
     // Clean shutdown: stop the non-daemon worker-pool threads (Lua, raft) so
     // druntime doesn't block joining their infinite loops when main() returns —
@@ -533,6 +540,20 @@ bool replyOff, replySkipNext, replyCmdExempt;
     void*[PIPELINE_CAP] pendingWrites;
     size_t pendingCount;
     bool inExec;
+    // Sharding pipeline (independent of raft): a keyed command whose owner is any
+    // shard is fired to that shard WITHOUT blocking, its ShardPending recorded here
+    // in command order, and its reply reaped in order at the next flush point (a
+    // keyless/inline-reply command, PIPELINE_CAP, or the end of the read chunk).
+    // This is what lets all shards run their slice concurrently instead of the
+    // connection fiber round-tripping one command at a time. Same discipline as the
+    // raft write pipeline above, but a separate array (raft is future/its own thread).
+    void*[PIPELINE_CAP] shardPends; // ShardPending* handles, in command order
+    size_t shardPendCount;
+    // Bitmask of shards this pipeline batch has enqueued commands to but not yet woken
+    // (bit s => shard s touched). Wakes are BATCHED: fire many commands, then one wake
+    // per touched shard at the flush point — cuts cross-thread futex wakeups ~Nx. Only
+    // tracks shards < 64; a rare higher shard id wakes immediately (see shardFire).
+    ulong shardTouch;
     // Async output, engaged on first (P)SUBSCRIBE (see PUBSUB.md fan-out): once
     // `subMode` is set, all output (replies and pub/sub messages) is enqueued on
     // `oq` and drained by the `oqWriter` fiber, so the publisher never blocks.
@@ -1518,6 +1539,212 @@ private void connSink(void* ctx, RcMsg* msg) nothrow
         c.oqEvt.emit();
 }
 
+// Per-shard drain fiber (runs on each shard thread). Consumes THIS shard's one inbound
+// queue, which carries both directions (CrossQueue `kind`):
+//   - cmd  (a routed command from some router): execute it on MY keyspace and ship the
+//     reply back to the requester shard (meta) — the raft router→worker apply pattern.
+//   - reply (a hop result for one of MY connections): fill the requester's Pending and
+//     wake it (same-thread; the connection fiber is parked on it).
+// v1 is dumb: it re-parses the raw command (RVal has arena pointers, not thread-portable)
+// and dispatches directly (no per-shard raft yet — that's 2b). SELF-QUEUE (owner==self)
+// still round-trips here; local fast-path is the marked next optimization.
+private void shardDrainLoop() nothrow
+{
+    import dreads.shard : myKeyspace, ShardMsg, ShardPending, shardWaitInbound,
+        shardDrainOnce, shardEnqueue, shardWake;
+    import core.bitop : bsf;
+
+    static ByteBuffer reply; // execute scratch (owner side)
+    static Arena arena;
+    // Process one message straight from the ring slice `p` (zero-copy):
+    //   cmd   → parse + dispatch on MY keyspace, ship the reply back to the requester
+    //           shard (meta) WITHOUT waking (batched via replyTouch), tag = its Pending.
+    //   reply → copy the bytes DIRECTLY into the requester's pending buffer (no
+    //           intermediate) and wake its connection fiber same-thread.
+    ulong replyTouch = void;
+    void handle(scope const(ubyte)[] p, void* tag, ulong meta, uint kind) nothrow
+    {
+        if (cast(ShardMsg) kind == ShardMsg.cmd)
+        {
+            arena.reset();
+            reply.clear();
+            RVal cmd;
+            size_t pos = 0;
+            if (parseValue(p, pos, arena, cmd) == ParseStatus.ok)
+                cast(void) dispatch(cmd, *myKeyspace(), reply, arena);
+            else
+                repError(reply, "ERR shard: malformed routed command");
+            shardEnqueue(cast(uint) meta, reply.data, tag, 0, ShardMsg.reply);
+            if (meta < 64)
+                replyTouch |= 1UL << meta;
+            else
+                shardWake(cast(uint) meta);
+        }
+        else // ShardMsg.reply — deliver straight into the waiting pending, same-thread
+        {
+            auto pend = cast(ShardPending*) tag;
+            pend.reply.clear();
+            pend.reply.append(p);
+            pend.ready = true;
+            pend.done.emit();
+        }
+    }
+
+    while (true)
+    {
+        try
+        {
+            shardWaitInbound(); // park on the per-shard event ONLY when all lanes idle
+            replyTouch = 0; // requester shards we owe a single batched wake this pass
+            cast(void) shardDrainOnce!handle();
+            // one cross-thread wake per requester shard we replied to this drain pass
+            while (replyTouch)
+            {
+                immutable s = cast(uint) bsf(replyTouch);
+                shardWake(s);
+                replyTouch &= replyTouch - 1;
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+}
+
+// Owner shard of a command's first key, or -1 if it is keyless (runs locally on this
+// router's own keyspace). `uname` is UPPERCASE (dispatch switch) but getCommandKeys
+// matches the LOWERCASE gCmdKeySpecs, so lowercase it back — else every lookup misses
+// and the command wrongly runs local (no hop). v1 routes by the FIRST key only.
+private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname) nothrow
+{
+    import dreads.shard : shardOfKey;
+    import dreads.acl : commandRouteKey;
+
+    char[16] lbuf = void;
+    if (uname.length > lbuf.length)
+        return -1; // over-long name is never a keyed data command
+    foreach (i, ch; uname)
+        lbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    auto key = commandRouteKey(cast(string) lbuf[0 .. uname.length], cmd.arr);
+    if (key is null)
+        return -1; // keyless → run locally on this router's own keyspace
+    return cast(int) shardOfKey(key);
+}
+
+// FIRE a keyed command at its owning shard WITHOUT blocking (the raw RESP bytes are
+// copied into the owner's inbound ring; the owner's drain fiber runs it on its own
+// keyspace and ships the reply back). The ShardPending is recorded on the connection
+// in command order; its reply is reaped later by flushShardPending. This is the async
+// hop: many commands (to many shards) are in flight at once, all shards busy in
+// parallel — instead of one blocking round-trip per command. The connection only ever
+// blocks at a flush point, in order. Reaping-when-full keeps per-conn state bounded.
+private void shardFire(ref Conn c, int owner, scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
+{
+    import dreads.shard : tShard, shardEnqueue, shardWake, acquireShardPending, ShardMsg;
+
+    auto p = acquireShardPending();
+    // Enqueue WITHOUT waking; the owner is woken once at the flush point (batched).
+    shardEnqueue(cast(uint) owner, rawCmd, cast(void*) p, tShard, ShardMsg.cmd);
+    if (owner < 64)
+        c.shardTouch |= 1UL << owner;
+    else
+        shardWake(cast(uint) owner); // rare high shard id: can't batch, wake now
+    if (c.shardPendCount == PIPELINE_CAP)
+        flushShardPending(c, o); // buffer full: reap in order, then continue
+    c.shardPends[c.shardPendCount++] = cast(void*) p;
+}
+
+// Reap every in-flight shard hop, appending each reply in command order (so the output
+// stays in pipeline order and a following inline command observes them). The ONLY place
+// the connection fiber blocks on a hop — at the batch boundary, not per command; while
+// it waits the event loop runs this thread's drain fiber (which delivers the replies)
+// and the other connections.
+private void flushShardPending(ref Conn c, ref ByteBuffer o) nothrow
+{
+    import dreads.shard : ShardPending, releaseShardPending, shardWake;
+    import core.bitop : bsf;
+
+    // First wake — once each — every owner shard this batch enqueued to, so they begin
+    // draining before we block on their replies (the batched cross-thread wake; skipped
+    // entirely for owners whose drain is already running).
+    auto t = c.shardTouch;
+    c.shardTouch = 0;
+    while (t)
+    {
+        immutable s = cast(uint) bsf(t);
+        shardWake(s);
+        t &= t - 1;
+    }
+
+    foreach (i; 0 .. c.shardPendCount)
+    {
+        auto p = cast(ShardPending*) c.shardPends[i];
+        while (!p.ready) // same-thread wake: my drain fiber emits done on delivery
+        {
+            auto ec = p.done.emitCount;
+            if (p.ready)
+                break;
+            try
+                p.done.wait(ec);
+            catch (Exception)
+            {
+            }
+        }
+        o.append(p.reply.data);
+        releaseShardPending(p);
+    }
+    c.shardPendCount = 0;
+}
+
+private __gshared shared(TaskPool)[] gShardPools; // keep the worker pools alive
+
+// A shard worker thread's entry (shards 1..N-1; shard 0 is the main thread). Sets this
+// thread's shard id, opens its OWN listener on the shared port (SO_REUSEPORT → the
+// kernel spreads connections across the N listeners, so EACH thread is a router — no
+// central accept, Amdahl distributed), and starts this shard's drain fiber. Returns;
+// the TaskPool worker's event loop then serves its connections + drains.
+private void shardThreadEntry(uint sid, ushort port) nothrow
+{
+    import dreads.shard : tShard;
+    import dreads.alloc : gAllocShard;
+
+    tShard = sid;
+    gAllocShard = sid; // route this thread's allocations to its own share-nothing slot
+    version (Windows)
+        enum sopts = TCPListenOptions.reuseAddress;
+    else
+        enum sopts = TCPListenOptions.reuseAddress | TCPListenOptions.reusePort;
+    try
+        cast(void) listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
+            serveClient(conn);
+        }, sopts);
+    catch (Exception)
+    {
+    }
+    runTask(() nothrow { shardDrainLoop(); });
+}
+
+// Bring the shard fabric up. Main thread becomes shard 0 (its listener is runServer's
+// existing listenTCP); shards 1..N-1 get their own worker thread + listener.
+private void startShards(ushort port) nothrow
+{
+    import dreads.shard : gShardCount, tShard;
+    import vibe.core.taskpool : TaskPool;
+
+    tShard = 0;
+    runTask(() nothrow { shardDrainLoop(); }); // shard 0's drain fiber (main thread)
+    try
+        foreach (i; 1 .. gShardCount)
+        {
+            auto pool = new shared TaskPool(1, "shard");
+            pool.runTaskH(&shardThreadEntry, cast(uint) i, port);
+            gShardPools ~= pool;
+        }
+    catch (Exception)
+    {
+    }
+}
+
 private void serveClient(TCPConnection tcp) nothrow
 {
     ByteBuffer inb;
@@ -1546,7 +1773,10 @@ private void serveClient(TCPConnection tcp) nothrow
     c.connMs = nowMs(); // for CLIENT LIST age=/idle=
     c.lastActiveMs = c.connMs;
     c.id = ++gClientIds;
-    c.dbp = &gDbs[0]; // default to db 0
+    // sharded: this connection reads/writes THIS thread's shard keyspace (DB-0-only);
+    // unsharded: the classic 16-DB gDbs[0]. myKeyspace() reads tShard (thread-local),
+    // so a conn served on shard-thread T binds to shard T's data.
+    c.dbp = sharded() ? myKeyspace() : &gDbs[0]; // default keyspace
     // ACL: start as the default user; a nopass default is authenticated at once,
     // a password-protected one (requirepass) must AUTH first. A DISABLED default
     // (`ACL SETUSER default off`) never pre-authenticates — new connections start
@@ -1683,6 +1913,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     flushTrackingInval(c.id); // grouped invalidations for this command
                 arena.reset();
             }
+            if (c.shardPendCount > 0)
+                flushShardPending(*c, outb);
             if (c.pendingCount > 0)
                 flushPending(*c, outb);
             gAof.flush();
@@ -1804,8 +2036,10 @@ private void serveClient(TCPConnection tcp) nothrow
                     arena.reset();
                 }
                 inb.consume(pos);
-                // Reap the chunk's trailing run of pipelined writes (their replies
-                // come last, in order) before flushing the batch to the client.
+                // Reap the chunk's in-flight shard hops + pipelined writes (their
+                // replies come last, in order) before flushing the batch to the client.
+                if (c.shardPendCount > 0)
+                    flushShardPending(*c, outb);
                 if (c.pendingCount > 0)
                     flushPending(*c, outb);
                 gAof.flush();
@@ -2970,6 +3204,17 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
+    // Sharding: resolve the owning shard of this command's first key up front.
+    // owner >= 0 => a keyed data command we DEFER to that shard (fired async below,
+    // reaped in order at a flush point). owner < 0 => keyless / runs inline HERE, so
+    // its reply must come AFTER any shard hops already in flight — reap them first to
+    // keep pipeline order. (Blocking/script/migrate ops are keyed but handled inline
+    // in the switch below; cross-shard support for those is a later phase — v1 runs
+    // them on the connection's own shard, see SHARDING.md.) Free when shards==1.
+    immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname) : -1;
+    if (shardOwner < 0 && c.shardPendCount > 0)
+        flushShardPending(c, o);
+
     // cluster (phase 2a): serve CLUSTER, and MOVED-redirect keys this shard
     // doesn't own so a cluster-aware client re-routes.
     if (gConfig.clusterEnabled)
@@ -3503,6 +3748,40 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     default:
         break;
+    }
+
+    // Sharded routing. A keyed data command whose owner is ANOTHER shard is fired
+    // there without blocking (reaped in order at the next flush point). A command
+    // owned by THIS shard needs no hop:
+    //   - nothing queued ahead → fall through to the normal path and run inline on our
+    //     own keyspace, at full single-thread speed WITH complete ACL/stats/notify;
+    //   - replies queued ahead → run into an in-order ready slot (bare dispatch, like
+    //     the drain) so it keeps its pipeline position — still no queue, no wakeup.
+    // The SELF-QUEUE fast-path: local traffic (conn-affine, or 1/N of uniform keys)
+    // never pays the cross-thread hop. Keyless commands already ran/fell through above.
+    if (shardOwner >= 0)
+    {
+        import dreads.shard : tShard, acquireShardPending;
+
+        if (cast(uint) shardOwner != tShard)
+        {
+            shardFire(c, shardOwner, rawCmd, o); // remote: async cross-shard hop
+            return true;
+        }
+        if (c.shardPendCount > 0)
+        {
+            // self-shard, but cross-shard replies sit ahead of us in the pipeline:
+            // execute into an ordered ready slot instead of straight to `o`.
+            auto p = acquireShardPending();
+            p.reply.clear();
+            cast(void) dispatch(cmd, *c.dbp, p.reply, arena);
+            p.ready = true;
+            if (c.shardPendCount == PIPELINE_CAP)
+                flushShardPending(c, o);
+            c.shardPends[c.shardPendCount++] = cast(void*) p;
+            return true;
+        }
+        // self-shard, nothing pending → fall through to the full local dispatch below.
     }
 
     // Resolve the command's ACL index ONCE for the whole tail: write/OOM
