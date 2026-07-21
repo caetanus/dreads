@@ -90,6 +90,11 @@ header .st { margin-left: auto; }
   background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; color: #c9d1d9;
   font-family: ui-monospace, monospace; font-size: .82rem; padding: .6rem .8rem; line-height: 1.5; }
 .small.up { color: #3fb950; }
+.membar { height: 10px; background: #0b0f16; border: 1px solid #1f2a3a; border-radius: 6px; overflow: hidden; margin: .3rem 0 .2rem; }
+.memfill { height: 100%; background: linear-gradient(90deg, #2f81f7, #db6d28); transition: width .4s; }
+.cmdlog { background: #0d1219; border: 1px solid #1f2a3a; border-radius: 8px; padding: .7rem .9rem;
+  font-family: ui-monospace, monospace; font-size: .8rem; color: #79b8ff; white-space: pre-wrap;
+  word-break: break-all; max-height: 30vh; overflow: auto; margin: 0; }
 .script.sel .sbody { border-color: #2f81f7; background: #101c2e; }
 .qsearch { width: 100%; margin: .5rem 0; background: #0d1219; border: 1px solid #1f2a3a; border-radius: 7px;
   color: #c9d1d9; padding: .4rem .55rem; font-size: .8rem; font-family: ui-monospace, monospace; outline: none; }

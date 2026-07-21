@@ -10,6 +10,16 @@ import './style.css'
 const WINDOW = 240
 const enc = new TextEncoder()
 
+// parse "512mb" / "2gb" / "1048576" / "0" (unlimited) -> bytes, or null if bad
+function parseBytes(s) {
+  const m = String(s).trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|k|m|g)?$/)
+  if (!m) return null
+  const mult = { '': 1, b: 1, k: 1024, kb: 1024, m: 1048576, mb: 1048576, g: 1073741824, gb: 1073741824 }
+  return Math.round(parseFloat(m[1]) * mult[m[2] || ''])
+}
+const fmtBytes = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
+  : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(0) + ' KB' : n + ' B'
+
 const fmt = (n) => {
   n = n || 0
   if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G'
@@ -922,14 +932,24 @@ function Streams() {
   )
 }
 
-// ---------- Admin: ACL user management (needs dashboard-admin) ----------
-function Admin() {
+// ---------- Admin: ACL users + memory + a saveable command log (needs dashboard-admin) ----------
+function Admin({ snap }) {
   const [users, setUsers] = useState([])
   const [sel, setSel] = useState(null)      // editing username, or '' for new, or null
   const [name, setName] = useState('')
   const [rules, setRules] = useState('')
   const [msg, setMsg] = useState('')
   const [gate, setGate] = useState('')      // set if dashboard-admin is off
+  const [log, setLog] = useState([])        // emitted commands, saveable
+  const [memIn, setMemIn] = useState('')
+  const [memMsg, setMemMsg] = useState('')
+
+  // run a command AND record it in the log so the admin can save the setup script
+  const runLogged = async (args, human) => {
+    const v = await exec(args)
+    if (v.t !== 'error') setLog((l) => [...l, human || args.join(' ')])
+    return v
+  }
 
   const refresh = useCallback(async () => {
     const v = await exec(['ACL', 'LIST'])
@@ -947,57 +967,95 @@ function Admin() {
   const save = async () => {
     if (!name.trim()) { setMsg('username required'); return }
     const toks = rules.split(/\s+/).filter(Boolean)
-    const v = await exec(['ACL', 'SETUSER', name.trim(), ...toks])
+    const v = await runLogged(['ACL', 'SETUSER', name.trim(), ...toks])
     setMsg(v.t === 'error' ? v.v : '✓ saved ' + name.trim())
     if (v.t !== 'error') setSel(name.trim())
     refresh()
   }
   const del = async (n) => {
-    const v = await exec(['ACL', 'DELUSER', n])
+    const v = await runLogged(['ACL', 'DELUSER', n])
     setMsg(v.t === 'error' ? v.v : '✓ deleted ' + n)
     if (sel === n) { setSel(null); setName(''); setRules('') }
     refresh()
   }
 
+  // memory (from the live metrics) + set maxmemory (bump OR shrink)
+  const used = snap && snap.cur ? snap.cur.mem : 0
+  const maxm = snap && snap.cur ? snap.cur.maxmem : 0
+  const pct = maxm > 0 ? Math.min(100, used / maxm * 100) : 0
+  const setMax = async () => {
+    const b = parseBytes(memIn)
+    if (b == null) { setMemMsg('bad value — try 512mb, 2gb, or 0'); return }
+    const v = await runLogged(['CONFIG', 'SET', 'maxmemory', '' + b])
+    setMemMsg(v.t === 'error' ? v.v : (b === 0 ? '✓ maxmemory: unlimited' : '✓ maxmemory → ' + fmtBytes(b)))
+    setMemIn('')
+  }
+  const copyLog = () => navigator.clipboard && navigator.clipboard.writeText(log.join('\n'))
+
   if (gate) return <div class="panel"><div class="dim" style="padding:1rem">{gate}</div></div>
   return (
-    <div class="kwrap">
-      <div class="kside">
-        <div class="qbar">
-          <span class="dim small">{users.length} users</span>
-          <button class="mini" title="new user" onClick={newUser}>＋</button>
-          <button class="mini" title="refresh" onClick={refresh}>⟳</button>
+    <div>
+      <div class="panel">
+        <div class="title">memory</div>
+        <div class="qstat">
+          <span><b>{fmtBytes(used)}</b> used</span>
+          <span class="dim">of {maxm > 0 ? fmtBytes(maxm) : 'unlimited'}{maxm > 0 ? ' (' + pct.toFixed(1) + '%)' : ''}</span>
         </div>
-        <div class="klist">
-          {users.map((u) => (
-            <div key={u.name} class={'krow ' + (sel === u.name ? 'on' : '')} onClick={() => editUser(u)}>
-              <span class="kn">{u.name}</span>
-              <span class={'kt ' + (u.on ? 'kt-list' : '')}>{u.on ? 'on' : 'off'}</span>
-            </div>
-          ))}
+        <div class="membar"><div class="memfill" style={'width:' + (maxm > 0 ? pct : 0) + '%'} /></div>
+        <div class="pgargs">
+          <label style="flex:1">set maxmemory
+            <input value={memIn} placeholder="e.g. 512mb · 2gb · 0 = unlimited" style="flex:1"
+              onInput={(e) => setMemIn(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && setMax()} /></label>
+          <button class="run" onClick={setMax}>Apply ▶</button>
+          {memMsg && <span class={'small ' + (memMsg[0] === '✓' ? 'up' : 'err')}>{memMsg}</span>}
         </div>
       </div>
-      <div class="kmain">
-        {sel === null && <div class="dim" style="padding:2rem">select a user, or ＋ to create one</div>}
-        {sel !== null && (
-          <div class="panel">
-            <div class="khead">
-              <span class="ktitle">{sel === '' ? 'new user' : sel}</span>
-              {sel && sel !== 'default' && <button class="del" onClick={() => del(sel)}>Delete</button>}
-            </div>
-            <label class="dim small">username</label>
-            <input class="qsearch wide" spellcheck={false} value={name} onInput={(e) => setName(e.target.value)}
-              placeholder="username" disabled={sel !== '' && sel !== name} />
-            <label class="dim small" style="margin-top:.6rem;display:block">ACL rules
-              <span class="dim"> — space-separated tokens (e.g. on &gt;pass ~key:* +@read -@dangerous)</span></label>
-            <textarea class="aclrules" spellcheck={false} value={rules}
-              onInput={(e) => setRules(e.target.value)} />
-            <div class="pgargs">
-              <button class="run" onClick={save}>{sel === '' ? 'Create ▶' : 'Save ▶'}</button>
-              {msg && <span class={'small ' + (msg[0] === '✓' ? 'up' : 'err')}>{msg}</span>}
-            </div>
+
+      <div class="kwrap">
+        <div class="kside">
+          <div class="qbar">
+            <span class="dim small">{users.length} users</span>
+            <button class="mini" title="new user" onClick={newUser}>＋</button>
+            <button class="mini" title="refresh" onClick={refresh}>⟳</button>
           </div>
-        )}
+          <div class="klist">
+            {users.map((u) => (
+              <div key={u.name} class={'krow ' + (sel === u.name ? 'on' : '')} onClick={() => editUser(u)}>
+                <span class="kn">{u.name}</span>
+                <span class={'kt ' + (u.on ? 'kt-list' : '')}>{u.on ? 'on' : 'off'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div class="kmain">
+          {sel === null && <div class="dim" style="padding:2rem">select a user, or ＋ to create one</div>}
+          {sel !== null && (
+            <div class="panel">
+              <div class="khead">
+                <span class="ktitle">{sel === '' ? 'new user' : sel}</span>
+                {sel && sel !== 'default' && <button class="del" onClick={() => del(sel)}>Delete</button>}
+              </div>
+              <label class="dim small">username</label>
+              <input class="qsearch wide" spellcheck={false} value={name} onInput={(e) => setName(e.target.value)}
+                placeholder="username" disabled={sel !== '' && sel !== name} />
+              <label class="dim small" style="margin-top:.6rem;display:block">ACL rules
+                <span class="dim"> — space-separated tokens (e.g. on &gt;pass ~key:* +@read -@dangerous)</span></label>
+              <textarea class="aclrules" spellcheck={false} value={rules}
+                onInput={(e) => setRules(e.target.value)} />
+              <div class="pgargs">
+                <button class="run" onClick={save}>{sel === '' ? 'Create ▶' : 'Save ▶'}</button>
+                {msg && <span class={'small ' + (msg[0] === '✓' ? 'up' : 'err')}>{msg}</span>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="title">emitted commands <span class="dim">— every admin action, save it as a setup script</span>
+          <button class="mini" title="copy" onClick={copyLog}>copy</button>
+          <button class="mini" title="clear" onClick={() => setLog([])}>✕</button></div>
+        <pre class="cmdlog">{log.length ? log.join('\n') : '# actions you take here appear as commands you can save'}</pre>
       </div>
     </div>
   )
@@ -1064,7 +1122,7 @@ function Dashboard() {
       {tab === 'queues' && <Queues />}
       {tab === 'streams' && <Streams />}
       {tab === 'playground' && <Playground />}
-      {tab === 'admin' && <Admin />}
+      {tab === 'admin' && <Admin snap={snap} />}
     </div>
   )
 }
