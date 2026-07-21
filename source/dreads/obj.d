@@ -1073,16 +1073,18 @@ unittest // UNLINK hands a big list to the free-thread; small ones free inline
     assert(ks.lookup("big") is null);
     assert(gLazyFree.statSubmitted == 1); // went off-loop
 
+    // the Deque-backed list frees NEL element blocks + its ONE ring buffer.
+    enum size_t NBLK = NEL + 1;
     // drain what the free-thread gathered, as the server tick would
     foreach (_; 0 .. 3000)
     {
         if (gLazyFree.reclaimPending)
             gLazyFree.drainReclaimed();
-        if (gLazyFree.statReclaimedBlocks >= NEL)
+        if (gLazyFree.statReclaimedBlocks >= NBLK)
             break;
         Thread.sleep(1.msecs);
     }
-    assert(gLazyFree.statReclaimedBlocks == NEL); // every node block freed on the loop
+    assert(gLazyFree.statReclaimedBlocks == NBLK); // every element block + the ring, freed on the loop
 }
 
 @("obj.unlink_offloads_big_zset_no_leak")
@@ -1136,3 +1138,4 @@ unittest // UNLINK offloads a big sorted set (skiplist chase); every block recla
     }
     assert(keyspaceBytesUsed() == base);
 }
+
