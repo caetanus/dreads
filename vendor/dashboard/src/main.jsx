@@ -20,6 +20,21 @@ function parseBytes(s) {
 const fmtBytes = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
   : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(0) + ' KB' : n + ' B'
 
+// ---- themes: a set of CSS variables; built-ins + custom ones stored in the dreads keyspace ----
+const THEME_VARS = ['--bg', '--panel', '--panel2', '--edge', '--fg', '--fg2', '--dim', '--dim2',
+  '--accent', '--accent2', '--ok', '--bad', '--warn', '--sel']
+const THEMES = {
+  default: { '--bg': '#0b0e14', '--panel': '#141b26', '--panel2': '#0d1219', '--edge': '#1f2a3a', '--fg': '#c9d1d9', '--fg2': '#adbac7', '--dim': '#7d8aa0', '--dim2': '#5c6b82', '--accent': '#2f81f7', '--accent2': '#79b8ff', '--ok': '#3fb950', '--bad': '#f85149', '--warn': '#db6d28', '--sel': '#101c2e' },
+  desert: { '--bg': '#2b2416', '--panel': '#3a3120', '--panel2': '#241e12', '--edge': '#4a3f28', '--fg': '#ece0c8', '--fg2': '#d8c9a8', '--dim': '#a89878', '--dim2': '#7a6d52', '--accent': '#cf8b3b', '--accent2': '#e0a458', '--ok': '#8faa4a', '--bad': '#c65d3b', '--warn': '#d29922', '--sel': '#3f3620' },
+  solarized: { '--bg': '#002b36', '--panel': '#073642', '--panel2': '#00252e', '--edge': '#0f4b58', '--fg': '#93a1a1', '--fg2': '#839496', '--dim': '#657b83', '--dim2': '#475a60', '--accent': '#268bd2', '--accent2': '#2aa198', '--ok': '#859900', '--bad': '#dc322f', '--warn': '#cb4b16', '--sel': '#0a4453' },
+  mocha: { '--bg': '#1e1e2e', '--panel': '#28283c', '--panel2': '#181825', '--edge': '#313244', '--fg': '#cdd6f4', '--fg2': '#bac2de', '--dim': '#a6adc8', '--dim2': '#6c7086', '--accent': '#89b4fa', '--accent2': '#b4befe', '--ok': '#a6e3a1', '--bad': '#f38ba8', '--warn': '#fab387', '--sel': '#313244' },
+  dracula: { '--bg': '#282a36', '--panel': '#343746', '--panel2': '#21222c', '--edge': '#44475a', '--fg': '#f8f8f2', '--fg2': '#e0e0e0', '--dim': '#8a92b8', '--dim2': '#6272a4', '--accent': '#bd93f9', '--accent2': '#8be9fd', '--ok': '#50fa7b', '--bad': '#ff5555', '--warn': '#ffb86c', '--sel': '#3c3f52' },
+}
+function applyTheme(vars) {
+  const root = document.documentElement
+  THEME_VARS.forEach((k) => { if (vars && vars[k]) root.style.setProperty(k, vars[k]) })
+}
+
 const fmt = (n) => {
   n = n || 0
   if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G'
@@ -1181,6 +1196,77 @@ function Admin({ snap }) {
   )
 }
 
+// theme picker + uploader — custom themes live in the dreads keyspace (hash dash:themes),
+// the active one in dash:theme:active, so they persist server-side across browsers.
+function ThemePicker() {
+  const [name, setName] = useState('default')
+  const [custom, setCustom] = useState({})
+  const [open, setOpen] = useState(false)
+  const [eName, setEName] = useState('')
+  const [eJson, setEJson] = useState('')
+  const [msg, setMsg] = useState('')
+  const all = { ...THEMES, ...custom }
+
+  const load = useCallback(async () => {
+    const a = rarr(await exec(['HGETALL', 'dash:themes'])), c = {}
+    for (let i = 0; i + 1 < a.length; i += 2) { try { c[rval(a[i])] = JSON.parse(rval(a[i + 1])) } catch (e) {} }
+    setCustom(c)
+    const act = rval(await exec(['GET', 'dash:theme:active'])) || 'default'
+    const t = { ...THEMES, ...c }
+    if (t[act]) { setName(act); applyTheme(t[act]) }
+  }, [])
+  useEffect(() => { load() }, [])
+
+  const pick = async (n) => { setName(n); applyTheme(all[n]); await exec(['SET', 'dash:theme:active', n]) }
+  const openEdit = () => {
+    setEName(name in THEMES ? '' : name)
+    setEJson(JSON.stringify(all[name] || THEMES.default, null, 2))
+    setMsg(''); setOpen(true)
+  }
+  const save = async () => {
+    const n = eName.trim()
+    if (!n) { setMsg('name required'); return }
+    if (n in THEMES) { setMsg('that is a built-in name'); return }
+    let vars; try { vars = JSON.parse(eJson) } catch (e) { setMsg('invalid JSON'); return }
+    const v = await exec(['HSET', 'dash:themes', n, JSON.stringify(vars)])
+    if (v.t === 'error') { setMsg(v.v); return }
+    setCustom((c) => ({ ...c, [n]: vars })); setName(n); applyTheme(vars)
+    await exec(['SET', 'dash:theme:active', n]); setOpen(false)
+  }
+  const del = async () => {
+    if (name in THEMES) return
+    await exec(['HDEL', 'dash:themes', name])
+    setCustom((c) => { const x = { ...c }; delete x[name]; return x }); pick('default'); setOpen(false)
+  }
+
+  return (
+    <div class="themebar">
+      <select class="themesel" value={name} onChange={(e) => pick(e.target.value)}>
+        {Object.keys(all).map((n) => <option key={n} value={n}>{n}</option>)}
+      </select>
+      <button class="mini big" title="edit / upload theme" onClick={openEdit}>🎨</button>
+      {open && (
+        <div class="themeedit">
+          <div class="title">theme editor <span class="dim small">— saved to the dreads keyspace</span></div>
+          <input class="qsearch wide" placeholder="theme name (custom)" value={eName}
+            onInput={(e) => setEName(e.target.value)} />
+          <textarea class="themejson" spellcheck={false} value={eJson} onInput={(e) => setEJson(e.target.value)} />
+          <div class="swatches">
+            {(() => { try { const v = JSON.parse(eJson); return THEME_VARS.map((k) =>
+              <span class="sw" key={k} title={k} style={'background:' + (v[k] || '#000')} />) } catch (e) { return null } })()}
+          </div>
+          <div class="pgargs">
+            <button class="run" onClick={save}>Save to dreads ▶</button>
+            {!(name in THEMES) && <button class="del" onClick={del}>Delete “{name}”</button>}
+            <button class="mini big" onClick={() => setOpen(false)}>close</button>
+            {msg && <span class="err small">{msg}</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Login({ onOk }) {
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
@@ -1233,6 +1319,7 @@ function Dashboard() {
           ))}
         </nav>
         <span class={'st ' + (snap.live ? 'live' : 'off')}>{snap.live ? 'live' : 'offline'}</span>
+        <ThemePicker />
         {AUTH && <button class="mini big" style="margin-left:.6rem" onClick={logout}>logout</button>}
       </header>
       {tab === 'overview' && <Overview snap={snap} />}
