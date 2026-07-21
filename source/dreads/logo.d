@@ -1,19 +1,23 @@
 module dreads.logo;
 
-/// The banner uses 24-bit ANSI/VT escapes. POSIX terminals interpret them; a
-/// Windows console does NOT by default, so it would print the escapes as garbage.
-/// Turn on ENABLE_VIRTUAL_TERMINAL_PROCESSING (Windows 10+) so the same escapes
-/// render like on a POSIX terminal — "something similar" via the Windows API,
-/// rather than stripping the colours. No-op on POSIX and when stdout is not a
-/// console (redirect/pipe): GetConsoleMode fails and we simply skip.
+/// The banner uses 24-bit ANSI/VT escapes and UTF-8 Braille art. POSIX terminals
+/// handle both; a Windows console needs two things turned on first, the same way
+/// npm/gh/cargo do it — otherwise the escapes print raw and the Braille mojibakes:
+///   - SetConsoleOutputCP(CP_UTF8): render the multibyte Braille, not codepage garbage.
+///   - ENABLE_VIRTUAL_TERMINAL_PROCESSING (Windows 10+): interpret the colour escapes.
+/// No-op on POSIX and when stdout is not a console (redirect/pipe): GetConsoleMode
+/// fails and we simply skip (the escapes still go to the file, exactly as on POSIX).
 void enableAnsi()
 {
     version (Windows)
     {
         import core.sys.windows.windows : GetStdHandle, STD_OUTPUT_HANDLE,
-            GetConsoleMode, SetConsoleMode, DWORD, INVALID_HANDLE_VALUE;
+            GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, DWORD,
+            INVALID_HANDLE_VALUE;
 
+        enum CP_UTF8 = 65_001;
         enum ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+        SetConsoleOutputCP(CP_UTF8);
         auto h = GetStdHandle(STD_OUTPUT_HANDLE);
         if (h is null || h is INVALID_HANDLE_VALUE)
             return;
