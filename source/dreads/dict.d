@@ -261,6 +261,15 @@ public struct StrVal
         str_ = null;
         kind = ValKind.embstr;
     }
+
+    /// Report this value's owned heap block to `add` WITHOUT freeing — for
+    /// off-loop lazyfree gathering. No-op for int/empty. The (ptr, len) matches
+    /// exactly what free()/freeSlice() would release (mallocDup allocates .length).
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) const @nogc nothrow @trusted
+    {
+        if (isStrKind && str_.ptr !is null)
+            add(cast(void*) str_.ptr, str_.length);
+    }
 }
 
 /// Redis's canonical-integer test: `v` must be exactly the decimal form of the
