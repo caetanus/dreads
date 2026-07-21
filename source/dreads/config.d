@@ -96,6 +96,12 @@ public struct Config
     // `dashboard-admin`. Both default OFF.
     bool dashboardWrite = false;
     bool dashboardAdmin = false;
+    // Live-metrics refresh cadence (ms): how often the main loop snapshots metrics
+    // and pushes to connected dashboard clients. Lower = finer resolution while
+    // debugging a running test; higher = lighter. Only runs while a client is
+    // watching ("no client, no watch"), so a snappy default is cheap. Floored to
+    // 50ms to prevent abuse.
+    uint dashboardIntervalMs = 500;
 }
 
 /// The live configuration (CONFIG GET/SET read and mutate it).
@@ -301,6 +307,15 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         else if (value == "no")
             cfg.dashboardAdmin = false;
         else
+            return false;
+        return true;
+    case "dashboard-interval":
+        try
+        {
+            immutable ms = value.to!uint;
+            cfg.dashboardIntervalMs = ms < 50 ? 50 : ms; // floor 50ms
+        }
+        catch (Exception)
             return false;
         return true;
     case "raft-compress":
