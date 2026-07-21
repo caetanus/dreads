@@ -30,7 +30,10 @@ else
     import core.sys.posix.unistd : ftruncate, fsync;
     // druntime binds fdatasync only for glibc; it exists in musl libc too, so declare
     // it directly there (lets dreads build against musl for small static images).
-    version (CRuntime_Musl)
+    // Darwin has no fdatasync at all — fsync is the best-effort equivalent.
+    version (OSX)
+        alias fdatasync = fsync;
+    else version (CRuntime_Musl)
         extern (C) int fdatasync(int) @nogc nothrow;
     else
         import core.sys.posix.unistd : fdatasync;

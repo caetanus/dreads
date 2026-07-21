@@ -25,6 +25,11 @@ version (Windows)
     extern (C) int _commit(int) @nogc nothrow;
     alias fdatasync = _commit; // best-effort durability on Windows
 }
+else version (OSX)
+{
+    import core.sys.posix.unistd : fsync;
+    alias fdatasync = fsync; // Darwin has no fdatasync; fsync is best-effort
+}
 else version (CRuntime_Musl)
     extern (C) int fdatasync(int) @nogc nothrow; // druntime omits it for musl
 else version (Posix)

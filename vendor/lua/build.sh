@@ -38,8 +38,13 @@ rm -rf "${SRC}"
 tar xzf "${TARBALL}" -C "${BUILD}"
 patch -p1 -d "${SRC}/src" < "${PATCH}"
 
-# build just the static library (no interpreter, no readline dependency)
+# build just the static library (no interpreter, no readline dependency).
+# The platform macro follows the OS (mirrors build.ps1): Darwin -> MACOSX.
+case "$(uname -s)" in
+  Darwin) LUA_PLAT="-DLUA_USE_MACOSX" ;;
+  *)      LUA_PLAT="-DLUA_USE_LINUX"  ;;
+esac
 make -C "${SRC}/src" liblua.a CC="${CC:-cc}" \
-  MYCFLAGS="-O2 -fPIC -DLUA_USE_LINUX" MYLIBS="" >/dev/null
+  MYCFLAGS="-O2 -fPIC ${LUA_PLAT}" MYLIBS="" >/dev/null
 cp "${SRC}/src/liblua.a" "${LIB}"
 echo "built ${LIB} (Lua ${VER} + dreads read-only patch)"

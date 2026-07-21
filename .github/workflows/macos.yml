@@ -1,0 +1,37 @@
+name: macos
+
+# Exploratory macOS build probe, like the windows one. Branch-only (not master),
+# push + manual dispatch. macOS is real POSIX, so the port is tiny: Darwin lacks
+# fdatasync (aliased to fsync in raftlog/syncer). Uses macos-13 (x86_64) so the
+# -mcpu=x86-64-v3 dflag stays valid; Apple Silicon would need that flag gated.
+on:
+  push:
+    branches: [windows-build]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (macos-13, ldc)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch submodules (HTTPS)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.42.0
+
+      # libsodium via Homebrew (jemalloc is libs-linux, skipped here). Put its lib
+      # dir on LIBRARY_PATH so ld finds -lsodium.
+      - name: Install libsodium
+        run: |
+          brew install libsodium
+          echo "LIBRARY_PATH=$(brew --prefix libsodium)/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      # vendor/lua+lz4 build.sh run as preBuildCommands-posix (bash, on macOS too).
+      - name: Build
+        run: dub build --compiler=ldc2
