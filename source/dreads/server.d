@@ -266,6 +266,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             // busy script can't stall the loop and SCRIPT KILL can reach it
             startLuaScriptPool();
         }
+        // built-in web dashboard — opt-in (`dashboard yes`), its own isolated
+        // event-loop thread; a no-op when disabled (no thread, no port bound).
+        {
+            import dreads.dashboard : startDashboard;
+
+            startDashboard();
+        }
         // Wire the expiry->tracking-invalidation hook (a key removed by expiry
         // queues a CLIENT TRACKING invalidation, gated by gTrackCount).
         gTrackInvalidateHook = (scope const(char)[] key) @nogc nothrow {
@@ -364,8 +371,10 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     // otherwise SIGTERM appears to hang for seconds. Daemon threads (lazyfree,
     // syncer) don't need this.
     import dreads.scripting : shutdownLuaScriptPool;
+    import dreads.dashboard : shutdownDashboard;
 
     shutdownLuaScriptPool();
+    shutdownDashboard();
     if (gReplicator !is null)
         gReplicator.stop();
     return rc;
