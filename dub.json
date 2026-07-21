@@ -92,7 +92,7 @@
 		"vibe-core": "~>2.8"
 	},
 	"description": "a dlang redis implementation",
-	"dflags-ldc": [
+	"dflags-x86_64-ldc": [
 		"-mcpu=x86-64-v3"
 	],
 	"dflags-windows-ldc": [

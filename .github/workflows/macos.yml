@@ -2,8 +2,9 @@ name: macos
 
 # Exploratory macOS build probe, like the windows one. Branch-only (not master),
 # push + manual dispatch. macOS is real POSIX, so the port is tiny: Darwin lacks
-# fdatasync (aliased to fsync in raftlog/syncer). Uses macos-13 (x86_64) so the
-# -mcpu=x86-64-v3 dflag stays valid; Apple Silicon would need that flag gated.
+# fdatasync (aliased to fsync in raftlog/syncer). Runs on macos-latest (Apple
+# Silicon / arm64) — the scarce macos-13 Intel runners queue for ages. The
+# -mcpu=x86-64-v3 dflag is x86_64-gated in dub.json, so arm64 just skips it.
 on:
   push:
     branches: [windows-build]
@@ -11,8 +12,8 @@ on:
 
 jobs:
   build:
-    name: build (macos-13, ldc)
-    runs-on: macos-13
+    name: build (macos-latest/arm64, ldc)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
