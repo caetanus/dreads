@@ -276,6 +276,23 @@ function LuaEditor({ code, onChange }) {
 
 // ---------- Playground: Lua scripts via EVAL, with a per-SHA sidebar ----------
 const DEFAULT_LUA = "-- KEYS[] and ARGV[] are available\nreturn redis.call('SET', KEYS[1], ARGV[1])"
+
+// A small hello-world library — click to load into the editor (with sample KEYS/ARGV).
+const EXAMPLES = [
+  { name: 'hello', keys: '', argv: '',
+    code: "-- the basics — KEYS[] and ARGV[] are available\nreturn 'Hello from Lua on dreads!'" },
+  { name: 'json', keys: '', argv: '',
+    code: "-- cjson: encode & decode\nlocal obj = { name = 'dreads', langs = { 'd', 'lua' }, fast = true }\nlocal s = cjson.encode(obj)\nlocal back = cjson.decode(s)\nreturn cjson.encode({ name = back.name, langs = #back.langs, json = s })" },
+  { name: 'msgpack', keys: '', argv: '',
+    code: "-- cmsgpack: pack & unpack (compact binary)\nlocal packed = cmsgpack.pack({ 1, 'two', { three = 3 } })\nlocal value = cmsgpack.unpack(packed)\nreturn cjson.encode({ bytes = #packed, unpacked = value })" },
+  { name: 'migration', keys: 'user:old user:new', argv: '',
+    code: "-- migration: copy a hash into a new key, versioning each field\nlocal data = redis.call('HGETALL', KEYS[1])\nfor i = 1, #data, 2 do\n  redis.call('HSET', KEYS[2], 'v2:' .. data[i], data[i + 1])\nend\nreturn redis.call('HLEN', KEYS[2])" },
+  { name: 'rate limit', keys: 'rl:user1', argv: '5',
+    code: "-- fixed-window rate limiter (INCR + EXPIRE)\nlocal n = redis.call('INCR', KEYS[1])\nif n == 1 then redis.call('EXPIRE', KEYS[1], 60) end\nif n > tonumber(ARGV[1]) then return 'blocked' end\nreturn 'allowed (' .. n .. ')'" },
+  { name: 'atomic swap', keys: 'a b', argv: '',
+    code: "-- atomic get-and-swap of two keys' values\nlocal va = redis.call('GET', KEYS[1])\nlocal vb = redis.call('GET', KEYS[2])\nredis.call('SET', KEYS[1], vb or '')\nredis.call('SET', KEYS[2], va or '')\nreturn cjson.encode({ [KEYS[1]] = vb, [KEYS[2]] = va })" },
+]
+
 function Playground() {
   const [code, setCode] = useState(DEFAULT_LUA)
   const [keys, setKeys] = useState('mykey')
@@ -304,6 +321,7 @@ function Playground() {
     setCode("-- new script — KEYS[] and ARGV[] are available\nreturn 'ok'")
     setKeys(''); setArgv(''); setOut({ out: '', cls: 'muted' })
   }
+  const useExample = (ex) => { setCode(ex.code); setKeys(ex.keys); setArgv(ex.argv); setOut({ out: '', cls: 'muted' }) }
   const save = async () => {
     // SCRIPT LOAD caches the script by SHA WITHOUT running it (create a new script)
     const v = await exec(['SCRIPT', 'LOAD', code])
@@ -313,7 +331,13 @@ function Playground() {
   return (
     <div class="pg">
       <aside class="scripts">
-        <div class="title">scripts <span class="dim">({scripts.length})</span>
+        <div class="title">examples</div>
+        <div class="examples">
+          {EXAMPLES.map((ex) => (
+            <button class="ex" key={ex.name} title={ex.code.split('\n')[0]} onClick={() => useExample(ex)}>{ex.name}</button>
+          ))}
+        </div>
+        <div class="title" style="margin-top:.9rem">scripts <span class="dim">({scripts.length})</span>
           <button class="mini" title="new script" onClick={newScript}>＋</button>
           <button class="mini" title="refresh" onClick={refresh}>⟳</button></div>
         {scripts.length === 0 && <div class="dim small">no cached scripts</div>}
