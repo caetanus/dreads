@@ -55,6 +55,23 @@ docker run -d --name dreads -p 6379:6379 -v dreads-data:/data \
   ghcr.io/caetanus/dreads:latest 6379 --appendonly
 ```
 
+**Swap it in for Redis in dev.** dreads speaks RESP2/RESP3 on port 6379, so your
+existing clients and tooling — `redis-cli`, `ioredis`, `redis-py`, `go-redis`,
+`Sidekiq`, … — talk to it **unchanged**. Just point them at the dreads port; no
+code changes. In a Compose stack, swap the image:
+
+```diff
+ services:
+   cache:
+-    image: redis:7
++    image: ghcr.io/caetanus/dreads:latest
+     ports: ["6379:6379"]
+```
+
+Or point your app straight at it via its usual env: `REDIS_URL=redis://localhost:6379`.
+Anything dreads doesn't yet implement identically is tracked in **[DRIFT.md](DRIFT.md)** —
+for day-to-day dev against the common command surface, it's a drop-in.
+
 See **[Docker](#docker)** for the full image matrix and the redis/valkey-style
 config interface.
 
