@@ -53,6 +53,10 @@ public struct Config
     // host:port matches its own (matched by port on 127.0.0.1 for local runs).
     bool clusterEnabled = false;
     string clusterNodes;
+    // thread-per-shard: number of data shards. 1 (default) = the single-thread path,
+    // with NO router/shard split and zero added cost. >1 spins N shard-worker threads
+    // (each its own keyspace) behind a router; commands route by hash slot.
+    uint shards = 1;
     // keyspace notifications: flag string like "KEA" ("" = disabled). See notify.d.
     string notifyKeyspaceEvents;
     // active expiration: run the drop-soon timer that proactively reclaims keys
@@ -340,6 +344,23 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "cluster-nodes":
         cfg.clusterNodes = value.unquote;
         return true;
+    case "shards":
+        {
+            // manual parse: applyDirective is nothrow, std.conv.to!uint is not
+            if (value.length == 0)
+                return false;
+            uint n = 0;
+            foreach (ch; value)
+            {
+                if (ch < '0' || ch > '9' || n > 100_000)
+                    return false;
+                n = n * 10 + (ch - '0');
+            }
+            if (n < 1)
+                return false;
+            cfg.shards = n;
+            return true;
+        }
     case "notify-keyspace-events":
         cfg.notifyKeyspaceEvents = value.unquote;
         return true;
