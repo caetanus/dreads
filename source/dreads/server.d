@@ -6608,7 +6608,10 @@ private void subReply(ref ByteBuffer o, scope const(char)[] verb,
     repInt(o, cast(long) count);
 }
 
-private void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
+// package-visible so the dashboard bridge can serve PUBSUB introspection: it is a
+// server-layer command (not in the commands.d dispatch executeScriptCommand uses), so
+// the bridge intercepts it and calls this directly on the main thread (reads gPubSub).
+package void pubsubIntrospect(const(RVal)[] args, ref ByteBuffer o) nothrow
 {
     if (args.length == 0)
     {

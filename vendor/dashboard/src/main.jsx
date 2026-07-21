@@ -606,6 +606,86 @@ function Keys() {
   )
 }
 
+// ---------- Pubsub: active channels / patterns / subscriber counts + publish tester ----------
+function Pubsub() {
+  const [chans, setChans] = useState([])   // [{ ch, subs }]
+  const [shard, setShard] = useState([])   // [{ ch, subs }]
+  const [npat, setNpat] = useState(0)
+  const [nameQ, setNameQ] = useState('')
+  const [pch, setPch] = useState(''); const [pmsg, setPmsg] = useState(''); const [pres, setPres] = useState('')
+  const nameQR = useRef(nameQ); nameQR.current = nameQ
+
+  const poll = useCallback(async () => {
+    const q = nameQR.current.trim()
+    const chArgs = ['PUBSUB', 'CHANNELS']; if (q) chArgs.push('*' + q + '*')
+    const list = rarr(await exec(chArgs)).map(rval)
+    const subs = list.length ? rpairs(rarr(await exec(['PUBSUB', 'NUMSUB', ...list]))) : []
+    setChans(subs.map((p) => ({ ch: p.f, subs: Number(p.v) })))
+    setNpat(Number(rval(await exec(['PUBSUB', 'NUMPAT']))) || 0)
+    const sh = rarr(await exec(['PUBSUB', 'SHARDCHANNELS'])).map(rval)
+    const shs = sh.length ? rpairs(rarr(await exec(['PUBSUB', 'SHARDNUMSUB', ...sh]))) : []
+    setShard(shs.map((p) => ({ ch: p.f, subs: Number(p.v) })))
+  }, [])
+  useEffect(() => { poll(); const id = setInterval(poll, 2000); return () => clearInterval(id) }, [poll])
+
+  const publish = async () => {
+    if (!pch) return
+    const r = await exec(['PUBLISH', pch, pmsg])
+    setPres(r.t === 'int' ? `delivered to ${r.v} subscriber${r.v === 1 ? '' : 's'}` : (r.v || 'error'))
+    poll()
+  }
+  const totSubs = chans.reduce((s, c) => s + c.subs, 0)
+
+  return (
+    <div>
+      <div class="qbar">
+        <input class="qsearch wide" spellcheck={false} placeholder="filter channels…"
+          value={nameQ} onInput={(e) => setNameQ(e.target.value)} />
+        <span class="dim small">{chans.length} channels · {npat} pattern{npat === 1 ? '' : 's'} · {totSubs} subs · auto-refresh 2s</span>
+        <button class="mini" title="refresh now" onClick={poll}>⟳</button>
+      </div>
+
+      <div class="panel">
+        <div class="pgargs">
+          <input value={pch} placeholder="channel" onInput={(e) => setPch(e.target.value)} style="flex:0 0 30%" />
+          <input value={pmsg} placeholder="message" onInput={(e) => setPmsg(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && publish()} style="flex:1" />
+          <button class="run" onClick={publish}>Publish ▶</button>
+        </div>
+        {pres && <div class="dim small" style="padding:.1rem">{pres}</div>}
+      </div>
+
+      <div class="panel nopad">
+        <table class="qtable">
+          <thead><tr><th>Channel</th><th class="num">Subscribers</th></tr></thead>
+          <tbody>
+            {chans.sort((a, b) => b.subs - a.subs).map((c) => (
+              <tr key={c.ch} onClick={() => { setPch(c.ch) }}>
+                <td class="qname">{c.ch}</td><td class="num strong">{c.subs}</td>
+              </tr>
+            ))}
+            {chans.length === 0 && <tr><td colspan="2" class="dim small" style="padding:1rem">no active channels</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {shard.length > 0 && (
+        <div class="panel nopad">
+          <div class="title" style="padding:.6rem .9rem 0">shard channels</div>
+          <table class="qtable">
+            <thead><tr><th>Shard channel</th><th class="num">Subscribers</th></tr></thead>
+            <tbody>
+              {shard.map((c) => (
+                <tr key={c.ch}><td class="qname">{c.ch}</td><td class="num strong">{c.subs}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const snap = useMetrics()
   const [tab, setTab] = useState('overview')
@@ -614,7 +694,7 @@ function App() {
       <header>
         <h1>dreads <span class="zap">⚡</span> dashboard</h1>
         <nav>
-          {['overview', 'console', 'keys', 'queues', 'playground'].map((t) => (
+          {['overview', 'console', 'keys', 'pubsub', 'queues', 'playground'].map((t) => (
             <button key={t} class={'tab ' + (tab === t ? 'on' : '')} onClick={() => setTab(t)}>{t}</button>
           ))}
         </nav>
@@ -623,6 +703,7 @@ function App() {
       {tab === 'overview' && <Overview snap={snap} />}
       {tab === 'console' && <Console />}
       {tab === 'keys' && <Keys />}
+      {tab === 'pubsub' && <Pubsub />}
       {tab === 'queues' && <Queues />}
       {tab === 'playground' && <Playground />}
     </div>

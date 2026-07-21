@@ -192,6 +192,19 @@ private const(char)[] dashDeny(scope const(RVal)[] arr) @nogc nothrow
 // CONFIG SET is control-plane (not in the keyspace dispatch), so handle the one
 // admin knob the dashboard needs — the maxmemory bump — directly. Value is bytes.
 // Returns true if it consumed the command (reply written).
+// PUBSUB is a server-layer command (not in the commands.d dispatch the bridge uses),
+// so serve its read-only introspection here — on the main thread, over the same
+// gPubSub the server does. Mirrors dashApplyConfig's intercept-before-dispatch pattern.
+private bool dashPubsub(scope const(RVal)[] arr, ref ByteBuffer reply) nothrow
+{
+    import dreads.server : pubsubIntrospect;
+
+    if (arr.length == 0 || !ciEq(arr[0].str, "pubsub"))
+        return false;
+    pubsubIntrospect(arr[1 .. $], reply);
+    return true;
+}
+
 private bool dashApplyConfig(scope const(RVal)[] arr, ref ByteBuffer reply) @nogc nothrow
 {
     import dreads.resp : repError;
@@ -283,6 +296,10 @@ private void dashCmdDrainLoop() nothrow
                     else if (dashApplyConfig(cmd.arr, slot.reply))
                     {
                         // handled in-place (maxmemory bump)
+                    }
+                    else if (dashPubsub(cmd.arr, slot.reply))
+                    {
+                        // PUBSUB introspection (server-layer command, served in-place)
                     }
                     else
                     {
