@@ -51,7 +51,6 @@ private immutable string[] LIST_CMDS = ["lpush", "rpush", "lpop", "rpop", "lset"
         "linsert", "ltrim", "lpushx", "rpushx", "rpoplpush", "lmove", "blpop", "brpop"];
 private immutable string[] STREAM_CMDS = ["xadd", "xdel", "xread", "xrange", "xrevrange",
         "xlen", "xtrim", "xreadgroup", "xack", "xclaim", "xautoclaim"];
-private immutable string[] PUB_CMDS = ["publish", "spublish"];
 
 private ulong sumCalls(const(string)[] names) @nogc nothrow
 {
@@ -76,8 +75,9 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
     import dreads.obj : gDbs, NUM_DBS, gExpiredKeys, gEvictedKeys, gConnectedClients,
         gBlockedClients;
     import dreads.mem : usedMemory;
+    import dreads.pubsub : gPubMessages;
 
-    ulong total = 0;
+    ulong total = gPubMessages; // publishes bypass gCmdStats; count them too
     foreach (ref s; gCmdStats)
         total += s.calls;
     ulong keys = 0;
@@ -91,7 +91,7 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
         cast(ulong) nowMs(), cast(ulong) usedMemory(), cast(ulong) gConfig.maxmemory,
         cast(long) gConnectedClients, cast(long) gBlockedClients, cast(ulong) gExpiredKeys,
         cast(ulong) gEvictedKeys, total, keys, sumCalls(STR_CMDS), sumCalls(LIST_CMDS),
-        sumCalls(STREAM_CMDS), sumCalls(PUB_CMDS), channels, patterns);
+        sumCalls(STREAM_CMDS), cast(ulong) gPubMessages, channels, patterns);
     if (n < 0)
         return 0;
     size_t p = n;

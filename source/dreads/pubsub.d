@@ -361,6 +361,11 @@ private struct PtrBucket
     }
 }
 
+/// Total messages published across all channels (every publish path), for the
+/// dashboard — PUBLISH is dispatched outside the command pipeline, so it never
+/// reaches gCmdStats; this counter is the reliable source.
+public __gshared ulong gPubMessages;
+
 public struct PubSub
 {
     private Dict!SubList channels; // channel -> subscribers
@@ -669,6 +674,7 @@ public struct PubSub
     long publish(scope const(char)[] channel, scope const(char)[] payload,
             scope const(char)[] verb = "message") nothrow
     {
+        gPubMessages++; // dashboard: total messages published (every publish path)
         long receivers = 0;
         auto list = channels.get(channel);
         if (list !is null && list.len > 0)
