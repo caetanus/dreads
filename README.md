@@ -8,6 +8,8 @@
 
 <p align="center">
   <a href="https://github.com/caetanus/dreads/actions/workflows/ci.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI — 548 tests + native Valkey parity sweep"></a>
+  <a href="https://github.com/caetanus/dreads/actions/workflows/windows.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/windows.yml/badge.svg?branch=master" alt="Windows build (static x64)"></a>
+  <a href="https://github.com/caetanus/dreads/actions/workflows/macos.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/macos.yml/badge.svg?branch=master" alt="macOS build (arm64)"></a>
   <a href="https://github.com/caetanus/dreads/actions/workflows/docker.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/docker.yml/badge.svg" alt="docker publish"></a>
   <a href="https://github.com/caetanus/dreads/pkgs/container/dreads"><img src="https://img.shields.io/badge/ghcr.io-caetanus%2Fdreads-2496ED?logo=docker&logoColor=white" alt="container image"></a>
   <a href="https://github.com/caetanus/dreads/releases"><img src="https://img.shields.io/github/v/tag/caetanus/dreads?label=release&sort=semver" alt="latest release"></a>
@@ -19,13 +21,42 @@ Redis-compatible, built with D/dub, vibe-core fibers, and the `draft` Raft
 package. The day-to-day build uses reggae+ninja; the runtime is built around
 three commitments: zero GC in the data plane, arena memory, and one purpose —
 speed. It speaks RESP2/RESP3 and tracks Redis/Valkey on the supported command
-surface.
+surface. Builds on Linux, macOS (Apple Silicon), and Windows — the Windows build
+is standalone (**[no Raft on Windows](WINDOWS.md)**).
 
 ```
 ⟜ Ultra-light. 16 logical DBs on one event-loop thread.
 ⟜ Arena memory. Zero-GC data plane.
 ⟜ Raft-replicated log. Custom types. One purpose: Speed.
 ```
+
+## Try it today
+
+One command, no build — pull and run:
+
+```sh
+docker run --rm -p 6379:6379 ghcr.io/caetanus/dreads:latest
+```
+
+Then, from another shell, talk to it with any Redis client:
+
+```sh
+redis-cli -p 6379 PING           # PONG
+redis-cli -p 6379 SET hello world
+redis-cli -p 6379 GET hello      # "world"
+```
+
+The image is **multi-arch (amd64 + arm64)** — it runs on Apple Silicon and AWS
+Graviton. Want the smaller one? Use `ghcr.io/caetanus/dreads:latest-alpine`
+(lighter, slightly slower). To keep your data, mount a volume and enable the AOF:
+
+```sh
+docker run -d --name dreads -p 6379:6379 -v dreads-data:/data \
+  ghcr.io/caetanus/dreads:latest 6379 --appendonly
+```
+
+See **[Docker](#docker)** for the full image matrix and the redis/valkey-style
+config interface.
 
 ## Compatibility, stated honestly
 
@@ -278,14 +309,16 @@ reggae -b ninja && ninja
 ### Docker
 
 Two images are published to GHCR on each release, like Redis/Valkey ship a Debian
-and an Alpine variant:
+and an Alpine variant. Both are **multi-arch (amd64 + arm64)** — the arm64 image
+runs on Apple Silicon and AWS Graviton:
 
 | tag | base | size | notes |
 | --- | --- | --- | --- |
-| `ghcr.io/caetanus/dreads:latest` (and `:X.Y.Z`) | distroless (glibc) | ~29 MB | the default — fastest |
-| `ghcr.io/caetanus/dreads:X.Y.Z-alpine` | Alpine (musl) | ~16 MB | slim; ~6–14 % slower on GET/SET (musl's string ops), still ahead of `valkey:*-alpine` |
+| `ghcr.io/caetanus/dreads:latest` (and `:X.Y.Z`) | distroless (glibc) | ~29 MB | the default — **faster** (glibc + jemalloc); includes a busybox shell for `docker exec … sh` |
+| `ghcr.io/caetanus/dreads:X.Y.Z-alpine` | Alpine (musl) | ~16 MB | **lighter but slower** — ~6–14 % behind on GET/SET (musl's allocator/string ops), still ahead of `valkey:*-alpine` |
 
-Both are smaller than `valkey:9.1.0-alpine` (45 MB) and `redis:7-alpine` (39 MB).
+**Rule of thumb: glibc for speed, Alpine for size.** Both are smaller than
+`valkey:9.1.0-alpine` (45 MB) and `redis:7-alpine` (39 MB).
 
 ```sh
 docker run -d --name dreads -p 6379:6379 ghcr.io/caetanus/dreads:latest

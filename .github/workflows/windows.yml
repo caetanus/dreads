@@ -1,12 +1,12 @@
 name: windows
 
-# Exploratory Windows build probe. Lives ONLY on the windows-build branch (never
-# merged to master) — triggers on push to that branch + manual dispatch, so it
-# doesn't run on the mainline. Goal: get the real LDC/Windows error surface for
-# the port (posix syscalls, vibe-core, libsodium.lib linking).
+# Windows build CI: a fully static (libcmt) x64 dreads.exe — posix syscall shims,
+# vibe-core, static libsodium (vcpkg) + vendored lua/lz4 (/MT). Publishes the exe
+# as a versioned artifact. Runs on master + PRs (badge on the README).
 on:
   push:
-    branches: [windows-build]
+    branches: [master]
+  pull_request:
   workflow_dispatch:
 
 jobs:

@@ -1,13 +1,13 @@
 name: macos
 
-# Exploratory macOS build probe, like the windows one. Branch-only (not master),
-# push + manual dispatch. macOS is real POSIX, so the port is tiny: Darwin lacks
-# fdatasync (aliased to fsync in raftlog/syncer). Runs on macos-latest (Apple
-# Silicon / arm64) — the scarce macos-13 Intel runners queue for ages. The
-# -mcpu=x86-64-v3 dflag is x86_64-gated in dub.json, so arm64 just skips it.
+# macOS build CI: Apple Silicon (arm64). macOS is real POSIX; the only shims are
+# Darwin's missing fdatasync (-> fsync) and clock_gettime (-> gettimeofday). The
+# -mcpu=x86-64-v3 dflag is x86_64-gated in dub.json, so arm64 skips it. Runs on
+# master + PRs (badge on the README).
 on:
   push:
-    branches: [windows-build]
+    branches: [master]
+  pull_request:
   workflow_dispatch:
 
 jobs:
