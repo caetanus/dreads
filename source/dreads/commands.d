@@ -10,7 +10,8 @@ import core.stdc.stdlib : strtod;
 import core.stdc.string : memcpy;
 
 import dreads.dict : canonicalInt, Dict, StrVal, Unit, ValKind;
-import dreads.aclcat : gCmdCats;
+import dreads.aclcat : gCmdCats, cmdIx;
+import dreads.acl : aclCmdIndex;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass, gNotifyDb;
@@ -70,7 +71,7 @@ private enum MAX_STRING_LEN = 512UL * 1024 * 1024;
 /// Executes one client command, appending the reply to o.
 /// Returns false when the connection should be closed (QUIT).
 public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref Arena arena,
-        ulong applyTime = 0) @nogc nothrow
+        ulong applyTime = 0, int knownIdx = -1) @nogc nothrow
 {
     // freeze the clock for this command: wall time now, or the logged time
     // when replaying a committed raft entry (deterministic apply on replicas)
@@ -105,16 +106,32 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         unknownCmd(o, name);
         return true;
     }
+    // one pass builds BOTH case views: UPPER for `uname` (used inside cases) and
+    // lower for the command-index fallback below
+    char[24] lbuf = void;
     foreach (i, c; name)
+    {
         nbuf[i] = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+        lbuf[i] = c >= 'A' && c <= 'Z' ? cast(char)(c + 32) : c;
+    }
     // case-insensitive view for comparisons INSIDE cases ('name' keeps the
     // client's original casing — scripts routinely send lowercase)
     auto uname = cast(const(char)[]) nbuf[0 .. name.length];
 
-    switch (cast(string) nbuf[0 .. name.length])
+    // INTEGER dispatch: the switch below is a jump table on the command's
+    // gCmdCats index, not a string switch. A caller that already knows the
+    // index passes it (`knownIdx`) and skips the name resolution entirely —
+    // the cross-shard hop ships it in the descriptor, so the OWNER never
+    // re-resolves the name the requester already resolved (the last piece of
+    // the owner re-parse tax). Callers without it pay aclCmdIndex once — the
+    // same length-bucketed compile-time switch the string dispatch was.
+    immutable cmdIdx = knownIdx >= 0 ? knownIdx
+        : aclCmdIndex(cast(const(char)[]) lbuf[0 .. name.length]);
+
+    switch (cmdIdx)
     {
         // --- connection / server ---
-    case "PING":
+    case cmdIx!"ping":
         {
             if (args.length == 0)
                 repSimple(o, "PONG");
@@ -124,7 +141,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "ping");
             break;
         }
-    case "ECHO":
+    case cmdIx!"echo":
         {
             if (args.length == 1)
                 repBulk(o, args[0].str);
@@ -132,7 +149,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "echo");
             break;
         }
-    case "COMMAND":
+    case cmdIx!"command":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
                 repHelp!"COMMAND"(o);
@@ -142,15 +159,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repArrayHeader(o, 0); // stub so redis-cli's handshake succeeds
             break;
         }
-    case "QUIT":
+    case cmdIx!"quit":
         {
             repSimple(o, "OK");
             return false;
         }
 
         // --- keyspace ---
-    case "DEL":
-    case "UNLINK":
+    case cmdIx!"del":
+    case cmdIx!"unlink":
         {
             if (args.length == 0)
             {
@@ -170,7 +187,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "EXISTS":
+    case cmdIx!"exists":
         {
             if (args.length == 0)
             {
@@ -183,7 +200,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "TYPE":
+    case cmdIx!"type":
         {
             if (args.length != 1)
             {
@@ -194,7 +211,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, obj is null ? "none" : obj.typeName);
             break;
         }
-    case "KEYS":
+    case cmdIx!"keys":
         {
             if (args.length != 1)
             {
@@ -222,7 +239,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "DBSIZE":
+    case cmdIx!"dbsize":
         {
             if (args.length == 0)
                 repInt(o, cast(long) ks.length); // raw count, like Redis (the 1s timer reaps)
@@ -230,13 +247,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 arityErr(o, "dbsize");
             break;
         }
-    case "FLUSHDB":
+    case cmdIx!"flushdb":
         {
             ks.clear(); // current database only
             repSimple(o, "OK");
             break;
         }
-    case "FLUSHALL":
+    case cmdIx!"flushall":
         {
             ks.clear(); // the current db (which may be a detached test keyspace)
             foreach (ref d; gDbs) // every database
@@ -244,10 +261,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "EXPIRE":
-    case "PEXPIRE":
-    case "EXPIREAT":
-    case "PEXPIREAT":
+    case cmdIx!"expire":
+    case cmdIx!"pexpire":
+    case cmdIx!"expireat":
+    case cmdIx!"pexpireat":
         {
             // EXPIRE(6)/EXPIREAT(8) take seconds; EXPIRE(6)/PEXPIRE(7) are relative
             bool isSec = name.length == 6 || name.length == 8;
@@ -347,8 +364,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "TTL":
-    case "PTTL":
+    case cmdIx!"ttl":
+    case cmdIx!"pttl":
         {
             bool inSec = name.length == 3;
             if (args.length != 1)
@@ -373,7 +390,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, inSec ? (rem + 500) / 1000 : rem);
             break;
         }
-    case "PERSIST":
+    case cmdIx!"persist":
         {
             if (args.length != 1)
             {
@@ -392,7 +409,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, 0);
             break;
         }
-    case "DUMP":
+    case cmdIx!"dump":
         {
             // DUMP key -> the RDB serialization of the value (via the compactor's
             // rebuild commands), or nil when the key is missing.
@@ -418,7 +435,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repBulk(o, cast(const(char)[]) payload.data);
             break;
         }
-    case "RESTORE":
+    case cmdIx!"restore":
         {
             // RESTORE key ttl serialized-value [REPLACE|ABSTTL|IDLETIME n|FREQ n]
             if (args.length < 3)
@@ -535,7 +552,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- strings ---
-    case "SET":
+    case cmdIx!"set":
         {
             if (args.length < 2)
             {
@@ -665,8 +682,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 propagateSet(args[0].str, args[1].str, obj.expireAtMs);
             break;
         }
-    case "SETEX":
-    case "PSETEX":
+    case cmdIx!"setex":
+    case cmdIx!"psetex":
         {
             bool isSec = name.length == 5;
             if (args.length != 3)
@@ -698,7 +715,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "GETEX":
+    case cmdIx!"getex":
         {
             if (args.length == 0)
             {
@@ -768,7 +785,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "GETDEL":
+    case cmdIx!"getdel":
         {
             if (args.length != 1)
             {
@@ -792,7 +809,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             notifyKeyspaceEvent(NClass.generic, "del", args[0].str);
             break;
         }
-    case "DELIFEQ":
+    case cmdIx!"delifeq":
         {
             // Valkey compare-and-delete: drop the key only when its current
             // string value equals the comparison; propagate as a plain DEL.
@@ -823,7 +840,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "SETNX":
+    case cmdIx!"setnx":
         {
             if (args.length != 2)
             {
@@ -840,7 +857,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "GET":
+    case cmdIx!"get":
         {
             if (args.length != 1)
             {
@@ -857,7 +874,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repStrVal(o, obj.str);
             break;
         }
-    case "GETSET":
+    case cmdIx!"getset":
         {
             if (args.length != 2)
             {
@@ -879,7 +896,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);
             break;
         }
-    case "APPEND":
+    case cmdIx!"append":
         {
             if (args.length != 2)
             {
@@ -911,7 +928,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             notifyKeyspaceEvent(NClass.str, "append", args[0].str);
             break;
         }
-    case "STRLEN":
+    case cmdIx!"strlen":
         {
             if (args.length != 1)
             {
@@ -926,7 +943,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.str.len());
             break;
         }
-    case "INCR":
+    case cmdIx!"incr":
         {
             if (args.length != 1)
                 arityErr(o, "incr");
@@ -934,7 +951,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 incrDecr(ks, args[0].str, 1, "incrby", o);
             break;
         }
-    case "DECR":
+    case cmdIx!"decr":
         {
             if (args.length != 1)
                 arityErr(o, "decr");
@@ -942,8 +959,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 incrDecr(ks, args[0].str, -1, "decrby", o);
             break;
         }
-    case "INCRBY":
-    case "DECRBY":
+    case cmdIx!"incrby":
+    case cmdIx!"decrby":
         {
             if (args.length != 2)
             {
@@ -965,7 +982,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                     nbuf[0] == 'I' ? "incrby" : "decrby", o);
             break;
         }
-    case "MSET":
+    case cmdIx!"mset":
         {
             if (args.length == 0 || args.length % 2 != 0)
             {
@@ -980,7 +997,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "MSETEX":
+    case cmdIx!"msetex":
         {
             // MSETEX numkeys k v [k v ...] [NX|XX]
             //        [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
@@ -1129,7 +1146,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "MGET":
+    case cmdIx!"mget":
         {
             if (args.length == 0)
             {
@@ -1149,8 +1166,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- lists ---
-    case "LPUSH":
-    case "RPUSH":
+    case cmdIx!"lpush":
+    case cmdIx!"rpush":
         {
             if (args.length < 2)
             {
@@ -1175,13 +1192,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, cast(long) obj.list.length);
             break;
         }
-    case "LPOP":
-    case "RPOP":
+    case cmdIx!"lpop":
+    case cmdIx!"rpop":
         {
             listPop(ks, args, nbuf[0] == 'L', o);
             break;
         }
-    case "LLEN":
+    case cmdIx!"llen":
         {
             if (args.length != 1)
             {
@@ -1196,7 +1213,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.list.length);
             break;
         }
-    case "QSTATS":
+    case cmdIx!"qstats":
         {
             // dreads-native: per-queue counters for a list — total items ever
             // enqueued/dequeued (push/pop) + current depth. Feeds the dashboard's
@@ -1222,7 +1239,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, obj is null ? 0 : cast(long) obj.list.length);
             break;
         }
-    case "LRANGE":
+    case cmdIx!"lrange":
         {
             if (args.length != 3)
             {
@@ -1256,7 +1273,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             });
             break;
         }
-    case "LINDEX":
+    case cmdIx!"lindex":
         {
             if (args.length != 2)
             {
@@ -1284,7 +1301,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
             break;
         }
-    case "LSET":
+    case cmdIx!"lset":
         {
             if (args.length != 3)
             {
@@ -1312,7 +1329,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR index out of range");
             break;
         }
-    case "LREM":
+    case cmdIx!"lrem":
         {
             if (args.length != 3)
             {
@@ -1346,7 +1363,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- hashes ---
-    case "HSET":
+    case cmdIx!"hset":
         {
             if (args.length < 3 || (args.length - 1) % 2 != 0)
             {
@@ -1367,7 +1384,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, added);
             break;
         }
-    case "HGET":
+    case cmdIx!"hget":
         {
             if (args.length != 2)
             {
@@ -1388,7 +1405,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repStrVal(o, *f);
             break;
         }
-    case "HMGET":
+    case cmdIx!"hmget":
         {
             if (args.length < 2)
             {
@@ -1413,7 +1430,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HDEL":
+    case cmdIx!"hdel":
         {
             if (args.length < 2)
             {
@@ -1441,7 +1458,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "HGETDEL":
+    case cmdIx!"hgetdel":
         {
             // HGETDEL key FIELDS numfields field [field ...] — reply the
             // values (nulls for misses) and delete those fields
@@ -1497,10 +1514,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HEXPIRE":
-    case "HPEXPIRE":
-    case "HEXPIREAT":
-    case "HPEXPIREAT":
+    case cmdIx!"hexpire":
+    case cmdIx!"hpexpire":
+    case cmdIx!"hexpireat":
+    case cmdIx!"hpexpireat":
         {
             // H*EXPIRE key ttl [NX|XX|GT|LT] FIELDS numfields field [field ...]
             immutable lname = name.length == 7 ? "hexpire" : name.length == 8
@@ -1668,10 +1685,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HTTL":
-    case "HPTTL":
-    case "HEXPIRETIME":
-    case "HPEXPIRETIME":
+    case cmdIx!"httl":
+    case cmdIx!"hpttl":
+    case cmdIx!"hexpiretime":
+    case cmdIx!"hpexpiretime":
         {
             // H* key FIELDS numfields field... — remaining TTL / absolute expiry per field
             immutable lname = name.length == 4 ? "httl" : name.length == 5
@@ -1732,7 +1749,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HPERSIST":
+    case cmdIx!"hpersist":
         {
             // HPERSIST key FIELDS numfields field...
             if (args.length < 4)
@@ -1801,7 +1818,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HGETEX":
+    case cmdIx!"hgetex":
         {
             // HGETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST] FIELDS numfields field...
             if (args.length < 4)
@@ -1970,7 +1987,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HSETEX":
+    case cmdIx!"hsetex":
         {
             // HSETEX key [FNX|FXX] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL] FIELDS n field value...
             if (args.length < 5)
@@ -2183,7 +2200,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "HLEN":
+    case cmdIx!"hlen":
         {
             if (args.length != 1)
             {
@@ -2198,7 +2215,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.hash.length);
             break;
         }
-    case "HEXISTS":
+    case cmdIx!"hexists":
         {
             if (args.length != 2)
             {
@@ -2213,9 +2230,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj !is null && obj.hash.exists(args[1].str) ? 1 : 0);
             break;
         }
-    case "HKEYS":
-    case "HVALS":
-    case "HGETALL":
+    case cmdIx!"hkeys":
+    case cmdIx!"hvals":
+    case cmdIx!"hgetall":
         {
             if (args.length != 1)
             {
@@ -2265,7 +2282,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HINCRBY":
+    case cmdIx!"hincrby":
         {
             if (args.length != 3)
             {
@@ -2310,7 +2327,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- sets ---
-    case "SADD":
+    case cmdIx!"sadd":
         {
             if (args.length < 2)
             {
@@ -2332,7 +2349,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "SREM":
+    case cmdIx!"srem":
         {
             if (args.length < 2)
             {
@@ -2360,7 +2377,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "SISMEMBER":
+    case cmdIx!"sismember":
         {
             if (args.length != 2)
             {
@@ -2375,7 +2392,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj !is null && obj.set.exists(args[1].str) ? 1 : 0);
             break;
         }
-    case "SCARD":
+    case cmdIx!"scard":
         {
             if (args.length != 1)
             {
@@ -2390,7 +2407,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.set.length);
             break;
         }
-    case "SMEMBERS":
+    case cmdIx!"smembers":
         {
             if (args.length != 1)
             {
@@ -2412,20 +2429,20 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "SINTER":
-    case "SDIFF":
+    case cmdIx!"sinter":
+    case cmdIx!"sdiff":
         {
             setCombine(ks, args, nbuf[1] == 'I', o, arena);
             break;
         }
-    case "SUNION":
+    case cmdIx!"sunion":
         {
             setUnion(ks, args, o);
             break;
         }
 
         // --- sorted sets ---
-    case "ZADD":
+    case cmdIx!"zadd":
         {
             import core.stdc.math : isnan;
 
@@ -2580,7 +2597,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, ch ? changed : added);
             break;
         }
-    case "ZREM":
+    case cmdIx!"zrem":
         {
             if (args.length < 2)
             {
@@ -2608,7 +2625,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "ZSCORE":
+    case cmdIx!"zscore":
         {
             if (args.length != 2)
             {
@@ -2629,7 +2646,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullBulk(o);
             break;
         }
-    case "ZINCRBY":
+    case cmdIx!"zincrby":
         {
             if (args.length != 3)
             {
@@ -2666,7 +2683,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repDouble(o, nv);
             break;
         }
-    case "ZCARD":
+    case cmdIx!"zcard":
         {
             if (args.length != 1)
             {
@@ -2681,8 +2698,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.zset.length);
             break;
         }
-    case "ZRANK":
-    case "ZREVRANK":
+    case cmdIx!"zrank":
+    case cmdIx!"zrevrank":
         {
             bool rev = name.length != 5;
             if (args.length < 2 || args.length > 3)
@@ -2731,78 +2748,78 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, rank);
             break;
         }
-    case "ZRANGE":
-    case "ZREVRANGE":
+    case cmdIx!"zrange":
+    case cmdIx!"zrevrange":
         {
             import dreads.zsetops : zrangeGeneric;
 
             zrangeGeneric(ks, args, o, arena, name.length == 6 ? 0 : 1);
             break;
         }
-    case "ZRANGEBYSCORE":
-    case "ZREVRANGEBYSCORE":
+    case cmdIx!"zrangebyscore":
+    case cmdIx!"zrevrangebyscore":
         {
             import dreads.zsetops : zrangeGeneric;
 
             zrangeGeneric(ks, args, o, arena, name.length == 13 ? 2 : 3);
             break;
         }
-    case "ZRANGEBYLEX":
-    case "ZREVRANGEBYLEX":
+    case cmdIx!"zrangebylex":
+    case cmdIx!"zrevrangebylex":
         {
             import dreads.zsetops : zrangeGeneric;
 
             zrangeGeneric(ks, args, o, arena, name.length == 11 ? 4 : 5);
             break;
         }
-    case "ZRANGESTORE":
+    case cmdIx!"zrangestore":
         {
             import dreads.zsetops : zrangestore;
 
             zrangestore(ks, args, o, arena);
             break;
         }
-    case "ZLEXCOUNT":
-    case "ZREMRANGEBYLEX":
+    case cmdIx!"zlexcount":
+    case cmdIx!"zremrangebylex":
         {
             import dreads.zsetops : zlexRange;
 
             zlexRange(ks, args, o, arena, name.length == 14);
             break;
         }
-    case "ZRANDMEMBER":
+    case cmdIx!"zrandmember":
         {
             import dreads.zsetops : zrandmember;
 
             zrandmember(ks, args, o);
             break;
         }
-    case "ZMPOP":
+    case cmdIx!"zmpop":
         {
             import dreads.zsetops : zmpop;
 
             zmpop(ks, args, o, arena);
             break;
         }
-    case "ZUNION":
-    case "ZINTER":
-    case "ZDIFF":
+    case cmdIx!"zunion":
+    case cmdIx!"zinter":
+    case cmdIx!"zdiff":
         {
             import dreads.zsetops : zsetCombine;
 
             zsetCombine(ks, args, o, arena, nbuf[1] == 'U' ? 'U' : (nbuf[1] == 'I' ? 'I' : 'D'), 0);
             break;
         }
-    case "ZUNIONSTORE":
-    case "ZINTERSTORE":
-    case "ZDIFFSTORE":
+    case cmdIx!"zunionstore":
+    case cmdIx!"zinterstore":
+    case cmdIx!"zdiffstore":
         {
             import dreads.zsetops : zsetCombine;
 
             zsetCombine(ks, args, o, arena, nbuf[1] == 'U' ? 'U' : (nbuf[1] == 'I' ? 'I' : 'D'), 1);
             break;
         }
-    case "ZINTERCARD":
+    case cmdIx!"zintercard":
         {
             import dreads.zsetops : zsetCombine;
 
@@ -2811,7 +2828,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- keyspace extras / server ---
-    case "RENAME":
+    case cmdIx!"rename":
         {
             if (args.length != 2)
             {
@@ -2828,7 +2845,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR no such key");
             break;
         }
-    case "RENAMENX":
+    case cmdIx!"renamenx":
         {
             if (args.length != 2)
             {
@@ -2851,7 +2868,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "TIME":
+    case cmdIx!"time":
         {
             auto ms = detNow();
             char[24] b = void;
@@ -2862,7 +2879,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repBulk(o, b[0 .. n]);
             break;
         }
-    case "SELECT":
+    case cmdIx!"select":
         {
             // the real per-connection db switch happens at the server layer; this
             // path (MULTI replay / apply) only validates the index.
@@ -2874,7 +2891,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
         // CONFIG is handled at the server layer (it owns the live Config)
-    case "INFO":
+    case cmdIx!"info":
         {
             import dreads.config : gConfig;
             import dreads.mem : usedMemory;
@@ -3007,7 +3024,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- string extras ---
-    case "GETRANGE":
+    case cmdIx!"getrange":
         {
             if (args.length != 3)
             {
@@ -3037,7 +3054,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repBulk(o, sv[cast(size_t) start .. cast(size_t) stop + 1]);
             break;
         }
-    case "SETRANGE":
+    case cmdIx!"setrange":
         {
             if (args.length != 3)
             {
@@ -3091,7 +3108,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, cast(long) newLen);
             break;
         }
-    case "INCRBYFLOAT":
+    case cmdIx!"incrbyfloat":
         {
             if (args.length != 2)
             {
@@ -3137,7 +3154,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             propagateSet(args[0].str, res, keptTtl);
             break;
         }
-    case "MSETNX":
+    case cmdIx!"msetnx":
         {
             if (args.length == 0 || args.length % 2 != 0)
             {
@@ -3159,7 +3176,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- list extras ---
-    case "LTRIM":
+    case cmdIx!"ltrim":
         {
             if (args.length != 3)
             {
@@ -3202,7 +3219,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "LINSERT":
+    case cmdIx!"linsert":
         {
             if (args.length != 4)
             {
@@ -3235,7 +3252,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, ins);
             break;
         }
-    case "LMOVE":
+    case cmdIx!"lmove":
         {
             if (args.length != 4)
             {
@@ -3251,7 +3268,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             lmove(ks, args[0].str, args[1].str, fromLeft, toLeft, o, arena);
             break;
         }
-    case "RPOPLPUSH":
+    case cmdIx!"rpoplpush":
         {
             if (args.length != 2)
             {
@@ -3263,7 +3280,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- hash extras ---
-    case "HSETNX":
+    case cmdIx!"hsetnx":
         {
             if (args.length != 3)
             {
@@ -3287,7 +3304,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "HSTRLEN":
+    case cmdIx!"hstrlen":
         {
             if (args.length != 2)
             {
@@ -3307,17 +3324,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- set extras ---
-    case "SPOP":
+    case cmdIx!"spop":
         {
             spop(ks, args, o, arena);
             break;
         }
-    case "SRANDMEMBER":
+    case cmdIx!"srandmember":
         {
             srandmember(ks, args, o, arena);
             break;
         }
-    case "SMOVE":
+    case cmdIx!"smove":
         {
             if (args.length != 3)
             {
@@ -3349,7 +3366,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "SMISMEMBER":
+    case cmdIx!"smismember":
         {
             if (args.length < 2)
             {
@@ -3368,14 +3385,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj !is null && obj.set.exists(a.str) ? 1 : 0);
             break;
         }
-    case "SINTERCARD":
+    case cmdIx!"sintercard":
         {
             sintercard(ks, args, o, arena);
             break;
         }
-    case "SINTERSTORE":
-    case "SUNIONSTORE":
-    case "SDIFFSTORE":
+    case cmdIx!"sinterstore":
+    case cmdIx!"sunionstore":
+    case cmdIx!"sdiffstore":
         {
             // nbuf[1]: I(nter) / U(nion) / D(iff)
             setStore(ks, args, nbuf[1], o, arena);
@@ -3383,7 +3400,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- zset extras ---
-    case "ZCOUNT":
+    case cmdIx!"zcount":
         {
             if (args.length != 3)
             {
@@ -3414,13 +3431,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "ZPOPMIN":
-    case "ZPOPMAX":
+    case cmdIx!"zpopmin":
+    case cmdIx!"zpopmax":
         {
             zpop(ks, args, nbuf[5] == 'A', o, arena); // ZPOPM[A]X vs ZPOPM[I]N
             break;
         }
-    case "ZMSCORE":
+    case cmdIx!"zmscore":
         {
             if (args.length < 2)
             {
@@ -3445,15 +3462,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "ZREMRANGEBYRANK":
-    case "ZREMRANGEBYSCORE":
+    case cmdIx!"zremrangebyrank":
+    case cmdIx!"zremrangebyscore":
         {
             zremrange(ks, args, name.length == 15, o, arena); // BYRANK is 15 chars
             break;
         }
 
         // --- streams ---
-    case "XADD":
+    case cmdIx!"xadd":
         {
             // XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] thr [LIMIT n]] <id|*> f v ...
             if (args.length < 4)
@@ -3581,7 +3598,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "XLEN":
+    case cmdIx!"xlen":
         {
             if (args.length != 1)
             {
@@ -3596,7 +3613,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.stream.length);
             break;
         }
-    case "XRANGE":
+    case cmdIx!"xrange":
         {
             size_t limit = 0;
             if (args.length == 5 && eqICKeyword(args[3].str, "COUNT"))
@@ -3644,80 +3661,80 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             });
             break;
         }
-    case "XREAD":
+    case cmdIx!"xread":
         {
             xread(ks, args, o);
             break;
         }
-    case "XREVRANGE":
+    case cmdIx!"xrevrange":
         {
             import dreads.streamops : xrevrange;
 
             xrevrange(ks, args, o, arena);
             break;
         }
-    case "XSETID":
+    case cmdIx!"xsetid":
         {
             import dreads.streamops : xsetid;
 
             xsetid(ks, args, o);
             break;
         }
-    case "XINFO":
+    case cmdIx!"xinfo":
         {
             import dreads.streamops : xinfo;
 
             xinfo(ks, args, o, arena);
             break;
         }
-    case "XGROUP":
+    case cmdIx!"xgroup":
         {
             import dreads.streamops : xgroup;
 
             xgroup(ks, args, o);
             break;
         }
-    case "XREADGROUP":
+    case cmdIx!"xreadgroup":
         {
             import dreads.streamops : xreadgroup;
 
             xreadgroup(ks, args, o, arena);
             break;
         }
-    case "XACK":
+    case cmdIx!"xack":
         {
             import dreads.streamops : xack;
 
             xack(ks, args, o);
             break;
         }
-    case "XPENDING":
+    case cmdIx!"xpending":
         {
             import dreads.streamops : xpending;
 
             xpending(ks, args, o);
             break;
         }
-    case "XCLAIM":
+    case cmdIx!"xclaim":
         {
             import dreads.streamops : xclaim;
 
             xclaim(ks, args, o);
             break;
         }
-    case "XAUTOCLAIM":
+    case cmdIx!"xautoclaim":
         {
             import dreads.streamops : xautoclaim;
 
             xautoclaim(ks, args, o, arena);
             break;
         }
-    case "MEMORY":
+    case cmdIx!"memory":
         {
             memoryCmd(ks, args, o);
             break;
         }
-    case "XDEL":
+    case cmdIx!"xdel":
         {
             if (args.length < 2)
             {
@@ -3748,7 +3765,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "XTRIM":
+    case cmdIx!"xtrim":
         {
             // XTRIM key MAXLEN|MINID [~|=] threshold [LIMIT n]
             if (args.length < 3 || !(eqICKeyword(args[1].str, "MAXLEN")
@@ -3784,7 +3801,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- generic / server batch ---
-    case "TOUCH":
+    case cmdIx!"touch":
         {
             if (args.length == 0)
             {
@@ -3797,7 +3814,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, n);
             break;
         }
-    case "RANDOMKEY":
+    case cmdIx!"randomkey":
         {
             import dreads.obj : gPauseUntilMs;
             import dreads.rand : randBelow;
@@ -3843,7 +3860,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repNullBulk(o);
             break;
         }
-    case "COPY":
+    case cmdIx!"copy":
         {
             if (args.length < 2)
             {
@@ -3912,8 +3929,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "EXPIRETIME":
-    case "PEXPIRETIME":
+    case cmdIx!"expiretime":
+    case cmdIx!"pexpiretime":
         {
             if (args.length != 1)
             {
@@ -3930,7 +3947,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         : cast(long) obj.expireAtMs);
             break;
         }
-    case "MOVE":
+    case cmdIx!"move":
         {
             // MOVE key db [REPLACE] — REPLACE overwrites an existing destination key
             // (and adopts the source's TTL, or clears it if the source has none).
@@ -3997,7 +4014,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, 1);
             break;
         }
-    case "SWAPDB":
+    case cmdIx!"swapdb":
         {
             if (args.length != 2)
             {
@@ -4033,29 +4050,29 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "WAIT":
+    case cmdIx!"wait":
         {
             repInt(o, 0); // no replicas until Raft lands
             break;
         }
-    case "WAITAOF": // dispatch-level (scripts/replay): the server-layer form
+    case cmdIx!"waitaof": // dispatch-level (scripts/replay): the server-layer form
         {           // owns the real fsync; here nothing can be awaited
             repArrayHeader(o, 2);
             repInt(o, 0);
             repInt(o, 0);
             break;
         }
-    case "OBJECT":
+    case cmdIx!"object":
         {
             objectCmd(ks, args, o);
             break;
         }
-    case "LOLWUT":
+    case cmdIx!"lolwut":
         {
             repVerbatim(o, "txt", "DREADS ⚡ DREADS Replicated Event-driven Arena Data Store\n");
             break;
         }
-    case "ROLE":
+    case cmdIx!"role":
         {
             repArrayHeader(o, 3);
             repBulk(o, "master");
@@ -4063,13 +4080,13 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repArrayHeader(o, 0);
             break;
         }
-    case "AUTH":
+    case cmdIx!"auth":
         {
             repError(o,
                     "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
             break;
         }
-    case "DEBUG":
+    case cmdIx!"debug":
         {
             // Dispatch-level DEBUG: reached from scripts (redis.call('debug',…))
             // and replay. The rich, connection-aware DEBUG lives at the server
@@ -4163,7 +4180,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "SLOWLOG":
+    case cmdIx!"slowlog":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
                 repSimple(o, "OK");
@@ -4175,7 +4192,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repArrayHeader(o, 0); // GET
             break;
         }
-    case "COMMANDLOG": // Valkey 8's generalized SLOWLOG; nothing is logged yet
+    case cmdIx!"commandlog": // Valkey 8's generalized SLOWLOG; nothing is logged yet
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
                 repSimple(o, "OK");
@@ -4189,7 +4206,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repUnknownSubcommand(o, "COMMANDLOG", args.length ? args[0].str : "");
             break;
         }
-    case "ACL":
+    case cmdIx!"acl":
         {
             // apply path only (replay/commit): apply the canonical mutation.
             // A client's ACL is fully handled by the server layer before dispatch.
@@ -4201,7 +4218,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "FUNCTION":
+    case cmdIx!"function":
         {
             if (gFunctionHook !is null)
             {
@@ -4220,8 +4237,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repUnknownSubcommand(o, "FUNCTION", args.length ? args[0].str : "");
             break;
         }
-    case "FCALL":
-    case "FCALL_RO":
+    case cmdIx!"fcall":
+    case cmdIx!"fcall_ro":
         {
             if (gFcallHook is null)
             {
@@ -4233,7 +4250,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             (cast(NoGcFn) gFcallHook)(args, ks, o, arena, name.length == 8);
             break;
         }
-    case "LATENCY":
+    case cmdIx!"latency":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "RESET"))
                 repInt(o, 0);
@@ -4241,7 +4258,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repArrayHeader(o, 0); // LATEST / HISTORY
             break;
         }
-    case "MODULE":
+    case cmdIx!"module":
         {
             if (args.length >= 1 && eqICKeyword(args[0].str, "HELP"))
                 repHelp!"MODULE"(o);
@@ -4250,9 +4267,9 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             break;
         }
         // --- string extras (batch) ---
-    case "SUBSTR": // deprecated alias of GETRANGE
-        goto case "GETRANGE";
-    case "HMSET": // deprecated HSET variant replying +OK
+    case cmdIx!"substr": // deprecated alias of GETRANGE
+        goto case cmdIx!"getrange";
+    case cmdIx!"hmset": // deprecated HSET variant replying +OK
         {
             if (args.length < 3 || (args.length - 1) % 2 != 0)
             {
@@ -4272,8 +4289,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repSimple(o, "OK");
             break;
         }
-    case "LPUSHX":
-    case "RPUSHX":
+    case cmdIx!"lpushx":
+    case cmdIx!"rpushx":
         {
             if (args.length < 2)
             {
@@ -4303,7 +4320,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             repInt(o, cast(long) obj.list.length);
             break;
         }
-    case "HINCRBYFLOAT":
+    case cmdIx!"hincrbyfloat":
         {
             if (args.length != 3)
             {
@@ -4365,14 +4382,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- misc tail: lists, sort, lcs, hash rand, hll ---
-    case "LPOS":
+    case cmdIx!"lpos":
         {
             import dreads.miscops : lpos;
 
             lpos(ks, args, o, arena);
             break;
         }
-    case "LMPOP":
+    case cmdIx!"lmpop":
         {
             import dreads.miscops : lmpop;
 
@@ -4385,8 +4402,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         // arrive from scripts, MULTI replay or the raft apply, where waiting
         // is impossible — Redis semantics is one immediate attempt. The
         // effect propagates as the non-blocking command that actually ran.
-    case "BLPOP":
-    case "BRPOP":
+    case cmdIx!"blpop":
+    case cmdIx!"brpop":
         {
             bool fromLeft = uname[1] == 'L';
             if (args.length < 2)
@@ -4432,8 +4449,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullArray(o);
             break;
         }
-    case "BZPOPMIN":
-    case "BZPOPMAX":
+    case cmdIx!"bzpopmin":
+    case cmdIx!"bzpopmax":
         {
             bool popMax = uname[6] == 'A'; // BZPOPM[A]X vs BZPOPM[I]N
             if (args.length < 2)
@@ -4482,10 +4499,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repNullArray(o);
             break;
         }
-    case "BRPOPLPUSH":
-    case "BLMOVE":
-    case "BLMPOP":
-    case "BZMPOP":
+    case cmdIx!"brpoplpush":
+    case cmdIx!"blmove":
+    case cmdIx!"blmpop":
+    case cmdIx!"bzmpop":
         {
             // rewrite into the non-blocking command and run it in place
             // (BLMPOP/BZMPOP carry the timeout FIRST; the others carry it last)
@@ -4530,43 +4547,43 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "SORT":
-    case "SORT_RO":
+    case cmdIx!"sort":
+    case cmdIx!"sort_ro":
         {
             import dreads.miscops : sortCmd;
 
             sortCmd(ks, args, o, arena, name.length == 7);
             break;
         }
-    case "LCS":
+    case cmdIx!"lcs":
         {
             import dreads.miscops : lcs;
 
             lcs(ks, args, o, arena);
             break;
         }
-    case "HRANDFIELD":
+    case cmdIx!"hrandfield":
         {
             import dreads.miscops : hrandfield;
 
             hrandfield(ks, args, o, arena);
             break;
         }
-    case "PFADD":
+    case cmdIx!"pfadd":
         {
             import dreads.hll : pfadd;
 
             pfadd(ks, args, o);
             break;
         }
-    case "PFCOUNT":
+    case cmdIx!"pfcount":
         {
             import dreads.hll : pfcount;
 
             pfcount(ks, args, o);
             break;
         }
-    case "PUBLISH", "SPUBLISH":
+    case cmdIx!"publish", cmdIx!"spublish":
         {
             // Server-layer command reachable here only via a script's redis.call
             // (the normal client path handles it in the server before dispatch).
@@ -4592,7 +4609,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             }
             break;
         }
-    case "PFMERGE":
+    case cmdIx!"pfmerge":
         {
             import dreads.hll : pfmerge;
 
@@ -4601,43 +4618,43 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- bitmaps ---
-    case "SETBIT":
+    case cmdIx!"setbit":
         {
             import dreads.bitmap : setbit;
 
             setbit(ks, args, o);
             break;
         }
-    case "GETBIT":
+    case cmdIx!"getbit":
         {
             import dreads.bitmap : getbit;
 
             getbit(ks, args, o);
             break;
         }
-    case "BITCOUNT":
+    case cmdIx!"bitcount":
         {
             import dreads.bitmap : bitcount;
 
             bitcount(ks, args, o);
             break;
         }
-    case "BITPOS":
+    case cmdIx!"bitpos":
         {
             import dreads.bitmap : bitpos;
 
             bitpos(ks, args, o);
             break;
         }
-    case "BITOP":
+    case cmdIx!"bitop":
         {
             import dreads.bitmap : bitop;
 
             bitop(ks, args, o, arena);
             break;
         }
-    case "BITFIELD":
-    case "BITFIELD_RO":
+    case cmdIx!"bitfield":
+    case cmdIx!"bitfield_ro":
         {
             import dreads.bitmap : bitfield;
 
@@ -4646,52 +4663,52 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- geo ---
-    case "GEOADD":
+    case cmdIx!"geoadd":
         {
             import dreads.geo : geoadd;
 
             geoadd(ks, args, o);
             break;
         }
-    case "GEOPOS":
+    case cmdIx!"geopos":
         {
             import dreads.geo : geopos;
 
             geopos(ks, args, o);
             break;
         }
-    case "GEODIST":
+    case cmdIx!"geodist":
         {
             import dreads.geo : geodist;
 
             geodist(ks, args, o);
             break;
         }
-    case "GEOHASH":
+    case cmdIx!"geohash":
         {
             import dreads.geo : geohashCmd;
 
             geohashCmd(ks, args, o);
             break;
         }
-    case "GEOSEARCH":
+    case cmdIx!"geosearch":
         {
             import dreads.geo : geosearch;
 
             geosearch(ks, args, o, arena);
             break;
         }
-    case "GEOSEARCHSTORE":
+    case cmdIx!"geosearchstore":
         {
             import dreads.geo : geosearchstore;
 
             geosearchstore(ks, args, o, arena);
             break;
         }
-    case "GEORADIUS":
-    case "GEORADIUS_RO":
-    case "GEORADIUSBYMEMBER":
-    case "GEORADIUSBYMEMBER_RO":
+    case cmdIx!"georadius":
+    case cmdIx!"georadius_ro":
+    case cmdIx!"georadiusbymember":
+    case cmdIx!"georadiusbymember_ro":
         {
             import dreads.geo : georadius;
 
@@ -4702,7 +4719,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
 
         // --- cursor iteration ---
-    case "SCAN":
+    case cmdIx!"scan":
         {
             if (args.length == 0)
             {
@@ -4754,8 +4771,8 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             scanReply(o, i >= cap ? 0 : i, found[0 .. got]);
             break;
         }
-    case "HSCAN":
-    case "SSCAN":
+    case cmdIx!"hscan":
+    case cmdIx!"sscan":
         {
             bool isHash = nbuf[0] == 'H';
             if (args.length < 2)
@@ -4810,7 +4827,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             scanReply(o, i >= cap ? 0 : i, found[0 .. got]);
             break;
         }
-    case "ZSCAN":
+    case cmdIx!"zscan":
         {
             // rank-based cursor: ordered, no slot-layout dependence
             if (args.length < 2)

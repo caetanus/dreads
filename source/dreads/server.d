@@ -1618,8 +1618,9 @@ private void shardDrainLoop() nothrow
             RVal cmd;
             // owner: rebuild from the descriptor — NO re-parse (the requester already
             // parsed; this just slices). Falls to an error reply if malformed.
-            if (decodeHop(p, arena, cmd))
-                cast(void) dispatch(cmd, *myKeyspace(), reply, arena);
+            int opcode;
+            if (decodeHop(p, arena, cmd, opcode))
+                cast(void) dispatch(cmd, *myKeyspace(), reply, arena, 0, opcode);
             else
                 repError(reply, "ERR shard: malformed bytecode hop");
             shardEnqueue(cast(uint) meta, reply.data, tag, 0, ShardMsg.reply);
@@ -1663,17 +1664,21 @@ private void shardDrainLoop() nothrow
 // router's own keyspace). `uname` is UPPERCASE (dispatch switch) but getCommandKeys
 // matches the LOWERCASE gCmdKeySpecs, so lowercase it back — else every lookup misses
 // and the command wrongly runs local (no hop). v1 routes by the FIRST key only.
-private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname) nothrow
+private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int opcode) nothrow
 {
     import dreads.shard : shardOfKey;
-    import dreads.acl : commandRouteKey;
+    import dreads.acl : aclCmdIndex, commandRouteKeyIx;
 
+    opcode = -1;
     char[16] lbuf = void;
     if (uname.length > lbuf.length)
         return -1; // over-long name is never a keyed data command
     foreach (i, ch; uname)
         lbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-    auto key = commandRouteKey(cast(string) lbuf[0 .. uname.length], cmd.arr);
+    // ONE name resolution serves both: the routing table row AND the hop opcode
+    // (dispatch's integer switch on the owner — no re-resolution there).
+    opcode = aclCmdIndex(cast(const(char)[]) lbuf[0 .. uname.length]);
+    auto key = commandRouteKeyIx(opcode, cast(string) lbuf[0 .. uname.length], cmd.arr);
     if (key is null)
         return -1; // keyless → run locally on this router's own keyspace
     return cast(int) shardOfKey(key);
@@ -1694,7 +1699,8 @@ private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname) nothrow
 // slicing, no parseValue. Wire form (all args are bulk strings, as every client
 // command is):  [u32 argc][ (u32 off, u32 len) × argc ][ raw command bytes ]
 // `off` is relative to the start of the raw bytes (== the requester's rawCmd).
-private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd) @trusted nothrow
+private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd,
+        int opcode) @trusted nothrow
 {
     // HEADER ONLY — rawCmd is NOT appended here. The first cut concatenated
     // [hdr][rawCmd] in this scratch buffer and shipped that, which copied the
@@ -1708,11 +1714,13 @@ private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte
     // one reserve, then indexed stores through a typed slice (bounds carried
     // by the slice) — an append per field would cost a reserve check + memcpy
     // call each, 7 calls for a SET; this is 1.
-    immutable size_t hdrBytes = 4 + cast(size_t) argc * 8;
+    immutable size_t hdrBytes = 8 + cast(size_t) argc * 8;
     auto w = cast(uint[]) bc.freeSpace(hdrBytes)[0 .. hdrBytes];
     w[0] = argc;
+    w[1] = cast(uint) opcode; // dispatch's integer-switch index — the owner
+                              // never re-resolves the command name
     auto base = cast(const(char)*) rawCmd.ptr;
-    size_t j = 1;
+    size_t j = 2;
     foreach (ref a; cmd.arr)
     {
         w[j++] = cast(uint)(a.str.ptr - base); // offset into rawCmd (same allocation)
@@ -1724,17 +1732,19 @@ private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte
 // Owner side: rebuild the RVal from the descriptor + raw bytes (which live in the
 // ring slice `payload`, valid until the drain pops it — same lifetime parseValue's
 // zero-copy slices had). No framing scan, no validation loop.
-private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal cmd) @trusted nothrow
+private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal cmd,
+        out int opcode) @trusted nothrow
 {
-    if (payload.length < 4)
+    if (payload.length < 8)
         return false;
     immutable uint argc = *cast(const(uint)*) payload.ptr;
-    immutable size_t hdr = 4 + cast(size_t) argc * 8;
+    opcode = *cast(const(int)*)(payload.ptr + 4);
+    immutable size_t hdr = 8 + cast(size_t) argc * 8;
     if (argc == 0 || payload.length < hdr)
         return false;
     auto raw = payload[hdr .. $];
     auto arr = arena.allocArray!RVal(argc);
-    auto offs = payload.ptr + 4;
+    auto offs = payload.ptr + 8;
     foreach (i; 0 .. argc)
     {
         immutable uint off = *cast(const(uint)*)(offs + i * 8);
@@ -1749,7 +1759,7 @@ private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal c
     return true;
 }
 
-private void shardFire(ref Conn c, int owner, const ref RVal cmd,
+private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
         scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
 {
     import dreads.shard : tShard, shardEnqueue, shardEnqueue2, shardWake,
@@ -1757,7 +1767,7 @@ private void shardFire(ref Conn c, int owner, const ref RVal cmd,
 
     auto p = acquireShardPending();
     // Enqueue WITHOUT waking; the owner is woken once at the flush point (batched).
-    compileHop(c.shardBc, cmd, rawCmd); // descriptor header only (see compileHop)
+    compileHop(c.shardBc, cmd, rawCmd, opcode); // descriptor header only (see compileHop)
     shardEnqueue2(cast(uint) owner, c.shardBc.data, rawCmd, cast(void*) p, tShard, ShardMsg.cmd);
     if (owner < 64)
         c.shardTouch |= 1UL << owner;
@@ -3349,7 +3359,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // keep pipeline order. (Blocking/script/migrate ops are keyed but handled inline
     // in the switch below; cross-shard support for those is a later phase — v1 runs
     // them on the connection's own shard, see SHARDING.md.) Free when shards==1.
-    immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname) : -1;
+    int shardOpcode = -1; // the resolved command index, reused as the hop opcode
+    immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname, shardOpcode) : -1;
     if (shardOwner < 0 && c.shardPendCount > 0)
         flushShardPending(c, o);
 
@@ -3903,7 +3914,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
 
         if (cast(uint) shardOwner != tShard)
         {
-            shardFire(c, shardOwner, cmd, rawCmd, o); // remote: async cross-shard hop
+            shardFire(c, shardOwner, shardOpcode, cmd, rawCmd, o); // remote: async cross-shard hop
             return true;
         }
         if (c.shardPendCount > 0)
@@ -3912,7 +3923,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // execute into an ordered ready slot instead of straight to `o`.
             auto p = acquireShardPending();
             p.reply.clear();
-            cast(void) dispatch(cmd, *c.dbp, p.reply, arena);
+            cast(void) dispatch(cmd, *c.dbp, p.reply, arena, 0, shardOpcode);
             p.ready = true;
             if (c.shardPendCount == PIPELINE_CAP)
                 flushShardPending(c, o);
@@ -3929,7 +3940,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     char[24] lc = void; // nbuf is char[24]; longest command name is 20
     foreach (i, ch; name)
         lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-    immutable cidx = aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]);
+    // the sharded router may have resolved the index already — never resolve twice
+    immutable cidx = shardOpcode >= 0 ? shardOpcode
+        : aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]);
     immutable cmdIsWrite = cmdWriteByIdx(cidx); // one array load; used across the tail
 
     // Raft policy gate — only when replication is configured; standalone
@@ -3987,7 +4000,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     immutable errPrev = gTotalErrorReplies; // leaf-vs-propagated guard (see stats.d)
     auto outBefore = o.length;
     gWriteNoOp = false; // a write command may flag itself a no-op (SETBIT/BITFIELD)
-    auto keep = dispatch(cmd, *c.dbp, o, arena);
+    auto keep = dispatch(cmd, *c.dbp, o, arena, 0, cidx); // integer dispatch: no re-resolution
     immutable errored = o.length > outBefore && o.data[outBefore] == '-';
     // errorstats/total: only a REAL leaf error (a nested command — e.g. a script's
     // redis.call — that failed already bumped the counter during dispatch, so the

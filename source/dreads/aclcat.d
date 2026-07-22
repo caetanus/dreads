@@ -35,6 +35,18 @@ enum AclCat : uint
 /// A command's canonical name (lowercase) and its category bitmask.
 struct CmdCats { string name; uint cats; }
 
+/// CTFE index of a (lowercase) command name in gCmdCats — the compile-time
+/// labels for dispatch's integer switch. A typo'd name is a compile error.
+template cmdIx(string lower)
+{
+    enum int cmdIx = {
+        foreach (i, c; gCmdCats)
+            if (c.name == lower)
+                return cast(int) i;
+        assert(false, "cmdIx: unknown command " ~ lower);
+    }();
+}
+
 /// All top-level commands with their categories; array index is the
 /// command's ACL bit index (see aclCmdIndex).
 immutable CmdCats[] gCmdCats = [
@@ -296,6 +308,8 @@ immutable CmdCats[] gCmdCats = [
     {"zscore", AclCat.fast | AclCat.read | AclCat.sortedset},
     {"zunion", AclCat.read | AclCat.slow | AclCat.sortedset},
     {"zunionstore", AclCat.slow | AclCat.sortedset | AclCat.write},
+    {"qstats", AclCat.fast | AclCat.server}, // dreads-internal (appended: indices above must not move)
+
 ];
 
 /// Category name (without '@') -> its AclCat bit, or 0 if unknown.

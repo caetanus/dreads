@@ -185,5 +185,6 @@
 	"license": "MIT",
 	"name": "dreads",
 	"targetPath": "bin",
-	"targetType": "executable"
+	"targetType": "executable",
+	"lflags-linux": []
 }
