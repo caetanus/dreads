@@ -30,3 +30,6 @@ compile_commands.json
 # runtime state
 *.aof
 blackbox/.fuzzout/
+
+# io_uring spike: machine-local vibe-core overlay (recreate via spike-uring/setup-overlay.sh)
+vendor/vibe-core-generic/
