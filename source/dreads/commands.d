@@ -3961,17 +3961,6 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case cmdIx!"move":
         {
-            {
-                import dreads.shard : sharded;
-
-                // MOVE is inherently multi-db (touches gDbs[dst]); cluster mode is
-                // DB-0-only, so refuse rather than write the coleguinha's keyspace.
-                if (sharded())
-                {
-                    repError(o, "ERR MOVE is not allowed in cluster mode");
-                    break;
-                }
-            }
             // MOVE key db [REPLACE] — REPLACE overwrites an existing destination key
             // (and adopts the source's TTL, or clears it if the source has none).
             if (args.length < 2)
@@ -4000,20 +3989,18 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR DB index is out of range");
                 break;
             }
-            int curIdx = -1; // which db is `ks`? (not in gDbs when unit-tested)
-            foreach (i, ref d; gDbs)
-                if (&d is &ks)
-                {
-                    curIdx = cast(int) i;
-                    break;
-                }
-            if (curIdx < 0 || dst == curIdx) // same db, or a detached keyspace
+            import dreads.shard : siblingDb;
+
+            immutable curIdx = ks.db; // the keyspace knows its own db (works sharded too)
+            if (dst == curIdx)
             {
                 repError(o, "ERR source and destination objects are the same");
                 break;
             }
+            // the destination db in the SAME partition (this shard's own, sharded)
+            auto destKs = siblingDb(cast(uint) dst);
             auto src = ks.lookup(args[0].str);
-            immutable dstExists = gDbs[cast(size_t) dst].exists(args[0].str);
+            immutable dstExists = destKs.exists(args[0].str);
             if (src is null || (dstExists && !replace))
             {
                 repInt(o, 0); // no such key, or the destination already has it (no REPLACE)
@@ -4022,15 +4009,14 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             immutable ttl = src.expireAtMs;
             if (dstExists) // REPLACE: drop the old destination (and its expire index)
             {
-                gDbs[cast(size_t) dst].disarmExpire(args[0].str,
-                        gDbs[cast(size_t) dst].lookup(args[0].str).expireAtMs);
-                gDbs[cast(size_t) dst].d.del(args[0].str);
+                destKs.disarmExpire(args[0].str, destKs.lookup(args[0].str).expireAtMs);
+                destKs.d.del(args[0].str);
             }
             ks.disarmExpire(args[0].str, ttl);
             RObj obj;
             ks.d.steal(args[0].str, obj);
-            gDbs[cast(size_t) dst].d.set(args[0].str, obj);
-            gDbs[cast(size_t) dst].armExpire(args[0].str, ttl);
+            destKs.d.set(args[0].str, obj);
+            destKs.armExpire(args[0].str, ttl);
             // move_from on the source db, move_to on the destination db.
             notifyKeyspaceEventDb(curIdx, NClass.generic, "move_from", args[0].str);
             notifyKeyspaceEventDb(cast(int) dst, NClass.generic, "move_to", args[0].str);
