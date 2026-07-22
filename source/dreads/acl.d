@@ -1114,9 +1114,22 @@ int commandRouteSlot(int i, scope const(char)[] lname, scope const(RVal)[] arr) 
                     || eqi(arr[1].str, "idletime") || eqi(arr[1].str, "refcount"));
         else if (i == cmdIx!"memory")
             keyed = arr.length >= 3 && eqi(arr[1].str, "usage");
+        else if (i == cmdIx!"xgroup")
+            // XGROUP CREATE|SETID|DESTROY|CREATECONSUMER|DELCONSUMER <key> ...;
+            // HELP takes no key (falls through to keyless → runs locally).
+            keyed = arr.length >= 3 && (eqi(arr[1].str, "create") || eqi(arr[1].str, "setid")
+                    || eqi(arr[1].str, "destroy") || eqi(arr[1].str, "createconsumer")
+                    || eqi(arr[1].str, "delconsumer"));
+        else if (i == cmdIx!"xinfo")
+            // XINFO STREAM|GROUPS|CONSUMERS <key> ...; HELP takes no key.
+            keyed = arr.length >= 3 && (eqi(arr[1].str, "stream") || eqi(arr[1].str, "groups")
+                    || eqi(arr[1].str, "consumers"));
         // NOTE: DEBUG OBJECT is NOT routed — DEBUG has its own executeCommand
         // handler that runs before the hop (test/dev infra; DRIFT treats DEBUG as
         // stubs). Its cross-shard tests are skipped (blackbox/valkey-shard.skip).
+        // XREAD/XREADGROUP need no case here: they're marked multi-key
+        // (buildMultiKey) so the block below routes them via forEachCommandKey,
+        // which already extracts the post-STREAMS keys and enforces same-slot.
         if (keyed)
             return cast(int) keyToSlot(arr[2].str);
     }
