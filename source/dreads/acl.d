@@ -1007,7 +1007,14 @@ private int[gCmdCats.length] buildRouteFirstKey()
 /// Multi-key commands route by their FIRST key (cross-slot spanning is a later phase).
 const(char)[] commandRouteKey(scope const(char)[] lname, scope const(RVal)[] arr) @trusted nothrow @nogc
 {
-    immutable i = aclCmdIndex(lname);
+    return commandRouteKeyIx(aclCmdIndex(lname), lname, arr);
+}
+
+/// commandRouteKey for a caller that ALREADY resolved the command index (the
+/// router resolves it once and reuses it as the hop opcode — see shardOwnerOf).
+const(char)[] commandRouteKeyIx(int i, scope const(char)[] lname,
+        scope const(RVal)[] arr) @trusted nothrow @nogc
+{
     if (i < 0)
         return null; // unknown command → run locally, let dispatch error it
     immutable pos = gRouteFirstKey[i];
