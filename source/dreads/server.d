@@ -2774,6 +2774,21 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 repError(o, "ERR wrong number of arguments for 'select' command");
             else if (n < 0 || n >= NUM_DBS)
                 repError(o, "ERR DB index is out of range");
+            else if (sharded())
+            {
+                // SHARE-NOTHING: gDbs is __gshared and would be touched by THIS
+                // shard thread with its own allocator — a cross-allocator free
+                // (the crash the multishard suite caught). Shard mode is DB-0-only
+                // (Redis Cluster semantics): SELECT 0 = this shard's own keyspace,
+                // any other db is refused. A shard thread never touches gDbs.
+                if (n == 0)
+                {
+                    c.dbp = myKeyspace();
+                    repSimple(o, "OK");
+                }
+                else
+                    repError(o, "ERR SELECT is not allowed in cluster mode");
+            }
             else
             {
                 c.dbp = &gDbs[cast(size_t) n];
