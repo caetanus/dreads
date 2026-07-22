@@ -17,7 +17,7 @@ module dreads.shard;
 // See memory/sharding-design.md + SHARDING.md.
 
 import dreads.slots : keyToSlot, SLOTS;
-import dreads.obj : Keyspace;
+import dreads.obj : Keyspace, NUM_DBS, gDbs;
 import dreads.raftq : RingCore;
 import dreads.mem : ByteBuffer;
 
@@ -58,17 +58,31 @@ public uint shardOfKey(scope const(char)[] key) @nogc nothrow @trusted
 // Cluster). A shard thread touches ONLY gShardKs[its own id] directly; another
 // shard's keyspace is reached only by HOPPING the command to that shard's thread
 // (never a cross-thread keyspace deref — that is what keeps it lock-free).
-public __gshared Keyspace[] gShardKs; // length gShardCount when sharded; empty otherwise
+// PER-SHARD 16 DBs (share-nothing multi-DB): flat [shard*NUM_DBS + db], length
+// gShardCount*NUM_DBS. Each shard owns its OWN 16 databases — SELECT picks the db
+// WITHIN this shard's partition, so a shard thread never touches another thread's
+// keyspace (the gDbs cross-allocator crash) AND the 16-DB feature is preserved.
+// A key's slot picks the shard; the connection's SELECT picks the db.
+public __gshared Keyspace[] gShardKs;
 
 /// Which shard THIS thread serves. Thread-local: set once when the shard loop starts;
 /// stays 0 on the main thread and in the unsharded build, so `gShardKs[tShard]` and
 /// the routing are never even consulted unless sharded().
 public uint tShard = 0;
 
-/// The keyspace this thread's connections read/write directly (its own shard's).
-public Keyspace* myKeyspace() @nogc nothrow @trusted
+/// This thread's keyspace for logical database `db` (0..NUM_DBS-1). Its own shard's.
+public Keyspace* myKeyspace(uint db = 0) @nogc nothrow @trusted
 {
-    return &gShardKs[tShard];
+    return &gShardKs[tShard * NUM_DBS + db];
+}
+
+/// The keyspace for `db` in the SAME partition the caller is operating in — this
+/// shard's own db under sharding, else the classic gDbs[db]. Lets intra-partition
+/// multi-db commands (MOVE, COPY DB) reach a sibling db WITHOUT touching another
+/// shard's state (tShard is this thread's shard).
+public Keyspace* siblingDb(uint db) @nogc nothrow @trusted
+{
+    return sharded() ? &gShardKs[tShard * NUM_DBS + db] : &gDbs[db];
 }
 
 // --- the cross-shard hop: SHARE-NOTHING, per-pair SPSC -------------------------
@@ -409,10 +423,10 @@ public void shardInit(uint count) @trusted nothrow
     foreach (i; 0 .. count)
         gSlotBase[i] = cast(uint)(i * per);
 
-    // per-shard keyspace (DB-0-only in shard mode) + inbound SPSC lane bundle.
-    gShardKs.length = count;
+    // per-shard 16 DBs + inbound SPSC lane bundle. gShardKs[shard*NUM_DBS + db].
+    gShardKs.length = count * NUM_DBS;
     foreach (i, ref ks; gShardKs)
-        ks.db = 0;
+        ks.db = cast(int)(i % NUM_DBS);
     gInbound.length = count;
     try
     {

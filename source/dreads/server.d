@@ -1638,9 +1638,10 @@ private void shardDrainLoop() nothrow
                 reply.clear();
                 RVal cmd;
                 int opcode;
+                uint db;
                 void* pend;
-                if (decodeHopSection(p, pos, arena, cmd, opcode, pend))
-                    cast(void) dispatch(cmd, *myKeyspace(), reply, arena, 0, opcode);
+                if (decodeHopSection(p, pos, arena, cmd, opcode, db, pend))
+                    cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
                 else
                 {
                     repError(reply, "ERR shard: malformed bytecode hop");
@@ -1763,7 +1764,7 @@ private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int 
 // `off` is relative to the section's own raw bytes. The pending pointer rides in
 // the section (the slot carries K commands, so the slot-level tag can't).
 private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd,
-        int opcode, void* pend) @trusted nothrow
+        int opcode, uint db, void* pend) @trusted nothrow
 {
     immutable uint argc = cast(uint) cmd.arr.length;
     immutable size_t hdrBytes = 4 + 8 + 8 + cast(size_t) argc * 8;
@@ -1776,8 +1777,9 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
     *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
     auto h = cast(uint[]) space[12 .. hdrBytes];
     h[0] = argc;
-    h[1] = cast(uint) opcode; // dispatch's integer-switch index — the owner
-                              // never re-resolves the command name
+    // opcode in the low 16 bits, the requester's current db in the high 16 — the
+    // owner runs the command on ITS OWN gShardKs[owner][db] (per-shard 16 DBs)
+    h[1] = (cast(uint) opcode & 0xFFFF) | (db << 16);
     auto base = cast(const(char)*) rawCmd.ptr;
     size_t j = 2;
     foreach (ref a; cmd.arr)
@@ -1796,7 +1798,7 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
 // advancing `pos` past it. The rebuilt slices point into the ring slice — valid
 // until the drain pops, exactly like the single-command descriptor was.
 private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref Arena arena,
-        out RVal cmd, out int opcode, out void* pend) @trusted nothrow
+        out RVal cmd, out int opcode, out uint db, out void* pend) @trusted nothrow
 {
     if (payload.length - pos < 4)
         return false;
@@ -1807,7 +1809,9 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     pos += 4 + sect;
     pend = cast(void*)*cast(const(ulong)*) sec.ptr;
     immutable uint argc = *cast(const(uint)*)(sec.ptr + 8);
-    opcode = *cast(const(int)*)(sec.ptr + 12);
+    immutable uint packed = *cast(const(uint)*)(sec.ptr + 12);
+    opcode = cast(int)(packed & 0xFFFF);
+    db = packed >> 16;
     immutable size_t hdr = 16 + cast(size_t) argc * 8;
     if (argc == 0 || sec.length < hdr)
         return false;
@@ -1828,7 +1832,7 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     return true;
 }
 
-private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
+private void shardFire(ref Conn c, int owner, int opcode, uint db, const ref RVal cmd,
         scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
 {
     import dreads.shard : tShard, shardEnqueue, shardEnqueue2, shardWake,
@@ -1839,7 +1843,7 @@ private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
     {
         // COALESCED: stage the command in this owner's batch buffer; the whole
         // batch travels as ONE ring slot at the flush point (with the wakes).
-        appendHopCmd(c.hopBatch[owner], cmd, rawCmd, opcode, cast(void*) p);
+        appendHopCmd(c.hopBatch[owner], cmd, rawCmd, opcode, db, cast(void*) p);
         c.shardTouch |= 1UL << owner;
     }
     else
@@ -1847,7 +1851,7 @@ private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
         // rare high shard id (beyond the touch/batch bitmaps): fire a batch of
         // one immediately, and wake now
         c.shardBc.clear();
-        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, cast(void*) p);
+        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, db, cast(void*) p);
         shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.cmd);
         shardWake(cast(uint) owner);
     }
@@ -2009,7 +2013,7 @@ private void serveClient(TCPConnection tcp) nothrow
     // sharded: this connection reads/writes THIS thread's shard keyspace (DB-0-only);
     // unsharded: the classic 16-DB gDbs[0]. myKeyspace() reads tShard (thread-local),
     // so a conn served on shard-thread T binds to shard T's data.
-    c.dbp = sharded() ? myKeyspace() : &gDbs[0]; // default keyspace
+    c.dbp = sharded() ? myKeyspace(0) : &gDbs[0]; // default keyspace (db 0)
     // ACL: start as the default user; a nopass default is authenticated at once,
     // a password-protected one (requirepass) must AUTH first. A DISABLED default
     // (`ACL SETUSER default off`) never pre-authenticates — new connections start
@@ -2776,18 +2780,10 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 repError(o, "ERR DB index is out of range");
             else if (sharded())
             {
-                // SHARE-NOTHING: gDbs is __gshared and would be touched by THIS
-                // shard thread with its own allocator — a cross-allocator free
-                // (the crash the multishard suite caught). Shard mode is DB-0-only
-                // (Redis Cluster semantics): SELECT 0 = this shard's own keyspace,
-                // any other db is refused. A shard thread never touches gDbs.
-                if (n == 0)
-                {
-                    c.dbp = myKeyspace();
-                    repSimple(o, "OK");
-                }
-                else
-                    repError(o, "ERR SELECT is not allowed in cluster mode");
+                // per-shard 16 DBs: SELECT picks the db WITHIN this shard's own
+                // partition — never touches another thread's keyspace.
+                c.dbp = myKeyspace(cast(uint) n);
+                repSimple(o, "OK");
             }
             else
             {
@@ -4016,7 +4012,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
 
         if (cast(uint) shardOwner != tShard)
         {
-            shardFire(c, shardOwner, shardOpcode, cmd, rawCmd, o); // remote: async cross-shard hop
+            shardFire(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, o); // remote hop, carries current db
             return true;
         }
         if (c.shardPendCount > 0)
