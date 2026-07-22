@@ -1724,10 +1724,15 @@ private void shardDrainLoop() nothrow
 // router's own keyspace). `uname` is UPPERCASE (dispatch switch) but getCommandKeys
 // matches the LOWERCASE gCmdKeySpecs, so lowercase it back — else every lookup misses
 // and the command wrongly runs local (no hop). v1 routes by the FIRST key only.
+// Owner shard of a command, or -1 (keyless → local) / SHARD_CROSSSLOT (a multi-key
+// command whose keys span slots). `uname` is UPPERCASE; lowercase it for the spec
+// tables. Single-key = O(1) first-key; multi-key = all-keys same-slot check.
+enum int SHARD_CROSSSLOT = -2;
+
 private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int opcode) nothrow
 {
-    import dreads.shard : shardOfKey;
-    import dreads.acl : aclCmdIndex, commandRouteKeyIx;
+    import dreads.shard : shardOfSlot;
+    import dreads.acl : aclCmdIndex, commandRouteSlot, ROUTE_CROSSSLOT;
 
     opcode = -1;
     char[16] lbuf = void;
@@ -1735,13 +1740,15 @@ private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int 
         return -1; // over-long name is never a keyed data command
     foreach (i, ch; uname)
         lbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-    // ONE name resolution serves both: the routing table row AND the hop opcode
+    // ONE name resolution serves both: the routing slot AND the hop opcode
     // (dispatch's integer switch on the owner — no re-resolution there).
     opcode = aclCmdIndex(cast(const(char)[]) lbuf[0 .. uname.length]);
-    auto key = commandRouteKeyIx(opcode, cast(string) lbuf[0 .. uname.length], cmd.arr);
-    if (key is null)
+    immutable slot = commandRouteSlot(opcode, cast(string) lbuf[0 .. uname.length], cmd.arr);
+    if (slot == ROUTE_CROSSSLOT)
+        return SHARD_CROSSSLOT;
+    if (slot < 0)
         return -1; // keyless → run locally on this router's own keyspace
-    return cast(int) shardOfKey(key);
+    return cast(int) shardOfSlot(cast(ushort) slot);
 }
 
 // FIRE a keyed command at its owning shard WITHOUT blocking (the raw RESP bytes are
@@ -3638,6 +3645,11 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // them on the connection's own shard, see SHARDING.md.) Free when shards==1.
     int shardOpcode = -1; // the resolved command index, reused as the hop opcode
     immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname, shardOpcode) : -1;
+    if (shardOwner == SHARD_CROSSSLOT)
+    {
+        repError(o, "CROSSSLOT Keys in request don't hash to the same slot");
+        return true;
+    }
     // BROADCAST: a keyless keyspace-wide command (KEYS/DBSIZE/…) is fired to every
     // shard and its N replies merged — before any local handling.
     if (sharded())
