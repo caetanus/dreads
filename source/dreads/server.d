@@ -1862,10 +1862,10 @@ private immutable BroadcastKind[gCmdCats.length] gBroadcastKind = () {
     BroadcastKind[gCmdCats.length] t;
     t[cmdIx!"dbsize"] = BroadcastKind.sumInt;
     t[cmdIx!"flushdb"] = BroadcastKind.gateOk; // clears each shard's current db
+    t[cmdIx!"flushall"] = BroadcastKind.gateOk; // each shard clears its own 16 dbs
     t[cmdIx!"keys"] = BroadcastKind.concatArr;
     t[cmdIx!"randomkey"] = BroadcastKind.firstNonNil;
-    // deferred: publish (dual pub/sub path), flushall (touches gDbs — needs the
-    // dispatch-side per-shard fix first) — see the pub/sub phase.
+    // deferred: publish (dual pub/sub delivery path) — see the pub/sub phase.
     return t;
 }();
 

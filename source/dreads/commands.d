@@ -255,9 +255,23 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case cmdIx!"flushall":
         {
-            ks.clear(); // the current db (which may be a detached test keyspace)
-            foreach (ref d; gDbs) // every database
-                d.clear();
+            import dreads.shard : sharded, siblingDb;
+            import dreads.obj : NUM_DBS;
+
+            if (sharded())
+            {
+                // SHARE-NOTHING: clear THIS shard's own 16 dbs (siblingDb), never
+                // gDbs (the coleguinha's). The broadcast fans FLUSHALL to every
+                // shard, so each clears its own partition → the whole keyspace.
+                foreach (uint db; 0 .. NUM_DBS)
+                    siblingDb(db).clear();
+            }
+            else
+            {
+                ks.clear(); // the current db (may be a detached test keyspace)
+                foreach (ref d; gDbs) // every database
+                    d.clear();
+            }
             repSimple(o, "OK");
             break;
         }
