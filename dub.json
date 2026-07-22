@@ -16,6 +16,15 @@
 			"targetType": "executable"
 		},
 		{
+			"comment": "EXPERIMENT (opt-in): the RESP→bytecode cross-shard hop — the owner rebuilds the command from a descriptor the requester computed for free, instead of re-parsing raw RESP. Same binary otherwise. `dub build --config=bytecode -b release --compiler=ldc2`.",
+			"name": "bytecode",
+			"targetType": "executable",
+			"versions": [
+				"DreadsDashboard",
+				"DreadsBytecode"
+			]
+		},
+		{
 			"dependencies": {
 				"fluent-asserts": "*",
 				"unit-threaded": "*"
