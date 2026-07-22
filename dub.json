@@ -88,6 +88,15 @@
 			"targetType": "executable"
 		},
 		{
+			"name": "bytecode-spike",
+			"excludedSourceFiles": [
+				"source/app.d"
+			],
+			"mainSourceFile": "bench/bytecode_spike.d",
+			"targetName": "bytecode_spike",
+			"targetType": "executable"
+		},
+		{
 			"name": "expire-bench",
 			"excludedSourceFiles": [
 				"source/app.d"
