@@ -187,6 +187,14 @@ public struct ShardPending
 // owns its slots (a slot's `done` is same-thread with the connection fiber waiting).
 private ShardPending* tPendFree;
 
+// GC ROOT for every pending this thread ever created. An IN-FLIGHT pending is
+// otherwise referenced only from malloc'd memory (Conn.shardPends inside a
+// Shared!Conn) and the calloc'd ring slots — none of which the GC scans — so
+// without this a collection mid-hop frees the very slot the owner will reply
+// into. TLS is scanned, the pool never shrinks, so appending each `new` here
+// (pool growth only, never per-op) keeps every slot alive for the thread's life.
+private ShardPending*[] tPendAll;
+
 /// Take a reply slot for one hop (reset + ready=false). Only called on a router fiber.
 public ShardPending* acquireShardPending() nothrow @trusted
 {
@@ -201,6 +209,7 @@ public ShardPending* acquireShardPending() nothrow @trusted
         return p;
     }
     p = new ShardPending;
+    tPendAll ~= p; // root it: see tPendAll — in-flight pendings are GC-invisible without this
     try
         p.done = createManualEvent();
     catch (Exception)
@@ -292,6 +301,49 @@ public void shardWaitInbound() nothrow
     gInbound[tShard].waitData();
 }
 
+// --- thread affinity: pin shard i's thread to the i-th ALLOWED core ------------
+// The hop is SPSC ring traffic between specific thread PAIRS; letting the scheduler
+// migrate shard threads (worse: across L3/CCX domains) turns every lane and every
+// keyspace access into cold cache lines. Pinning respects the process mask, so
+// `taskset -c 0-3 dreads --shards 4` puts shard i on the i-th core of THAT set —
+// placement stays the operator's knob, we just stop the migration.
+private __gshared int[] gShardCpus; // allowed CPUs at boot, in enumeration order
+
+/// Capture the boot-time affinity mask (main thread, before workers exist).
+private void shardCaptureCpus() @trusted nothrow
+{
+    version (linux)
+    {
+        import core.sys.linux.sched : cpu_set_t, sched_getaffinity, CPU_ISSET;
+
+        cpu_set_t mask;
+        if (sched_getaffinity(0, mask.sizeof, &mask) != 0)
+            return; // no mask, no pinning — pinShardThread stays a no-op
+        foreach (cpu; 0 .. cpu_set_t.sizeof * 8)
+            if (CPU_ISSET(cpu, &mask))
+                gShardCpus ~= cast(int) cpu;
+    }
+}
+
+/// Pin the CALLING thread (serving shard `sid`) to the sid-th allowed CPU. More shards
+/// than cores wraps (two pinned shards sharing a core still beats migration). No-op if
+/// the mask was unreadable or pinning is off. @trusted: the syscall writes a local
+/// fixed-size cpu_set_t; nothing escapes.
+public void pinShardThread(uint sid) @trusted nothrow @nogc
+{
+    version (linux)
+    {
+        import core.sys.linux.sched : cpu_set_t, sched_setaffinity, CPU_SET;
+
+        if (gShardCpus.length == 0)
+            return;
+        immutable cpu = gShardCpus[sid % gShardCpus.length];
+        cpu_set_t one; // zero-init = empty set
+        CPU_SET(cast(size_t) cpu, &one);
+        cast(void) sched_setaffinity(0, one.sizeof, &one); // pid 0 = calling THREAD
+    }
+}
+
 /// Initialize the shard runtime from config. Called once at boot. When count <= 1 this
 /// is a no-op and the single-thread path stays exactly as it was.
 public void shardInit(uint count) @trusted nothrow
@@ -328,6 +380,7 @@ public void shardInit(uint count) @trusted nothrow
         count = MAX_SHARDS;
     }
     gShardCount = count;
+    shardCaptureCpus(); // main thread, before any worker exists
     // slot→shard base table (contiguous even split); phase 2b makes ranges movable.
     gSlotBase.length = count;
     immutable per = SLOTS / count;

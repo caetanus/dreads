@@ -4,7 +4,11 @@ module dreads.rand;
 // (RANDOMKEY, SRANDMEMBER, HRANDFIELD, ZRANDMEMBER, SPOP sampling). @nogc,
 // one mul per draw. NOT for anything security-sensitive.
 
-private __gshared ulong gRandState = 0x9E37_79B9_7F4A_7C15;
+// THREAD-LOCAL (share-nothing rule): a __gshared xorshift raced under
+// thread-per-shard — two threads reading the same state draw the SAME value and
+// one update is lost. Each thread owns a stream; shard workers re-seed with
+// their id mixed in (shardThreadEntry) so streams differ across shards.
+private ulong gRandState = 0x9E37_79B9_7F4A_7C15;
 
 /// Mix boot-time entropy in (the wall clock is plenty for shuffling replies).
 public void seedRand(ulong seed) @nogc nothrow
