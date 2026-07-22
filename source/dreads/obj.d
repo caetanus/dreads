@@ -374,6 +374,27 @@ public struct Keyspace
     private alias ExpBucket = Vector!(const(char)[], KeyspaceAllocator);
     private Map!(ulong, ExpBucket, KeyspaceAllocator) expires;
 
+    // Bucket entries OWN their key bytes (dup'd on arm, freed on every removal
+    // path). They used to borrow the Dict's stored-key slices, but with SSO the
+    // table keeps short keys INLINE in the slot — there is no stable heap slice
+    // to borrow (a rehash moves the bytes). Owning also fixes the FLUSHDB hole:
+    // clear() used to free the Dict keys while the index kept borrowed slices.
+    private static const(char)[] dupKeyBytes(scope const(char)[] k) @nogc nothrow @trusted
+    {
+        if (k.length == 0)
+            return "";
+        auto b = KeyspaceAllocator.instance.allocate(k.length);
+        assert(b.ptr !is null, "out of memory");
+        (cast(char*) b.ptr)[0 .. k.length] = k[];
+        return cast(const(char)[]) b;
+    }
+
+    private static void freeKeyBytes(scope const(char)[] s) @nogc nothrow @trusted
+    {
+        if (s.length)
+            KeyspaceAllocator.instance.deallocate(cast(void[])(cast(char[]) s));
+    }
+
     /// The secondary "sub-expiry" index: container-INTERNAL TTLs (hash fields
     /// today, zset members later). Distinct from `expires`, which keys a whole
     /// key. An entry is tagged by TYPE and names the container by key, registered
@@ -384,7 +405,7 @@ public struct Keyspace
     private struct SubEnt
     {
         ObjType type;
-        const(char)[] key; // non-owning slice into Dict-owned key memory
+        const(char)[] key; // bucket-owned copy (dupKeyBytes; freed on removal)
     }
 
     private alias SubBucket = Vector!(SubEnt, KeyspaceAllocator);
@@ -412,10 +433,10 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return; // not in the keyspace, nothing to expire
-        auto sk = d.storedKey(k); // the Dict's own stable key bytes — no dup
+        auto sk = dupKeyBytes(k); // bucket-owned copy (see dupKeyBytes)
         auto bucket = expires.emplace(at); // one descent, bucket built in place
         o.expireSlot = cast(uint) bucket.length; // its position, for O(1) removal
-        bucket.put(sk); // non-owning slice into Dict-owned memory
+        bucket.put(sk);
     }
 
     /// Remove `k`'s entry from its deadline bucket. O(log n) to find the bucket
@@ -436,6 +457,7 @@ public struct Keyspace
         immutable slot = o.expireSlot;
         if (slot >= bucket.length || (*bucket)[slot] != k)
             return; // not actually indexed here
+        auto victim = (*bucket)[slot]; // bucket-owned bytes of the entry leaving
         immutable last = bucket.length - 1;
         if (slot != last)
         {
@@ -445,6 +467,7 @@ public struct Keyspace
                 mo.expireSlot = cast(uint) slot;
         }
         bucket.popBack();
+        freeKeyBytes(victim);
         if (bucket.length == 0)
             expires.remove(at); // the empty Vector's array is freed by its dtor
     }
@@ -509,7 +532,7 @@ public struct Keyspace
                     }
                     dropped++;
                 }
-                // key is a non-owning slice into Dict memory — nothing to free
+                freeKeyBytes(key); // bucket-owned copy, consumed with the bucket
             }
         }
         return dropped;
@@ -527,7 +550,7 @@ public struct Keyspace
         auto o = d.get(k);
         if (o is null)
             return;
-        auto sk = d.storedKey(k); // stable Dict-owned key bytes — no dup
+        auto sk = dupKeyBytes(k); // bucket-owned copy (see dupKeyBytes)
         auto bucket = subExpires.emplace(at); // bucket built in place
         o.subExpireSlot = cast(uint) bucket.length;
         o.subExpireAt = at;
@@ -558,6 +581,7 @@ public struct Keyspace
             o.subExpireAt = 0;
             return;
         }
+        auto victim = (*bucket)[slot].key; // bucket-owned bytes of the entry leaving
         immutable last = bucket.length - 1;
         if (slot != last)
         {
@@ -567,6 +591,7 @@ public struct Keyspace
                 mo.subExpireSlot = cast(uint) slot;
         }
         bucket.popBack();
+        freeKeyBytes(victim);
         if (bucket.length == 0)
             subExpires.remove(at);
         o.subExpireAt = 0;
@@ -632,14 +657,25 @@ public struct Keyspace
                     break; // only hashes carry internal TTLs today
                 }
             }
+            foreach (j; 0 .. e.value.length)
+                freeKeyBytes(e.value[j].key); // bucket-owned copies, consumed with the bucket
         }
         return reaped;
     }
 
     private void freeExpiresIndex() @nogc nothrow
     {
-        // buckets hold non-owning slices into Dict key memory — only the tree
-        // and its bucket arrays need releasing
+        // bucket entries own their key bytes — release them before the trees
+        cast(void) expires.opApply((ref ulong at, ref ExpBucket b) @nogc nothrow {
+            foreach (j; 0 .. b.length)
+                freeKeyBytes(b[j]);
+            return 0;
+        });
+        cast(void) subExpires.opApply((ref ulong at, ref SubBucket b) @nogc nothrow {
+            foreach (j; 0 .. b.length)
+                freeKeyBytes(b[j].key);
+            return 0;
+        });
         expires.clear();
         subExpires.clear();
     }
@@ -851,6 +887,10 @@ public struct Keyspace
 
     void clear() @nogc nothrow
     {
+        // the TTL indexes must go with the data: their entries name keys that no
+        // longer exist (and previously borrowed now-freed Dict slices — a FLUSHDB
+        // use-after-free with active expiry on, fixed by the owned-copy design)
+        freeExpiresIndex();
         d.clear();
     }
 
