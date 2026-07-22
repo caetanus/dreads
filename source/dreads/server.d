@@ -4030,6 +4030,12 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // the sharded router may have resolved the index already — never resolve twice
     immutable cidx = shardOpcode >= 0 ? shardOpcode
         : aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]);
+    {
+        import dreads.acl : routeFirstKeyPos;
+        immutable kp = routeFirstKeyPos(cidx);
+        if (kp >= 1 && kp < cmd.arr.length)
+            c.dbp.d.prefetchKey(cmd.arr[kp].str);
+    }
     immutable cmdIsWrite = cmdWriteByIdx(cidx); // one array load; used across the tail
 
     // Raft policy gate — only when replication is configured; standalone
