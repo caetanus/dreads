@@ -583,12 +583,9 @@ bool replyOff, replySkipNext, replyCmdExempt;
     // per touched shard at the flush point — cuts cross-thread futex wakeups ~Nx. Only
     // tracks shards < 64; a rare higher shard id wakes immediately (see shardFire).
     ulong shardTouch;
-    version (DreadsBytecode)
-    {
-        // per-connection scratch for the compiled cross-shard hop payload (must survive
-        // a shardEnqueue backpressure yield, so per-conn not a shared static).
-        ByteBuffer shardBc;
-    }
+    // per-connection scratch for the compiled cross-shard hop descriptor (must survive
+    // a shardEnqueue backpressure yield, so per-conn not a shared static).
+    ByteBuffer shardBc;
     // Async output, engaged on first (P)SUBSCRIBE (see PUBSUB.md fan-out): once
     // `subMode` is set, all output (replies and pub/sub messages) is enqueued on
     // `oq` and drained by the `oqWriter` fiber, so the publisher never blocks.
@@ -1619,23 +1616,12 @@ private void shardDrainLoop() nothrow
             arena.reset();
             reply.clear();
             RVal cmd;
-            version (DreadsBytecode)
-            {
-                // owner: rebuild from the descriptor — NO re-parse (the requester already
-                // parsed; this just slices). Falls to an error reply if malformed.
-                if (decodeHop(p, arena, cmd))
-                    cast(void) dispatch(cmd, *myKeyspace(), reply, arena);
-                else
-                    repError(reply, "ERR shard: malformed bytecode hop");
-            }
+            // owner: rebuild from the descriptor — NO re-parse (the requester already
+            // parsed; this just slices). Falls to an error reply if malformed.
+            if (decodeHop(p, arena, cmd))
+                cast(void) dispatch(cmd, *myKeyspace(), reply, arena);
             else
-            {
-                size_t pos = 0;
-                if (parseValue(p, pos, arena, cmd) == ParseStatus.ok)
-                    cast(void) dispatch(cmd, *myKeyspace(), reply, arena);
-                else
-                    repError(reply, "ERR shard: malformed routed command");
-            }
+                repError(reply, "ERR shard: malformed bytecode hop");
             shardEnqueue(cast(uint) meta, reply.data, tag, 0, ShardMsg.reply);
             if (meta < 64)
                 replyTouch |= 1UL << meta;
@@ -1700,75 +1686,79 @@ private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname) nothrow
 // hop: many commands (to many shards) are in flight at once, all shards busy in
 // parallel — instead of one blocking round-trip per command. The connection only ever
 // blocks at a flush point, in order. Reaping-when-full keeps per-conn state bounded.
-version (DreadsBytecode)
+// --- RESP→bytecode cross-shard hop -------------------------------------------------
+// The owner used to RE-PARSE the raw RESP bytes on every hop (perf: ~505 ins/op).
+// The requester ALREADY parsed the command in the serve loop, so instead of shipping
+// raw RESP for the owner to re-scan+validate, ship a tiny descriptor it computed for
+// free — the arg offsets into the raw bytes — and the owner rebuilds the RVal by
+// slicing, no parseValue. Wire form (all args are bulk strings, as every client
+// command is):  [u32 argc][ (u32 off, u32 len) × argc ][ raw command bytes ]
+// `off` is relative to the start of the raw bytes (== the requester's rawCmd).
+private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd) @trusted nothrow
 {
-    // --- RESP→bytecode cross-shard hop (opt-in) ------------------------------------
-    // The owner used to RE-PARSE the raw RESP bytes on every hop (perf: ~505 ins/op).
-    // The requester ALREADY parsed the command in the serve loop, so instead of shipping
-    // raw RESP for the owner to re-scan+validate, ship a tiny descriptor it computed for
-    // free — the arg offsets into the raw bytes — and the owner rebuilds the RVal by
-    // slicing, no parseValue. Wire form (all args are bulk strings, as every client
-    // command is):  [u32 argc][ (u32 off, u32 len) × argc ][ raw command bytes ]
-    // `off` is relative to the start of the raw bytes (== the requester's rawCmd).
-    private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd) @trusted nothrow
+    // HEADER ONLY — rawCmd is NOT appended here. The first cut concatenated
+    // [hdr][rawCmd] in this scratch buffer and shipped that, which copied the
+    // whole command TWICE (scratch, then ring slot) — measured: −170 ins/op
+    // but +2% cyc/op at shards=4 (the extra memcpy ate the parse win on Zen).
+    // Now the ring appends the two segments itself (shardEnqueue2/push2):
+    // one copy of rawCmd, same as the raw-RESP path, and the header is tiny
+    // (4 + 8·argc bytes, L1-hot).
+    bc.clear();
+    immutable uint argc = cast(uint) cmd.arr.length;
+    // one reserve, then indexed stores through a typed slice (bounds carried
+    // by the slice) — an append per field would cost a reserve check + memcpy
+    // call each, 7 calls for a SET; this is 1.
+    immutable size_t hdrBytes = 4 + cast(size_t) argc * 8;
+    auto w = cast(uint[]) bc.freeSpace(hdrBytes)[0 .. hdrBytes];
+    w[0] = argc;
+    auto base = cast(const(char)*) rawCmd.ptr;
+    size_t j = 1;
+    foreach (ref a; cmd.arr)
     {
-        bc.clear();
-        immutable uint argc = cast(uint) cmd.arr.length;
-        bc.append((cast(const(ubyte)*)&argc)[0 .. 4]);
-        auto base = cast(const(char)*) rawCmd.ptr;
-        foreach (ref a; cmd.arr)
-        {
-            immutable uint off = cast(uint)(a.str.ptr - base);
-            immutable uint len = cast(uint) a.str.length;
-            bc.append((cast(const(ubyte)*)&off)[0 .. 4]);
-            bc.append((cast(const(ubyte)*)&len)[0 .. 4]);
-        }
-        bc.append(rawCmd);
+        w[j++] = cast(uint)(a.str.ptr - base); // offset into rawCmd (same allocation)
+        w[j++] = cast(uint) a.str.length;
     }
+    bc.grow(hdrBytes);
+}
 
-    // Owner side: rebuild the RVal from the descriptor + raw bytes (which live in the
-    // ring slice `payload`, valid until the drain pops it — same lifetime parseValue's
-    // zero-copy slices had). No framing scan, no validation loop.
-    private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal cmd) @trusted nothrow
+// Owner side: rebuild the RVal from the descriptor + raw bytes (which live in the
+// ring slice `payload`, valid until the drain pops it — same lifetime parseValue's
+// zero-copy slices had). No framing scan, no validation loop.
+private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal cmd) @trusted nothrow
+{
+    if (payload.length < 4)
+        return false;
+    immutable uint argc = *cast(const(uint)*) payload.ptr;
+    immutable size_t hdr = 4 + cast(size_t) argc * 8;
+    if (argc == 0 || payload.length < hdr)
+        return false;
+    auto raw = payload[hdr .. $];
+    auto arr = arena.allocArray!RVal(argc);
+    auto offs = payload.ptr + 4;
+    foreach (i; 0 .. argc)
     {
-        if (payload.length < 4)
+        immutable uint off = *cast(const(uint)*)(offs + i * 8);
+        immutable uint len = *cast(const(uint)*)(offs + i * 8 + 4);
+        if (cast(size_t) off + len > raw.length)
             return false;
-        immutable uint argc = *cast(const(uint)*) payload.ptr;
-        immutable size_t hdr = 4 + cast(size_t) argc * 8;
-        if (argc == 0 || payload.length < hdr)
-            return false;
-        auto raw = payload[hdr .. $];
-        auto arr = arena.allocArray!RVal(argc);
-        auto offs = payload.ptr + 4;
-        foreach (i; 0 .. argc)
-        {
-            immutable uint off = *cast(const(uint)*)(offs + i * 8);
-            immutable uint len = *cast(const(uint)*)(offs + i * 8 + 4);
-            if (cast(size_t) off + len > raw.length)
-                return false;
-            arr[i].type = RType.BulkString;
-            arr[i].str = cast(const(char)[]) raw[off .. off + len];
-        }
-        cmd.type = RType.Array;
-        cmd.arr = arr;
-        return true;
+        arr[i].type = RType.BulkString;
+        arr[i].str = cast(const(char)[]) raw[off .. off + len];
     }
+    cmd.type = RType.Array;
+    cmd.arr = arr;
+    return true;
 }
 
 private void shardFire(ref Conn c, int owner, const ref RVal cmd,
         scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
 {
-    import dreads.shard : tShard, shardEnqueue, shardWake, acquireShardPending, ShardMsg;
+    import dreads.shard : tShard, shardEnqueue, shardEnqueue2, shardWake,
+        acquireShardPending, ShardMsg;
 
     auto p = acquireShardPending();
     // Enqueue WITHOUT waking; the owner is woken once at the flush point (batched).
-    version (DreadsBytecode)
-    {
-        compileHop(c.shardBc, cmd, rawCmd); // ship a re-parse-free descriptor, not raw RESP
-        shardEnqueue(cast(uint) owner, c.shardBc.data, cast(void*) p, tShard, ShardMsg.cmd);
-    }
-    else
-        shardEnqueue(cast(uint) owner, rawCmd, cast(void*) p, tShard, ShardMsg.cmd);
+    compileHop(c.shardBc, cmd, rawCmd); // descriptor header only (see compileHop)
+    shardEnqueue2(cast(uint) owner, c.shardBc.data, rawCmd, cast(void*) p, tShard, ShardMsg.cmd);
     if (owner < 64)
         c.shardTouch |= 1UL << owner;
     else
