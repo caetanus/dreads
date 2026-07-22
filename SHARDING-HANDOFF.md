@@ -120,6 +120,30 @@ MULTI/EXEC, WATCH, blocking commands (BLPOP family), and Lua scripts across shar
 the connection's own shard today (can be wrong if the key lives elsewhere). Windows has no
 SO_REUSEPORT → sharding is forced off there (single-thread), by design.
 
+## 2b routing — session end 2026-07-22 (next: phase 2.5b)
+Landed today on `sharding` (576/0, sweep @ shards=4 all green: keyspace 46/0, scan 21/0,
+string 104/0, incr 31/0, other 26/0):
+- `aa2cc77` — OBJECT ENCODING/FREQ/IDLETIME/REFCOUNT + MEMORY USAGE route by arg[2]
+  (container block in `acl.d commandRouteSlot`); RANDOMKEY merge fixed firstNonNil→**randomNonNil**
+  (was biased to the lowest-indexed shard); `blackbox/valkey-shard.skip` = the multishard skip list.
+- `ee4d92c` — **Phase 2.5 stream routing**: XGROUP/XINFO route by arg[2]; XREAD/XREADGROUP were
+  already routed (buildMultiKey + forEachCommandKey STREAMS-token). Stale "Phase 2.5 TODO" comment
+  in `aclkeys.d` corrected.
+
+**Skip-file gotcha (cost a cycle):** regex form is `/pattern` — leading `/` ONLY; a trailing `/`
+is taken literally (`search_pattern_list` strips index 0). Names carry a `{$type}` prefix
+(`{standalone} SCAN ...`) so use the regex form to match through it.
+
+**NEXT — phase 2.5b = BLOCKING commands under sharding.** The stream suites (baseline shards=1:
+71/0 + 51/0) fail under shards>1 ONLY on `XREAD`/`XREADGROUP` with `BLOCK`: the client parks on the
+ROUTER shard, but the wake (XADD) fires on the KEY-OWNER shard and never reaches the parked client →
+NOGROUP / timeout. Same root cause as the v1-scope "blocking commands (BLPOP family)" gap below —
+now the concrete workstream. Design sketch: hop the blocking command to the owner and park there
+(the connection's reply path must reach the owner), OR make the block registry shard-aware.
+Also still open: (c) **pub/sub cross-shard** (broker-critical — subscriber on router shard never
+sees a PUBLISH/keyspace-notification fired on the owner shard; keyspace-notif tests HANG, skipped),
+(d) **INFO keyspace aggregation** (each router reports only its shard's key count).
+
 ## Files
 `source/dreads/shard.d` (SPSC transport, ShardInbound class, routing math),
 `source/dreads/server.d` (shardDrainLoop / shardFire / flushShardPending / serve-loop hooks /
