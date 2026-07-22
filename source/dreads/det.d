@@ -22,6 +22,20 @@ import dreads.stream : wallNow = nowMs;
 /// the shared-nothing per-shard future wants.
 public ulong gClock;
 
+/// Coarse wall clock (ms), refreshed ONCE per event-loop pass (per read chunk /
+/// per drain pass) rather than per command. A per-command gettimeofday was ~3%
+/// of the 8-shard profile; Redis solves it identically (server.mstime cached in
+/// the loop). ms granularity per batch is exact enough for TTL/timestamps, and
+/// the raft apply path (applyTime != 0) never touches it. Thread-local.
+public ulong gWallCache;
+
+/// Refresh the coarse clock from real wall time. Call once per loop pass.
+public ulong refreshWall() @nogc nothrow
+{
+    gWallCache = wallNow();
+    return gWallCache;
+}
+
 /// The command-consistent now: the frozen clock, or the wall clock as a
 /// fallback for code paths reached outside dispatch (tests, timers).
 public ulong now() @nogc nothrow
@@ -33,7 +47,9 @@ public ulong now() @nogc nothrow
 /// logged clock; 0 freezes the current wall time for a fresh command.
 public void freezeClock(ulong applyTime) @nogc nothrow
 {
-    gClock = applyTime != 0 ? applyTime : wallNow();
+    // live command: use the coarse cached clock (refreshed per loop pass); fall
+    // back to a real read only if the cache was never primed (tests, early boot).
+    gClock = applyTime != 0 ? applyTime : (gWallCache != 0 ? gWallCache : wallNow());
 }
 
 // REGRESSION (background active-expire was dead): gClock is frozen per command
