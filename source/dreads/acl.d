@@ -796,43 +796,101 @@ private bool kwLit(scope const(char)[] a, scope const(char)[] lit) @nogc nothrow
 /// early. Returns false iff `fn` stopped it. Both ACL enforcement (`aclDeniedKey`)
 /// and key discovery (`getCommandKeys` for COMMAND GETKEYS + CLIENT TRACKING) go
 /// through this, so there is exactly ONE key-extraction implementation.
+// Compile-time index into the key-spec tables, keyed by command index (aclCmdIndex).
+// forEachCommandKey used to LINEAR-SCAN all ~215 gCmdKeySpecs (+13 numspecs) by name on
+// every call — a real cost on the enforcement / COMMAND GETKEYS / tracking paths (the
+// routing hot path already dodges it via `commandRouteKey`). A command's specs are
+// CONTIGUOUS in the table, so one [start,count) range per command replaces the scan with
+// an aclCmdIndex lookup + a tiny local loop. The contiguity is enforced at COMPILE TIME
+// (a CTFE `assert` fires if someone reorders the table so a command's specs get split).
+private struct KeySpecRange
+{
+    ushort start;
+    ushort count;
+}
+
+private KeySpecRange[gCmdCats.length] buildKeySpecRange()
+{
+    import dreads.aclkeys : gCmdKeySpecs;
+
+    KeySpecRange[gCmdCats.length] t;
+    foreach (i, ref ks; gCmdKeySpecs)
+    {
+        immutable ci = aclCmdIndex(ks.name);
+        if (ci < 0)
+            continue;
+        if (t[ci].count == 0)
+            t[ci].start = cast(ushort) i;
+        else
+            assert(i == cast(size_t)(t[ci].start + t[ci].count),
+                    "gCmdKeySpecs: a command's key specs must be contiguous");
+        t[ci].count++;
+    }
+    return t;
+}
+
+private KeySpecRange[gCmdCats.length] buildKeyNumSpecRange()
+{
+    import dreads.aclkeys : gCmdKeyNumSpecs;
+
+    KeySpecRange[gCmdCats.length] t;
+    foreach (i, ref ks; gCmdKeyNumSpecs)
+    {
+        immutable ci = aclCmdIndex(ks.name);
+        if (ci < 0)
+            continue;
+        if (t[ci].count == 0)
+            t[ci].start = cast(ushort) i;
+        else
+            assert(i == cast(size_t)(t[ci].start + t[ci].count),
+                    "gCmdKeyNumSpecs: a command's numkey specs must be contiguous");
+        t[ci].count++;
+    }
+    return t;
+}
+
+private immutable KeySpecRange[gCmdCats.length] gKeySpecRange = buildKeySpecRange();
+private immutable KeySpecRange[gCmdCats.length] gKeyNumSpecRange = buildKeyNumSpecRange();
+
 package bool forEachCommandKey(alias fn)(scope const(char)[] name, scope const(RVal)[] arr)
         @trusted nothrow @nogc
 {
     import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
 
     immutable argc = cast(int) arr.length;
-    foreach (ref ks; gCmdKeySpecs) // static index+range specs
+    immutable ci = aclCmdIndex(name); // O(1) command index; -1 for keyword-only/unknown
+    if (ci >= 0)
     {
-        if (ks.name != name)
-            continue;
-        immutable last = ks.last >= 0 ? ks.first + ks.last : argc + ks.last;
-        for (int idx = ks.first; idx <= last && idx < argc; idx += ks.step)
+        immutable r = gKeySpecRange[ci]; // static index+range specs for THIS command only
+        foreach (ref ks; gCmdKeySpecs[r.start .. r.start + r.count])
         {
-            if (idx < 1)
-                continue;
-            if (!fn(arr[idx].str, ks.needR, ks.needW))
-                return false;
+            immutable last = ks.last >= 0 ? ks.first + ks.last : argc + ks.last;
+            for (int idx = ks.first; idx <= last && idx < argc; idx += ks.step)
+            {
+                if (idx < 1)
+                    continue;
+                if (!fn(arr[idx].str, ks.needR, ks.needW))
+                    return false;
+            }
         }
-    }
-    foreach (ref ks; gCmdKeyNumSpecs) // numkeys-based specs
-    {
-        if (ks.name != name)
-            continue;
-        immutable numAt = ks.pos + ks.keynumidx;
-        if (numAt < 1 || numAt >= argc)
-            continue;
-        long nk;
-        if (!parseKeyCount(arr[numAt].str, nk) || nk <= 0)
-            continue;
-        immutable first = ks.pos + ks.firstkey;
-        for (long i = 0; i < nk; i++)
+        immutable rn = gKeyNumSpecRange[ci]; // numkeys-based specs for THIS command
+        foreach (ref ks; gCmdKeyNumSpecs[rn.start .. rn.start + rn.count])
         {
-            immutable idx = first + cast(int) i * ks.step;
-            if (idx < 1 || idx >= argc)
-                break;
-            if (!fn(arr[idx].str, ks.needR, ks.needW))
-                return false;
+            immutable numAt = ks.pos + ks.keynumidx;
+            if (numAt < 1 || numAt >= argc)
+                continue;
+            long nk;
+            if (!parseKeyCount(arr[numAt].str, nk) || nk <= 0)
+                continue;
+            immutable first = ks.pos + ks.firstkey;
+            for (long i = 0; i < nk; i++)
+            {
+                immutable idx = first + cast(int) i * ks.step;
+                if (idx < 1 || idx >= argc)
+                    break;
+                if (!fn(arr[idx].str, ks.needR, ks.needW))
+                    return false;
+            }
         }
     }
     // keyword-positioned keys (STORE dests, XREAD STREAMS keys, MIGRATE KEYS)
