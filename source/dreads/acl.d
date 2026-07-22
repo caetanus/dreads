@@ -1036,6 +1036,82 @@ const(char)[] commandRouteKeyIx(int i, scope const(char)[] lname,
     return first;
 }
 
+// CTFE: can command `i` touch MORE THAN ONE key? (variadic spec, step>1, a
+// second key-position spec, or a numkeys spec). Single-key commands — the common
+// fast path — skip the cross-slot check entirely.
+private immutable bool[gCmdCats.length] gCmdMultiKey = buildMultiKey();
+
+private bool[gCmdCats.length] buildMultiKey()
+{
+    import dreads.aclkeys : gCmdKeySpecs, gCmdKeyNumSpecs;
+
+    bool[gCmdCats.length] t;
+    int[gCmdCats.length] seen; // count of static key-position specs per command
+    foreach (ref ks; gCmdKeySpecs)
+    {
+        immutable i = aclCmdIndex(ks.name);
+        if (i < 0)
+            continue;
+        seen[i]++;
+        // last<0 = variadic to end; step>1 = strided (MSET) — both multi-key.
+        if (ks.last < 0 || ks.step > 1 || seen[i] > 1)
+            t[i] = true;
+    }
+    foreach (ref ks; gCmdKeyNumSpecs) // numkeys N k1..kN
+    {
+        immutable i = aclCmdIndex(ks.name);
+        if (i >= 0)
+            t[i] = true;
+    }
+    // keyword-positioned multi-key commands (extracted in forEachCommandKey)
+    foreach (nm; ["sort", "sort_ro", "georadius", "georadiusbymember",
+            "xread", "xreadgroup", "migrate"])
+    {
+        immutable i = aclCmdIndex(nm);
+        if (i >= 0)
+            t[i] = true;
+    }
+    return t;
+}
+
+/// The routing SLOT of a command, enforcing Redis Cluster's same-slot rule:
+///   >=0  the slot every key hashes to (caller maps slot→shard)
+///   -1   keyless / single-key-missing → caller runs locally
+///   -2   CROSSSLOT — a multi-key command whose keys span slots (caller errors)
+/// Single-key commands take the O(1) first-key path; only multi-key commands pay
+/// the all-keys scan (they are the minority).
+enum int ROUTE_CROSSSLOT = -2;
+
+int commandRouteSlot(int i, scope const(char)[] lname, scope const(RVal)[] arr) @trusted nothrow @nogc
+{
+    import dreads.slots : keyToSlot;
+
+    if (i < 0)
+        return -1;
+    if (!gCmdMultiKey[i])
+    {
+        auto k = commandRouteKeyIx(i, lname, arr);
+        return k is null ? -1 : cast(int) keyToSlot(k);
+    }
+    // multi-key: every key must hash to the SAME slot ({hashtag} co-locates)
+    int slot = -1;
+    bool crossSlot = false;
+    cast(void) forEachCommandKey!((scope const(char)[] key, bool r, bool w) {
+        immutable sl = keyToSlot(key);
+        if (slot < 0)
+            slot = sl;
+        else if (sl != slot)
+        {
+            crossSlot = true;
+            return false; // stop early
+        }
+        return true;
+    })(lname, arr);
+    if (crossSlot)
+        return ROUTE_CROSSSLOT;
+    return slot; // -1 if no keys found (keyless-in-practice), else the common slot
+}
+
 /// The first key this command touches that the user CANNOT access, or null if
 /// all are allowed (used both for enforcement and for the ACL LOG object name).
 const(char)[] aclDeniedKey(const(AclUser)* u, scope const(char)[] name, scope const(RVal)[] arr) @trusted nothrow @nogc
