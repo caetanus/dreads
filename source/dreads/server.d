@@ -1875,6 +1875,196 @@ BroadcastKind broadcastKindOf(int opcode) @nogc nothrow
         ? gBroadcastKind[opcode] : BroadcastKind.none;
 }
 
+// SCAN across shards: NOT a broadcast — a COMPOSITE cursor walks one shard at a
+// time. cursor = (shardIdx << 56) | innerCursor. Each call routes SCAN (with the
+// inner cursor) to the current shard; when that shard is exhausted (inner→0) the
+// next call advances to shard+1; cursor 0 when all shards are done. Keys are
+// returned as they come — the same weak SCAN guarantee Redis gives.
+private enum int SCAN_SHARD_SHIFT = 56;
+private enum ulong SCAN_INNER_MASK = (1UL << SCAN_SHARD_SHIFT) - 1;
+
+private void scanSharded(ref Conn c, int opcode, uint db, const ref RVal cmd,
+        ref ByteBuffer o, ref Arena arena) nothrow
+{
+    import dreads.shard : tShard, gShardCount, shardEnqueue, shardWake, ShardMsg,
+        ShardPending, acquireShardPending, releaseShardPending;
+    import dreads.resp : parseValue, ParseStatus;
+
+    if (c.shardPendCount > 0)
+        flushShardPending(c, o);
+
+    // decode the composite cursor
+    long cur;
+    if (cmd.arr.length < 2 || !parseLong(cmd.arr[1].str, cur) || cur < 0)
+    {
+        repError(o, "ERR invalid cursor");
+        return;
+    }
+    immutable ulong ucur = cast(ulong) cur;
+    uint shard = cast(uint)(ucur >> SCAN_SHARD_SHIFT);
+    immutable ulong inner = ucur & SCAN_INNER_MASK;
+    if (shard >= gShardCount)
+    {
+        scanEmit(o, 0, null); // out of range → done
+        return;
+    }
+
+    // re-serialize SCAN with the INNER cursor (arg[1]), keeping the rest verbatim
+    static ByteBuffer mbuf;
+    mbuf.clear();
+    char[24] nb = void;
+    immutable nn = snprintfLong(nb[], cast(long) inner);
+    mbuf.append("*");
+    appendLongAscii(mbuf, cast(long) cmd.arr.length);
+    mbuf.append("\r\n");
+    foreach (i, ref a; cmd.arr)
+    {
+        auto part = (i == 1) ? cast(const(char)[]) nb[0 .. nn] : a.str;
+        mbuf.append("$");
+        appendLongAscii(mbuf, cast(long) part.length);
+        mbuf.append("\r\n");
+        mbuf.append(part);
+        mbuf.append("\r\n");
+    }
+
+    // parse it back into an RVal so the hop descriptor's arg offsets are valid
+    RVal mcmd;
+    size_t pp = 0;
+    if (parseValue(mbuf.data, pp, arena, mcmd) != ParseStatus.ok)
+    {
+        repError(o, "ERR scan: internal");
+        return;
+    }
+
+    // fire the modified SCAN to `shard`, collect its reply
+    auto pend = acquireShardPending();
+    c.shardBc.clear();
+    appendHopCmd(c.shardBc, mcmd, mbuf.data, opcode, db, cast(void*) pend);
+    shardEnqueue(shard, c.shardBc.data, null, tShard, ShardMsg.cmd);
+    shardWake(shard);
+    while (!pend.ready)
+    {
+        auto ec = pend.done.emitCount;
+        if (pend.ready)
+            break;
+        try
+            pend.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    // reply is *2\r\n$<L>\r\n<innerNext>\r\n<keys-array-bytes>, or an error
+    auto r = pend.reply.data;
+    if (r.length && r[0] == '-') // the shard rejected it (bad TYPE, etc.) — propagate
+    {
+        o.append(r);
+        releaseShardPending(pend);
+        return;
+    }
+    ulong innerNext;
+    size_t keysAt;
+    immutable okParse = scanReplyParse(r, innerNext, keysAt);
+    // compute the next composite cursor
+    ulong nextCur;
+    if (!okParse)
+        nextCur = 0;
+    else if (innerNext != 0)
+        nextCur = (cast(ulong) shard << SCAN_SHARD_SHIFT) | (innerNext & SCAN_INNER_MASK);
+    else if (shard + 1 < gShardCount)
+        nextCur = cast(ulong)(shard + 1) << SCAN_SHARD_SHIFT; // next shard, inner 0
+    else
+        nextCur = 0; // all shards done
+    // emit: [nextCur, <keys array bytes verbatim from the shard reply>]
+    o.append("*2\r\n$");
+    char[24] cb = void;
+    immutable cn = snprintfLong(cb[], cast(long) nextCur);
+    appendLongAscii(o, cast(long) cn);
+    o.append("\r\n");
+    o.append(cb[0 .. cn]);
+    o.append("\r\n");
+    if (okParse && keysAt <= r.length)
+        o.append(r[keysAt .. $]);
+    else
+        o.append("*0\r\n");
+    releaseShardPending(pend);
+}
+
+// Parse a SCAN reply `*2\r\n$L\r\n<cursor>\r\n<keys...>` → the cursor value and
+// the offset where the keys array begins. false on a malformed reply.
+private bool scanReplyParse(scope const(ubyte)[] r, out ulong cursor, out size_t keysAt) @nogc nothrow
+{
+    // skip "*2\r\n"
+    if (r.length < 4 || r[0] != '*')
+        return false;
+    size_t i = 0;
+    while (i < r.length && r[i] != '\n')
+        i++;
+    i++; // past *2\r\n
+    if (i >= r.length || r[i] != '$')
+        return false;
+    // bulk length of the cursor
+    size_t j = i + 1;
+    long blen = 0;
+    while (j < r.length && r[j] >= '0' && r[j] <= '9')
+        blen = blen * 10 + (r[j++] - '0');
+    j += 2; // past \r\n
+    // the cursor digits
+    cursor = 0;
+    foreach (k; 0 .. cast(size_t) blen)
+    {
+        if (j + k >= r.length)
+            return false;
+        immutable d = r[j + k];
+        if (d >= '0' && d <= '9')
+            cursor = cursor * 10 + (d - '0');
+    }
+    keysAt = j + cast(size_t) blen + 2; // past the cursor + \r\n
+    return keysAt <= r.length;
+}
+
+// SCAN reply with an explicit cursor + a key list (used for the empty/out-of-range case).
+private void scanEmit(ref ByteBuffer o, ulong cursor, const(char)[][] keys) nothrow
+{
+    o.append("*2\r\n$");
+    char[24] cb = void;
+    immutable cn = snprintfLong(cb[], cast(long) cursor);
+    appendLongAscii(o, cast(long) cn);
+    o.append("\r\n");
+    o.append(cb[0 .. cn]);
+    o.append("\r\n");
+    appendLongAscii2Array(o, keys);
+}
+
+// helpers: decimal ascii of a long into a buffer (returns length)
+private size_t snprintfLong(char[] buf, long v) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    return cast(size_t) snprintf(buf.ptr, buf.length, "%lld", v);
+}
+
+private void appendLongAscii(ref ByteBuffer o, long v) nothrow
+{
+    char[24] b = void;
+    immutable n = snprintfLong(b[], v);
+    o.append(b[0 .. n]);
+}
+
+private void appendLongAscii2Array(ref ByteBuffer o, const(char)[][] keys) nothrow
+{
+    o.append("*");
+    appendLongAscii(o, cast(long) keys.length);
+    o.append("\r\n");
+    foreach (k; keys)
+    {
+        o.append("$");
+        appendLongAscii(o, cast(long) k.length);
+        o.append("\r\n");
+        o.append(k);
+        o.append("\r\n");
+    }
+}
+
 // Fire `cmd` to EVERY shard (each runs it locally), collect the N replies, merge
 // them into `o` per `kind`. Blocks at the collect point like flushShardPending.
 private void broadcastCommand(ref Conn c, int opcode, uint db, const ref RVal cmd,
@@ -3654,6 +3844,13 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // shard and its N replies merged — before any local handling.
     if (sharded())
     {
+        import dreads.aclcat : cmdIx;
+
+        if (shardOpcode == cmdIx!"scan")
+        {
+            scanSharded(c, shardOpcode, cast(uint) c.dbp.db, cmd, o, arena);
+            return true;
+        }
         immutable bk = broadcastKindOf(shardOpcode);
         if (bk != BroadcastKind.none)
         {
