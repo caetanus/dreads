@@ -42,13 +42,5 @@ INCR can modify objects in-place
 # pub/sub (PUBLISH fan-out across shards) lands, else the test hangs 300s.
 MSETEX keyspace notifications
 
-# (E) stream consumer-group commands don't route by key yet: XGROUP/XINFO carry
-# the key at arg[2] (container-style, like OBJECT/MEMORY) and XREAD/XREADGROUP
-# carry keys after the STREAMS keyword (keyword-positioned = Phase 2.5, see
-# aclkeys.d). Until stream routing lands they run on the client's router shard,
-# not the key owner, so a co-located {hashtag} stream is "no such key". This test
-# drives XGROUP CREATE + XREADGROUP, so it needs the full set.
-COPY basic usage for stream-cgroups
-
 # (B) forbidden under sharding by design
 /SWAPDB

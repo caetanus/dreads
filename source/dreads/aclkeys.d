@@ -1,8 +1,11 @@
 // GENERATED from Valkey src/commands/*.json key_specs. Per-spec: a command
 // with both a static dest and numkeys srcs contributes to BOTH tables.
 // Shard pub/sub excluded (channel-as-key); EVAL/FCALL excluded (transparent).
-// Keyword-positioned keys (GEORADIUS STORE, XREAD STREAMS, …) are Phase 2.5.
-// Do not hand-edit.
+// Keyword-positioned keys (GEORADIUS STORE, XREAD STREAMS, MIGRATE KEYS) are
+// NOT in these tables — they're extracted in acl.d forEachCommandKey's switch,
+// which both ACL and sharding routing consume. Container commands whose key
+// follows a subcommand (OBJECT/MEMORY/XGROUP/XINFO) route via acl.d
+// commandRouteSlot's container block. Do not hand-edit the tables below.
 module dreads.aclkeys;
 
 /// Static spec: keys at arr[first], arr[first+step], … up to
