@@ -3907,7 +3907,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 }
             Keyspace* destKs = &ks;
             if (destDb >= 0 && destDb != curIdx)
+            {
+                import dreads.shard : sharded;
+
+                // SHARE-NOTHING: gDbs[destDb] belongs to no single shard thread —
+                // reaching it here would be a cross-allocator write. Cluster mode
+                // is DB-0-only; COPY across DBs is refused (Redis Cluster too).
+                if (sharded())
+                {
+                    repError(o, "ERR COPY to another database is not allowed in cluster mode");
+                    break;
+                }
                 destKs = &gDbs[cast(size_t) destDb];
+            }
             if (destKs is &ks && args[0].str == args[1].str)
             {
                 repError(o, "ERR source and destination objects are the same");
@@ -3949,6 +3961,17 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
         }
     case cmdIx!"move":
         {
+            {
+                import dreads.shard : sharded;
+
+                // MOVE is inherently multi-db (touches gDbs[dst]); cluster mode is
+                // DB-0-only, so refuse rather than write the coleguinha's keyspace.
+                if (sharded())
+                {
+                    repError(o, "ERR MOVE is not allowed in cluster mode");
+                    break;
+                }
+            }
             // MOVE key db [REPLACE] — REPLACE overwrites an existing destination key
             // (and adopts the source's TTL, or clears it if the source has none).
             if (args.length < 2)
@@ -4020,6 +4043,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             {
                 arityErr(o, "swapdb");
                 break;
+            }
+            {
+                import dreads.shard : sharded;
+
+                if (sharded()) // swaps two gDbs entries — meaningless & unsafe in cluster mode
+                {
+                    repError(o, "ERR SWAPDB is not allowed in cluster mode");
+                    break;
+                }
             }
             long a, b;
             if (!parseLong(args[0].str, a)) // report which index is malformed
