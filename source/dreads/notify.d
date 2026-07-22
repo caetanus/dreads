@@ -32,7 +32,11 @@ enum NClass : uint
     all = generic | str | list | set | hash | zset | expired | evicted | stream | modevt,
 }
 
+// JUSTIFIED __gshared exception: word-size flag mirror of CONFIG
+// notify-keyspace-events — written by CONFIG SET (rare), read as a gate.
 __gshared uint gNotifyFlags = 0;
+// JUSTIFIED __gshared exception: installed once at boot, before shard threads
+// exist; read-only afterwards (same for gPublishHook below).
 __gshared void delegate(scope const(char)[] chan, scope const(char)[] msg) nothrow gNotifyPublish;
 // PUBLISH/SPUBLISH from the data plane (a redis.call inside a script reaches the
 // pub/sub layer through this, since dispatch can't touch the server module). The
@@ -42,8 +46,10 @@ __gshared long delegate(scope const(char)[] chan, scope const(char)[] msg, bool 
 // Events are QUEUED here (length-prefixed chan,msg pairs) by notifyKeyspaceEvent,
 // which runs inside the @nogc command dispatch and so cannot publish directly.
 // The server drains this via flushPendingNotify() after the command, on the
-// non-@nogc side. Single event-loop thread, so a plain global buffer is safe.
-private __gshared ByteBuffer pending;
+// non-@nogc side. THREAD-LOCAL (share-nothing): each shard queues and drains the
+// events of the commands IT executed; the publish itself is that shard's local
+// pub/sub registry (shard-local v1, see server.d gPubSub).
+private ByteBuffer pending;
 
 private void appU32(ref ByteBuffer b, uint v) @nogc nothrow
 {

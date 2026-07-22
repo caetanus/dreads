@@ -57,6 +57,10 @@ public struct Config
     // with NO router/shard split and zero added cost. >1 spins N shard-worker threads
     // (each its own keyspace) behind a router; commands route by hash slot.
     uint shards = 1;
+    // pin shard i's thread to the i-th allowed core (respects taskset). On by default
+    // when sharded: the SPSC hop is thread-pair traffic, and scheduler migration
+    // (especially across L3/CCX domains) costs more than any balance it buys.
+    bool shardPin = true;
     // keyspace notifications: flag string like "KEA" ("" = disabled). See notify.d.
     string notifyKeyspaceEvents;
     // active expiration: run the drop-soon timer that proactively reclaims keys
@@ -404,6 +408,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.shards = n;
             return true;
         }
+    case "shard-pin":
+        if (value == "yes")
+            cfg.shardPin = true;
+        else if (value == "no")
+            cfg.shardPin = false;
+        else
+            return false;
+        return true;
     case "notify-keyspace-events":
         cfg.notifyKeyspaceEvents = value.unquote;
         return true;

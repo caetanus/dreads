@@ -54,6 +54,22 @@
 			"targetType": "executable"
 		},
 		{
+			"comment": "AddressSanitizer hunting build: raw malloc/free on both allocator planes (no freelist masking UAF/overflow), ASan instrumentation, symbols. Run with the system allocator (build ignores the jemalloc link via ASan interposition). `dub build --config=asan --compiler=ldc2`.",
+			"name": "asan",
+			"targetType": "executable",
+			"targetName": "dreads-asan",
+			"versions": [
+				"DreadsDashboard",
+				"DreadsDataMalloc",
+				"DreadsConnMalloc"
+			],
+			"dflags-ldc": [
+				"-fsanitize=address",
+				"-g",
+				"--frame-pointer=all"
+			]
+		},
+		{
 			"name": "pubsub-bench",
 			"excludedSourceFiles": [
 				"source/app.d"

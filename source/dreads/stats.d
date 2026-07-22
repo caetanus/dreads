@@ -2,8 +2,10 @@ module dreads.stats;
 
 // INFO # Errorstats + total_error_replies. (Per-command commandstats lives in
 // dreads.server as gCmdStats/statCall/statRejected.) Counted at the top of the
-// command pipeline on the main thread — a script's redis.call round-trips there,
-// so top-level commands and script sub-calls flow through the same choke point.
+// command pipeline on the EXECUTING thread (thread-local tallies; shard-local
+// INFO is the v1 convention) — a script's redis.call round-trips to the main
+// thread, so top-level commands and script sub-calls flow through one choke
+// point there.
 //
 // Model mirrors Valkey (afterErrorReply guarded by a prev-error-count): each REAL
 // leaf error bumps total_error_replies + errorstat_<code> exactly once; a script
@@ -22,7 +24,11 @@ public struct CmdStat
     ulong calls, usec, rejected, failed;
 }
 
-public __gshared CmdStat[gCmdCats.length] gCmdStats;
+// THREAD-LOCAL (share-nothing rule): each shard counts the commands IT ran;
+// INFO commandstats reports the serving shard's view (the established v1
+// convention — see obj.d gConnectedClients; cross-shard aggregation = 2b).
+// As __gshared these were lost-update races from every listener thread.
+public CmdStat[gCmdCats.length] gCmdStats;
 
 public void statRejected(int idx) @nogc nothrow
 {
@@ -46,8 +52,10 @@ public void resetCmdStats() @nogc nothrow
         s = CmdStat.init;
 }
 
-public __gshared Dict!ulong gErrorStats; // error code (OOM/ERR/WRONGTYPE/…) -> count
-public __gshared ulong gTotalErrorReplies;
+// THREAD-LOCAL: same shard-local v1 convention as gCmdStats — and as __gshared
+// the Dict was a cross-thread rehash double-free (the conn-registry crash class).
+public Dict!ulong gErrorStats; // error code (OOM/ERR/WRONGTYPE/…) -> count
+public ulong gTotalErrorReplies;
 
 // Count one leaf error reply: bump total + errorstat_<code>. `reply` is the raw
 // RESP error (with or without the leading '-'); the code is the first token,

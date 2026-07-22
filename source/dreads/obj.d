@@ -31,6 +31,9 @@ public enum ObjType : ubyte
 
 /// Coarse LRU clock in seconds, refreshed by the server's 1s timer — keeps
 /// per-lookup touching to a single store instead of a clock_gettime call.
+/// JUSTIFIED __gshared exception (share-nothing rule): word-size, and every
+/// writer stores the SAME wall-clock value — a torn/raced read is impossible
+/// (single store) and a stale-by-a-tick read is exactly what a coarse clock is.
 public __gshared uint lruClock;
 
 /// Whether the drop-soon active-expiration timer runs (mirrors
@@ -39,34 +42,39 @@ public __gshared uint lruClock;
 public __gshared bool gActiveExpire;
 
 /// INFO stats: lifetime count of keys dropped by lazy or active expiration.
-public __gshared ulong gExpiredKeys;
+/// TLS (share-nothing): each shard reaps its own keyspace; INFO reports the
+/// serving shard's tally (v1 gap: no cross-shard sum — SHARDING.md).
+public ulong gExpiredKeys;
 
 /// Background (timer) eviction: opt-in like gActiveExpire (default off — the
 /// write path already frees on demand; the cycle only matters for the Redis
 /// contract that a key can be evicted without a subsequent write). INFO stats
 /// `evicted_keys` counts keys dropped by maxmemory pressure (write path + cycle).
+/// JUSTIFIED __gshared exception: config mirror, word-size bool, written by
+/// CONFIG SET (rare) and only read as a gate — a stale read delays one cycle.
 public __gshared bool gActiveEviction;
-public __gshared ulong gEvictedKeys;
+public ulong gEvictedKeys; // TLS: per-shard eviction tally (INFO: serving shard's)
 
 /// INFO stats `expired_fields`: hash fields dropped by TTL (lazy/active reap or a
 /// past-deadline HEXPIRE/HGETEX/HSETEX). The per-field analog of gExpiredKeys.
-public __gshared ulong gExpiredFields;
+public ulong gExpiredFields; // TLS: per-shard tally (see gExpiredKeys)
 
 /// Import mode (`CONFIG SET import-mode yes` + `CLIENT IMPORT-SOURCE ON`): a
 /// bulk-load window for migration tools. While on, expiration is PAUSED so a
 /// stream of RESTOREs with absolute TTLs (some already past) loads consistently
 /// instead of racing the expiry cycle. Turned off, normal expiry resumes.
+/// JUSTIFIED __gshared exception: CONFIG-SET mirror, word-size bool gate.
 public __gshared bool gImportMode;
 
 /// The CURRENT command's client is in `CLIENT IMPORT-SOURCE ON` — set per command
 /// by the serve loop (mirrors gRespProto/gCmdConn). Only such a client may VISIT
 /// an expired-but-kept key while import-mode is on; normal clients see it as gone.
-public __gshared bool gImportSourceActive;
+public bool gImportSourceActive; // TLS: per-command flag, inherently per-thread (like gCmdConn)
 
 /// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
 /// Also counts clients parked by a CLIENT PAUSE barrier (Valkey counts postponed
 /// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
-public __gshared long gBlockedClients;
+public long gBlockedClients; // TLS: each shard parks its own conns (see gConnectedClients)
 
 /// INFO clients: number of live client connections. TLS (not __gshared) on
 /// purpose — with the coming per-thread sharding each shard accepts and serves
@@ -100,15 +108,19 @@ public __gshared ExpireReapHook gExpireReapHook;
 /// frozen to the entry's stamp), so every node reaps identically and the delete
 /// is local with no new DEL to propagate — reading it lets the reap hook tell a
 /// deterministic apply apart from a live, node-local read.
+/// JUSTIFIED __gshared exception: replication apply runs on the raft loop with
+/// the write path quiesced (single-writer window); word-size bool.
 public __gshared bool gApplying;
 
 /// CLIENT PAUSE state (server layer owns the barrier/replay; kept here so INFO in
 /// the data plane can read it without a module cycle). `gPauseUntilMs` is the
 /// absolute deadline (0 = not paused); `gPauseAll` true = pause ALL, false = WRITE
 /// only. Stacking keeps the higher end-time and the most restrictive action.
-public __gshared ulong gPauseUntilMs;
-public __gshared bool gPauseAll = true;
-public __gshared ulong gPauseIssuer; // conn id that set the pause (exempt from it)
+/// THREAD-LOCAL: CLIENT PAUSE is v1 shard-local (it barriers the issuer's
+/// shard only — SHARDING.md gap; whole-server pause = 2b hop broadcast).
+public ulong gPauseUntilMs;
+public bool gPauseAll = true;
+public ulong gPauseIssuer; // conn id that set the pause (exempt from it)
 
 /// The logical databases (Redis SELECT 0..15). The *current* db is per-client
 /// (`Conn.db`); the connection dispatches against `gDbs[conn.db]`, SELECT just

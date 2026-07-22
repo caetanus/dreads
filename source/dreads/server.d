@@ -78,25 +78,50 @@ private ref Keyspace gKeys() @property @nogc nothrow @trusted
     return gDbs[0];
 }
 
-private __gshared PubSub gPubSub;
-private __gshared PubSub gShardPubSub; // single node: shard = plain, own namespace
+// THREAD-LOCAL (share-nothing rule): a subscriber's sink writes into its Conn's
+// buffers, which only that conn's thread may touch — a __gshared registry would
+// make every cross-shard PUBLISH a cross-thread buffer write (UB) on top of the
+// unsynchronized table itself. v1 semantics: pub/sub is SHARD-LOCAL — subscriber
+// and publisher must land on the same shard thread (SHARDING.md gap; the 2b fix
+// is PUBLISH fan-out through the SPSC hop, delivering same-thread on each shard).
+// Unsharded (shards=1) every conn lives on the main thread — identical to before.
+private PubSub gPubSub;
+private PubSub gShardPubSub; // single node: shard = plain, own namespace
 private __gshared Aof gAof;
 private __gshared const(char)[] gAofPath;
-public __gshared ulong gWriteEpoch; // bumped on every effective write (WATCH + INFO changes)
-private __gshared ulong gClientIds;
+// THREAD-LOCAL (share-nothing rule): WATCH is v1 same-shard, and every write to a
+// key executes on its owner's thread (local or hopped) — so the epoch a WATCHer
+// compares moves on exactly the thread whose keyspace it watches. As __gshared,
+// N threads' unsynchronized `++` lost increments (a lost bump = a missed WATCH
+// invalidation = EXEC on stale data).
+public ulong gWriteEpoch; // bumped on every effective write (WATCH + INFO changes)
+// Monotonic client-id source. `shared` + atomic increment: under thread-per-shard
+// every listener thread mints ids, and a plain `++` would hand two conns the same
+// id (breaking the no-ABA guarantee CLIENT KILL/UNBLOCK rely on). Connect-time
+// only — never on the command path.
+private shared ulong gClientIds;
 // The connection whose command is executing right NOW (single-thread, set by the
 // serve loop around handleCommand). A pub/sub message published to THIS connection
 // (publish-to-self) must trail the running command's reply, not interleave before
 // it — connSink defers such a message to pendingInval (drained after outb). Null
 // between commands so an ordinary cross-client delivery goes straight to the queue.
-private __gshared Conn* gCmdConn;
+// THREAD-LOCAL (share-nothing rule): "the conn running THIS thread's current
+// command" is inherently per-thread state — as __gshared, shard threads scribbled
+// each other's publish-to-self detection every command.
+private Conn* gCmdConn;
 // MONITOR feed: the SET of monitor conn ids (not raw Conn*), resolved to a strong
 // lock via connById at feed time — so a monitor freed cross-fiber can never dangle.
 // Mirrors the CLIENT TRACKING id-set registries (gBcastConns), the Phase-C model.
-private __gshared Dict!Unit gMonitors;
+// THREAD-LOCAL: a monitor watches ITS OWN shard's command stream (same v1 shard
+// scope as tConnById, which the feed resolves through anyway); a shared Dict here
+// is a rehash double-free across listener threads.
+private Dict!Unit gMonitors;
 
-// blocked clients (BLPOP & co.) wake on any write and re-check their keys
-private __gshared LocalManualEvent gKeyActivity;
+// blocked clients (BLPOP & co.) wake on any write and re-check their keys.
+// THREAD-LOCAL: LocalManualEvent is same-thread-only BY CONTRACT — as __gshared
+// under shards>1 a cross-thread emit/wait is UB. Blocking is v1 same-shard
+// (SHARDING.md): each shard wakes its own blocked conns on its own writes.
+private LocalManualEvent gKeyActivity;
 
 // CLIENT PAUSE barrier: while `gPauseUntilMs` is in the future, commands that match
 // the mode (ALL, or WRITE-only) are NOT executed — each connection's fiber buffers
@@ -106,7 +131,11 @@ private __gshared LocalManualEvent gKeyActivity;
 // gPauseUntilMs / gPauseAll / gPauseIssuer live in dreads.obj (so INFO can read
 // them without a module cycle); imported publicly here for the rest of server.d.
 public import dreads.obj : gPauseUntilMs, gPauseAll, gPauseIssuer;
-private __gshared LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE / timeout
+// THREAD-LOCAL (with the whole pause-state group below): LocalManualEvent is
+// same-thread-only, and CLIENT PAUSE is v1 SHARD-LOCAL — it barriers only the
+// conns of the shard the issuer landed on (SHARDING.md gap; whole-server pause
+// needs a cross-shard hop broadcast, phase 2b).
+private LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE / timeout
 // Replay re-entrancy guard (the CLIENT PAUSE heisenbug). replayPaused() drains a
 // connection's held commands through the normal pipeline, and that path does IO
 // (flushOut / gAof.flush) which yields — another connection's fiber can land a
@@ -116,11 +145,11 @@ private __gshared LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE /
 // Fix: clear the (already-lifted) window BEFORE the drain, and while `gReplaying`
 // is set DEFER any incoming CLIENT PAUSE into gPausePending* — applied AFTER the
 // drain finishes, so it never interleaves with the very commands it must follow.
-private __gshared bool gReplaying;         // a replayPaused() drain is in progress
-private __gshared bool gPausePending;      // a CLIENT PAUSE arrived mid-replay
-private __gshared ulong gPausePendingEnd;  // its (already absolute) deadline
-private __gshared bool gPausePendingAll;   // its ALL(true)/WRITE(false) mode
-private __gshared ulong gPausePendingIssuer; // its issuer conn id (exempt)
+private bool gReplaying;         // a replayPaused() drain is in progress (TLS: per-shard pause)
+private bool gPausePending;      // a CLIENT PAUSE arrived mid-replay
+private ulong gPausePendingEnd;  // its (already absolute) deadline
+private bool gPausePendingAll;   // its ALL(true)/WRITE(false) mode
+private ulong gPausePendingIssuer; // its issuer conn id (exempt)
 // Backstop re-check interval for a quiet barriered fiber: CLIENT UNPAUSE wakes it
 // via gPauseEvt at once, but this caps the wait so a client that resumes flooding
 // after going idle is drained into pausedBuf (and trips the overflow guard) within
@@ -612,17 +641,23 @@ bool replyOff, replySkipNext, replyCmdExempt;
     }
 }
 
-// Registry of every live connection: an id→Weak!Conn index. It is the single
-// source of truth for both O(1) lookup (CLIENT UNBLOCK, tracking redirect) and
-// iteration (CLIENT LIST / KILL, ACL revoke) — the old intrusive list is gone.
+// Registry of THIS THREAD's live connections: an id→Weak!Conn index. It is the
+// single source of truth for both O(1) lookup (CLIENT UNBLOCK, tracking redirect)
+// and iteration (CLIENT LIST / KILL, ACL revoke) — the old intrusive list is gone.
 // Each connection lives in a Shared!Conn owned by its serveClient fiber; the
 // registry holds a WEAK observer, so a cross-fiber user resolves it via lock()
 // and keeps the Conn (and its RAII resources) alive for the duration of the
-// access — the UAF that killed tracking is impossible by construction. All
-// access is on the single event-loop thread, so the counts need no atomics.
-private __gshared Dict!(Weak!Conn) gConnById; // keyed by the id's raw 8 bytes
+// access — the UAF that killed tracking is impossible by construction.
+//
+// THREAD-LOCAL, not __gshared: under thread-per-shard every listener thread
+// registers its own conns, and an unsynchronized shared HashMap means concurrent
+// rehash → double-free (caught by ASan; as `__gshared` this was the shards>1
+// crash). Share-nothing like everything else on the serve path: a shard resolves
+// only its OWN clients — a cross-shard id is simply not found, the same v1
+// same-shard scope MULTI/blocking/tracking already have (SHARDING.md).
+private Dict!(Weak!Conn) tConnById; // keyed by the id's raw 8 bytes
 
-// The 8 raw bytes of a client id, used as the gConnById key (HashMap.set dups it).
+// The 8 raw bytes of a client id, used as the tConnById key (HashMap.set dups it).
 private const(char)[] connIdKey(ref const ulong id) @nogc nothrow @trusted
 {
     return (cast(const(char)*)&id)[0 .. ulong.sizeof];
@@ -633,32 +668,32 @@ private const(char)[] connIdKey(ref const ulong id) @nogc nothrow @trusted
 /// cannot be freed under a yield.
 private Shared!Conn connById(ulong id) nothrow @trusted
 {
-    if (auto w = gConnById.get(connIdKey(id)))
+    if (auto w = tConnById.get(connIdKey(id)))
         return w.lock();
     return Shared!Conn.init;
 }
 
 private void registerConn(ref Shared!Conn sc) @nogc nothrow
 {
-    gConnById.set(connIdKey(sc.get().id), sc.weaken());
+    tConnById.set(connIdKey(sc.get().id), sc.weaken());
     gConnectedClients++;
 }
 
 private void unregisterConn(ulong id) @nogc nothrow
 {
-    if (gConnById.remove(connIdKey(id)))
+    if (tConnById.remove(connIdKey(id)))
         gConnectedClients--;
 }
 
 /// Snapshot every live connection's id into `outv`. Iterating the registry
 /// directly while killing/closing conns is unsafe (tcp.close may yield and let a
-/// target fiber unregister mid-iteration, mutating gConnById). Callers walk the
+/// target fiber unregister mid-iteration, mutating tConnById). Callers walk the
 /// id snapshot and re-resolve each via connById() (which returns a strong lock),
 /// so a conn that died in the meantime is simply skipped and the one being acted
 /// on is kept alive by its lock. ids are monotonic, so there is no ABA reuse.
 private void snapshotConnIds(ref Vector!ulong outv) nothrow @trusted
 {
-    foreach (key, ref w; gConnById)
+    foreach (key, ref w; tConnById)
         if (key.length == ulong.sizeof)
             outv.put(*cast(const(ulong)*) key.ptr);
 }
@@ -674,9 +709,15 @@ private void snapshotConnIds(ref Vector!ulong outv) nothrow @trusted
 // Delivery resolves the target through the Weak!Conn registry (connById -> a
 // strong lock) so the target Conn stays alive across the push — the Phase-C
 // guarantee is what makes this safe from another fiber's write path.
-private __gshared Dict!(Dict!Unit) gInvalTable; // default mode: key -> conn-id set
-private __gshared Dict!Unit gBcastConns; // bcast mode: conn-id set
-private __gshared size_t gTrackCount; // # tracking conns (the unlikely gate)
+// THREAD-LOCAL (share-nothing rule, whole tracking group): tracking is v1
+// SHARD-LOCAL — a shard invalidates its own tracking clients for writes IT
+// executes (hopped writes run on the key's owner thread, so a same-shard tracker
+// sees them; a tracker on another shard does NOT — SHARDING.md gap, 2b hop fix).
+// As __gshared these Dicts were rehash double-frees across listener threads, and
+// delivery resolves through tConnById (thread-local) anyway.
+private Dict!(Dict!Unit) gInvalTable; // default mode: key -> conn-id set
+private Dict!Unit gBcastConns; // bcast mode: conn-id set
+private size_t gTrackCount; // # tracking conns (the unlikely gate)
 
 // Append a single-key (or null = FLUSHALL/FLUSHDB "everything") invalidation
 // frame to `o`, framed by the TARGET's protocol: a RESP3 client gets an
@@ -789,14 +830,14 @@ private void trackRecordKey(ref Conn c, scope const(char)[] key) nothrow
 // Default mode uses group ""; BCAST uses the matching prefix. Flushed (delivered)
 // at the top-level command boundary — after the command's own reply is staged so
 // a self-push trails it.
-private __gshared Dict!(Dict!Unit) gPend;
+private Dict!(Dict!Unit) gPend; // TLS: tracking group (see gInvalTable — shard-local v1)
 // BCAST keys written this command (raw). Which bcast client/prefix each belongs to
 // is resolved at flush (connById is not @nogc, but the expiry accumulation path is).
-private __gshared Dict!Unit gBcastPendingKeys;
+private Dict!Unit gBcastPendingKeys; // TLS: tracking group (shard-local v1)
 // Keys invalidated by a SERVER-caused event (expiry) this cycle. NOLOOP suppresses
 // keys the CLIENT modified, but not these — so an expiry of a key the client also
 // wrote in the same command still reaches it. Cleared at flush.
-private __gshared Dict!Unit gExpireKeys;
+private Dict!Unit gExpireKeys; // TLS: tracking group (shard-local v1)
 
 private void pendAdd(ulong id, scope const(char)[] group, scope const(char)[] key) @nogc nothrow @trusted
 {
@@ -1138,7 +1179,10 @@ private struct WaiterQ
     }
 }
 
-private __gshared Dict!WaiterQ[NUM_DBS] gWaiters;
+// THREAD-LOCAL (share-nothing rule): blocking is v1 same-shard — each shard
+// parks/wakes its own conns against its own keyspace writes (a __gshared Dict
+// here is the same rehash double-free class as the conn registry was).
+private Dict!WaiterQ[NUM_DBS] gWaiters;
 
 // Is the connection still usable to receive a wakeup? (peer may have vanished
 // while its fiber was parked — never fire at a dead conn.)
@@ -1705,11 +1749,29 @@ private __gshared shared(TaskPool)[] gShardPools; // keep the worker pools alive
 // the TaskPool worker's event loop then serves its connections + drains.
 private void shardThreadEntry(uint sid, ushort port) nothrow
 {
-    import dreads.shard : tShard;
+    import dreads.shard : tShard, pinShardThread;
     import dreads.alloc : gAllocShard;
 
     tShard = sid;
     gAllocShard = sid; // route this thread's allocations to its own share-nothing slot
+    if (gConfig.shardPin)
+        pinShardThread(sid);
+    {
+        // this thread's PRNG stream (TLS): distinct from every other shard's
+        import dreads.rand : seedRand;
+        import dreads.stream : nowMs;
+
+        seedRand(nowMs() ^ (ulong(sid) * 0x9E37_79B9_7F4A_7C15UL));
+    }
+    // this thread's wake events (TLS: LocalManualEvent is same-thread-only; the
+    // main thread's pair is created at boot — see runServer)
+    try
+    {
+        gKeyActivity = createManualEvent();
+        gPauseEvt = createManualEvent();
+    }
+    catch (Exception)
+        assert(false, "shard thread event alloc failed");
     version (Windows)
         enum sopts = TCPListenOptions.reuseAddress;
     else
@@ -1728,10 +1790,12 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
 // existing listenTCP); shards 1..N-1 get their own worker thread + listener.
 private void startShards(ushort port) nothrow
 {
-    import dreads.shard : gShardCount, tShard;
+    import dreads.shard : gShardCount, tShard, pinShardThread;
     import vibe.core.taskpool : TaskPool;
 
     tShard = 0;
+    if (gConfig.shardPin)
+        pinShardThread(0); // shard 0 = the main thread
     runTask(() nothrow { shardDrainLoop(); }); // shard 0's drain fiber (main thread)
     try
         foreach (i; 1 .. gShardCount)
@@ -1772,7 +1836,11 @@ private void serveClient(TCPConnection tcp) nothrow
     }
     c.connMs = nowMs(); // for CLIENT LIST age=/idle=
     c.lastActiveMs = c.connMs;
-    c.id = ++gClientIds;
+    {
+        import core.atomic : atomicFetchAdd;
+
+        c.id = atomicFetchAdd(gClientIds, 1) + 1;
+    }
     // sharded: this connection reads/writes THIS thread's shard keyspace (DB-0-only);
     // unsharded: the classic 16-DB gDbs[0]. myKeyspace() reads tShard (thread-local),
     // so a conn served on shard-thread T binds to shard T's data.
@@ -4486,12 +4554,12 @@ private void configInfo(const(RVal)[] pats, ref ByteBuffer o) nothrow
 
 import dreads.mem : usedMemory; // jemalloc accounting (shared with INFO)
 
-private __gshared size_t gEvictCursor;
+private size_t gEvictCursor; // TLS: eviction walks THIS shard's keyspace only
 
 // Set when an expiry/eviction DEL was tryPut to the raft proposal queue (which
 // skips the consumer wake to stay @nogc); the periodic timer nudges the consumer
 // to drain them. Avoids waking the raft loop when nothing is pending.
-private __gshared bool gExpireDelPending;
+private bool gExpireDelPending; // TLS: per-shard active-expire state
 
 /// Approximate LRU eviction: sample live keys, evict the coldest, repeat.
 /// Returns false when memory stays over the limit (noeviction, or nothing
@@ -4704,7 +4772,7 @@ private struct MigrateSock
     bool alive;
 }
 
-private __gshared MigrateSock[8] gMigrateCache;
+private MigrateSock[8] gMigrateCache; // TLS: a socket may only be used by its opening thread
 private enum ulong MIGRATE_IDLE_MS = 10_000; // release a cached socket after 10s idle
 
 public size_t migrateCachedCount() @nogc nothrow
