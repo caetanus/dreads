@@ -583,8 +583,17 @@ bool replyOff, replySkipNext, replyCmdExempt;
     // per touched shard at the flush point — cuts cross-thread futex wakeups ~Nx. Only
     // tracks shards < 64; a rare higher shard id wakes immediately (see shardFire).
     ulong shardTouch;
-    // per-connection scratch for the compiled cross-shard hop descriptor (must survive
-    // a shardEnqueue backpressure yield, so per-conn not a shared static).
+    // HOP COALESCING: per-owner staging buffers. A pipeline batch's commands to
+    // the SAME owner accumulate here and travel as ONE ring slot at the flush
+    // point (one contiguous copy, one cross-core line handoff, one wake) instead
+    // of one slot each — the per-hop cycle cost is cache-line TRANSFER latency
+    // (measured growing 1030→2840 cyc/hop from 2 to 8 shards while instructions
+    // stayed flat), and it amortizes exactly like syscalls under pipelining.
+    // Indexed by owner shard; 64 mirrors the shardTouch wake bitmap (an owner
+    // >= 64 is fired unbatched, same as its wake). Per-conn, not a shared
+    // static: staging must survive a backpressure yield inside the flush.
+    ByteBuffer[64] hopBatch;
+    // scratch for the rare unbatched fire (owner >= 64, outside the bitmaps)
     ByteBuffer shardBc;
     // Async output, engaged on first (P)SUBSCRIBE (see PUBSUB.md fan-out): once
     // `subMode` is set, all output (replies and pub/sub messages) is enqueued on
@@ -1603,39 +1612,82 @@ private void shardDrainLoop() nothrow
 
     static ByteBuffer reply; // execute scratch (owner side)
     static Arena arena;
+    // COALESCED replies: per-requester staging (TLS — one set per shard thread).
+    // A drain pass executes K commands from many batches; the replies for each
+    // requester accumulate here and ship as ONE ring slot per requester at the
+    // end of the pass (with its single wake) — the return path amortizes its
+    // cross-core line handoffs exactly like the command path does. Section form:
+    //   [u32 bytes][u64 pending][reply bytes]
+    static ByteBuffer[64] replyBatch;
     // Process one message straight from the ring slice `p` (zero-copy):
-    //   cmd   → parse + dispatch on MY keyspace, ship the reply back to the requester
-    //           shard (meta) WITHOUT waking (batched via replyTouch), tag = its Pending.
-    //   reply → copy the bytes DIRECTLY into the requester's pending buffer (no
-    //           intermediate) and wake its connection fiber same-thread.
+    //   cmd   → walk the coalesced batch, dispatch each section on MY keyspace,
+    //           stage its reply for the requester shard (meta).
+    //   reply → walk the coalesced reply batch, fill each pending, same-thread.
     ulong replyTouch = void;
     void handle(scope const(ubyte)[] p, void* tag, ulong meta, uint kind) nothrow
     {
         if (cast(ShardMsg) kind == ShardMsg.cmd)
         {
-            arena.reset();
-            reply.clear();
-            RVal cmd;
-            // owner: rebuild from the descriptor — NO re-parse (the requester already
-            // parsed; this just slices). Falls to an error reply if malformed.
-            int opcode;
-            if (decodeHop(p, arena, cmd, opcode))
-                cast(void) dispatch(cmd, *myKeyspace(), reply, arena, 0, opcode);
-            else
-                repError(reply, "ERR shard: malformed bytecode hop");
-            shardEnqueue(cast(uint) meta, reply.data, tag, 0, ShardMsg.reply);
-            if (meta < 64)
-                replyTouch |= 1UL << meta;
-            else
-                shardWake(cast(uint) meta);
+            // owner: K commands in ONE slot; each section rebuilds by slicing
+            // and jumps by opcode (no re-parse, no name re-resolution)
+            size_t pos = 0;
+            while (pos < p.length)
+            {
+                arena.reset();
+                reply.clear();
+                RVal cmd;
+                int opcode;
+                void* pend;
+                if (decodeHopSection(p, pos, arena, cmd, opcode, pend))
+                    cast(void) dispatch(cmd, *myKeyspace(), reply, arena, 0, opcode);
+                else
+                {
+                    repError(reply, "ERR shard: malformed bytecode hop");
+                    pos = p.length; // poisoned batch: stop walking
+                }
+                if (meta < 64)
+                {
+                    // stage: [bytes][pending][reply] into the requester's batch
+                    auto rb = &replyBatch[cast(size_t) meta];
+                    immutable size_t sect = 12 + reply.length;
+                    auto space = rb.freeSpace(sect)[0 .. sect];
+                    *cast(uint*) space.ptr = cast(uint)(8 + reply.length);
+                    *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
+                    space[12 .. $] = reply.data[];
+                    rb.grow(sect);
+                    replyTouch |= 1UL << meta;
+                }
+                else // rare wide shard id: unbatched reply, immediate wake
+                {
+                    shardEnqueue(cast(uint) meta, reply.data, pend, 0, ShardMsg.reply);
+                    shardWake(cast(uint) meta);
+                }
+            }
         }
-        else // ShardMsg.reply — deliver straight into the waiting pending, same-thread
+        else // ShardMsg.reply — walk the coalesced batch, fill each pending
         {
-            auto pend = cast(ShardPending*) tag;
-            pend.reply.clear();
-            pend.reply.append(p);
-            pend.ready = true;
-            pend.done.emit();
+            if (tag !is null) // unbatched single (wide shard id): tag is the pending
+            {
+                auto pend = cast(ShardPending*) tag;
+                pend.reply.clear();
+                pend.reply.append(p);
+                pend.ready = true;
+                pend.done.emit();
+                return;
+            }
+            size_t pos = 0;
+            while (pos + 12 <= p.length)
+            {
+                immutable uint sect = *cast(const(uint)*)(p.ptr + pos);
+                if (sect < 8 || p.length - pos - 4 < sect)
+                    break; // malformed tail: drop (a pending never filled is a bug loud in tests)
+                auto pend = cast(ShardPending*)*cast(const(ulong)*)(p.ptr + pos + 4);
+                pend.reply.clear();
+                pend.reply.append(p[pos + 12 .. pos + 4 + sect]);
+                pend.ready = true;
+                pend.done.emit();
+                pos += 4 + sect;
+            }
         }
     }
 
@@ -1644,12 +1696,17 @@ private void shardDrainLoop() nothrow
         try
         {
             shardWaitInbound(); // park on the per-shard event ONLY when all lanes idle
-            replyTouch = 0; // requester shards we owe a single batched wake this pass
+            replyTouch = 0; // requester shards we owe a batch + single wake this pass
             cast(void) shardDrainOnce!handle();
-            // one cross-thread wake per requester shard we replied to this drain pass
+            // ship each requester's coalesced reply batch, then its ONE wake
             while (replyTouch)
             {
                 immutable s = cast(uint) bsf(replyTouch);
+                if (replyBatch[s].length)
+                {
+                    shardEnqueue(s, replyBatch[s].data, null, 0, ShardMsg.reply);
+                    replyBatch[s].clear();
+                }
                 shardWake(s);
                 replyTouch &= replyTouch - 1;
             }
@@ -1699,52 +1756,62 @@ private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int 
 // slicing, no parseValue. Wire form (all args are bulk strings, as every client
 // command is):  [u32 argc][ (u32 off, u32 len) × argc ][ raw command bytes ]
 // `off` is relative to the start of the raw bytes (== the requester's rawCmd).
-private void compileHop(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd,
-        int opcode) @trusted nothrow
+// Append ONE command as a SECTION of an owner's coalesced hop message:
+//   [u32 sectionBytes][u64 pending][u32 argc][i32 opcode][(u32 off,u32 len)×argc][raw]
+// `off` is relative to the section's own raw bytes. The pending pointer rides in
+// the section (the slot carries K commands, so the slot-level tag can't).
+private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(ubyte)[] rawCmd,
+        int opcode, void* pend) @trusted nothrow
 {
-    // HEADER ONLY — rawCmd is NOT appended here. The first cut concatenated
-    // [hdr][rawCmd] in this scratch buffer and shipped that, which copied the
-    // whole command TWICE (scratch, then ring slot) — measured: −170 ins/op
-    // but +2% cyc/op at shards=4 (the extra memcpy ate the parse win on Zen).
-    // Now the ring appends the two segments itself (shardEnqueue2/push2):
-    // one copy of rawCmd, same as the raw-RESP path, and the header is tiny
-    // (4 + 8·argc bytes, L1-hot).
-    bc.clear();
     immutable uint argc = cast(uint) cmd.arr.length;
-    // one reserve, then indexed stores through a typed slice (bounds carried
-    // by the slice) — an append per field would cost a reserve check + memcpy
-    // call each, 7 calls for a SET; this is 1.
-    immutable size_t hdrBytes = 8 + cast(size_t) argc * 8;
-    auto w = cast(uint[]) bc.freeSpace(hdrBytes)[0 .. hdrBytes];
-    w[0] = argc;
-    w[1] = cast(uint) opcode; // dispatch's integer-switch index — the owner
+    immutable size_t hdrBytes = 4 + 8 + 8 + cast(size_t) argc * 8;
+    immutable size_t sect = hdrBytes + rawCmd.length;
+    // one reserve for the whole section, then indexed stores through typed
+    // slices (bounds carried by the slice)
+    auto space = bc.freeSpace(sect)[0 .. sect];
+    auto w = cast(uint[]) space[0 .. 4];
+    w[0] = cast(uint)(sect - 4); // bytes after this length field
+    *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
+    auto h = cast(uint[]) space[12 .. hdrBytes];
+    h[0] = argc;
+    h[1] = cast(uint) opcode; // dispatch's integer-switch index — the owner
                               // never re-resolves the command name
     auto base = cast(const(char)*) rawCmd.ptr;
     size_t j = 2;
     foreach (ref a; cmd.arr)
     {
-        w[j++] = cast(uint)(a.str.ptr - base); // offset into rawCmd (same allocation)
-        w[j++] = cast(uint) a.str.length;
+        h[j++] = cast(uint)(a.str.ptr - base); // offset into rawCmd
+        h[j++] = cast(uint) a.str.length;
     }
-    bc.grow(hdrBytes);
+    space[hdrBytes .. $] = cast(const(ubyte)[]) rawCmd[];
+    bc.grow(sect);
 }
 
 // Owner side: rebuild the RVal from the descriptor + raw bytes (which live in the
 // ring slice `payload`, valid until the drain pops it — same lifetime parseValue's
 // zero-copy slices had). No framing scan, no validation loop.
-private bool decodeHop(scope const(ubyte)[] payload, ref Arena arena, out RVal cmd,
-        out int opcode) @trusted nothrow
+// Decode the section at `pos` of a coalesced hop message (see appendHopCmd),
+// advancing `pos` past it. The rebuilt slices point into the ring slice — valid
+// until the drain pops, exactly like the single-command descriptor was.
+private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref Arena arena,
+        out RVal cmd, out int opcode, out void* pend) @trusted nothrow
 {
-    if (payload.length < 8)
+    if (payload.length - pos < 4)
         return false;
-    immutable uint argc = *cast(const(uint)*) payload.ptr;
-    opcode = *cast(const(int)*)(payload.ptr + 4);
-    immutable size_t hdr = 8 + cast(size_t) argc * 8;
-    if (argc == 0 || payload.length < hdr)
+    immutable uint sect = *cast(const(uint)*)(payload.ptr + pos);
+    if (sect < 16 || payload.length - pos - 4 < sect)
         return false;
-    auto raw = payload[hdr .. $];
+    auto sec = payload[pos + 4 .. pos + 4 + sect];
+    pos += 4 + sect;
+    pend = cast(void*)*cast(const(ulong)*) sec.ptr;
+    immutable uint argc = *cast(const(uint)*)(sec.ptr + 8);
+    opcode = *cast(const(int)*)(sec.ptr + 12);
+    immutable size_t hdr = 16 + cast(size_t) argc * 8;
+    if (argc == 0 || sec.length < hdr)
+        return false;
+    auto raw = sec[hdr .. $];
     auto arr = arena.allocArray!RVal(argc);
-    auto offs = payload.ptr + 8;
+    auto offs = sec.ptr + 16;
     foreach (i; 0 .. argc)
     {
         immutable uint off = *cast(const(uint)*)(offs + i * 8);
@@ -1766,15 +1833,24 @@ private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
         acquireShardPending, ShardMsg;
 
     auto p = acquireShardPending();
-    // Enqueue WITHOUT waking; the owner is woken once at the flush point (batched).
-    compileHop(c.shardBc, cmd, rawCmd, opcode); // descriptor header only (see compileHop)
-    shardEnqueue2(cast(uint) owner, c.shardBc.data, rawCmd, cast(void*) p, tShard, ShardMsg.cmd);
     if (owner < 64)
+    {
+        // COALESCED: stage the command in this owner's batch buffer; the whole
+        // batch travels as ONE ring slot at the flush point (with the wakes).
+        appendHopCmd(c.hopBatch[owner], cmd, rawCmd, opcode, cast(void*) p);
         c.shardTouch |= 1UL << owner;
+    }
     else
-        shardWake(cast(uint) owner); // rare high shard id: can't batch, wake now
+    {
+        // rare high shard id (beyond the touch/batch bitmaps): fire a batch of
+        // one immediately, and wake now
+        c.shardBc.clear();
+        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, cast(void*) p);
+        shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.cmd);
+        shardWake(cast(uint) owner);
+    }
     if (c.shardPendCount == PIPELINE_CAP)
-        flushShardPending(c, o); // buffer full: reap in order, then continue
+        flushShardPending(c, o); // buffer full: flush batches + reap in order, then continue
     c.shardPends[c.shardPendCount++] = cast(void*) p;
 }
 
@@ -1785,17 +1861,24 @@ private void shardFire(ref Conn c, int owner, int opcode, const ref RVal cmd,
 // and the other connections.
 private void flushShardPending(ref Conn c, ref ByteBuffer o) nothrow
 {
-    import dreads.shard : ShardPending, releaseShardPending, shardWake;
+    import dreads.shard : ShardMsg, ShardPending, releaseShardPending, shardEnqueue,
+        shardWake, tShard;
     import core.bitop : bsf;
 
-    // First wake — once each — every owner shard this batch enqueued to, so they begin
-    // draining before we block on their replies (the batched cross-thread wake; skipped
-    // entirely for owners whose drain is already running).
+    // Ship every owner's staged batch as ONE ring slot, then wake — once each.
+    // The push must come first (a wake with an empty ring is a lost signal for
+    // commands still sitting in staging), and the whole batch travels in one
+    // cross-core cache-line handoff instead of one per command.
     auto t = c.shardTouch;
     c.shardTouch = 0;
     while (t)
     {
         immutable s = cast(uint) bsf(t);
+        if (c.hopBatch[s].length)
+        {
+            shardEnqueue(s, c.hopBatch[s].data, null, tShard, ShardMsg.cmd);
+            c.hopBatch[s].clear();
+        }
         shardWake(s);
         t &= t - 1;
     }
