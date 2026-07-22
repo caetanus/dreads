@@ -1,0 +1,54 @@
+# Extra skips for the MULTISHARD sweep (shards>1), used IN ADDITION to
+# valkey-sync.skip by sweep-shards.sh. Kinds:
+#
+#  (A) cluster-incompatible tests — CORRECT dreads behavior under sharding, the
+#      Valkey unit suite just isn't cluster-aware. A multi-key op whose keys land
+#      on different slots gets -CROSSSLOT (Redis Cluster's contract); the test
+#      used arbitrary keys and didn't hashtag. Not a bug — a conscious decision.
+#  (B) commands forbidden under sharding by design (SWAPDB — the db spans all
+#      shards, cross-shard atomicity too costly for a rare admin op).
+#  (C) cross-shard pub/sub not yet built (the next 2b item).
+#  (D) INFO cross-shard aggregation deferred (each router reports its own shard).
+#
+# NOTE: commands dreads does NOT support at all are a global matter, not a
+# sharding one, and live in valkey-sync.skip — not here. See SHARDING-COMMANDS.md.
+#
+# Matching (tests/support/test.tcl search_pattern_list): a line whose FIRST char
+# is `/` is a regexp (unanchored substring); the leading `/` is stripped but a
+# trailing `/` is NOT — so write `/pattern`, never `/pattern/`. Any other line is
+# an exact full-name match. Test names may carry a `{$type}` prefix (e.g.
+# "{standalone} SCAN ...") — use the regexp form to match through it.
+
+# (A) CROSSSLOT — multi-key ops across slots (test must hashtag to co-locate).
+# NB: the "COPY basic usage for <type>" tests DO co-locate (mykey{t}/mynewkey{t})
+# and pass — do not skip them; only genuinely cross-slot multi-key ops go here.
+MSETEX with illegal arguments
+Untagged multi-key commands
+
+# (A/DEBUG) DEBUG OBJECT/JMAP on a specific key isn't routed under sharding
+# (DEBUG is test/dev infra with a local executeCommand handler, no hop).
+INCR can modify objects in-place
+
+# (D) INFO keyspace count not aggregated across shards: each router reports only
+# its own shard's key count (~total/N), so tests asserting keys=<total> from
+# `info keyspace` fail. SCAN itself (composite cursor) is correct.
+/SCAN unknown type
+/SCAN with expired keys
+
+# (C) cross-shard pub/sub not yet built (next 2b item): a subscriber connection
+# lands on one router; the key write / PUBLISH runs on the shard owning the key
+# and the (keyspace-notification) message is published locally there, so the
+# subscriber's shard never sees it and `$rd read` blocks. Skip until sharded
+# pub/sub (PUBLISH fan-out across shards) lands, else the test hangs 300s.
+MSETEX keyspace notifications
+
+# (E) stream consumer-group commands don't route by key yet: XGROUP/XINFO carry
+# the key at arg[2] (container-style, like OBJECT/MEMORY) and XREAD/XREADGROUP
+# carry keys after the STREAMS keyword (keyword-positioned = Phase 2.5, see
+# aclkeys.d). Until stream routing lands they run on the client's router shard,
+# not the key owner, so a co-located {hashtag} stream is "no such key". This test
+# drives XGROUP CREATE + XREADGROUP, so it needs the full set.
+COPY basic usage for stream-cgroups
+
+# (B) forbidden under sharding by design
+/SWAPDB

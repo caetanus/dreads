@@ -1085,9 +1085,41 @@ enum int ROUTE_CROSSSLOT = -2;
 int commandRouteSlot(int i, scope const(char)[] lname, scope const(RVal)[] arr) @trusted nothrow @nogc
 {
     import dreads.slots : keyToSlot;
+    import dreads.aclcat : cmdIx;
 
     if (i < 0)
         return -1;
+    // CONTAINER commands whose key sits after the subcommand (arg[2]): OBJECT
+    // ENCODING/FREQ/IDLETIME/REFCOUNT and MEMORY USAGE — both supported
+    // (DRIFT.md), but the keyspec tables index them by the SUBCOMMAND name so the
+    // top-level route table sees them as keyless. Extract the key here → hop to
+    // its owner (else they run on the router's shard = "no such key" under shards).
+    {
+        static bool eqi(scope const(char)[] a, string b) @nogc nothrow
+        {
+            if (a.length != b.length)
+                return false;
+            foreach (k, ch; a)
+            {
+                immutable lc = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+                if (lc != b[k])
+                    return false;
+            }
+            return true;
+        }
+
+        bool keyed = false;
+        if (i == cmdIx!"object")
+            keyed = arr.length >= 3 && (eqi(arr[1].str, "encoding") || eqi(arr[1].str, "freq")
+                    || eqi(arr[1].str, "idletime") || eqi(arr[1].str, "refcount"));
+        else if (i == cmdIx!"memory")
+            keyed = arr.length >= 3 && eqi(arr[1].str, "usage");
+        // NOTE: DEBUG OBJECT is NOT routed — DEBUG has its own executeCommand
+        // handler that runs before the hop (test/dev infra; DRIFT treats DEBUG as
+        // stubs). Its cross-shard tests are skipped (blackbox/valkey-shard.skip).
+        if (keyed)
+            return cast(int) keyToSlot(arr[2].str);
+    }
     if (!gCmdMultiKey[i])
     {
         auto k = commandRouteKeyIx(i, lname, arr);

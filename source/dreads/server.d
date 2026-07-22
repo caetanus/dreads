@@ -1852,7 +1852,7 @@ enum BroadcastKind : ubyte
     sumInt, // DBSIZE / PUBLISH / *numsub — Σ of the :N replies
     gateOk, // FLUSHALL / FLUSHDB — +OK iff every shard replied +OK
     concatArr, // KEYS — one flat array = concat of the N arrays
-    firstNonNil, // RANDOMKEY — the first non-$-1 reply
+    randomNonNil, // RANDOMKEY — a RANDOM non-$-1 reply (uniform across shards)
 }
 
 // CTFE opcode → BroadcastKind (indexed by aclCmdIndex, like gRouteFirstKey).
@@ -1864,7 +1864,7 @@ private immutable BroadcastKind[gCmdCats.length] gBroadcastKind = () {
     t[cmdIx!"flushdb"] = BroadcastKind.gateOk; // clears each shard's current db
     t[cmdIx!"flushall"] = BroadcastKind.gateOk; // each shard clears its own 16 dbs
     t[cmdIx!"keys"] = BroadcastKind.concatArr;
-    t[cmdIx!"randomkey"] = BroadcastKind.firstNonNil;
+    t[cmdIx!"randomkey"] = BroadcastKind.randomNonNil;
     // deferred: publish (dual pub/sub delivery path) — see the pub/sub phase.
     return t;
 }();
@@ -2155,17 +2155,41 @@ private void mergeBroadcast(BroadcastKind kind, ShardPending*[] pend, ref ByteBu
                 o.append(d[body_ .. $]);
         }
         break;
-    case BroadcastKind.firstNonNil:
+    case BroadcastKind.randomNonNil:
+        // RANDOMKEY: each shard replied with one of its own keys at random (or
+        // nil if empty). Pick uniformly among the non-nil shard replies so the
+        // draw isn't biased toward the lowest-indexed shard. Not weighted by a
+        // shard's key count — same approximation Redis Cluster makes (it samples
+        // one node), good enough for a random-key probe.
+        import dreads.rand : randBelow;
+
+        static bool isNil(scope const(ubyte)[] d) @nogc nothrow
+        {
+            return !(d.length >= 3 && !(d[0] == '$' && d[1] == '-'));
+        }
+
+        size_t live = 0;
+        foreach (p; pend)
+            if (!isNil(p.reply.data))
+                live++;
+        if (live == 0)
+        {
+            o.append("$-1\r\n");
+            break;
+        }
+        size_t pick = randBelow(live);
         foreach (p; pend)
         {
             auto d = p.reply.data;
-            if (d.length >= 3 && !(d[0] == '$' && d[1] == '-')) // not $-1 (nil)
+            if (isNil(d))
+                continue;
+            if (pick == 0)
             {
                 o.append(d);
-                return;
+                break;
             }
+            pick--;
         }
-        o.append("$-1\r\n");
         break;
     }
 }

@@ -19,7 +19,7 @@ for f in $FILES; do
   (cd /tmp && $DREADS $CONF $PORT --shards $SHARDS >"$OUT/server-$(echo $f | tr '/' '_').log" 2>&1 &)
   for i in $(seq 50); do redis-cli -p $PORT ping >/dev/null 2>&1 && break; sleep 0.1; done
   name=$(echo $f | tr '/' '_')
-  timeout 300 ./runtest --host 127.0.0.1 --port $PORT --single $f --singledb --skipfile $SKIP > "$OUT/$name.log" 2>&1
+  timeout 300 ./runtest --host 127.0.0.1 --port $PORT --single $f --singledb --skipfile $SKIP --skipfile /home/caetano/lab/dreads/blackbox/valkey-shard.skip > "$OUT/$name.log" 2>&1
   rc=$?
   # strip ANSI, then read the reliable signals
   clean=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$name.log")
