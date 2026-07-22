@@ -252,6 +252,28 @@ public void shardEnqueue(uint dst, scope const(ubyte)[] payload, void* tag, ulon
     }
 }
 
+/// Two-segment shardEnqueue: the message is `hdr ~ payload`, appended straight into
+/// the ring slot (RingCore.push2) — no scratch-buffer concatenation, ONE copy of
+/// `payload`. Same SPSC/backpressure discipline as shardEnqueue.
+public void shardEnqueue2(uint dst, scope const(ubyte)[] hdr, scope const(ubyte)[] payload,
+        void* tag, ulong meta, ShardMsg k) nothrow
+{
+    import vibe.core.core : yield;
+
+    auto lane = &gInbound[dst].lanes[tShard]; // my SPSC lane to dst
+    for (;;)
+    {
+        if (lane.push2(hdr, payload, tag, meta, cast(uint) k))
+            return;
+        shardWake(dst); // full: let the consumer drain (never yield without a wake)
+        try
+            yield();
+        catch (Exception)
+        {
+        }
+    }
+}
+
 /// Wake shard `dst`'s drain if it is parked (a no-op if it is actively draining — the
 /// common case under load, so no syscall). Called ONCE per batch per touched shard.
 public void shardWake(uint dst) nothrow

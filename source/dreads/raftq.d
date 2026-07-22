@@ -115,6 +115,31 @@ struct RingCore
         return true;
     }
 
+    /// Producer: like push(), but the message is `hdr ~ payload` — two source
+    /// segments appended into the ONE slot buffer. Exists so a caller with a
+    /// small prefix (e.g. the bytecode-hop descriptor) doesn't have to build
+    /// `hdr ~ payload` in a scratch buffer first and pay a second full copy of
+    /// `payload` — the segments land in the slot directly, one copy each.
+    bool push2(scope const(ubyte)[] hdr, scope const(ubyte)[] payload, void* tag,
+            ulong meta, uint kind = 0) @nogc nothrow
+    {
+        const t = atomicLoad!(MemoryOrder.raw)(tail_); // producer owns tail
+        const h = atomicLoad!(MemoryOrder.acq)(head_); // see the consumer's progress
+        if (t - h > mask)
+            return false; // full
+        auto s = &slots[t & mask];
+        s.buf.clear();
+        if (hdr.length)
+            s.buf.append(hdr);
+        if (payload.length)
+            s.buf.append(payload);
+        s.tag = tag;
+        s.meta = meta;
+        s.kind = kind;
+        atomicStore!(MemoryOrder.rel)(tail_, t + 1); // publish (release the fill)
+        return true;
+    }
+
     /// Consumer: peek the head item. The returned slice stays valid until pop():
     /// the producer can't overwrite the head slot while it is held, because a
     /// write to that slot index needs occupancy == cap, which push() rejects.
