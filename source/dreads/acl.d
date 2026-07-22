@@ -1010,6 +1010,11 @@ const(char)[] commandRouteKey(scope const(char)[] lname, scope const(RVal)[] arr
     return commandRouteKeyIx(aclCmdIndex(lname), lname, arr);
 }
 
+int routeFirstKeyPos(int i) @trusted nothrow @nogc
+{
+    return (i >= 0 && i < cast(int) gRouteFirstKey.length) ? gRouteFirstKey[i] : ROUTE_FALLBACK;
+}
+
 /// commandRouteKey for a caller that ALREADY resolved the command index (the
 /// router resolves it once and reuses it as the hop opcode — see shardOwnerOf).
 const(char)[] commandRouteKeyIx(int i, scope const(char)[] lname,
