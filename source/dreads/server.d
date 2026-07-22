@@ -34,7 +34,7 @@ import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
     cmdWriteByIdx, cmdDenyOomByIdx, gScriptWritesHook, propagationOverride, parseLong, gWriteNoOp;
-import dreads.shard : sharded, myKeyspace;
+import dreads.shard : sharded, myKeyspace, ShardPending;
 import vibe.core.taskpool : TaskPool;
 import dreads.stats : gTotalErrorReplies, statErrorReply, resetErrorStats,
     gCmdStats, CmdStat, statCall, statRejected, resetCmdStats;
@@ -1832,6 +1832,185 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     return true;
 }
 
+// --- BROADCAST primitive (keyless keyspace-wide commands) ------------------------
+// A keyless command whose answer spans ALL shards (KEYS/DBSIZE/SCAN/FLUSH*/…) is
+// fired to every shard over the SAME hop transport; each shard runs it on its own
+// gShardKs[shard][db] (the drain's dispatch already does this — the partial reply),
+// and the router MERGES the N replies. This is Redis-cluster-shaped, but it is also
+// the fan-out core of the broker engine (pub/sub delivery, per-topic aggregation).
+
+enum BroadcastKind : ubyte
+{
+    none = 0, // not a broadcast command
+    sumInt, // DBSIZE / PUBLISH / *numsub — Σ of the :N replies
+    gateOk, // FLUSHALL / FLUSHDB — +OK iff every shard replied +OK
+    concatArr, // KEYS — one flat array = concat of the N arrays
+    firstNonNil, // RANDOMKEY — the first non-$-1 reply
+}
+
+// CTFE opcode → BroadcastKind (indexed by aclCmdIndex, like gRouteFirstKey).
+private immutable BroadcastKind[gCmdCats.length] gBroadcastKind = () {
+    import dreads.aclcat : cmdIx;
+
+    BroadcastKind[gCmdCats.length] t;
+    t[cmdIx!"dbsize"] = BroadcastKind.sumInt;
+    t[cmdIx!"flushdb"] = BroadcastKind.gateOk; // clears each shard's current db
+    t[cmdIx!"keys"] = BroadcastKind.concatArr;
+    t[cmdIx!"randomkey"] = BroadcastKind.firstNonNil;
+    // deferred: publish (dual pub/sub path), flushall (touches gDbs — needs the
+    // dispatch-side per-shard fix first) — see the pub/sub phase.
+    return t;
+}();
+
+BroadcastKind broadcastKindOf(int opcode) @nogc nothrow
+{
+    return (opcode >= 0 && opcode < cast(int) gBroadcastKind.length)
+        ? gBroadcastKind[opcode] : BroadcastKind.none;
+}
+
+// Fire `cmd` to EVERY shard (each runs it locally), collect the N replies, merge
+// them into `o` per `kind`. Blocks at the collect point like flushShardPending.
+private void broadcastCommand(ref Conn c, int opcode, uint db, const ref RVal cmd,
+        scope const(ubyte)[] rawCmd, BroadcastKind kind, ref ByteBuffer o) nothrow
+{
+    import dreads.shard : tShard, gShardCount, shardEnqueue, shardWake, ShardMsg,
+        ShardPending, acquireShardPending, releaseShardPending;
+
+    // any in-flight keyed hops must be reaped first — this reply comes after them
+    if (c.shardPendCount > 0)
+        flushShardPending(c, o);
+
+    immutable n = gShardCount;
+    ShardPending*[64] pend = void; // gShardCount <= MAX_SHARDS; 64 covers the wake bitmap
+    if (n > pend.length)
+    {
+        repError(o, "ERR broadcast: too many shards");
+        return;
+    }
+    // fire one single-section batch to each shard, carrying its own pending
+    foreach (uint sIdx; 0 .. n)
+    {
+        auto p = acquireShardPending();
+        pend[sIdx] = p;
+        c.shardBc.clear();
+        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, db, cast(void*) p);
+        shardEnqueue(sIdx, c.shardBc.data, null, tShard, ShardMsg.cmd);
+    }
+    foreach (uint sIdx; 0 .. n)
+        shardWake(sIdx);
+    // collect (block per pending; the drain fiber delivers while we wait)
+    foreach (uint sIdx; 0 .. n)
+    {
+        auto p = pend[sIdx];
+        while (!p.ready)
+        {
+            auto ec = p.done.emitCount;
+            if (p.ready)
+                break;
+            try
+                p.done.wait(ec);
+            catch (Exception)
+            {
+            }
+        }
+    }
+    // merge
+    mergeBroadcast(kind, pend[0 .. n], o);
+    foreach (uint sIdx; 0 .. n)
+        releaseShardPending(pend[sIdx]);
+}
+
+// Merge the N partial RESP replies into `o` according to `kind`.
+private void mergeBroadcast(BroadcastKind kind, ShardPending*[] pend, ref ByteBuffer o) nothrow
+{
+
+    final switch (kind)
+    {
+    case BroadcastKind.none:
+        break;
+    case BroadcastKind.sumInt:
+        long total = 0;
+        foreach (p; pend)
+            total += parseRespInt(p.reply.data);
+        repInt(o, total);
+        break;
+    case BroadcastKind.gateOk:
+        // propagate the first error, else +OK
+        foreach (p; pend)
+            if (p.reply.data.length && p.reply.data[0] == '-')
+            {
+                o.append(p.reply.data);
+                return;
+            }
+        repSimple(o, "OK");
+        break;
+    case BroadcastKind.concatArr:
+        // each reply is *M\r\n<M bulk strings>; emit *ΣM then all the bodies
+        long total = 0;
+        foreach (p; pend)
+            total += parseRespArrayLen(p.reply.data);
+        repArrayHeader(o, total < 0 ? 0 : total);
+        foreach (p; pend)
+        {
+            auto d = p.reply.data;
+            immutable body_ = respArrayBody(d);
+            if (body_ > 0 && body_ <= d.length)
+                o.append(d[body_ .. $]);
+        }
+        break;
+    case BroadcastKind.firstNonNil:
+        foreach (p; pend)
+        {
+            auto d = p.reply.data;
+            if (d.length >= 3 && !(d[0] == '$' && d[1] == '-')) // not $-1 (nil)
+            {
+                o.append(d);
+                return;
+            }
+        }
+        o.append("$-1\r\n");
+        break;
+    }
+}
+
+// Parse a leading RESP integer reply `:N\r\n` → N (0 on anything else).
+private long parseRespInt(scope const(ubyte)[] d) @nogc nothrow
+{
+    if (d.length < 3 || d[0] != ':')
+        return 0;
+    long v = 0;
+    bool neg = false;
+    size_t i = 1;
+    if (i < d.length && d[i] == '-')
+    {
+        neg = true;
+        i++;
+    }
+    for (; i < d.length && d[i] >= '0' && d[i] <= '9'; i++)
+        v = v * 10 + (d[i] - '0');
+    return neg ? -v : v;
+}
+
+// Parse a RESP array header `*M\r\n` → M (0 on anything else / empty).
+private long parseRespArrayLen(scope const(ubyte)[] d) @nogc nothrow
+{
+    if (d.length < 4 || d[0] != '*')
+        return 0;
+    long v = 0;
+    for (size_t i = 1; i < d.length && d[i] >= '0' && d[i] <= '9'; i++)
+        v = v * 10 + (d[i] - '0');
+    return v;
+}
+
+// Offset of the array BODY (past `*M\r\n`), or -1.
+private size_t respArrayBody(scope const(ubyte)[] d) @nogc nothrow
+{
+    foreach (i; 0 .. d.length - 1)
+        if (d[i] == '\r' && d[i + 1] == '\n')
+            return i + 2;
+    return 0;
+}
+
 private void shardFire(ref Conn c, int owner, int opcode, uint db, const ref RVal cmd,
         scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
 {
@@ -3459,6 +3638,17 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // them on the connection's own shard, see SHARDING.md.) Free when shards==1.
     int shardOpcode = -1; // the resolved command index, reused as the hop opcode
     immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname, shardOpcode) : -1;
+    // BROADCAST: a keyless keyspace-wide command (KEYS/DBSIZE/…) is fired to every
+    // shard and its N replies merged — before any local handling.
+    if (sharded())
+    {
+        immutable bk = broadcastKindOf(shardOpcode);
+        if (bk != BroadcastKind.none)
+        {
+            broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, bk, o);
+            return true;
+        }
+    }
     if (shardOwner < 0 && c.shardPendCount > 0)
         flushShardPending(c, o);
 
