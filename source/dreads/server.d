@@ -1608,6 +1608,7 @@ private void shardDrainLoop() nothrow
 {
     import dreads.shard : myKeyspace, ShardMsg, ShardPending, shardWaitInbound,
         shardDrainOnce, shardEnqueue, shardWake;
+    import dreads.det : refreshWall;
     import core.bitop : bsf;
 
     static ByteBuffer reply; // execute scratch (owner side)
@@ -1696,6 +1697,7 @@ private void shardDrainLoop() nothrow
         try
         {
             shardWaitInbound(); // park on the per-shard event ONLY when all lanes idle
+            refreshWall(); // one clock read per drain pass (owner dispatches hopped cmds)
             replyTouch = 0; // requester shards we owe a batch + single wake this pass
             cast(void) shardDrainOnce!handle();
             // ship each requester's coalesced reply batch, then its ONE wake
@@ -2220,10 +2222,12 @@ private void serveClient(TCPConnection tcp) nothrow
                 if (n == 0)
                     break;
                 inb.grow(n);
-                // Stamp activity ONCE per read (drives CLIENT LIST idle=). One
-                // clock read amortized over the whole pipeline batch — a per-command
-                // clock_gettime was a real throughput hit.
-                c.lastActiveMs = nowMs();
+                // ONE clock read per chunk, amortized over the whole pipeline
+                // batch (a per-command gettimeofday was a real hit): primes the
+                // coarse cache freezeClock() reads AND stamps activity (idle=).
+                import dreads.det : refreshWall;
+
+                c.lastActiveMs = refreshWall();
 
                 size_t pos = 0;
                 while (keep)
