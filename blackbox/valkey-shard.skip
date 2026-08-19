@@ -41,12 +41,9 @@ INCR can modify objects in-place
 # (E) MULTI/EXEC/WATCH under sharding — documented v1 gap (SHARDING.md "out of
 # scope"): EXEC hops its commands one at a time (yielding at each flush), so a
 # transaction is NOT atomic even same-slot (an owner-parked blocked client can
-# wake MID-transaction), queued blocking commands serve the router's local
-# keyspace, and the WATCH epoch is per-shard. Un-skip when same-slot MULTI
-# ships to the owner as a unit (phase 2.5c candidate).
-BRPOPLPUSH inside a transaction
-BLPOP inside a transaction
-BLMPOP_LEFT inside a transaction
+# wake MID-transaction), and the WATCH epoch is per-shard. Un-skip when
+# same-slot MULTI ships to the owner as a unit. (Blocking commands INSIDE a
+# transaction serve their one-shot form on the owner now — HOP_NOBLOCK.)
 PUSH resulting from BRPOPLPUSH affect WATCH
 BZPOPMIN unblock but the key is expired and then block again - reprocessing command
 BLPOP unblock but the key is expired and then block again - reprocessing command
