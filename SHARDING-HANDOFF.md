@@ -157,11 +157,48 @@ clean — if it re-appears, start there). Skip file gained (D) stats-not-aggrega
 NOTE: /tmp/valkey battery setup = valkey-9.1.0 tarball + `make MALLOC=libc valkey-server`,
 symlinked to /tmp/valkey (it lives in a session scratchpad — re-create after reboot).
 
-**NEXT — phase 2.5c candidates** (pick by broker-value): (c) cross-shard pub/sub
-(broker-critical), (d) INFO/stats aggregation (keyspace, used_memory, errorstats,
-commandstats, dirty — several (D) skips un-skip when it lands), (e) same-slot MULTI/EXEC
-shipped to the owner as a unit (un-skips the (E) category; Redis Cluster supports
-same-slot transactions). Original 2.5b note kept below for context:
+## 2.5c/2.5d — session 2026-08-19 (SAME session continued): ALL of (c), (d), (e) LANDED
+
+- `5534643` **(c) cross-shard pub/sub + per-shard maintenance**: PUBLISH/SPUBLISH broadcast
+  (sumInt, gated by the shared atomic `gSubTotal` — zero subscribers ⇒ :0 with no hop);
+  keyspace notifications / script publishes fan out via `ShardMsg.pub`; PUBSUB introspection
+  aggregates (unionArr/sumPairs/unionCount merges — NUMPAT ships pattern NAMES, a count
+  cannot be deduped). Pre-existing fixed: the drain never flushed pending notifications
+  (losses + stale-backlog dupes); active expire/eviction swept gDbs from the main thread
+  ONLY (nothing was reaped on any shard under sharding!) → per-shard 200ms/1s maintenance
+  timers over `myDbSlice()`; `gNotifyDb` was __gshared (cross-shard db-name races) → TLS.
+- `b7a4a5e` **(d) INFO/stats aggregation**: INFO broadcasts, `infoMerge` sums per-shard TLS
+  scalars, unions cmdstat_/errorstat_/dbN lines with fields summed (policy list in
+  `mergeInfoTexts`). The drain now counts commandstats/errorstats on the OWNER (hopped
+  commands were counted NOWHERE). CONFIG RESETSTAT broadcasts. CLIENT UNBLOCK honours the
+  Redis contract (unblock has HAPPENED at :1): direct cancel write + kick + DEFERRED :1 via
+  a watcher fiber (`ShardPending.genq` detects slot reuse). KEY LESSON: cross-LANE ordering
+  in the SPSC fabric is NOT FIFO — two shards' messages to a third can drain in either
+  order; any "A must be visible before B" contract needs the reply chain, not lane luck.
+- `1913718` blocking-in-MULTI/EXEC serves its one-shot form ON THE OWNER (`HOP_NOBLOCK`).
+- `6fda4b9` **(e) same-slot MULTI/EXEC ships as ONE atomic unit** (`ShardMsg.execBatch`):
+  owner drain executes sections back-to-back with no yield, write-tail + notify flush once
+  at the end (the "reprocessing" contract); DEBUG SLEEP allowed (sleeps the owner thread);
+  falls back to per-command replay for mixed owners / server-layer / restricted-ACL.
+
+**Sweep: ALL TEN suites green** @ shards=4 AND shards=1 (keyspace 46, scan 24, other 26,
+pubsub 34, incr 31, string 105, list 276, zset 321, stream 71, cgroups 51 — full baseline
+counts), spot-green @ shards=8. 576/0, LDC release ok.
+
+**Remaining correctness edges (all documented in blackbox/valkey-shard.skip):**
+(E) WATCH visibility (per-shard gWriteEpoch — a shared atomic would put a contended line
+on the per-write hot path; needs a per-slot/per-shard epoch check design), CLIENT LIST
+aggregation (1 test, upstream harness bug in its fail path), (F) valkey-9.1.0 drift
+(2 list-encoding tests + background-expire notification — fail at shards=1 too).
+Also still open globally: AOF under sharding (hopped writes never AOF — pre-existing),
+cross-shard client tracking, scripts/MIGRATE across shards, the ACL-on-owner hop contract.
+
+**NEXT — back to the PERF campaign on the fastbox** (this PC is too noisy): bytecode IR is
+the judged next structural step (see "The big structural idea" above). Re-measure the
+sharded ladder first — this session added per-write drain work (stats + write-tail) and
+hop bits; the arbiter is perf instructions/op, shards=1 must still equal baseline.
+
+Original 2.5b→2.5c note kept below for context:
 OLD — phase 2.5b = BLOCKING commands under sharding. The stream suites (baseline shards=1:
 71/0 + 51/0) fail under shards>1 ONLY on `XREAD`/`XREADGROUP` with `BLOCK`: the client parks on the
 ROUTER shard, but the wake (XADD) fires on the KEY-OWNER shard and never reaches the parked client →
