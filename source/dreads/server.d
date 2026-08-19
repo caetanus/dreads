@@ -1834,6 +1834,97 @@ private void shardDrainLoop() nothrow
             {
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.execBatch)
+        {
+            // Same-slot transaction (phase 2.5d): execute ALL sections
+            // back-to-back — this loop never yields, so the transaction is
+            // ATOMIC on this shard — then fire wakes/notifications ONCE at the
+            // end (a parked blocker must not wake mid-transaction). One reply
+            // (the concatenated per-command replies) answers the single pending.
+            import dreads.aclcat : cmdIx;
+            import dreads.commands : cmdWriteByIdx;
+
+            reply.clear();
+            void* pend0 = null;
+            bool anyWrite = false;
+            uint db0 = 0;
+            size_t pos = 0;
+            Conn cx; // synthetic: serves blocking sections' one-shot form
+            cx.remoteBlock = true;
+            cx.inExec = true;
+            cx.authed = true;
+            while (pos < p.length)
+            {
+                arena.reset();
+                RVal cmd;
+                int opcode;
+                uint db;
+                bool blocking, resp3, noblock;
+                void* pend;
+                if (!decodeHopSection(p, pos, arena, cmd, opcode, db, blocking,
+                        resp3, noblock, pend))
+                {
+                    repError(reply, "ERR shard: malformed exec batch");
+                    break;
+                }
+                if (pend0 is null)
+                    pend0 = pend;
+                db0 = db;
+                cx.dbp = myKeyspace(db);
+                cx.resp3 = resp3;
+                cx.remotePend = cast(ShardPending*) pend0;
+                gRespProto = resp3 ? 3 : 2;
+                gWriteNoOp = false;
+                immutable errPrev = gTotalErrorReplies;
+                immutable ob = reply.length;
+                if (blocking)
+                {
+                    // one-shot serve on OUR keyspace (cx.inExec ⇒ never parks);
+                    // stats come from statBlockingReply inside the switch
+                    auto name = cmd.arr[0].str;
+                    char[16] nbuf = void;
+                    bool served = false;
+                    if (name.length <= nbuf.length)
+                    {
+                        foreach (i2, ch; name)
+                            nbuf[i2] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+                        served = serveBlockingSwitch(cx,
+                                cast(const(char)[]) nbuf[0 .. name.length], cmd,
+                                reply, arena);
+                    }
+                    if (!served)
+                        cast(void) dispatch(cmd, *myKeyspace(db), reply, arena);
+                }
+                else if (opcode == cmdIx!"debug")
+                    debugCmd(cx, cmd.arr[1 .. $], reply); // SLEEP only (see router)
+                else
+                {
+                    cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
+                    immutable errored = reply.length > ob && reply.data[ob] == '-';
+                    if (errored && gTotalErrorReplies == errPrev)
+                        statErrorReply(cast(const(char)[]) reply.data[ob .. $]);
+                    statCall(opcode, errored);
+                }
+                if (cmdWriteByIdx(opcode) && !gWriteNoOp
+                        && !(reply.length > ob && reply.data[ob] == '-'))
+                {
+                    gWriteEpoch++;
+                    anyWrite = true;
+                }
+            }
+            if (anyWrite)
+            {
+                cast(void) gKeyActivity.emit();
+                signalReadyKeys(cast(int) db0, *myKeyspace(db0));
+            }
+            if (gNotifyFlags)
+                flushPendingNotify();
+            if (pend0 !is null)
+            {
+                shardEnqueue(cast(uint) meta, reply.data, pend0, 0, ShardMsg.reply);
+                shardWake(cast(uint) meta);
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.pub)
         {
             // cross-shard keyspace notification / script publish (phase 2.5c):
@@ -3175,6 +3266,117 @@ private void flushShardPending(ref Conn c, ref ByteBuffer o) nothrow
     c.shardPendCount = 0;
 }
 
+// Ship a same-slot transaction to its key-owner shard as ONE unit (phase
+// 2.5d): the drain executes the queued sections back-to-back with no yield —
+// ATOMIC on the owner — and fires wakes/notifications once, at the end (a
+// blocked client must not wake mid-transaction; its key may expire before the
+// transaction finishes — the "reprocessing" contract). Returns false when the
+// transaction cannot ship: keys span owners or slots, a keyless/server-layer
+// command is queued (only DEBUG SLEEP is allowed through — it sleeps the
+// owner's thread exactly like Redis's whole-server stall), a restricted user
+// needs the per-slot ACL re-check, or the owner is this very shard.
+private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) nothrow
+{
+    import dreads.acl : aclCmdIndex;
+    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+        shardEnqueue, shardWake, ShardMsg;
+
+    if (c.multiCount == 0)
+        return false;
+    if (gAclActive && c.user !is null && !c.user.root.allKeys)
+        return false; // per-command replay re-checks key ACL per slot
+    int owner = -1;
+    {
+        // pass 1: classify every queued command and find the single owner
+        size_t qpos = 0;
+        foreach (_; 0 .. c.multiCount)
+        {
+            RVal qcmd;
+            if (parseValue(c.multiQueue.data, qpos, arena, qcmd) != ParseStatus.ok)
+                return false;
+            if (qcmd.type != RType.Array || qcmd.arr.length == 0)
+                return false;
+            auto name = qcmd.arr[0].str;
+            char[16] nbuf = void;
+            if (name.length > nbuf.length)
+                return false;
+            foreach (i, ch; name)
+                nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+            auto uname = cast(const(char)[]) nbuf[0 .. name.length];
+            switch (uname)
+            {
+            case "DEBUG":
+                if (qcmd.arr.length < 2 || !eqICDebug(qcmd.arr[1].str, "SLEEP"))
+                    return false;
+                continue; // keyless but shippable (see the drain's exec handler)
+            case "MIGRATE", "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO",
+                 "FCALL", "FCALL_RO":
+                return false; // keyed but server-layer — cannot run on the drain
+            default:
+                break;
+            }
+            int opc;
+            immutable so = shardOwnerOf(qcmd, uname, opc);
+            if (so == SHARD_CROSSSLOT || so < 0)
+                return false; // cross-slot, or keyless/server-layer
+            if (owner < 0)
+                owner = so;
+            else if (owner != so)
+                return false;
+        }
+    }
+    if (owner < 0 || cast(uint) owner == tShard)
+        return false;
+    // pass 2: encode the whole transaction as one coalesced batch
+    auto p = acquireShardPending();
+    c.shardBc.clear();
+    {
+        size_t qpos = 0;
+        foreach (_; 0 .. c.multiCount)
+        {
+            RVal qcmd;
+            immutable size_t qs = qpos;
+            cast(void) parseValue(c.multiQueue.data, qpos, arena, qcmd);
+            auto name = qcmd.arr[0].str;
+            char[16] nbuf = void;
+            foreach (i, ch; name)
+                nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+            auto uname = cast(const(char)[]) nbuf[0 .. name.length];
+            uint flags = c.resp3 ? HOP_RESP3 : 0;
+            int opc;
+            if (uname == "DEBUG")
+                opc = aclCmdIndex("debug");
+            else
+            {
+                cast(void) shardOwnerOf(qcmd, uname, opc);
+                if (isBlockingHopForm(uname, qcmd.arr[1 .. $]))
+                    flags |= HOP_BLOCKING | HOP_NOBLOCK; // one-shot form on the owner
+            }
+            appendHopCmd(c.shardBc, qcmd, c.multiQueue.data[qs .. qpos],
+                    cast(int)(cast(uint) opc | flags), cast(uint) c.dbp.db, cast(void*) p);
+        }
+    }
+    shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.execBatch);
+    shardWake(cast(uint) owner);
+    // synchronous wait: every section is one-shot (HOP_NOBLOCK), so the batch
+    // completes in bounded time (DEBUG SLEEP included — it bounds itself)
+    while (!p.ready)
+    {
+        immutable ec = p.done.emitCount;
+        if (p.ready)
+            break;
+        try
+            p.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    repArrayHeader(o, c.multiCount);
+    o.append(p.reply.data);
+    releaseShardPending(p);
+    return true;
+}
+
 // Should this command hop to its key-owner shard as a BLOCKING serve (phase
 // 2.5b)? True for the pop family always (arg errors are surfaced by the owner)
 // and for XREAD/XREADGROUP only when a BLOCK keyword is present. Over-marking
@@ -4257,6 +4459,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 repNullArray(o); // aborted EXEC: RESP3 null
                 return true;
             }
+            // Same-slot transaction whose keys live on a REMOTE owner: ship it
+            // as ONE atomic unit (phase 2.5d). Falls through to the per-command
+            // replay when it cannot (mixed owners, server-layer commands,
+            // restricted ACL) — the documented non-atomic v1 behavior.
+            if (sharded() && shardExecAsUnit(c, o, arena))
+                return true;
             repArrayHeader(o, c.multiCount);
             size_t qpos = 0;
             bool keep = true;
