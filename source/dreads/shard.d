@@ -179,6 +179,11 @@ public enum ShardMsg : uint
 {
     cmd = 0,
     reply = 1,
+    // A requester cancelled a remote BLOCKING hop (phase 2.5b): the owner's
+    // drain emits its gKeyActivity so parked XREAD/XREADGROUP fibers re-check
+    // their pending's cancel flag NOW instead of on a poll tick. (The pop
+    // family polls at the block tick and needs no kick.)
+    blockKick = 2,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which
@@ -193,6 +198,14 @@ public struct ShardPending
     ByteBuffer reply;
     LocalManualEvent done;
     bool ready;
+    // Cross-thread CANCEL of a remote BLOCKING hop (phase 2.5b, see server.d
+    // shardFireBlocking / remoteBlockServe): written by the REQUESTER thread
+    // (atomicStore), polled by the owner's parked fiber (atomicLoad) at its
+    // block tick. 0 = none, 1 = peer disconnected, 2 = CLIENT UNBLOCK (TIMEOUT
+    // reply), 3 = CLIENT UNBLOCK ERROR (-UNBLOCKED). The owner ALWAYS replies
+    // after observing a cancel (within one tick), so the handshake completes and
+    // the requester never releases a slot the owner may still touch.
+    shared ubyte cancel;
     ShardPending* next; // thread-local free-list link (no per-op alloc)
 }
 
@@ -217,9 +230,12 @@ public ShardPending* acquireShardPending() nothrow @trusted
     auto p = tPendFree;
     if (p !is null)
     {
+        import core.atomic : atomicStore;
+
         tPendFree = p.next;
         p.ready = false;
         p.reply.clear();
+        atomicStore(p.cancel, cast(ubyte) 0); // reused slot: clear any stale cancel
         return p;
     }
     p = new ShardPending;

@@ -24,6 +24,9 @@
 # and pass — do not skip them; only genuinely cross-slot multi-key ops go here.
 MSETEX with illegal arguments
 Untagged multi-key commands
+# untagged `r del myzset myzset2 myzset3` at the top (upstream {cluster:skip});
+# the raw error aborts the whole file, so skipping is load-bearing
+BZMPOP should not blocks on non key arguments - #10762
 
 # (A/DEBUG) DEBUG OBJECT/JMAP on a specific key isn't routed under sharding
 # (DEBUG is test/dev infra with a local executeCommand handler, no hop).
@@ -35,6 +38,24 @@ INCR can modify objects in-place
 /SCAN unknown type
 /SCAN with expired keys
 
+# (D) INFO errorstats not aggregated across shards: the blocked XREADGROUP is
+# correctly woken with -NOGROUP (that part passes), but the error is counted on
+# the key-owner shard's TLS errorstats while the test's `r` connection reads
+# INFO on its own router. Un-skip when INFO aggregation lands.
+XGROUP DESTROY should unblock XREADGROUP with -NOGROUP
+# rdb_changes_since_last_save: the pop effect dirties the key-OWNER shard while
+# the test's connection reads INFO on its own router
+BLPOP/BLMOVE should increase dirty
+# commandstats: a hopped blocking command is counted on the key-owner shard
+# (statBlockingReply runs in the owner's fiber) while the test reads its own
+# router's INFO commandstats
+Blocking command accounted only once in commandstats
+Blocking command accounted only once in commandstats after timeout
+# used_memory: per-shard allocator stat — the key lives on the owner shard, the
+# test's router (idle at higher N) reports ~0 (surfaces at shards=8)
+Test LPUSH and LPOP on plain nodes
+Test LREM on plain nodes
+
 # (C) cross-shard pub/sub not yet built (next 2b item): a subscriber connection
 # lands on one router; the key write / PUBLISH runs on the shard owning the key
 # and the (keyspace-notification) message is published locally there, so the
@@ -44,3 +65,26 @@ MSETEX keyspace notifications
 
 # (B) forbidden under sharding by design
 /SWAPDB
+
+# (E) MULTI/EXEC/WATCH under sharding — documented v1 gap (SHARDING.md "out of
+# scope"): EXEC hops its commands one at a time (yielding at each flush), so a
+# transaction is NOT atomic even same-slot (an owner-parked blocked client can
+# wake MID-transaction), queued blocking commands serve the router's local
+# keyspace, and the WATCH epoch is per-shard. Un-skip when same-slot MULTI
+# ships to the owner as a unit (phase 2.5c candidate).
+BRPOPLPUSH inside a transaction
+BLPOP inside a transaction
+BLMPOP_LEFT inside a transaction
+PUSH resulting from BRPOPLPUSH affect WATCH
+BZPOPMIN unblock but the key is expired and then block again - reprocessing command
+BLPOP unblock but the key is expired and then block again - reprocessing command
+# also (D)-flavored: asserts `r client list` sees a conn on ANOTHER router
+# (CLIENT LIST is per-router); its fail path has a harness bug ($cmd undefined)
+# that ABORTS the file, so skipping is load-bearing
+BRPOPLPUSH does not affect WATCH while still blocked
+
+# (F) NOT sharding: fail identically at shards=1 (valkey-9.1.0 suite drift,
+# tracked in the main blackbox TODO). Skipped here so the multishard sweep's
+# verdict flags only sharding gaps.
+List listpack -> quicklist encoding conversion
+List encoding conversion when RDB loading

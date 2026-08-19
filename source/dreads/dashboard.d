@@ -81,6 +81,7 @@ private ulong sumCalls(const(string)[] names) @nogc nothrow
 // Build the compact metrics JSON into `dst`; returns bytes written (0 on error).
 private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patterns) @nogc nothrow
 {
+    import core.atomic : atomicLoad, MemoryOrder;
     import core.stdc.stdio : snprintf;
     import dreads.stats : gCmdStats;
     import dreads.obj : gDbs, NUM_DBS, gExpiredKeys, gEvictedKeys, gConnectedClients,
@@ -100,7 +101,8 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
         ~ `"expired":%llu,"evicted":%llu,"cmds":%llu,"keys":%llu,"str":%llu,`
         ~ `"list":%llu,"stream":%llu,"pub":%llu,"channels":%zu,"patterns":%zu,"db":[`,
         cast(ulong) nowMs(), cast(ulong) usedMemory(), cast(ulong) gConfig.maxmemory,
-        cast(long) gConnectedClients, cast(long) gBlockedClients, cast(ulong) gExpiredKeys,
+        cast(long) gConnectedClients,
+        cast(long) atomicLoad!(MemoryOrder.raw)(gBlockedClients), cast(ulong) gExpiredKeys,
         cast(ulong) gEvictedKeys, total, keys, sumCalls(STR_CMDS), sumCalls(LIST_CMDS),
         sumCalls(STREAM_CMDS), cast(ulong) gPubMessages, channels, patterns);
     if (n < 0)

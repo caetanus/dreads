@@ -626,6 +626,13 @@ bool replyOff, replySkipNext, replyCmdExempt;
     // `unblockReq` is set by another client (1 = TIMEOUT reply, 2 = -UNBLOCKED).
     bool blocked;
     ubyte unblockReq;
+    // REMOTE BLOCKING (phase 2.5b): this Conn is a synthetic, fiber-local
+    // stand-in for a client parked from ANOTHER shard's router (see
+    // remoteBlockServe). It has no socket; the requester's liveness travels
+    // through remotePend.cancel, which connAlive/peerGone/blockWait map onto
+    // the normal block-loop exits.
+    bool remoteBlock;
+    ShardPending* remotePend;
     // CLIENT TRACKING (client-side caching invalidation). `tracking` gates it all
     // (mirrored by gTrackCount, the `unlikely` fast-path gate). Default mode: keys
     // the client READS are recorded in gInvalTable (key -> conn-id set); a later
@@ -1202,6 +1209,12 @@ private bool connAlive(Conn* c) nothrow
 {
     if (c is null)
         return false;
+    if (c.remoteBlock) // synthetic (no socket): alive until the requester cancels
+    {
+        import core.atomic : atomicLoad;
+
+        return atomicLoad(c.remotePend.cancel) == 0;
+    }
     try
         return c.tcp.connected;
     catch (Exception)
@@ -1222,6 +1235,12 @@ private bool peerGone(Conn* c) nothrow
 
     if (c is null)
         return true;
+    if (c.remoteBlock) // synthetic: "peer gone" = the requester flagged a disconnect
+    {
+        import core.atomic : atomicLoad;
+
+        return atomicLoad(c.remotePend.cancel) == 1;
+    }
     try
     {
         if (!c.tcp.connected)
@@ -1333,7 +1352,9 @@ private void signalReadyKeys(int db, ref Keyspace ks) nothrow @trusted
 {
     import dreads.obj : gBlockedClients, ObjType;
 
-    if (gBlockedClients == 0 || gWaiters[db].length == 0)
+    import core.atomic : atomicLoad, MemoryOrder;
+
+    if (atomicLoad!(MemoryOrder.raw)(gBlockedClients) == 0 || gWaiters[db].length == 0)
         return;
     // collect keys first (signalKey/remove must not mutate during iteration)
     static const(char)[][256] buf;
@@ -1639,9 +1660,43 @@ private void shardDrainLoop() nothrow
                 RVal cmd;
                 int opcode;
                 uint db;
+                bool blocking, resp3;
                 void* pend;
-                if (decodeHopSection(p, pos, arena, cmd, opcode, db, pend))
-                    cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
+                if (decodeHopSection(p, pos, arena, cmd, opcode, db, blocking, resp3, pend))
+                {
+                    if (blocking)
+                    {
+                        // BLOCKING serve (phase 2.5b): never park the drain —
+                        // a fiber parks instead and replies on its own later.
+                        spawnRemoteBlock(cmd, cast(uint) meta,
+                                cast(ShardPending*) pend, db, resp3);
+                        continue;
+                    }
+                    import dreads.aclcat : cmdIx;
+                    import dreads.commands : cmdWriteByIdx;
+
+                    gRespProto = resp3 ? 3 : 2; // encode in the REQUESTER's protocol
+                    gWriteNoOp = false;
+                    if (opcode == cmdIx!"client")
+                    {
+                        // server-layer hop: only CLIENT UNBLOCK is broadcast
+                        // (see executeCommand); serve it on THIS shard's registry
+                        drainClientUnblock(cmd, reply);
+                    }
+                    else
+                        cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
+                    // The write-tail the LOCAL path runs after dispatch (see
+                    // executeCommand): wake THIS shard's parked blockers. The
+                    // wake must fire where the keyspace changed — without this a
+                    // blocked BLPOP/XREAD whose data arrives by hop never wakes.
+                    if (cmdWriteByIdx(opcode) && !gWriteNoOp && reply.length
+                            && reply.data[0] != '-')
+                    {
+                        gWriteEpoch++;
+                        cast(void) gKeyActivity.emit();
+                        signalReadyKeys(cast(int) db, *myKeyspace(db));
+                    }
+                }
                 else
                 {
                     repError(reply, "ERR shard: malformed bytecode hop");
@@ -1665,6 +1720,12 @@ private void shardDrainLoop() nothrow
                     shardWake(cast(uint) meta);
                 }
             }
+        }
+        else if (cast(ShardMsg) kind == ShardMsg.blockKick)
+        {
+            // a requester cancelled a remote block (phase 2.5b): wake the parked
+            // XREAD/XREADGROUP fibers so they observe the cancel flag NOW
+            cast(void) gKeyActivity.emit();
         }
         else // ShardMsg.reply — walk the coalesced batch, fill each pending
         {
@@ -1720,6 +1781,126 @@ private void shardDrainLoop() nothrow
     }
 }
 
+// Serve a broadcast CLIENT UNBLOCK section on THIS shard (phase 2.5b): look the
+// target id up in this thread's own conn registry and wake it if parked. The
+// requester already validated the form (see executeCommand); each shard replies
+// :1 (found + unblocked) or :0 and the sumInt merge yields the client's answer.
+// A locally-parked conn wakes via its blockEvt; a conn parked as a REQUESTER of
+// a remote block (shardFireBlocking) picks its unblockReq up at the next block
+// tick and cancels its remote park through the pending.
+private void drainClientUnblock(const ref RVal cmd, ref ByteBuffer reply) nothrow
+{
+    import dreads.commands : parseLong;
+    import dreads.stream : nowMs;
+
+    long id = 0;
+    cast(void) parseLong(cmd.arr[2].str, id);
+    immutable ubyte mode = cmd.arr.length == 4
+        && eqICDebug(cmd.arr[3].str, "ERROR") ? 2 : 1;
+    // CLIENT PAUSE holds blocked clients in place (see clientCmd's UNBLOCK)
+    immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
+    long unblocked = 0;
+    if (!paused && id >= 0)
+    {
+        auto s = connById(cast(ulong) id);
+        auto p = s.isNull ? null : &s.get();
+        if (p !is null && p.blocked)
+        {
+            p.unblockReq = mode;
+            if (p.blockEvtInit)
+                p.blockEvt.emit(); // wake it; the block loop honours unblockReq
+            unblocked = 1;
+        }
+    }
+    repInt(reply, unblocked);
+}
+
+// Copy a hopped BLOCKING command out of the transient ring slice and park a
+// fiber that serves it as a LOCAL blocking command on this owner shard (phase
+// 2.5b, see remoteBlockServe). Rare path: the GC alloc for the copy + task is
+// fine here (same class as acquireShardPending's pool growth).
+private void spawnRemoteBlock(const ref RVal cmd, uint reqShard, ShardPending* pend,
+        uint db, bool resp3) nothrow
+{
+    import dreads.shard : shardEnqueue, shardWake, ShardMsg;
+
+    // re-encode: the RVal's slices die when the drain pops the ring slot; the
+    // fiber owns a GC copy (also what roots it for the fiber's lifetime)
+    static ByteBuffer enc; // TLS: only the drain fiber runs here, no yield before dup
+    enc.clear();
+    repArrayHeader(enc, cmd.arr.length);
+    foreach (ref a; cmd.arr)
+        repBulk(enc, a.str);
+    auto bytes = enc.data.dup;
+    try
+        cast(void) runTask((ubyte[] by, uint rq, ShardPending* pd, uint dbx, bool r3) nothrow {
+            remoteBlockServe(by, rq, pd, dbx, r3);
+        }, bytes, reqShard, pend, db, resp3);
+    catch (Exception)
+    {
+        // spawn failed: reply an error so the requester never hangs
+        static ByteBuffer eb; // TLS, drain fiber only
+        eb.clear();
+        repError(eb, "ERR shard: blocking task spawn failed");
+        shardEnqueue(reqShard, eb.data, cast(void*) pend, 0, ShardMsg.reply);
+        shardWake(reqShard);
+    }
+}
+
+// Serve a hopped BLOCKING command on its key-owner shard, in its own fiber
+// (phase 2.5b). A synthetic Conn (remoteBlock=true) stands in for the remote
+// client, so the existing block machinery — gWaiters FIFO hand-off, the
+// gKeyActivity fan-out, blockWait's tick — runs UNCHANGED against this shard's
+// keyspace: the waiter and the wake are finally on the same thread. The
+// requester's liveness (peer gone / CLIENT UNBLOCK) travels through
+// pend.cancel; we ALWAYS reply — possibly empty on a disconnect — so the
+// pending handshake completes and the requester's fiber never leaks.
+private void remoteBlockServe(ubyte[] cmdBytes, uint reqShard, ShardPending* pend,
+        uint db, bool resp3) nothrow
+{
+    import dreads.shard : myKeyspace, shardEnqueue, shardWake, ShardMsg;
+
+    ByteBuffer reply;
+    Arena arena;
+    Conn c; // fiber-local stand-in; NEVER in the conn registry, has no socket
+    c.remoteBlock = true;
+    c.remotePend = pend;
+    c.dbp = myKeyspace(db);
+    c.resp3 = resp3;
+    gRespProto = resp3 ? 3 : 2; // entry-time forms (nil hoists) in the requester's proto
+    c.authed = true; // ACL ran on the requester before the hop (v1 hop contract)
+    // gWaiters entries hold Conn* into THIS stack frame — purge before it dies
+    scope (exit)
+        waitPurgeConn(&c);
+    RVal cmd;
+    size_t pos = 0;
+    bool served = false;
+    if (parseValue(cmdBytes, pos, arena, cmd) == ParseStatus.ok
+            && cmd.type == RType.Array && cmd.arr.length > 0)
+    {
+        auto name = cmd.arr[0].str;
+        char[16] nbuf = void;
+        if (name.length <= nbuf.length)
+        {
+            foreach (i, ch; name)
+                nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+            auto uname = cast(const(char)[]) nbuf[0 .. name.length];
+            served = serveBlockingSwitch(c, uname, cmd, reply, arena);
+            if (!served)
+            {
+                // predicate drift (e.g. XREAD with a malformed BLOCK form):
+                // plain one-shot dispatch on this owner's keyspace is correct
+                cast(void) dispatch(cmd, *c.dbp, reply, arena);
+                served = true;
+            }
+        }
+    }
+    if (!served)
+        repError(reply, "ERR shard: malformed blocking hop");
+    shardEnqueue(reqShard, reply.data, cast(void*) pend, 0, ShardMsg.reply);
+    shardWake(reqShard);
+}
+
 // Owner shard of a command's first key, or -1 if it is keyless (runs locally on this
 // router's own keyspace). `uname` is UPPERCASE (dispatch switch) but getCommandKeys
 // matches the LOWERCASE gCmdKeySpecs, so lowercase it back — else every lookup misses
@@ -1728,6 +1909,20 @@ private void shardDrainLoop() nothrow
 // command whose keys span slots). `uname` is UPPERCASE; lowercase it for the spec
 // tables. Single-key = O(1) first-key; multi-key = all-keys same-slot check.
 enum int SHARD_CROSSSLOT = -2;
+
+// Bit 15 of the packed opcode half of a hop section marks a BLOCKING serve
+// (phase 2.5b): the owner must NOT dispatch it inline on the drain (a parked
+// drain would stall the whole shard) but spawn a fiber that parks against the
+// owner's own gWaiters/gKeyActivity (see remoteBlockServe). Command indexes are
+// far below 0x8000, so the bit is free inside the 16-bit opcode field.
+enum uint HOP_BLOCKING = 0x8000;
+
+// Bit 14: the requester connection negotiated RESP3 (HELLO 3). The owner must
+// encode the reply — nil forms, double scores, map/push frames — in the
+// REQUESTER's protocol, not whatever its own last local command left in the
+// thread-global gRespProto. Carried per hop section; the drain (and a blocking
+// fiber) sets gRespProto from it around the dispatch.
+enum uint HOP_RESP3 = 0x4000;
 
 private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int opcode) nothrow
 {
@@ -1805,7 +2000,8 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
 // advancing `pos` past it. The rebuilt slices point into the ring slice — valid
 // until the drain pops, exactly like the single-command descriptor was.
 private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref Arena arena,
-        out RVal cmd, out int opcode, out uint db, out void* pend) @trusted nothrow
+        out RVal cmd, out int opcode, out uint db, out bool blocking, out bool resp3,
+        out void* pend) @trusted nothrow
 {
     if (payload.length - pos < 4)
         return false;
@@ -1817,7 +2013,9 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     pend = cast(void*)*cast(const(ulong)*) sec.ptr;
     immutable uint argc = *cast(const(uint)*)(sec.ptr + 8);
     immutable uint packed = *cast(const(uint)*)(sec.ptr + 12);
-    opcode = cast(int)(packed & 0xFFFF);
+    opcode = cast(int)(packed & 0x3FFF);
+    blocking = (packed & HOP_BLOCKING) != 0;
+    resp3 = (packed & HOP_RESP3) != 0;
     db = packed >> 16;
     immutable size_t hdr = 16 + cast(size_t) argc * 8;
     if (argc == 0 || sec.length < hdr)
@@ -1939,7 +2137,8 @@ private void scanSharded(ref Conn c, int opcode, uint db, const ref RVal cmd,
     // fire the modified SCAN to `shard`, collect its reply
     auto pend = acquireShardPending();
     c.shardBc.clear();
-    appendHopCmd(c.shardBc, mcmd, mbuf.data, opcode, db, cast(void*) pend);
+    appendHopCmd(c.shardBc, mcmd, mbuf.data,
+            cast(int)(cast(uint) opcode | (c.resp3 ? HOP_RESP3 : 0)), db, cast(void*) pend);
     shardEnqueue(shard, c.shardBc.data, null, tShard, ShardMsg.cmd);
     shardWake(shard);
     while (!pend.ready)
@@ -2090,7 +2289,8 @@ private void broadcastCommand(ref Conn c, int opcode, uint db, const ref RVal cm
         auto p = acquireShardPending();
         pend[sIdx] = p;
         c.shardBc.clear();
-        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, db, cast(void*) p);
+        appendHopCmd(c.shardBc, cmd, rawCmd,
+                cast(int)(cast(uint) opcode | (c.resp3 ? HOP_RESP3 : 0)), db, cast(void*) p);
         shardEnqueue(sIdx, c.shardBc.data, null, tShard, ShardMsg.cmd);
     }
     foreach (uint sIdx; 0 .. n)
@@ -2243,7 +2443,8 @@ private void shardFire(ref Conn c, int owner, int opcode, uint db, const ref RVa
     {
         // COALESCED: stage the command in this owner's batch buffer; the whole
         // batch travels as ONE ring slot at the flush point (with the wakes).
-        appendHopCmd(c.hopBatch[owner], cmd, rawCmd, opcode, db, cast(void*) p);
+        appendHopCmd(c.hopBatch[owner], cmd, rawCmd,
+                cast(int)(cast(uint) opcode | (c.resp3 ? HOP_RESP3 : 0)), db, cast(void*) p);
         c.shardTouch |= 1UL << owner;
     }
     else
@@ -2251,7 +2452,8 @@ private void shardFire(ref Conn c, int owner, int opcode, uint db, const ref RVa
         // rare high shard id (beyond the touch/batch bitmaps): fire a batch of
         // one immediately, and wake now
         c.shardBc.clear();
-        appendHopCmd(c.shardBc, cmd, rawCmd, opcode, db, cast(void*) p);
+        appendHopCmd(c.shardBc, cmd, rawCmd,
+                cast(int)(cast(uint) opcode | (c.resp3 ? HOP_RESP3 : 0)), db, cast(void*) p);
         shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.cmd);
         shardWake(cast(uint) owner);
     }
@@ -2307,6 +2509,99 @@ private void flushShardPending(ref Conn c, ref ByteBuffer o) nothrow
         releaseShardPending(p);
     }
     c.shardPendCount = 0;
+}
+
+// Should this command hop to its key-owner shard as a BLOCKING serve (phase
+// 2.5b)? True for the pop family always (arg errors are surfaced by the owner)
+// and for XREAD/XREADGROUP only when a BLOCK keyword is present. Over-marking
+// is harmless: the owner's serveBlockingSwitch falls back to a plain dispatch
+// when the form turns out not to block (e.g. XREADGROUP without `>`).
+private bool isBlockingHopForm(scope const(char)[] uname, const(RVal)[] args) nothrow
+{
+    switch (uname)
+    {
+    case "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX",
+         "BLMOVE", "BRPOPLPUSH", "BLMPOP", "BZMPOP":
+        return true;
+    case "XREAD", "XREADGROUP":
+        foreach (ref a; args)
+            if (eqICDebug(a.str, "BLOCK"))
+                return true;
+        return false;
+    default:
+        return false;
+    }
+}
+
+// Fire a BLOCKING command at its key-owner shard and wait SYNCHRONOUSLY for the
+// reply (phase 2.5b). The owner parks a fiber (see remoteBlockServe); this conn
+// fiber polls at the block tick so a vanished peer or a CLIENT UNBLOCK still
+// reaches the remote park (through the pending's cancel flag). The owner ALWAYS
+// replies after observing a cancel — never release a slot it may still write.
+private void shardFireBlocking(ref Conn c, int owner, int opcode, uint db,
+        const ref RVal cmd, scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
+{
+    import core.atomic : atomicLoad, atomicStore;
+    import core.time : msecs;
+
+    import dreads.obj : gBlockedClients;
+    import dreads.shard : acquireShardPending, releaseShardPending, shardEnqueue,
+        shardWake, ShardMsg, tShard;
+
+    // pipeline order: everything in flight replies BEFORE the block's reply,
+    // and replies already staged reach the client before we park
+    if (c.shardPendCount > 0)
+        flushShardPending(c, o);
+    flushBeforeBlock(c, o);
+    auto p = acquireShardPending();
+    c.shardBc.clear();
+    appendHopCmd(c.shardBc, cmd, rawCmd,
+            cast(int)(cast(uint) opcode | HOP_BLOCKING | (c.resp3 ? HOP_RESP3 : 0)),
+            db, cast(void*) p);
+    shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.cmd);
+    shardWake(cast(uint) owner);
+    import core.atomic : atomicOp;
+
+    atomicOp!"+="(gBlockedClients, 1); // INFO clients: this router's client is parked (remotely)
+    c.blocked = true; // eligible for CLIENT UNBLOCK while parked here
+    scope (exit)
+    {
+        atomicOp!"-="(gBlockedClients, 1);
+        c.blocked = false;
+        c.unblockReq = 0;
+    }
+    while (!p.ready)
+    {
+        immutable ec = p.done.emitCount;
+        if (p.ready)
+            break;
+        try
+            cast(void) p.done.waitUninterruptible(msecs(BLOCK_POLL_MS), ec);
+        catch (Exception)
+        {
+        }
+        if (p.ready)
+            break;
+        if (atomicLoad(p.cancel) == 0)
+        {
+            ubyte k = 0;
+            if (c.unblockReq != 0)
+                k = c.unblockReq == 2 ? 3 : 2;
+            else if (peerGone(&c))
+                k = 1;
+            if (k != 0)
+            {
+                atomicStore(p.cancel, k);
+                // kick the owner so a parked XREAD fiber re-checks NOW (the pop
+                // family polls at its own block tick and needs no kick)
+                static immutable ubyte[1] kickByte = [0];
+                shardEnqueue(cast(uint) owner, kickByte[], null, tShard, ShardMsg.blockKick);
+                shardWake(cast(uint) owner);
+            }
+        }
+    }
+    o.append(p.reply.data);
+    releaseShardPending(p);
 }
 
 private __gshared shared(TaskPool)[] gShardPools; // keep the worker pools alive
@@ -2434,7 +2729,11 @@ private void serveClient(TCPConnection tcp) nothrow
         unregisterMonitor(c);
         unregisterConn(c.id);
         if (c.pauseBlocked) // parked on the pause barrier at disconnect — un-count
-            gBlockedClients--;
+        {
+            import core.atomic : atomicOp;
+
+            atomicOp!"-="(gBlockedClients, 1);
+        }
         waitPurgeConn(c); // drop any lingering block-waiter entries (no dangling c)
         // Close the socket LAST — after shutdownOutput has drained the output
         // queue. Closing earlier would make the writer see a disconnected socket
@@ -2493,8 +2792,10 @@ private void serveClient(TCPConnection tcp) nothrow
         {
             if (c.pauseBlocked)
             {
+                import core.atomic : atomicOp;
+
                 c.pauseBlocked = false;
-                gBlockedClients--;
+                atomicOp!"-="(gBlockedClients, 1);
             }
         }
 
@@ -2596,8 +2897,10 @@ private void serveClient(TCPConnection tcp) nothrow
                 {
                     if (!c.pauseBlocked) // count this parked client as blocked (once)
                     {
+                        import core.atomic : atomicOp;
+
                         c.pauseBlocked = true;
-                        gBlockedClients++;
+                        atomicOp!"+="(gBlockedClients, 1);
                     }
                     immutable rem = gPauseUntilMs - now;
                     immutable cap = rem < PAUSE_POLL_MS ? rem : PAUSE_POLL_MS;
@@ -2721,6 +3024,8 @@ private bool isDeferrableWrite(ref Conn c, const ref RVal cmd) nothrow
 // forever to read them. Send them now, then keep waiting on an empty buffer.
 private void flushBeforeBlock(ref Conn c, ref ByteBuffer o) nothrow
 {
+    if (c.remoteBlock)
+        return; // synthetic conn: `o` is the hop reply staging, nothing to flush
     if (o.empty)
         return;
     try
@@ -3881,6 +4186,27 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, bk, o);
             return true;
         }
+        // CLIENT UNBLOCK <id> [TIMEOUT|ERROR] (phase 2.5b): the target client's
+        // connection lives on ONE router's TLS registry — broadcast so its owner
+        // finds it (each shard tries its own registry, sumInt merges the :0/:1s).
+        // Only a VALID form is broadcast; malformed falls through to clientCmd
+        // for the proper local error.
+        if (shardOpcode == cmdIx!"client" && cmd.arr.length >= 3 && cmd.arr.length <= 4
+                && eqICDebug(cmd.arr[1].str, "UNBLOCK"))
+        {
+            import dreads.commands : parseLong;
+
+            long ubId;
+            immutable idOk = parseLong(cmd.arr[2].str, ubId) && ubId >= 0;
+            immutable modeOk = cmd.arr.length == 3
+                || eqICDebug(cmd.arr[3].str, "TIMEOUT") || eqICDebug(cmd.arr[3].str, "ERROR");
+            if (idOk && modeOk)
+            {
+                broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd,
+                        BroadcastKind.sumInt, o);
+                return true;
+            }
+        }
     }
     if (shardOwner < 0 && c.shardPendCount > 0)
         flushShardPending(c, o);
@@ -3930,6 +4256,24 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 o.appendByte(ch == '\r' || ch == '\n' ? ' ' : ch);
             o.append(
                 "': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / HELLO / RESET are allowed in this context\r\n");
+            return true;
+        }
+    }
+
+    // BLOCKING command whose keys live on ANOTHER shard (phase 2.5b): hop it
+    // there and park THERE. The wake (XADD/LPUSH) fires on the key-owner shard,
+    // so the wait must live where the wake is: the owner parks a fiber against
+    // its OWN gWaiters/gKeyActivity (FIFO fairness intact — every waiter of a
+    // key queues in ONE place) and replies when served/timed-out/cancelled.
+    // This conn's fiber waits synchronously (a blocked client cannot pipeline
+    // past its block). MULTI/EXEC keeps the local one-shot path (v1 gap).
+    if (shardOwner >= 0 && !c.inMulti && !c.inExec && isBlockingHopForm(uname, args))
+    {
+        import dreads.shard : tShard;
+
+        if (cast(uint) shardOwner != tShard)
+        {
+            shardFireBlocking(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, o);
             return true;
         }
     }
@@ -3991,139 +4335,15 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             raftCmd(args, o);
             return true;
         }
-    case "BLPOP":
-    case "BRPOP":
-        {
-            immutable eb = gTotalErrorReplies, ob = o.length;
-            blockingPop(c, args, uname[1] == 'L', o, arena);
-            statBlockingReply(uname, o, ob, eb); // count once when it finally returns
+    case "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX", "BLMOVE", "BRPOPLPUSH",
+         "XREAD", "XREADGROUP", "BLMPOP", "BZMPOP":
+        // Blocking family: served by the shared switch (also entered by
+        // remoteBlockServe for hopped blocks — phase 2.5b). False ⇒ not a
+        // blocking form (XREAD without BLOCK, XREADGROUP without `>`/BLOCK or
+        // in MULTI): fall through to the normal one-shot dispatch path.
+        if (serveBlockingSwitch(c, uname, cmd, o, arena))
             return true;
-        }
-    case "BZPOPMIN":
-    case "BZPOPMAX":
-        {
-            immutable eb = gTotalErrorReplies, ob = o.length;
-            blockingZPop(c, args, uname == "BZPOPMAX", o, arena);
-            statBlockingReply(uname, o, ob, eb);
-            return true;
-        }
-    case "BLMOVE":
-    case "BRPOPLPUSH":
-        {
-            // rewrite into the non-blocking form and retry until data/timeout
-            if ((uname == "BLMOVE" && args.length != 5) || (uname == "BRPOPLPUSH"
-                    && args.length != 3))
-            {
-                repError(o, "ERR wrong number of arguments");
-                return true;
-            }
-            ulong timeoutMs;
-            if (auto terr = parseTimeout(args[$ - 1].str, timeoutMs))
-            {
-                repError(o, terr);
-                return true;
-            }
-            immutable eb = gTotalErrorReplies, ob = o.length;
-            blockingRetry(c, cmd.arr[0 .. $ - 1], uname == "BLMOVE" ? "LMOVE"
-                    : "RPOPLPUSH", "$-1\r\n", timeoutMs, o, arena);
-            statBlockingReply(uname, o, ob, eb);
-            return true;
-        }
-    case "XREAD":
-        {
-            // only the BLOCK form is handled here; plain XREAD dispatches
-            ptrdiff_t blockAt = -1;
-            foreach (i, ref a; args)
-            {
-                if (eqICDebug(a.str, "BLOCK"))
-                {
-                    blockAt = cast(ptrdiff_t) i;
-                    break;
-                }
-            }
-            if (blockAt < 0)
-                break;
-            import dreads.commands : parseLong;
-
-            long blockMs;
-            if (blockAt + 1 >= args.length || !parseLong(args[blockAt + 1].str, blockMs)
-                    || blockMs < 0)
-            {
-                repError(o, "ERR timeout is not an integer or out of range");
-                return true;
-            }
-            xreadBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
-            return true;
-        }
-    case "XREADGROUP":
-        {
-            // Only the blocking form on a `>` id parks here; history reads
-            // (explicit ids from the PEL), the non-BLOCK form, and MULTI/EXEC all
-            // fall through to the normal dispatch/raft path (a single attempt).
-            import dreads.commands : parseLong;
-
-            ptrdiff_t blockAt = -1, streamsAt = -1;
-            foreach (i, ref a; args)
-            {
-                if (blockAt < 0 && eqICDebug(a.str, "BLOCK"))
-                    blockAt = cast(ptrdiff_t) i;
-                else if (streamsAt < 0 && eqICDebug(a.str, "STREAMS"))
-                    streamsAt = cast(ptrdiff_t) i;
-            }
-            // no BLOCK option (blockAt must precede STREAMS to be the keyword),
-            // malformed, or inside a transaction ⇒ normal one-shot dispatch
-            if (blockAt < 0 || streamsAt < 0 || blockAt > streamsAt
-                    || c.inMulti || c.inExec)
-                break;
-            auto after = args[streamsAt + 1 .. $];
-            if (after.length == 0 || after.length % 2 != 0)
-                break; // let dispatch surface the syntax error
-            auto half = after.length / 2;
-            bool hasGt = false;
-            foreach (ref idTok; after[half .. $])
-                if (idTok.str == ">")
-                {
-                    hasGt = true;
-                    break;
-                }
-            if (!hasGt)
-                break; // only `>` (new messages) can block; explicit ids read now
-            long blockMs;
-            if (blockAt + 1 >= cast(ptrdiff_t) args.length
-                    || !parseLong(args[blockAt + 1].str, blockMs) || blockMs < 0)
-            {
-                repError(o, "ERR timeout is not an integer or out of range");
-                return true;
-            }
-            immutable xrgErrPrev = gTotalErrorReplies;
-            immutable xrgOutBefore = o.length;
-            xreadgroupBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
-            statBlockingReply("xreadgroup", o, xrgOutBefore, xrgErrPrev);
-            return true;
-        }
-    case "BLMPOP":
-    case "BZMPOP":
-        {
-            // B*MPOP timeout numkeys key [key ...] WHERE -> *MPOP numkeys ...
-            if (args.length < 4)
-            {
-                repError(o, uname == "BLMPOP"
-                        ? "ERR wrong number of arguments for 'blmpop' command"
-                        : "ERR wrong number of arguments for 'bzmpop' command");
-                return true;
-            }
-            ulong timeoutMs;
-            if (auto terr = parseTimeout(args[0].str, timeoutMs))
-            {
-                repError(o, terr);
-                return true;
-            }
-            immutable eb = gTotalErrorReplies, ob = o.length;
-            blockingRetry(c, cmd.arr[1 .. $], uname == "BLMPOP" ? "LMPOP" : "ZMPOP",
-                    "*-1\r\n", timeoutMs, o, arena, true);
-            statBlockingReply(uname, o, ob, eb);
-            return true;
-        }
+        break;
     case "HELLO":
         {
             int ver = c.resp3 ? 3 : 2;
@@ -5695,17 +5915,32 @@ private const(char)[] parseTimeout(scope const(char)[] s, out ulong ms) nothrow
 /// True while the caller should keep waiting (updates the emit count).
 // XREAD BLOCK is fan-out (all readers wake and read the same new entries — no
 // hand-off), so it stays on the global broadcast event, not the per-key FIFO.
-private bool waitForActivity(ref int ec, ref long remainingMs, ulong timeoutMs) nothrow
+private bool waitForActivity(Conn* c, ref int ec, ref long remainingMs, ulong timeoutMs) nothrow
 {
     import core.time : MonoTime, msecs;
 
     import dreads.obj : gBlockedClients;
 
+    import core.atomic : atomicOp;
+
     if (timeoutMs != 0 && remainingMs <= 0)
         return false;
-    gBlockedClients++;
+    // a synthetic remote-block conn is already counted by its requester's router
+    immutable count = c is null || !c.remoteBlock;
+    if (count)
+        atomicOp!"+="(gBlockedClients, 1);
     scope (exit)
-        gBlockedClients--;
+    {
+        if (count)
+            atomicOp!"-="(gBlockedClients, 1);
+        if (c !is null) // restore this conn's reply protocol (see blockWait)
+            gRespProto = c.resp3 ? 3 : 2;
+    }
+    // NB: a remote block (phase 2.5b) waits the FULL slice like a local one —
+    // re-waking on a poll tick would RE-REGISTER on gKeyActivity each tick and
+    // shuffle the event's FIFO waiter order (fairness: the first-blocked client
+    // must be first to re-dispatch on a wake). A requester-side cancel wakes us
+    // through ShardMsg.blockKick (the owner's drain emits gKeyActivity).
     auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs;
     auto before = MonoTime.currTime;
     ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
@@ -5782,14 +6017,25 @@ private BlockWake blockWait(Conn* c, int ec, ref long remainingMs, ulong timeout
 
     import dreads.obj : gBlockedClients;
 
+    import core.atomic : atomicOp;
+
     if (timeoutMs != 0 && remainingMs <= 0)
         return BlockWake.timedOut;
-    gBlockedClients++; // INFO clients: parked in a blocking wait
+    // a synthetic remote-block conn is already counted by its requester's router
+    immutable count = !c.remoteBlock;
+    if (count)
+        atomicOp!"+="(gBlockedClients, 1); // INFO clients: parked in a blocking wait
     c.blocked = true; // eligible for CLIENT UNBLOCK while parked here
     scope (exit)
     {
-        gBlockedClients--;
+        if (count)
+            atomicOp!"-="(gBlockedClients, 1);
         c.blocked = false;
+        // restore THIS conn's reply protocol: other fibers ran while we were
+        // parked and reset the thread-global (RESP3 nil/double forms would
+        // otherwise come out in the LAST client's protocol — also a latent
+        // single-shard bug, not just a hop one)
+        gRespProto = c.resp3 ? 3 : 2;
     }
     // Decrement the caller's `remainingMs` by ACTUAL elapsed per tick — never
     // recompute it from the original timeoutMs, or a re-block (caller re-enters
@@ -5809,11 +6055,172 @@ private BlockWake blockWait(Conn* c, int ec, ref long remainingMs, ulong timeout
             return BlockWake.ready;
         if (c.unblockReq != 0)
             return BlockWake.ready;
+        if (c.remoteBlock) // remote CLIENT UNBLOCK arrives via the pending's cancel
+        {
+            import core.atomic : atomicLoad;
+
+            immutable k = atomicLoad(c.remotePend.cancel);
+            if (k == 2 || k == 3)
+            {
+                c.unblockReq = k == 3 ? 2 : 1; // handleUnblock: 2 ⇒ -UNBLOCKED, else nil
+                return BlockWake.ready;
+            }
+        }
         if (peerGone(c)) // peer vanished while we were parked (EOF probe)
             return BlockWake.disconnected;
         if (timeoutMs != 0 && remainingMs <= 0)
             return BlockWake.timedOut;
         // else: poll tick elapsed with no event — loop and wait again
+    }
+}
+
+// The blocking-command serve switch, shared by executeCommand (a client whose
+// keys live on its OWN shard — or single-shard mode) and remoteBlockServe (a
+// hopped blocking command parked on this owner shard in its own fiber, phase
+// 2.5b). Returns false when the form doesn't block (XREAD without BLOCK,
+// XREADGROUP without `>`/BLOCK or inside MULTI) — the caller falls through to
+// the plain one-shot dispatch path.
+private bool serveBlockingSwitch(ref Conn c, scope const(char)[] uname,
+        const ref RVal cmd, ref ByteBuffer o, ref Arena arena) nothrow
+{
+    auto args = cmd.arr[1 .. $];
+    switch (uname)
+    {
+    case "BLPOP":
+    case "BRPOP":
+        {
+            immutable eb = gTotalErrorReplies, ob = o.length;
+            blockingPop(c, args, uname[1] == 'L', o, arena);
+            statBlockingReply(uname, o, ob, eb); // count once when it finally returns
+            return true;
+        }
+    case "BZPOPMIN":
+    case "BZPOPMAX":
+        {
+            immutable eb = gTotalErrorReplies, ob = o.length;
+            blockingZPop(c, args, uname == "BZPOPMAX", o, arena);
+            statBlockingReply(uname, o, ob, eb);
+            return true;
+        }
+    case "BLMOVE":
+    case "BRPOPLPUSH":
+        {
+            // rewrite into the non-blocking form and retry until data/timeout
+            if ((uname == "BLMOVE" && args.length != 5) || (uname == "BRPOPLPUSH"
+                    && args.length != 3))
+            {
+                repError(o, "ERR wrong number of arguments");
+                return true;
+            }
+            ulong timeoutMs;
+            if (auto terr = parseTimeout(args[$ - 1].str, timeoutMs))
+            {
+                repError(o, terr);
+                return true;
+            }
+            immutable eb = gTotalErrorReplies, ob = o.length;
+            blockingRetry(c, cmd.arr[0 .. $ - 1], uname == "BLMOVE" ? "LMOVE"
+                    : "RPOPLPUSH", "$-1\r\n", timeoutMs, o, arena);
+            statBlockingReply(uname, o, ob, eb);
+            return true;
+        }
+    case "XREAD":
+        {
+            // only the BLOCK form is handled here; plain XREAD dispatches
+            ptrdiff_t blockAt = -1;
+            foreach (i, ref a; args)
+            {
+                if (eqICDebug(a.str, "BLOCK"))
+                {
+                    blockAt = cast(ptrdiff_t) i;
+                    break;
+                }
+            }
+            if (blockAt < 0)
+                return false;
+            import dreads.commands : parseLong;
+
+            long blockMs;
+            if (blockAt + 1 >= args.length || !parseLong(args[blockAt + 1].str, blockMs)
+                    || blockMs < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return true;
+            }
+            xreadBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
+            return true;
+        }
+    case "XREADGROUP":
+        {
+            // Only the blocking form on a `>` id parks here; history reads
+            // (explicit ids from the PEL), the non-BLOCK form, and MULTI/EXEC all
+            // fall through to the normal dispatch/raft path (a single attempt).
+            import dreads.commands : parseLong;
+
+            ptrdiff_t blockAt = -1, streamsAt = -1;
+            foreach (i, ref a; args)
+            {
+                if (blockAt < 0 && eqICDebug(a.str, "BLOCK"))
+                    blockAt = cast(ptrdiff_t) i;
+                else if (streamsAt < 0 && eqICDebug(a.str, "STREAMS"))
+                    streamsAt = cast(ptrdiff_t) i;
+            }
+            // no BLOCK option (blockAt must precede STREAMS to be the keyword),
+            // malformed, or inside a transaction ⇒ normal one-shot dispatch
+            if (blockAt < 0 || streamsAt < 0 || blockAt > streamsAt
+                    || c.inMulti || c.inExec)
+                return false;
+            auto after = args[streamsAt + 1 .. $];
+            if (after.length == 0 || after.length % 2 != 0)
+                return false; // let dispatch surface the syntax error
+            auto half = after.length / 2;
+            bool hasGt = false;
+            foreach (ref idTok; after[half .. $])
+                if (idTok.str == ">")
+                {
+                    hasGt = true;
+                    break;
+                }
+            if (!hasGt)
+                return false; // only `>` (new messages) can block; explicit ids read now
+            long blockMs;
+            if (blockAt + 1 >= cast(ptrdiff_t) args.length
+                    || !parseLong(args[blockAt + 1].str, blockMs) || blockMs < 0)
+            {
+                repError(o, "ERR timeout is not an integer or out of range");
+                return true;
+            }
+            immutable xrgErrPrev = gTotalErrorReplies;
+            immutable xrgOutBefore = o.length;
+            xreadgroupBlock(c, args, cast(size_t) blockAt, cast(ulong) blockMs, o, arena);
+            statBlockingReply("xreadgroup", o, xrgOutBefore, xrgErrPrev);
+            return true;
+        }
+    case "BLMPOP":
+    case "BZMPOP":
+        {
+            // B*MPOP timeout numkeys key [key ...] WHERE -> *MPOP numkeys ...
+            if (args.length < 4)
+            {
+                repError(o, uname == "BLMPOP"
+                        ? "ERR wrong number of arguments for 'blmpop' command"
+                        : "ERR wrong number of arguments for 'bzmpop' command");
+                return true;
+            }
+            ulong timeoutMs;
+            if (auto terr = parseTimeout(args[0].str, timeoutMs))
+            {
+                repError(o, terr);
+                return true;
+            }
+            immutable eb = gTotalErrorReplies, ob = o.length;
+            blockingRetry(c, cmd.arr[1 .. $], uname == "BLMPOP" ? "LMPOP" : "ZMPOP",
+                    "*-1\r\n", timeoutMs, o, arena, true);
+            statBlockingReply(uname, o, ob, eb);
+            return true;
+        }
+    default:
+        return false;
     }
 }
 
@@ -6192,7 +6599,11 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
 
     import dreads.obj : ObjType;
 
-    static ByteBuffer synth; // TLS
+    // per-call (NOT static/TLS): a parked fiber yields in waitForActivity while
+    // OTHER blocked fibers on this thread run this same function — a shared TLS
+    // buffer would be clobbered and the woken fiber would re-parse someone
+    // else's rewritten command (same rule blockingRetry documents).
+    ByteBuffer synth;
     synth.clear();
     // locate STREAMS to know where ids start
     ptrdiff_t streamsAt = -1;
@@ -6235,12 +6646,17 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             repBulk(synth, a.str);
     }
 
-    static ByteBuffer attempt; // TLS
+    ByteBuffer attempt; // per-call, same rule as `synth` above
     auto ec = gKeyActivity.emitCount;
     long remaining = cast(long) timeoutMs;
     bool firstPass = true;
+    immutable xnil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
     for (;;)
     {
+        // remote block (phase 2.5b): the requester may have cancelled while we
+        // waited — disconnect ⇒ empty reply (discarded), UNBLOCK ⇒ nil/-UNBLOCKED
+        if (c.remoteBlock && remoteBlockCancelled(c, o, xnil))
+            return;
         attempt.clear();
         RVal cmd2;
         size_t pos = 0;
@@ -6254,7 +6670,7 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             return;
         dispatch(cmd2, *c.dbp, attempt, arena);
         auto rep = cast(const(char)[]) attempt.data;
-        auto nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREAD nil per protocol
+        auto nil = xnil;
         // A WRONGTYPE that appears only AFTER blocking means the key changed type
         // while we waited (XADD then DEL then LPUSH): keep waiting, don't wake with
         // an error. On the first attempt a wrong-typed key is a real error.
@@ -6265,12 +6681,31 @@ private void xreadBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             return;
         }
         firstPass = false;
-        if (c.inMulti || c.inExec || !waitForActivity(ec, remaining, timeoutMs))
+        if (c.inMulti || c.inExec || !waitForActivity(&c, ec, remaining, timeoutMs))
         {
             o.append(nil);
             return;
         }
     }
+}
+
+// A remote block's cancel check (phase 2.5b), shared by the XREAD/XREADGROUP
+// retry loops (the pop family handles cancel inside blockWait/peerGone). True ⇒
+// the caller must return: disconnect (1) leaves `o` untouched (an empty reply
+// completes the pending handshake; the requester's peer is gone), CLIENT
+// UNBLOCK maps to the command's nil (2) or -UNBLOCKED (3).
+private bool remoteBlockCancelled(ref Conn c, ref ByteBuffer o, scope const(char)[] nilReply) nothrow
+{
+    import core.atomic : atomicLoad;
+
+    immutable k = atomicLoad(c.remotePend.cancel);
+    if (k == 0)
+        return false;
+    if (k == 2)
+        o.append(nilReply);
+    else if (k == 3)
+        repError(o, "UNBLOCKED client unblocked via CLIENT UNBLOCK");
+    return true;
 }
 
 /// Count a blocking command's final reply into INFO commandstats/errorstats —
@@ -6323,6 +6758,9 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
     immutable nil = gRespProto >= 3 ? "_\r\n" : "*-1\r\n"; // XREADGROUP empty reply
     for (;;)
     {
+        // remote block (phase 2.5b): requester cancelled while we waited
+        if (c.remoteBlock && remoteBlockCancelled(c, o, nil))
+            return;
         attempt.clear();
         RVal cmd2;
         size_t pos = 0;
@@ -6353,7 +6791,7 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             cast(void) gKeyActivity.emit();
             return;
         }
-        if (!waitForActivity(ec, remaining, timeoutMs))
+        if (!waitForActivity(&c, ec, remaining, timeoutMs))
         {
             o.append(nil);
             return;
