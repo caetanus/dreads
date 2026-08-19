@@ -1690,16 +1690,17 @@ private void shardDrainLoop() nothrow
                 RVal cmd;
                 int opcode;
                 uint db;
-                bool blocking, resp3;
+                bool blocking, resp3, noblock;
                 void* pend;
-                if (decodeHopSection(p, pos, arena, cmd, opcode, db, blocking, resp3, pend))
+                if (decodeHopSection(p, pos, arena, cmd, opcode, db, blocking, resp3,
+                        noblock, pend))
                 {
                     if (blocking)
                     {
                         // BLOCKING serve (phase 2.5b): never park the drain —
                         // a fiber parks instead and replies on its own later.
                         spawnRemoteBlock(cmd, cast(uint) meta,
-                                cast(ShardPending*) pend, db, resp3);
+                                cast(ShardPending*) pend, db, resp3, noblock);
                         continue;
                     }
                     import dreads.aclcat : cmdIx;
@@ -2015,7 +2016,7 @@ private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) n
 // 2.5b, see remoteBlockServe). Rare path: the GC alloc for the copy + task is
 // fine here (same class as acquireShardPending's pool growth).
 private void spawnRemoteBlock(const ref RVal cmd, uint reqShard, ShardPending* pend,
-        uint db, bool resp3) nothrow
+        uint db, bool resp3, bool noBlock) nothrow
 {
     import dreads.shard : shardEnqueue, shardWake, ShardMsg;
 
@@ -2028,9 +2029,10 @@ private void spawnRemoteBlock(const ref RVal cmd, uint reqShard, ShardPending* p
         repBulk(enc, a.str);
     auto bytes = enc.data.dup;
     try
-        cast(void) runTask((ubyte[] by, uint rq, ShardPending* pd, uint dbx, bool r3) nothrow {
-            remoteBlockServe(by, rq, pd, dbx, r3);
-        }, bytes, reqShard, pend, db, resp3);
+        cast(void) runTask((ubyte[] by, uint rq, ShardPending* pd, uint dbx, bool r3,
+                bool nb) nothrow {
+            remoteBlockServe(by, rq, pd, dbx, r3, nb);
+        }, bytes, reqShard, pend, db, resp3, noBlock);
     catch (Exception)
     {
         // spawn failed: reply an error so the requester never hangs
@@ -2051,7 +2053,7 @@ private void spawnRemoteBlock(const ref RVal cmd, uint reqShard, ShardPending* p
 // pend.cancel; we ALWAYS reply — possibly empty on a disconnect — so the
 // pending handshake completes and the requester's fiber never leaks.
 private void remoteBlockServe(ubyte[] cmdBytes, uint reqShard, ShardPending* pend,
-        uint db, bool resp3) nothrow
+        uint db, bool resp3, bool noBlock) nothrow
 {
     import dreads.shard : myKeyspace, shardEnqueue, shardWake, ShardMsg;
 
@@ -2062,6 +2064,7 @@ private void remoteBlockServe(ubyte[] cmdBytes, uint reqShard, ShardPending* pen
     c.remotePend = pend;
     c.dbp = myKeyspace(db);
     c.resp3 = resp3;
+    c.inExec = noBlock; // MULTI/EXEC: the block loops bail after the first pass
     gRespProto = resp3 ? 3 : 2; // entry-time forms (nil hoists) in the requester's proto
     c.authed = true; // ACL ran on the requester before the hop (v1 hop contract)
     // gWaiters entries hold Conn* into THIS stack frame — purge before it dies
@@ -2120,6 +2123,13 @@ enum uint HOP_BLOCKING = 0x8000;
 // thread-global gRespProto. Carried per hop section; the drain (and a blocking
 // fiber) sets gRespProto from it around the dispatch.
 enum uint HOP_RESP3 = 0x4000;
+
+// Bit 13: serve the blocking command's NON-blocking form (MULTI/EXEC: Redis
+// runs the one-shot equivalent and replies nil when there is nothing to serve).
+// The owner fiber sets its synthetic conn's inExec, so the existing block loops
+// bail after the first pass — against the OWNER's keyspace, which is the point
+// (the local path read the ROUTER's keyspace and saw the wrong data).
+enum uint HOP_NOBLOCK = 0x2000;
 
 private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int opcode) nothrow
 {
@@ -2198,7 +2208,7 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
 // until the drain pops, exactly like the single-command descriptor was.
 private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref Arena arena,
         out RVal cmd, out int opcode, out uint db, out bool blocking, out bool resp3,
-        out void* pend) @trusted nothrow
+        out bool noblock, out void* pend) @trusted nothrow
 {
     if (payload.length - pos < 4)
         return false;
@@ -2210,9 +2220,10 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     pend = cast(void*)*cast(const(ulong)*) sec.ptr;
     immutable uint argc = *cast(const(uint)*)(sec.ptr + 8);
     immutable uint packed = *cast(const(uint)*)(sec.ptr + 12);
-    opcode = cast(int)(packed & 0x3FFF);
+    opcode = cast(int)(packed & 0x1FFF);
     blocking = (packed & HOP_BLOCKING) != 0;
     resp3 = (packed & HOP_RESP3) != 0;
+    noblock = (packed & HOP_NOBLOCK) != 0;
     db = packed >> 16;
     immutable size_t hdr = 16 + cast(size_t) argc * 8;
     if (argc == 0 || sec.length < hdr)
@@ -3192,7 +3203,8 @@ private bool isBlockingHopForm(scope const(char)[] uname, const(RVal)[] args) no
 // reaches the remote park (through the pending's cancel flag). The owner ALWAYS
 // replies after observing a cancel — never release a slot it may still write.
 private void shardFireBlocking(ref Conn c, int owner, int opcode, uint db,
-        const ref RVal cmd, scope const(ubyte)[] rawCmd, ref ByteBuffer o) nothrow
+        const ref RVal cmd, scope const(ubyte)[] rawCmd, ref ByteBuffer o,
+        bool noBlock = false) nothrow
 {
     import core.atomic : atomicLoad, atomicStore;
     import core.time : msecs;
@@ -3209,7 +3221,8 @@ private void shardFireBlocking(ref Conn c, int owner, int opcode, uint db,
     auto p = acquireShardPending();
     c.shardBc.clear();
     appendHopCmd(c.shardBc, cmd, rawCmd,
-            cast(int)(cast(uint) opcode | HOP_BLOCKING | (c.resp3 ? HOP_RESP3 : 0)),
+            cast(int)(cast(uint) opcode | HOP_BLOCKING | (c.resp3 ? HOP_RESP3 : 0)
+                | (noBlock ? HOP_NOBLOCK : 0)),
             db, cast(void*) p);
     shardEnqueue(cast(uint) owner, c.shardBc.data, null, tShard, ShardMsg.cmd);
     shardWake(cast(uint) owner);
@@ -4990,14 +5003,17 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // its OWN gWaiters/gKeyActivity (FIFO fairness intact — every waiter of a
     // key queues in ONE place) and replies when served/timed-out/cancelled.
     // This conn's fiber waits synchronously (a blocked client cannot pipeline
-    // past its block). MULTI/EXEC keeps the local one-shot path (v1 gap).
-    if (shardOwner >= 0 && !c.inMulti && !c.inExec && isBlockingHopForm(uname, args))
+    // past its block). Inside MULTI/EXEC the hop carries HOP_NOBLOCK: Redis
+    // serves the one-shot equivalent (nil when empty) — but it must still be
+    // served on the OWNER's keyspace, not this router's.
+    if (shardOwner >= 0 && isBlockingHopForm(uname, args))
     {
         import dreads.shard : tShard;
 
         if (cast(uint) shardOwner != tShard)
         {
-            shardFireBlocking(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, o);
+            shardFireBlocking(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd,
+                    rawCmd, o, c.inMulti || c.inExec);
             return true;
         }
     }
