@@ -38,15 +38,12 @@ INCR can modify objects in-place
 # (B) forbidden under sharding by design
 /SWAPDB
 
-# (E) MULTI/EXEC/WATCH under sharding — documented v1 gap (SHARDING.md "out of
-# scope"): EXEC hops its commands one at a time (yielding at each flush), so a
-# transaction is NOT atomic even same-slot (an owner-parked blocked client can
-# wake MID-transaction), and the WATCH epoch is per-shard. Un-skip when
-# same-slot MULTI ships to the owner as a unit. (Blocking commands INSIDE a
-# transaction serve their one-shot form on the owner now — HOP_NOBLOCK.)
+# (E) WATCH under sharding — the WATCH epoch is per-shard, so a write on the
+# key-owner shard doesn't abort a watcher's EXEC on another router (and vice
+# versa: unrelated local writes can falsely abort). Same-slot transactions DO
+# ship to the owner as one atomic unit now (execBatch — phase 2.5d); only the
+# WATCH visibility remains.
 PUSH resulting from BRPOPLPUSH affect WATCH
-BZPOPMIN unblock but the key is expired and then block again - reprocessing command
-BLPOP unblock but the key is expired and then block again - reprocessing command
 # also (D)-flavored: asserts `r client list` sees a conn on ANOTHER router
 # (CLIENT LIST is per-router); its fail path has a harness bug ($cmd undefined)
 # that ABORTS the file, so skipping is load-bearing

@@ -190,6 +190,12 @@ public enum ShardMsg : uint
     // ITS thread's local gPubSub subscribers. (Client PUBLISH itself travels
     // as a broadcast `cmd` instead — it needs the summed receiver-count reply.)
     pub = 3,
+    // A same-slot MULTI/EXEC shipped as ONE unit (phase 2.5d): the coalesced
+    // sections are the queued commands; the owner's drain executes them
+    // back-to-back WITHOUT yielding (the transaction is atomic on its shard)
+    // and fires the wakes/notifications once at the end. One reply, holding
+    // the concatenated per-command replies, answers the batch's single pending.
+    execBatch = 4,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which
