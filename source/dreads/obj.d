@@ -74,7 +74,11 @@ public bool gImportSourceActive; // TLS: per-command flag, inherently per-thread
 /// INFO clients: clients currently parked in a blocking wait (B*POP etc.).
 /// Also counts clients parked by a CLIENT PAUSE barrier (Valkey counts postponed
 /// clients as blocked), so `wait_for_blocked_clients_count` sees a paused client.
-public long gBlockedClients; // TLS: each shard parks its own conns (see gConnectedClients)
+// SHARED (unlike the other TLS stats): a client blocked via a cross-shard hop
+// (phase 2.5b) parks its fiber on ONE router while the test/monitor connection
+// asking INFO may sit on ANOTHER — blocked_clients must be globally visible.
+// Rare-path counter: atomic add on block entry/exit only, plain load to read.
+public shared long gBlockedClients;
 
 /// INFO clients: number of live client connections. TLS (not __gshared) on
 /// purpose — with the coming per-thread sharding each shard accepts and serves
