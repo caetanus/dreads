@@ -366,6 +366,12 @@ private struct PtrBucket
 /// reaches gCmdStats; this counter is the reliable source.
 public __gshared ulong gPubMessages;
 
+// TOTAL live subscriptions (channels + patterns + shard channels) across ALL
+// threads' PubSub instances (phase 2.5c). A cross-shard PUBLISH or keyspace-
+// notification fan-out is pointless when nobody anywhere is subscribed — this
+// is the one-load gate (raw atomic add on the rare (un)subscribe path only).
+public shared long gSubTotal;
+
 // --- message tap (dashboard live-ish tail) ---------------------------------------
 // Buffer published (channel,payload) pairs while ARMED, drained in batches by
 // PUBSUB TAP (dreads-native). The publish hot path pays only ONE bool load when
@@ -487,8 +493,11 @@ public struct PubSub
     /// True when the channel subscription is new for this subscriber.
     bool subscribe(Subscriber* s, scope const(char)[] channel) @nogc nothrow
     {
+        import core.atomic : atomicOp;
+
         if (!s.channels.set(channel, Unit()))
             return false;
+        atomicOp!"+="(gSubTotal, 1);
         auto list = channels.get(channel);
         if (list is null)
         {
@@ -516,8 +525,11 @@ public struct PubSub
 
     bool unsubscribe(Subscriber* s, scope const(char)[] channel) @nogc nothrow
     {
+        import core.atomic : atomicOp;
+
         if (!s.channels.del(channel))
             return false;
+        atomicOp!"-="(gSubTotal, 1);
         auto list = channels.get(channel);
         if (list !is null)
         {
@@ -533,16 +545,22 @@ public struct PubSub
 
     bool psubscribe(Subscriber* s, scope const(char)[] pattern) @nogc nothrow
     {
+        import core.atomic : atomicOp;
+
         if (!s.patterns.set(pattern, Unit()))
             return false;
+        atomicOp!"+="(gSubTotal, 1);
         insertPattern(s, pattern);
         return true;
     }
 
     bool punsubscribe(Subscriber* s, scope const(char)[] pattern) @nogc nothrow
     {
+        import core.atomic : atomicOp;
+
         if (!s.patterns.del(pattern))
             return false;
+        atomicOp!"-="(gSubTotal, 1);
         removePattern(s, pattern);
         return true;
     }
@@ -550,6 +568,10 @@ public struct PubSub
     /// Removes every subscription (connection teardown).
     void dropAll(Subscriber* s) @nogc nothrow
     {
+        import core.atomic : atomicOp;
+
+        if (s.subCount)
+            atomicOp!"-="(gSubTotal, cast(long) s.subCount);
         foreach (ch, ref u; s.channels)
         {
             auto list = channels.get(ch);
@@ -973,6 +995,17 @@ public struct PubSub
     }
 
     /// Number of *unique* patterns with at least one subscriber (PUBSUB NUMPAT).
+    /// Iterate the distinct pattern STRINGS (for the cross-shard NUMPAT union —
+    /// a per-shard unique COUNT cannot be summed when the same pattern is
+    /// subscribed on two routers).
+    int eachPattern(scope int delegate(scope const(char)[]) @nogc nothrow dg) @nogc nothrow
+    {
+        foreach (patName, ref cnt; patCounts)
+            if (auto r = dg(patName))
+                return r;
+        return 0;
+    }
+
     size_t patternCount() const @nogc nothrow
     {
         return patCounts.length;
