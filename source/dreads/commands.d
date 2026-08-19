@@ -3026,8 +3026,15 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 ib.append(b[0 .. n]);
             }
 
+            // Under sharding this thread's databases live in its gShardKs slice —
+            // iterating gDbs there would report an EMPTY keyspace (phase 2.5c:
+            // each shard renders its own INFO; the router merges the sections).
+            import dreads.shard : sharded, gShardKs, tShard;
+
+            auto dbSlice = sharded()
+                ? gShardKs[tShard * NUM_DBS .. (tShard + 1) * NUM_DBS] : gDbs[];
             bool ksIsGlobal = false;
-            foreach (i, ref db; gDbs)
+            foreach (i, ref db; dbSlice)
             {
                 if (&db is &ks)
                     ksIsGlobal = true;

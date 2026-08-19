@@ -16,7 +16,7 @@ import core.stdc.stdio : printf;
 
 import core.time : seconds, msecs;
 
-import vibe.core.core : runEventLoop, runTask, setTimer;
+import vibe.core.core : runEventLoop, runTask, setTimer, yield;
 import vibe.core.net : TCPConnection, connectTCP, listenTCP, TCPListenOptions;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
@@ -1310,6 +1310,41 @@ private void waitPurgeConn(Conn* c) nothrow @trusted
     }
 }
 
+// Wake EVERY live block-waiter on this shard (blockKick: a cancel must be
+// observed now, not at the next poll tick). Rotates each deque in place, so
+// FIFO order is untouched; spurious wakes are safe (see the kick handler).
+private void wakeAllBlockWaiters() nothrow @trusted
+{
+    static const(char)[][256] keys; // @nogc collect first (emit may alloc)
+    foreach (db; 0 .. NUM_DBS)
+    {
+        if (gWaiters[db].length == 0)
+            continue;
+        size_t n = 0;
+        foreach (key, ref _wq; gWaiters[db])
+        {
+            if (n == keys.length)
+                break;
+            keys[n++] = key;
+        }
+        foreach (i; 0 .. n)
+        {
+            auto wq = gWaiters[db].get(keys[i]);
+            if (wq is null)
+                continue;
+            immutable ln = wq.q.length;
+            foreach (_; 0 .. ln)
+            {
+                auto e = wq.q.front;
+                wq.q.popFront();
+                if (e.c !is null && e.c.bwGen == e.gen && e.c.blockEvtInit)
+                    e.c.blockEvt.emit();
+                wq.q.pushBack(e);
+            }
+        }
+    }
+}
+
 // Wake the live front waiter of `key` (posts the wake; the fiber resumes in loop
 // context and re-verifies via lookup). Front-trims stale/dead first.
 private void signalKey(int db, scope const(char)[] key) nothrow @trusted
@@ -1675,9 +1710,35 @@ private void shardDrainLoop() nothrow
                     if (opcode == cmdIx!"client")
                     {
                         // server-layer hop: only CLIENT UNBLOCK is broadcast
-                        // (see executeCommand); serve it on THIS shard's registry
-                        drainClientUnblock(cmd, reply);
+                        // (see executeCommand); serve it on THIS shard's registry.
+                        auto wp = drainClientUnblock(cmd, reply);
+                        if (wp !is null)
+                        {
+                            // cancelled a REMOTE park: defer the :1 until the
+                            // park's round-trip completes (Redis contract — see
+                            // watchUnblockDone), then reply from that fiber
+                            immutable wgen = wp.genq;
+                            try
+                            {
+                                cast(void) runTask((ShardPending* w, uint g,
+                                        uint rq, void* pd) nothrow {
+                                    watchUnblockDone(w, g, rq, pd);
+                                }, wp, wgen, cast(uint) meta, pend);
+                                continue; // no staged reply for this section
+                            }
+                            catch (Exception)
+                                repInt(reply, 1); // spawn failed: reply now
+                        }
+                        // a LOCALLY-parked fiber this woke must run (and count
+                        // its stats) BEFORE any later message — YIELD to it
+                        try
+                            yield();
+                        catch (Exception)
+                        {
+                        }
                     }
+                    else if (opcode == cmdIx!"config")
+                        configCmd(cmd.arr[1 .. $], reply); // only RESETSTAT is broadcast
                     else if (opcode == cmdIx!"publish")
                         repInt(reply, gPubSub.publish(cmd.arr[1].str, cmd.arr[2].str));
                     else if (opcode == cmdIx!"spublish")
@@ -1699,7 +1760,18 @@ private void shardDrainLoop() nothrow
                             pubsubIntrospect(cmd.arr[1 .. $], reply);
                     }
                     else
+                    {
+                        immutable errPrev = gTotalErrorReplies;
                         cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
+                        // commandstats/errorstats on the OWNER (phase 2.5c): the
+                        // requester's executeCommand returns at the hop, before
+                        // its stats tail, so a hopped command was counted
+                        // NOWHERE. Count where it executed — INFO merges the sum.
+                        immutable errored = reply.length && reply.data[0] == '-';
+                        if (errored && gTotalErrorReplies == errPrev)
+                            statErrorReply(cast(const(char)[]) reply.data);
+                        statCall(opcode, errored);
+                    }
                     // The write-tail the LOCAL path runs after dispatch (see
                     // executeCommand): wake THIS shard's parked blockers. The
                     // wake must fire where the keyspace changed — without this a
@@ -1746,8 +1818,20 @@ private void shardDrainLoop() nothrow
         else if (cast(ShardMsg) kind == ShardMsg.blockKick)
         {
             // a requester cancelled a remote block (phase 2.5b): wake the parked
-            // XREAD/XREADGROUP fibers so they observe the cancel flag NOW
+            // XREAD/XREADGROUP fibers so they observe the cancel flag NOW —
+            // and the pop-family fibers too (spurious wakes are safe: the block
+            // loops re-check and re-wait WITHOUT re-registering, so the FIFO
+            // order is preserved). Cancels are rare; this is off the hot path.
             cast(void) gKeyActivity.emit();
+            wakeAllBlockWaiters();
+            // YIELD so the woken fibers observe the cancel and finish (reply +
+            // stats) before this drain processes any later message (e.g. the
+            // INFO that a test issues immediately after CLIENT UNBLOCK).
+            try
+                yield();
+            catch (Exception)
+            {
+            }
         }
         else if (cast(ShardMsg) kind == ShardMsg.pub)
         {
@@ -1822,7 +1906,7 @@ private void shardDrainLoop() nothrow
 // A locally-parked conn wakes via its blockEvt; a conn parked as a REQUESTER of
 // a remote block (shardFireBlocking) picks its unblockReq up at the next block
 // tick and cancels its remote park through the pending.
-private void drainClientUnblock(const ref RVal cmd, ref ByteBuffer reply) nothrow
+private ShardPending* drainClientUnblock(const ref RVal cmd, ref ByteBuffer reply) nothrow
 {
     import dreads.commands : parseLong;
     import dreads.stream : nowMs;
@@ -1843,10 +1927,62 @@ private void drainClientUnblock(const ref RVal cmd, ref ByteBuffer reply) nothro
             p.unblockReq = mode;
             if (p.blockEvtInit)
                 p.blockEvt.emit(); // wake it; the block loop honours unblockReq
+            if (!p.remoteBlock && p.remotePend !is null)
+            {
+                // Parked as the REQUESTER of a remote block (shardFireBlocking,
+                // on this very thread): write the cancel NOW and kick every
+                // shard so the owner's parked fiber observes it immediately.
+                // The :1 reply is DEFERRED (see the drain's watcher): Redis's
+                // contract is that when CLIENT UNBLOCK returns, the unblock has
+                // HAPPENED — a test reads INFO commandstats right after, and
+                // the owner's stats must already be written.
+                import core.atomic : atomicStore;
+                import dreads.shard : gShardCount, shardEnqueue, shardWake,
+                    ShardMsg, tShard;
+
+                atomicStore(p.remotePend.cancel, cast(ubyte)(mode == 2 ? 3 : 2));
+                static immutable ubyte[1] kb = [0];
+                foreach (uint s2; 0 .. gShardCount)
+                    if (s2 != tShard)
+                    {
+                        shardEnqueue(s2, kb[], null, tShard, ShardMsg.blockKick);
+                        shardWake(s2);
+                    }
+                return p.remotePend; // caller defers the :1 until this completes
+            }
             unblocked = 1;
         }
     }
     repInt(reply, unblocked);
+    return null;
+}
+
+// Deferred CLIENT UNBLOCK reply (phase 2.5c): wait until the cancelled remote
+// park completes — its pending goes ready, or the slot's acquire-generation
+// moves (the conn already reaped and reused it) — then send the :1 to the
+// broadcast's requester. Runs in its own fiber on the conn's router thread.
+private void watchUnblockDone(ShardPending* wp, uint gen, uint reqShard, void* pend) nothrow
+{
+    import core.time : msecs;
+    import dreads.shard : shardEnqueue, shardWake, ShardMsg;
+
+    for (;;)
+    {
+        if (wp.ready || wp.genq != gen)
+            break;
+        immutable ec = wp.done.emitCount;
+        if (wp.ready || wp.genq != gen)
+            break;
+        try
+            cast(void) wp.done.waitUninterruptible(msecs(BLOCK_POLL_MS), ec);
+        catch (Exception)
+        {
+        }
+    }
+    ByteBuffer rb;
+    repInt(rb, 1);
+    shardEnqueue(reqShard, rb.data, pend, 0, ShardMsg.reply);
+    shardWake(reqShard);
 }
 
 // Fan a fire-and-forget publish (keyspace notification / script publish) out
@@ -2115,6 +2251,7 @@ enum BroadcastKind : ubyte
     unionArr, // PUBSUB (SHARD)CHANNELS — union of the N bulk arrays, deduped
     sumPairs, // PUBSUB (SHARD)NUMSUB — [ch,:n]* pairs, counts summed pairwise
     unionCount, // PUBSUB NUMPAT — :|union| of per-shard pattern-name arrays
+    infoMerge, // INFO — per-field numeric aggregation of the N section texts
 }
 
 // CTFE opcode → BroadcastKind (indexed by aclCmdIndex, like gRouteFirstKey).
@@ -2472,6 +2609,9 @@ private void mergeBroadcast(BroadcastKind kind, ShardPending*[] pend, ref ByteBu
         static const(char)[][1024] uniqC; // TLS
         repInt(o, cast(long) collectUnionBulks(pend, uniqC[]));
         break;
+    case BroadcastKind.infoMerge:
+        mergeInfoTexts(pend, o);
+        break;
     case BroadcastKind.sumPairs:
         // PUBSUB (SHARD)NUMSUB: every shard answers the SAME requested channels
         // in the SAME order — walk the replies in lockstep and sum the counts.
@@ -2530,6 +2670,328 @@ private void mergeBroadcast(BroadcastKind kind, ShardPending*[] pend, ref ByteBu
         }
         break;
     }
+}
+
+// --- INFO cross-shard aggregation (phase 2.5c, workstream (d)) -----------------
+// Each shard rendered its own full INFO text (the drain's plain dispatch — its
+// keyspace section iterates that shard's own db slice). The merge takes THIS
+// shard's text as the base and rewrites the per-shard numeric fields:
+//   - scalar counters that are TLS per shard (connected_clients, used_memory,
+//     expired/evicted, total_error_replies, rdb_changes_since_last_save, ACL
+//     denies, migrate sockets) are SUMMED across the N texts;
+//   - blocked_clients is already a shared global (every text agrees) — kept;
+//   - cmdstat_/errorstat_/dbN lines are UNIONED (a command counted only on the
+//     key-owner shard must still appear) with their numeric fields summed.
+// Everything else (versions, config mirrors, paused state) keeps the base value.
+private immutable string[] INFO_SUM_FIELDS = [
+    "connected_clients", "used_memory", "mem_clients_normal", "expired_keys",
+    "expired_fields", "evicted_keys", "total_error_replies",
+    "migrate_cached_sockets", "acl_access_denied_auth", "acl_access_denied_cmd",
+    "acl_access_denied_key", "acl_access_denied_channel",
+    "rdb_changes_since_last_save",
+];
+
+// Extract the text payload of a bulk ($) or verbatim (=) INFO reply.
+private const(char)[] infoReplyText(return scope const(ubyte)[] d) @nogc nothrow @trusted
+{
+    if (d.length < 4 || (d[0] != '$' && d[0] != '='))
+        return null;
+    size_t pos = 0;
+    const(char)[] hdr;
+    if (!respLine(d, pos, hdr))
+        return null;
+    auto t = cast(const(char)[]) d[pos .. d.length >= pos + 2 ? d.length - 2 : pos];
+    if (d[0] == '=' && t.length >= 4 && t[0 .. 4] == "txt:")
+        t = t[4 .. $]; // verbatim carries a format prefix
+    return t;
+}
+
+// Find `name` as a line key in `text` ("name:..." at a line start), returning
+// the value slice up to the line end (null if absent).
+private const(char)[] infoFindLine(return scope const(char)[] text, scope const(char)[] name) @nogc nothrow @trusted
+{
+    size_t i = 0;
+    while (i < text.length)
+    {
+        if (i + name.length < text.length && text[i .. i + name.length] == name
+                && text[i + name.length] == ':')
+        {
+            size_t v = i + name.length + 1, e = v;
+            while (e < text.length && text[e] != '\r' && text[e] != '\n')
+                e++;
+            return text[v .. e];
+        }
+        while (i < text.length && text[i] != '\n')
+            i++;
+        i++;
+    }
+    return null;
+}
+
+// Parse the leading unsigned integer of `v` (0 if none/null).
+private ulong infoNum(scope const(char)[] v) @nogc nothrow
+{
+    ulong n = 0;
+    foreach (ch; v)
+    {
+        if (ch < '0' || ch > '9')
+            break;
+        n = n * 10 + (ch - '0');
+    }
+    return n;
+}
+
+// Extract `field=` inside a comma-separated value like "calls=3,usec=0,...".
+private ulong infoField(scope const(char)[] v, scope const(char)[] field) @nogc nothrow
+{
+    size_t i = 0;
+    while (i < v.length)
+    {
+        if (i + field.length + 1 <= v.length && v[i .. i + field.length] == field
+                && v[i + field.length] == '=')
+            return infoNum(v[i + field.length + 1 .. $]);
+        while (i < v.length && v[i] != ',')
+            i++;
+        i++;
+    }
+    return 0;
+}
+
+private bool infoIsSumField(scope const(char)[] name) @nogc nothrow
+{
+    foreach (f; INFO_SUM_FIELDS)
+        if (name == f)
+            return true;
+    return false;
+}
+
+// Advance past a family's lines (prefix-keyed) following a section header.
+private size_t infoSkipFamily(scope const(char)[] t, size_t i, scope const(char)[] prefix) @nogc nothrow
+{
+    while (i < t.length)
+    {
+        if (!(i + prefix.length < t.length && t[i .. i + prefix.length] == prefix))
+            break;
+        while (i < t.length && t[i] != '\n')
+            i++;
+        i++;
+    }
+    return i;
+}
+
+// Collect the distinct `prefix`-keyed line keys across all texts into `keys`.
+private size_t infoCollectKeys(scope const(char)[][] texts, scope const(char)[] prefix,
+        const(char)[][] keys, bool dbNumeric) @nogc nothrow
+{
+    size_t nk = 0;
+    foreach (t; texts)
+    {
+        size_t i = 0;
+        while (i < t.length)
+        {
+            if (i + prefix.length < t.length && t[i .. i + prefix.length] == prefix)
+            {
+                size_t e = i;
+                while (e < t.length && t[e] != ':' && t[e] != '\n')
+                    e++;
+                if (e < t.length && t[e] == ':')
+                {
+                    auto key = t[i .. e];
+                    bool ok = true;
+                    if (dbNumeric) // require db<digits> exactly (not "dbsize")
+                    {
+                        ok = key.length > prefix.length;
+                        foreach (ch; key[prefix.length .. $])
+                            if (ch < '0' || ch > '9')
+                            {
+                                ok = false;
+                                break;
+                            }
+                    }
+                    if (ok)
+                    {
+                        bool dup = false;
+                        foreach (k2; keys[0 .. nk])
+                            if (k2 == key)
+                            {
+                                dup = true;
+                                break;
+                            }
+                        if (!dup && nk < keys.length)
+                            keys[nk++] = key;
+                    }
+                }
+            }
+            while (i < t.length && t[i] != '\n')
+                i++;
+            i++;
+        }
+    }
+    return nk;
+}
+
+// cmdstat lines: calls/usec summed, the literal usec_per_call kept, rejected/
+// failed summed — rendered exactly like the local emit so `cmdrstat` matches.
+private void infoEmitCmdstats(ref ByteBuffer ob, scope const(char)[][] texts) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    static const(char)[][1024] keys; // TLS
+    immutable nk = infoCollectKeys(texts, "cmdstat_", keys[], false);
+    char[256] lb = void;
+    foreach (key; keys[0 .. nk])
+    {
+        ulong calls = 0, usec = 0, rej = 0, fail = 0;
+        foreach (t; texts)
+        {
+            auto v = infoFindLine(t, key);
+            if (v is null)
+                continue;
+            calls += infoField(v, "calls");
+            usec += infoField(v, "usec");
+            rej += infoField(v, "rejected_calls");
+            fail += infoField(v, "failed_calls");
+        }
+        auto n = snprintf(lb.ptr, lb.length,
+                "%.*s:calls=%llu,usec=%llu,usec_per_call=0.00,rejected_calls=%llu,failed_calls=%llu\r\n",
+                cast(int) key.length, key.ptr, calls, usec, rej, fail);
+        ob.append(lb[0 .. n]);
+    }
+}
+
+private void infoEmitErrorstats(ref ByteBuffer ob, scope const(char)[][] texts) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    static const(char)[][512] keys; // TLS
+    immutable nk = infoCollectKeys(texts, "errorstat_", keys[], false);
+    char[256] lb = void;
+    foreach (key; keys[0 .. nk])
+    {
+        ulong count = 0;
+        foreach (t; texts)
+        {
+            auto v = infoFindLine(t, key);
+            if (v !is null)
+                count += infoField(v, "count");
+        }
+        auto n = snprintf(lb.ptr, lb.length, "%.*s:count=%llu\r\n",
+                cast(int) key.length, key.ptr, count);
+        ob.append(lb[0 .. n]);
+    }
+}
+
+// db lines: keys/expires/volatile-items summed, avg_ttl kept 0.
+private void infoEmitKeyspace(ref ByteBuffer ob, scope const(char)[][] texts) nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    static const(char)[][32] keys; // TLS
+    immutable nk = infoCollectKeys(texts, "db", keys[], true);
+    char[256] lb = void;
+    foreach (key; keys[0 .. nk])
+    {
+        ulong keysN = 0, expires = 0, vol = 0;
+        foreach (t; texts)
+        {
+            auto v = infoFindLine(t, key);
+            if (v is null)
+                continue;
+            keysN += infoField(v, "keys");
+            expires += infoField(v, "expires");
+            vol += infoField(v, "keys_with_volatile_items");
+        }
+        auto n = snprintf(lb.ptr, lb.length,
+                "%.*s:keys=%llu,expires=%llu,avg_ttl=0,keys_with_volatile_items=%llu\r\n",
+                cast(int) key.length, key.ptr, keysN, expires, vol);
+        ob.append(lb[0 .. n]);
+    }
+}
+
+// The infoMerge body: base = this shard's own text, fields rewritten per policy.
+private void mergeInfoTexts(ShardPending*[] pend, ref ByteBuffer o) nothrow
+{
+    import core.stdc.stdio : snprintf;
+    import dreads.resp : repVerbatim;
+    import dreads.shard : tShard;
+
+    static const(char)[][64] textsBuf; // TLS
+    size_t nt = 0;
+    foreach (p; pend)
+    {
+        auto t = infoReplyText(p.reply.data);
+        if (t !is null && nt < textsBuf.length)
+            textsBuf[nt++] = t;
+    }
+    auto texts = textsBuf[0 .. nt];
+    if (texts.length == 0)
+    {
+        repVerbatim(o, "txt", "");
+        return;
+    }
+    auto base = tShard < texts.length ? texts[tShard] : texts[0];
+    static ByteBuffer mb; // TLS: the merged text
+    mb.clear();
+    char[256] lb = void;
+    size_t i = 0;
+    while (i < base.length)
+    {
+        size_t le = i;
+        while (le < base.length && base[le] != '\r' && base[le] != '\n')
+            le++;
+        auto line = base[i .. le];
+        size_t next = le;
+        while (next < base.length && (base[next] == '\r' || base[next] == '\n'))
+        {
+            if (base[next] == '\n')
+            {
+                next++;
+                break;
+            }
+            next++;
+        }
+        size_t c = 0;
+        while (c < line.length && line[c] != ':')
+            c++;
+        auto key = line[0 .. c];
+        if (c < line.length && infoIsSumField(key))
+        {
+            ulong sum = 0;
+            foreach (t; texts)
+                sum += infoNum(infoFindLine(t, key));
+            auto n = snprintf(lb.ptr, lb.length, "%.*s:%llu\r\n",
+                    cast(int) key.length, key.ptr, sum);
+            mb.append(lb[0 .. n]);
+        }
+        else if (line == "# Commandstats")
+        {
+            mb.append("# Commandstats\r\n");
+            infoEmitCmdstats(mb, texts);
+            i = infoSkipFamily(base, next, "cmdstat_");
+            continue;
+        }
+        else if (line == "# Errorstats")
+        {
+            mb.append("# Errorstats\r\n");
+            infoEmitErrorstats(mb, texts);
+            i = infoSkipFamily(base, next, "errorstat_");
+            continue;
+        }
+        else if (line == "# Keyspace")
+        {
+            mb.append("# Keyspace\r\n");
+            infoEmitKeyspace(mb, texts);
+            i = infoSkipFamily(base, next, "db");
+            continue;
+        }
+        else
+        {
+            mb.append(line);
+            mb.append("\r\n");
+        }
+        i = next;
+    }
+    repVerbatim(o, "txt", cast(const(char)[]) mb.data);
 }
 
 // Collect the union of the bulk strings of N array replies into `uniq`
@@ -2755,11 +3217,13 @@ private void shardFireBlocking(ref Conn c, int owner, int opcode, uint db,
 
     atomicOp!"+="(gBlockedClients, 1); // INFO clients: this router's client is parked (remotely)
     c.blocked = true; // eligible for CLIENT UNBLOCK while parked here
+    c.remotePend = p; // lets drainClientUnblock cancel the remote park DIRECTLY
     scope (exit)
     {
         atomicOp!"-="(gBlockedClients, 1);
         c.blocked = false;
         c.unblockReq = 0;
+        c.remotePend = null;
     }
     while (!p.ready)
     {
@@ -4447,6 +4911,25 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, pk, o);
                 return true;
             }
+        }
+        // INFO (phase 2.5c, workstream (d)): stats are TLS per shard — every
+        // shard renders its own text (the drain's plain dispatch; its keyspace
+        // section iterates that shard's own slice) and the merge sums the
+        // per-shard numeric fields. See mergeInfoTexts for the field policy.
+        if (shardOpcode == cmdIx!"info")
+        {
+            broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd,
+                    BroadcastKind.infoMerge, o);
+            return true;
+        }
+        // CONFIG RESETSTAT clears TLS counters — reset every shard's, or the
+        // INFO merge keeps resurrecting the other shards' stale counts.
+        if (shardOpcode == cmdIx!"config" && cmd.arr.length == 2
+                && eqICDebug(cmd.arr[1].str, "RESETSTAT"))
+        {
+            broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd,
+                    BroadcastKind.gateOk, o);
+            return true;
         }
     }
     if (shardOwner < 0 && c.shardPendCount > 0)

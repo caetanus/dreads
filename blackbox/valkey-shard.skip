@@ -7,8 +7,11 @@
 #      used arbitrary keys and didn't hashtag. Not a bug — a conscious decision.
 #  (B) commands forbidden under sharding by design (SWAPDB — the db spans all
 #      shards, cross-shard atomicity too costly for a rare admin op).
-#  (C) cross-shard pub/sub not yet built (the next 2b item).
-#  (D) INFO cross-shard aggregation deferred (each router reports its own shard).
+#  (E) MULTI/EXEC/WATCH under sharding (v1 gap; un-skip when same-slot MULTI
+#      ships to the owner as a unit).
+#  (F) not sharding: fails identically at shards=1 (suite drift / old gaps).
+#  [(C) cross-shard pub/sub and (D) INFO/stats aggregation LANDED — phase 2.5c;
+#   their former skips are gone.]
 #
 # NOTE: commands dreads does NOT support at all are a global matter, not a
 # sharding one, and live in valkey-sync.skip — not here. See SHARDING-COMMANDS.md.
@@ -31,30 +34,6 @@ BZMPOP should not blocks on non key arguments - #10762
 # (A/DEBUG) DEBUG OBJECT/JMAP on a specific key isn't routed under sharding
 # (DEBUG is test/dev infra with a local executeCommand handler, no hop).
 INCR can modify objects in-place
-
-# (D) INFO keyspace count not aggregated across shards: each router reports only
-# its own shard's key count (~total/N), so tests asserting keys=<total> from
-# `info keyspace` fail. SCAN itself (composite cursor) is correct.
-/SCAN unknown type
-/SCAN with expired keys
-
-# (D) INFO errorstats not aggregated across shards: the blocked XREADGROUP is
-# correctly woken with -NOGROUP (that part passes), but the error is counted on
-# the key-owner shard's TLS errorstats while the test's `r` connection reads
-# INFO on its own router. Un-skip when INFO aggregation lands.
-XGROUP DESTROY should unblock XREADGROUP with -NOGROUP
-# rdb_changes_since_last_save: the pop effect dirties the key-OWNER shard while
-# the test's connection reads INFO on its own router
-BLPOP/BLMOVE should increase dirty
-# commandstats: a hopped blocking command is counted on the key-owner shard
-# (statBlockingReply runs in the owner's fiber) while the test reads its own
-# router's INFO commandstats
-Blocking command accounted only once in commandstats
-Blocking command accounted only once in commandstats after timeout
-# used_memory: per-shard allocator stat — the key lives on the owner shard, the
-# test's router (idle at higher N) reports ~0 (surfaces at shards=8)
-Test LPUSH and LPOP on plain nodes
-Test LREM on plain nodes
 
 # (B) forbidden under sharding by design
 /SWAPDB
