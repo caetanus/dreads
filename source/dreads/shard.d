@@ -184,6 +184,12 @@ public enum ShardMsg : uint
     // their pending's cancel flag NOW instead of on a poll tick. (The pop
     // family polls at the block tick and needs no kick.)
     blockKick = 2,
+    // Cross-shard pub/sub delivery (phase 2.5c): a fire-and-forget keyspace
+    // notification / script publish fanned out from the shard that generated
+    // it. Payload: [u32 chanLen][chan][msg]; the receiving drain delivers to
+    // ITS thread's local gPubSub subscribers. (Client PUBLISH itself travels
+    // as a broadcast `cmd` instead — it needs the summed receiver-count reply.)
+    pub = 3,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which

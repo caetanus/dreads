@@ -253,9 +253,30 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         cast(void) parseNotifyFlags(gConfig.notifyKeyspaceEvents, gNotifyFlags);
         gNotifyPublish = (scope const(char)[] chan, scope const(char)[] msg) nothrow{
             gPubSub.publish(chan, msg);
+            // phase 2.5c: a notification fires on the shard that ran the write —
+            // subscribers may sit on any router, so fan it out (gated: no
+            // subscriber anywhere ⇒ nothing to deliver, skip the lanes)
+            if (sharded())
+            {
+                import core.atomic : atomicLoad, MemoryOrder;
+                import dreads.pubsub : gSubTotal;
+
+                if (atomicLoad!(MemoryOrder.raw)(gSubTotal) != 0)
+                    shardPubFanout(chan, msg);
+            }
         };
-        // lets a script's redis.call('publish'/'spublish') reach the pub/sub layer
+        // lets a script's redis.call('publish'/'spublish') reach the pub/sub layer.
+        // Under sharding the RETURN stays the local receiver count (scripts across
+        // shards are a documented v1 gap) but delivery still fans out.
         gPublishHook = (scope const(char)[] chan, scope const(char)[] msg, bool shard) nothrow{
+            if (!shard && sharded())
+            {
+                import core.atomic : atomicLoad, MemoryOrder;
+                import dreads.pubsub : gSubTotal;
+
+                if (atomicLoad!(MemoryOrder.raw)(gSubTotal) != 0)
+                    shardPubFanout(chan, msg);
+            }
             return shard ? gShardPubSub.publish(chan, msg, "smessage")
                 : gPubSub.publish(chan, msg);
         };
@@ -345,8 +366,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // separate from the 1s cron below so the fsync/eviction/lru work does NOT
         // also run 5x more often.
         cast(void) setTimer(200.msecs, delegate() @trusted nothrow {
-            import dreads.det : freezeClock;
-            import dreads.obj : gActiveExpire, gLazyFree;
+            import dreads.obj : gLazyFree;
 
             // Reclaim blocks the free-thread gathered from off-loop UNLINKs. Bounded
             // per tick so a giant value's deallocate spreads over ticks instead of
@@ -362,47 +382,11 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 gReplicator.nudgeProposals();
                 gExpireDelPending = false;
             }
-
-            // Cheap early-out: with active expiry off (the default) this fast timer
-            // must do NOTHING — no clock read, no db sweep, no flush — so it never
-            // costs the hot path a wasted wakeup's worth of work.
-            if (!gActiveExpire)
-                return;
-            // Master-authoritative: ONLY the leader actively reaps and propagates
-            // the expiry DELs; a follower applies those from the log and never
-            // self-expires (that would fork the truth about a key's life).
-            if (gReplicator !is null && !gReplicator.isLeader)
-                return;
-            freezeClock(0); // pin this cycle's clock to wall time (see below)
-            // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
-            // is a propagated DEL) is held until the window lifts, like eviction.
-            immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
-            if (paused)
-                return;
-            foreach (ref d; gDbs) // drop-soon sweep across every database
-            {
-                gNotifyDb = d.db; // "expired" fires on THIS db's channel
-                d.activeExpireCycle();
-                d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
-            }
-            flushPendingNotify(); // deliver the "expired"/"hexpired"/"evicted" events queued
-            if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
-                flushTrackingInval(0);
+            maintExpireTick(); // sweep the databases THIS thread owns
         }, true);
         cast(void) setTimer(1.seconds, delegate() @trusted nothrow {
-            // Pin THIS cycle's clock to wall time. detNow() otherwise returns the
-            // last command's frozen gClock (never reset to 0 after dispatch), which
-            // is stale here — so a background eviction cycle would compare against a
-            // frozen "now".
-            import dreads.det : freezeClock;
-
-            freezeClock(0); // 0 => freeze the current wall clock into gClock
-            lruClock = cast(uint)(nowMs() / 1000);
-            runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
+            maintEvictionTick(); // clock pin + LRU clock + eviction of OUR slice
             releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
-            flushPendingNotify(); // deliver any events the eviction cycle queued
-            if (gTrackCount)
-                flushTrackingInval(0);
             pubsubTapExpire(nowMs()); // disarm the dashboard message tap if polling stopped
             gAof.fsyncNow();
         }, true);
@@ -1203,6 +1187,17 @@ private struct WaiterQ
 // here is the same rehash double-free class as the conn registry was).
 private Dict!WaiterQ[NUM_DBS] gWaiters;
 
+// The 16 logical databases THIS thread owns: its shard's partition under
+// sharding, the classic gDbs otherwise. The maintenance sweeps (active expire,
+// eviction) iterate this — sweeping gDbs under sharding touches keyspaces that
+// hold no data (and another shard's keys would never be reaped/evicted).
+private Keyspace[] myDbSlice() nothrow @trusted
+{
+    import dreads.shard : gShardKs, tShard;
+
+    return sharded() ? gShardKs[tShard * NUM_DBS .. (tShard + 1) * NUM_DBS] : gDbs[];
+}
+
 // Is the connection still usable to receive a wakeup? (peer may have vanished
 // while its fiber was parked — never fire at a dead conn.)
 private bool connAlive(Conn* c) nothrow
@@ -1683,6 +1678,26 @@ private void shardDrainLoop() nothrow
                         // (see executeCommand); serve it on THIS shard's registry
                         drainClientUnblock(cmd, reply);
                     }
+                    else if (opcode == cmdIx!"publish")
+                        repInt(reply, gPubSub.publish(cmd.arr[1].str, cmd.arr[2].str));
+                    else if (opcode == cmdIx!"spublish")
+                        repInt(reply, gShardPubSub.publish(cmd.arr[1].str,
+                                cmd.arr[2].str, "smessage"));
+                    else if (opcode == cmdIx!"pubsub")
+                    {
+                        // NUMPAT answers this shard's distinct pattern NAMES —
+                        // internal wire for the unionCount merge (a :count per
+                        // shard cannot be deduped); the rest introspect locally.
+                        if (cmd.arr.length >= 2 && eqICDebug(cmd.arr[1].str, "NUMPAT"))
+                        {
+                            size_t np = 0;
+                            gPubSub.eachPattern((pat) { np++; return 0; });
+                            repArrayHeader(reply, np);
+                            gPubSub.eachPattern((pat) { repBulk(reply, pat); return 0; });
+                        }
+                        else
+                            pubsubIntrospect(cmd.arr[1 .. $], reply);
+                    }
                     else
                         cast(void) dispatch(cmd, *myKeyspace(db), reply, arena, 0, opcode);
                     // The write-tail the LOCAL path runs after dispatch (see
@@ -1696,6 +1711,13 @@ private void shardDrainLoop() nothrow
                         cast(void) gKeyActivity.emit();
                         signalReadyKeys(cast(int) db, *myKeyspace(db));
                     }
+                    // keyspace notifications the dispatch QUEUED (it is @nogc and
+                    // cannot publish) — the serve loop flushes after each local
+                    // command; the drain must do the same or a hopped write's
+                    // events sit in this shard's TLS buffer until some unrelated
+                    // local command flushes a stale backlog (phase 2.5c).
+                    if (gNotifyFlags)
+                        flushPendingNotify();
                 }
                 else
                 {
@@ -1726,6 +1748,18 @@ private void shardDrainLoop() nothrow
             // a requester cancelled a remote block (phase 2.5b): wake the parked
             // XREAD/XREADGROUP fibers so they observe the cancel flag NOW
             cast(void) gKeyActivity.emit();
+        }
+        else if (cast(ShardMsg) kind == ShardMsg.pub)
+        {
+            // cross-shard keyspace notification / script publish (phase 2.5c):
+            // deliver to THIS shard's local subscribers, fire-and-forget
+            if (p.length >= 4)
+            {
+                immutable uint cl = *cast(const(uint)*) p.ptr;
+                if (4 + cast(size_t) cl <= p.length)
+                    cast(void) gPubSub.publish(cast(const(char)[]) p[4 .. 4 + cl],
+                            cast(const(char)[]) p[4 + cl .. $]);
+            }
         }
         else // ShardMsg.reply — walk the coalesced batch, fill each pending
         {
@@ -1815,6 +1849,31 @@ private void drainClientUnblock(const ref RVal cmd, ref ByteBuffer reply) nothro
     repInt(reply, unblocked);
 }
 
+// Fan a fire-and-forget publish (keyspace notification / script publish) out
+// to every OTHER shard's local subscriber registry (phase 2.5c). Callers gate
+// on gSubTotal — with no subscriber anywhere this is never reached. Runs on
+// whichever shard thread generated the event (the enqueue writes only this
+// thread's own SPSC lanes).
+private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) nothrow
+{
+    import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake, ShardMsg;
+
+    static ByteBuffer pb; // TLS: one staging per shard thread, no yield inside
+    pb.clear();
+    immutable size_t len = 4 + chan.length + msg.length;
+    auto space = pb.freeSpace(len)[0 .. len];
+    *cast(uint*) space.ptr = cast(uint) chan.length;
+    space[4 .. 4 + chan.length] = cast(const(ubyte)[]) chan[];
+    space[4 + chan.length .. $] = cast(const(ubyte)[]) msg[];
+    pb.grow(len);
+    foreach (uint s2; 0 .. gShardCount)
+        if (s2 != tShard)
+        {
+            shardEnqueue(s2, pb.data, null, tShard, ShardMsg.pub);
+            shardWake(s2);
+        }
+}
+
 // Copy a hopped BLOCKING command out of the transient ring slice and park a
 // fiber that serves it as a LOCAL blocking command on this owner shard (phase
 // 2.5b, see remoteBlockServe). Rare path: the GC alloc for the copy + task is
@@ -1897,6 +1956,8 @@ private void remoteBlockServe(ubyte[] cmdBytes, uint reqShard, ShardPending* pen
     }
     if (!served)
         repError(reply, "ERR shard: malformed blocking hop");
+    if (gNotifyFlags) // events queued by the blocking serve (nobody else flushes here)
+        flushPendingNotify();
     shardEnqueue(reqShard, reply.data, cast(void*) pend, 0, ShardMsg.reply);
     shardWake(reqShard);
 }
@@ -2051,6 +2112,9 @@ enum BroadcastKind : ubyte
     gateOk, // FLUSHALL / FLUSHDB — +OK iff every shard replied +OK
     concatArr, // KEYS — one flat array = concat of the N arrays
     randomNonNil, // RANDOMKEY — a RANDOM non-$-1 reply (uniform across shards)
+    unionArr, // PUBSUB (SHARD)CHANNELS — union of the N bulk arrays, deduped
+    sumPairs, // PUBSUB (SHARD)NUMSUB — [ch,:n]* pairs, counts summed pairwise
+    unionCount, // PUBSUB NUMPAT — :|union| of per-shard pattern-name arrays
 }
 
 // CTFE opcode → BroadcastKind (indexed by aclCmdIndex, like gRouteFirstKey).
@@ -2391,7 +2455,134 @@ private void mergeBroadcast(BroadcastKind kind, ShardPending*[] pend, ref ByteBu
             pick--;
         }
         break;
+    case BroadcastKind.unionArr:
+        // PUBSUB (SHARD)CHANNELS: a channel can have subscribers on several
+        // routers — union the per-shard arrays and dedup (reply order is
+        // unspecified, like Redis).
+        static const(char)[][1024] uniqA; // TLS; slices point into pend replies
+        immutable n = collectUnionBulks(pend, uniqA[]);
+        repArrayHeader(o, n);
+        foreach (u; uniqA[0 .. n])
+            repBulk(o, u);
+        break;
+    case BroadcastKind.unionCount:
+        // PUBSUB NUMPAT: each shard replied its distinct pattern NAMES (see the
+        // drain's pubsub special-case) — the answer is the size of the union
+        // (a sum would overcount a pattern subscribed on two routers).
+        static const(char)[][1024] uniqC; // TLS
+        repInt(o, cast(long) collectUnionBulks(pend, uniqC[]));
+        break;
+    case BroadcastKind.sumPairs:
+        // PUBSUB (SHARD)NUMSUB: every shard answers the SAME requested channels
+        // in the SAME order — walk the replies in lockstep and sum the counts.
+        import dreads.commands : parseLong;
+
+        static const(char)[][512] chNames; // TLS; slices into the first reply
+        static long[512] chSums;
+        size_t k = 0;
+        bool first = true;
+        foreach (p; pend)
+        {
+            auto d = p.reply.data;
+            size_t pos = 0;
+            const(char)[] hdr;
+            if (!respLine(d, pos, hdr) || hdr.length < 2 || hdr[0] != '*')
+                continue;
+            size_t i = 0;
+            while (pos < d.length && d[pos] == '$')
+            {
+                const(char)[] lenLine;
+                if (!respLine(d, pos, lenLine))
+                    break;
+                long bl;
+                if (lenLine.length < 2 || !parseLong(lenLine[1 .. $], bl) || bl < 0
+                        || pos + cast(size_t) bl + 2 > d.length)
+                    break;
+                auto ch = cast(const(char)[]) d[pos .. pos + cast(size_t) bl];
+                pos += cast(size_t) bl + 2;
+                if (pos >= d.length || d[pos] != ':')
+                    break;
+                const(char)[] numLine;
+                if (!respLine(d, pos, numLine))
+                    break;
+                long cnt = 0;
+                cast(void) parseLong(numLine[1 .. $], cnt);
+                if (first)
+                {
+                    if (i < chNames.length)
+                    {
+                        chNames[i] = ch;
+                        chSums[i] = cnt;
+                        k = i + 1;
+                    }
+                }
+                else if (i < k)
+                    chSums[i] += cnt;
+                i++;
+            }
+            first = false;
+        }
+        repArrayHeader(o, k * 2);
+        foreach (i; 0 .. k)
+        {
+            repBulk(o, chNames[i]);
+            repInt(o, chSums[i]);
+        }
+        break;
     }
+}
+
+// Collect the union of the bulk strings of N array replies into `uniq`
+// (deduped, order of first appearance). Bounded: past uniq.length the tail is
+// dropped (introspection scale, not data). Returns the union size.
+private size_t collectUnionBulks(ShardPending*[] pend, const(char)[][] uniq) nothrow
+{
+    import dreads.commands : parseLong;
+
+    size_t n = 0;
+    foreach (p; pend)
+    {
+        auto d = p.reply.data;
+        size_t pos = 0;
+        const(char)[] hdr;
+        if (!respLine(d, pos, hdr) || hdr.length < 2 || hdr[0] != '*')
+            continue;
+        while (pos < d.length && d[pos] == '$')
+        {
+            const(char)[] lenLine;
+            if (!respLine(d, pos, lenLine))
+                break;
+            long bl;
+            if (lenLine.length < 2 || !parseLong(lenLine[1 .. $], bl) || bl < 0
+                    || pos + cast(size_t) bl + 2 > d.length)
+                break;
+            auto ch = cast(const(char)[]) d[pos .. pos + cast(size_t) bl];
+            pos += cast(size_t) bl + 2;
+            bool dup = false;
+            foreach (u; uniq[0 .. n])
+                if (u == ch)
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup && n < uniq.length)
+                uniq[n++] = ch;
+        }
+    }
+    return n;
+}
+
+// Advance `pos` past one CRLF-terminated line of `d`, yielding its body.
+private bool respLine(scope const(ubyte)[] d, ref size_t pos, out const(char)[] line) @nogc nothrow
+{
+    size_t e = pos;
+    while (e + 1 < d.length && !(d[e] == '\r' && d[e + 1] == '\n'))
+        e++;
+    if (e + 1 >= d.length)
+        return false;
+    line = cast(const(char)[]) d[pos .. e];
+    pos = e + 2;
+    return true;
 }
 
 // Parse a leading RESP integer reply `:N\r\n` → N (0 on anything else).
@@ -2644,6 +2835,16 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         cast(void) listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
             serveClient(conn);
         }, sopts);
+    catch (Exception)
+    {
+    }
+    // per-shard maintenance (phase 2.5c): each shard reaps its OWN expired keys
+    // and evicts from its OWN partition, on its own event loop
+    try
+    {
+        cast(void) setTimer(200.msecs, () @trusted nothrow { maintExpireTick(); }, true);
+        cast(void) setTimer(1.seconds, () @trusted nothrow { maintEvictionTick(); }, true);
+    }
     catch (Exception)
     {
     }
@@ -4207,6 +4408,46 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
         }
+        // PUBLISH / SPUBLISH (phase 2.5c): subscribers register on their OWN
+        // router's TLS PubSub, so a publish must reach every shard; each shard
+        // delivers locally and replies its receiver count, sumInt merges the
+        // total (Redis's contract). Zero subscribers anywhere ⇒ :0 without a
+        // hop (the gSubTotal gate). RESP2 subscribe-mode conns fall through to
+        // the switch's restriction error, malformed arity to the local error.
+        if ((shardOpcode == cmdIx!"publish" || shardOpcode == cmdIx!"spublish")
+                && cmd.arr.length == 3 && !(c.totalSubs > 0 && !c.resp3))
+        {
+            import core.atomic : atomicLoad, MemoryOrder;
+            import dreads.pubsub : gSubTotal;
+
+            if (atomicLoad!(MemoryOrder.raw)(gSubTotal) == 0)
+                repInt(o, 0);
+            else
+                broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd,
+                        BroadcastKind.sumInt, o);
+            return true;
+        }
+        // PUBSUB introspection (phase 2.5c): subscriber registries are per-router
+        // TLS, so CHANNELS/NUMSUB/NUMPAT must aggregate across shards. NUMPAT is
+        // a sum of per-shard unique counts (overcounts only when the SAME pattern
+        // is subscribed on two routers — acceptable for an introspection probe).
+        if (shardOpcode == cmdIx!"pubsub" && cmd.arr.length >= 2)
+        {
+            auto psub = cmd.arr[1].str;
+            BroadcastKind pk = BroadcastKind.none;
+            if (eqICDebug(psub, "CHANNELS") || eqICDebug(psub, "SHARDCHANNELS"))
+                pk = BroadcastKind.unionArr;
+            else if ((eqICDebug(psub, "NUMSUB") || eqICDebug(psub, "SHARDNUMSUB"))
+                    && cmd.arr.length > 2)
+                pk = BroadcastKind.sumPairs;
+            else if (eqICDebug(psub, "NUMPAT"))
+                pk = BroadcastKind.unionCount;
+            if (pk != BroadcastKind.none)
+            {
+                broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, pk, o);
+                return true;
+            }
+        }
     }
     if (shardOwner < 0 && c.shardPendCount > 0)
         flushShardPending(c, o);
@@ -5565,6 +5806,59 @@ private bool freeMemoryIfNeeded() nothrow
 // Timer path (opt-in `active-eviction`): Redis evicts on a cron too — a key can
 // be dropped without a subsequent write. Sweeps every db. CLIENT PAUSE holds it
 // back: no eviction while a pause window is open (the effect waits for unpause).
+// Active-expire sweep of the databases THIS thread owns (phase 2.5c: every
+// shard runs its own maintenance — the main thread's timers only see shard 0's
+// slice, so a TTL'd key on shard 2 would otherwise never actively expire and
+// its `expired` notification would never fire).
+private void maintExpireTick() @trusted nothrow
+{
+    import dreads.det : freezeClock;
+    import dreads.obj : gActiveExpire;
+
+    // Cheap early-out: with active expiry off (the default) this fast timer
+    // must do NOTHING — no clock read, no db sweep, no flush.
+    if (!gActiveExpire)
+        return;
+    // Master-authoritative: ONLY the leader actively reaps and propagates
+    // the expiry DELs; a follower applies those from the log and never
+    // self-expires (that would fork the truth about a key's life).
+    if (gReplicator !is null && !gReplicator.isLeader)
+        return;
+    freezeClock(0); // pin this cycle's clock to wall time (see maintEvictionTick)
+    // A CLIENT PAUSE freezes replicated mutation: active expiry (an expiry
+    // is a propagated DEL) is held until the window lifts, like eviction.
+    immutable paused = gPauseUntilMs != 0 && nowMs() < gPauseUntilMs;
+    if (paused)
+        return;
+    foreach (ref d; myDbSlice()) // drop-soon sweep across every database WE own
+    {
+        gNotifyDb = d.db; // "expired" fires on THIS db's channel
+        d.activeExpireCycle();
+        d.activeSubExpireCycle(); // reap due hash-field TTLs (the "path pro resto")
+    }
+    flushPendingNotify(); // deliver the "expired"/"hexpired" events queued
+    if (gTrackCount) // deliver invalidations queued by active expiry (no writer)
+        flushTrackingInval(0);
+}
+
+// Eviction tick for the databases THIS thread owns (see maintExpireTick).
+private void maintEvictionTick() @trusted nothrow
+{
+    // Pin THIS cycle's clock to wall time. detNow() otherwise returns the
+    // last command's frozen gClock (never reset to 0 after dispatch), which
+    // is stale here — so a background eviction cycle would compare against a
+    // frozen "now".
+    import dreads.det : freezeClock;
+    import dreads.obj : lruClock;
+
+    freezeClock(0); // 0 => freeze the current wall clock into gClock
+    lruClock = cast(uint)(nowMs() / 1000);
+    runEvictionCycle(); // opt-in background maxmemory eviction (skips under pause)
+    flushPendingNotify(); // deliver any events the eviction cycle queued
+    if (gTrackCount)
+        flushTrackingInval(0);
+}
+
 private void runEvictionCycle() nothrow
 {
     import dreads.obj : gActiveEviction;
@@ -5576,7 +5870,7 @@ private void runEvictionCycle() nothrow
         return; // eviction is skipped during a client pause
     bool volatileOnly, randomPick;
     evictionMode(volatileOnly, randomPick);
-    foreach (ref d; gDbs)
+    foreach (ref d; myDbSlice())
     {
         size_t budget = 0;
         while (usedMemory() > gConfig.maxmemory && budget++ < 1024)

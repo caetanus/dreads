@@ -133,7 +133,11 @@ bool parseNotifyFlags(scope const(char)[] s, out uint flags) @nogc nothrow
 /// The db index the notification channels are shaped for — set by the command
 /// dispatch (and the active-expire/eviction loops) to the keyspace being touched,
 /// so `__keyspace@<db>__` / `__keyevent@<db>__` name the RIGHT database, not 0.
-public __gshared int gNotifyDb;
+/// THREAD-LOCAL (phase 2.5c): each shard thread dispatches / sweeps its own
+/// keyspaces concurrently — a __gshared here let one shard's db index leak into
+/// another shard's channel names (`pending` right below is TLS for the same
+/// reason).
+public int gNotifyDb;
 
 void notifyKeyspaceEvent(uint klass, scope const(char)[] event, scope const(char)[] key) @nogc nothrow
 {

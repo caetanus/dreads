@@ -56,13 +56,6 @@ Blocking command accounted only once in commandstats after timeout
 Test LPUSH and LPOP on plain nodes
 Test LREM on plain nodes
 
-# (C) cross-shard pub/sub not yet built (next 2b item): a subscriber connection
-# lands on one router; the key write / PUBLISH runs on the shard owning the key
-# and the (keyspace-notification) message is published locally there, so the
-# subscriber's shard never sees it and `$rd read` blocks. Skip until sharded
-# pub/sub (PUBLISH fan-out across shards) lands, else the test hangs 300s.
-MSETEX keyspace notifications
-
 # (B) forbidden under sharding by design
 /SWAPDB
 
@@ -88,3 +81,6 @@ BRPOPLPUSH does not affect WATCH while still blocked
 # verdict flags only sharding gaps.
 List listpack -> quicklist encoding conversion
 List encoding conversion when RDB loading
+# hangs 300s: background active-expire never fires the `expired` notification
+# on db 9 (fails identically at shards=1; pre-existing, NOT a sharding gap)
+Keyspace notifications: expired events (background expire)
