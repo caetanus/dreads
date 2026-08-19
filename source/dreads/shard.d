@@ -212,6 +212,11 @@ public struct ShardPending
     // after observing a cancel (within one tick), so the handshake completes and
     // the requester never releases a slot the owner may still touch.
     shared ubyte cancel;
+    // Acquire generation: bumped every acquireShardPending. Lets a same-thread
+    // WATCHER of an in-flight slot (drainClientUnblock's deferred :1 reply)
+    // detect that the slot was reaped and reused — "ready OR gen moved" both
+    // mean the wait it was watching has completed.
+    uint genq;
     ShardPending* next; // thread-local free-list link (no per-op alloc)
 }
 
@@ -242,6 +247,7 @@ public ShardPending* acquireShardPending() nothrow @trusted
         p.ready = false;
         p.reply.clear();
         atomicStore(p.cancel, cast(ubyte) 0); // reused slot: clear any stale cancel
+        p.genq++;
         return p;
     }
     p = new ShardPending;
