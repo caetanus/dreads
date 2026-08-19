@@ -134,7 +134,35 @@ string 104/0, incr 31/0, other 26/0):
 is taken literally (`search_pattern_list` strips index 0). Names carry a `{$type}` prefix
 (`{standalone} SCAN ...`) so use the regex form to match through it.
 
-**NEXT — phase 2.5b = BLOCKING commands under sharding.** The stream suites (baseline shards=1:
+**[DONE 2026-08-19, `921825c`] phase 2.5b — BLOCKING commands under sharding.**
+Design that landed: hop the blocking command to the key-owner shard and park it THERE —
+the owner's drain spawns a fiber per blocking hop (`HOP_BLOCKING` bit 15) that runs the
+EXISTING block machinery (gWaiters FIFO / gKeyActivity / blockWait) against a synthetic
+`Conn` (`remoteBlock=true`); the requester waits synchronously, cancelling via the atomic
+`ShardPending.cancel` handshake (+ `ShardMsg.blockKick` for instant XREAD cancel). KEY
+LESSON: a remote park must wait the FULL slice on gKeyActivity — re-waking on a poll tick
+re-registers and shuffles the event's FIFO waiter order (fairness break, caught by the
+"reprocessing command" test). Pre-existing bugs fixed en route: owner drain now runs the
+write-tail (gKeyActivity/signalReadyKeys — without it even local blockers never woke on
+hopped writes); `HOP_RESP3` bit 14 carries the requester's protocol (RESP3 nil/double
+forms were wrong for EVERY hopped command) + per-conn gRespProto restore on block wakes
+(latent single-shard bug); xreadBlock's static-TLS buffers made per-call; gBlockedClients
+is a shared atomic; CLIENT UNBLOCK broadcasts (sumInt) since conn registries are per-router.
+Sweep @ shards=4 ALL green incl. list 269/0, zset 319/0, stream 71/0, cgroups 50/0;
+shards=8 spot green; shards=1 parity intact; 576/0.
+WATCH: one 1-in-10 hang of unit/type/list at "Unblock fairness is kept while pipelining"
+(shards=4, full-matrix run only; 9 subsequent runs + a 200-iteration direct repro all
+clean — if it re-appears, start there). Skip file gained (D) stats-not-aggregated,
+(E) MULTI/EXEC/WATCH-under-sharding, (F) valkey-9.1.0 drift categories.
+NOTE: /tmp/valkey battery setup = valkey-9.1.0 tarball + `make MALLOC=libc valkey-server`,
+symlinked to /tmp/valkey (it lives in a session scratchpad — re-create after reboot).
+
+**NEXT — phase 2.5c candidates** (pick by broker-value): (c) cross-shard pub/sub
+(broker-critical), (d) INFO/stats aggregation (keyspace, used_memory, errorstats,
+commandstats, dirty — several (D) skips un-skip when it lands), (e) same-slot MULTI/EXEC
+shipped to the owner as a unit (un-skips the (E) category; Redis Cluster supports
+same-slot transactions). Original 2.5b note kept below for context:
+OLD — phase 2.5b = BLOCKING commands under sharding. The stream suites (baseline shards=1:
 71/0 + 51/0) fail under shards>1 ONLY on `XREAD`/`XREADGROUP` with `BLOCK`: the client parks on the
 ROUTER shard, but the wake (XADD) fires on the KEY-OWNER shard and never reaches the parked client →
 NOGROUP / timeout. Same root cause as the v1-scope "blocking commands (BLPOP family)" gap below —
