@@ -152,6 +152,49 @@ private string unquote(string s) nothrow
     return s;
 }
 
+/++
+Maps a `DREADS_<DIRECTIVE>` environment variable onto its directive name, or
+null when the variable is not ours.
+
+`DREADS_MAXMEMORY_POLICY` -> `maxmemory-policy`: strip the prefix, lower-case,
+underscores to dashes — the exact surface the example docker-compose has
+documented since the dashboard release, and which nothing implemented until
+now: the compose said `DREADS_APPENDONLY: "yes"` turned the AOF on, and against
+the published image `CONFIG GET appendonly` answered `no`, silently. A
+documented knob that does nothing is worse than a missing one, because the
+operator who set it has no reason to look again.
++/
+public string envToDirective(string envName) nothrow
+{
+    import std.algorithm.searching : startsWith;
+    import std.uni : toLower;
+
+    enum prefix = "DREADS_";
+    if (!envName.startsWith(prefix) || envName.length == prefix.length)
+        return null;
+
+    try
+    {
+        char[] outp;
+        foreach (c; envName[prefix.length .. $])
+            outp ~= c == '_' ? '-' : c;
+        return outp.toLower.idup;
+    }
+    catch (Exception)
+        return null;
+}
+
+unittest
+{
+    assert(envToDirective("DREADS_APPENDONLY") == "appendonly");
+    assert(envToDirective("DREADS_MAXMEMORY_POLICY") == "maxmemory-policy");
+    assert(envToDirective("DREADS_DASHBOARD_PASSWORD") == "dashboard-password");
+    // Not ours, not a directive: nulls, so the caller skips them.
+    assert(envToDirective("PATH") is null);
+    assert(envToDirective("DREADS_") is null);
+    assert(envToDirective("DREADSX") is null);
+}
+
 /// Applies one directive; false = unknown or invalid value.
 public bool applyDirective(string name, string value, ref Config cfg) nothrow
 {

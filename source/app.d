@@ -25,6 +25,41 @@ else
         // left-to-right so later args override earlier — a `--flag` after the
         // config file overrides the file, exactly like redis-server.
         string cliLock; // --lockfile= : a CLI-only knob, NOT a config directive
+
+        // DREADS_<DIRECTIVE>=value — the environment half of the redis-style
+        // surface (see envToDirective). Applied BEFORE the command line, so a
+        // flag or a conf file keeps the last word: a container image's CMD can
+        // still override the stack's environment, which is the precedence an
+        // operator already expects from redis-server itself.
+        {
+            import dreads.config : envToDirective;
+            import std.process : environment;
+
+            foreach (name, value; environment.toAA)
+            {
+                auto directive = envToDirective(name);
+                if (directive is null)
+                    continue;
+                if (directive == "lockfile")
+                {
+                    stderr.writeln("dreads: DREADS_LOCKFILE is ignored; "
+                        ~ "--lockfile is CLI-only");
+                    continue;
+                }
+                // Same convenience as the flag: a non-boolean value is the
+                // AOF filename, turning the AOF on and naming it at once.
+                if (directive == "appendonly" && value != "yes" && value != "no")
+                {
+                    gConfig.appendonly = true;
+                    gConfig.appendfilename = value;
+                    continue;
+                }
+                if (!applyDirective(directive, value, gConfig))
+                    stderr.writeln("dreads: ignoring unknown/invalid env: ",
+                        name, "=", value);
+            }
+        }
+
         auto argv = args[1 .. $];
         for (size_t i = 0; i < argv.length; i++)
         {
