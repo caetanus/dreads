@@ -193,10 +193,22 @@ aggregation (1 test, upstream harness bug in its fail path), (F) valkey-9.1.0 dr
 Also still open globally: AOF under sharding (hopped writes never AOF — pre-existing),
 cross-shard client tracking, scripts/MIGRATE across shards, the ACL-on-owner hop contract.
 
-**NEXT — back to the PERF campaign on the fastbox** (this PC is too noisy): bytecode IR is
-the judged next structural step (see "The big structural idea" above). Re-measure the
-sharded ladder first — this session added per-write drain work (stats + write-tail) and
-hop bits; the arbiter is perf instructions/op, shards=1 must still equal baseline.
+**[DONE 2026-08-20, `7986b90`] perf re-adjudication after the correctness campaign** (on
+the 3950X fastbox, governor was POWERSAVE — official re-baseline still pending): instr/op
+P=64 SET: shards=1 2834→**2738 (−3.4%, now −6.5% vs master!)** — the local write-tail
+emitted gKeyActivity on EVERY write; a TLS `tKeyWaiters` gate (bracketed by
+waitForActivity; safe on the cooperative loop) wakes only live waiters. shards=2
+3246→3327: was 3473 — fixed a seq-cst cancel store in acquireShardPending (implicit XCHG
+per hop → relaxed) and isBlockingHopForm's per-keyed-command string switch (→ CTFE
+`gCmdBlockingHop` opcode table); the remaining +81/op is the owner-side stats/write-tail/
+notify work the drain now legitimately does. Powersave ladder: 1→1.61M · 2→2.30M(71%) ·
+4→4.20M(65%) · 6→5.03M(52%) · 8→5.72M(44%).
+
+**NEXT — the structural perf levers, on a performance-governor session:** (1) re-baseline
+the ladder officially; (2) the bytecode IR (kills commandRouteSlot 7-8% + owner re-parse +
+string dispatch — see "The big structural idea"); (3) the hashtable (Keyspace.lookup ~23%
+at s2); (4) vibe-core logTrace ~2-3% sits in the read path of BOTH builds — a vibe build
+with compiled-out trace logging is a cheap candidate. The old plan below for context:
 
 Original 2.5b→2.5c note kept below for context:
 OLD — phase 2.5b = BLOCKING commands under sharding. The stream suites (baseline shards=1:
