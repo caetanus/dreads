@@ -29,7 +29,7 @@ import dreads.acl : AclUser, aclUser, aclInit, aclCheckPassword, aclGetOrCreate,
     aclDeniedKey, aclCanRunCmdSub, aclCmdHasSubRule, aclIsContainer, aclLogAdd,
     aclLogReset, aclLogCount, aclLogAt, gAclLogMaxLen, gAclActive, aclDeniedDb,
     aclCanAccessDb, aclCanAccessKey, forEachCommandKey;
-import dreads.aclcat : gCmdCats;
+import dreads.aclcat : cmdIx, gCmdCats;
 import dreads.authpw : initAuthPw;
 import dreads.aof : Aof, aofLoad, aofRewrite;
 import dreads.commands : dispatch, globMatch, isWriteCommand, isPausedByWrite,
@@ -2237,21 +2237,14 @@ enum uint HOP_RESP3 = 0x4000;
 // (the local path read the ROUTER's keyspace and saw the wrong data).
 enum uint HOP_NOBLOCK = 0x2000;
 
-private int shardOwnerOf(const ref RVal cmd, scope const(char)[] uname, out int opcode) nothrow
+// IR-1: the caller resolved the opcode (one lowercase+hash per command, at the
+// top of executeCommand) — this only maps it to a slot and a shard.
+private int shardOwnerOf(const ref RVal cmd, int opcode, scope const(char)[] lname) nothrow
 {
     import dreads.shard : shardOfSlot;
-    import dreads.acl : aclCmdIndex, commandRouteSlot, ROUTE_CROSSSLOT;
+    import dreads.acl : commandRouteSlot, ROUTE_CROSSSLOT;
 
-    opcode = -1;
-    char[16] lbuf = void;
-    if (uname.length > lbuf.length)
-        return -1; // over-long name is never a keyed data command
-    foreach (i, ch; uname)
-        lbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-    // ONE name resolution serves both: the routing slot AND the hop opcode
-    // (dispatch's integer switch on the owner — no re-resolution there).
-    opcode = aclCmdIndex(cast(const(char)[]) lbuf[0 .. uname.length]);
-    immutable slot = commandRouteSlot(opcode, cast(string) lbuf[0 .. uname.length], cmd.arr);
+    immutable slot = commandRouteSlot(opcode, cast(string) lname, cmd.arr);
     if (slot == ROUTE_CROSSSLOT)
         return SHARD_CROSSSLOT;
     if (slot < 0)
@@ -3316,22 +3309,22 @@ private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) noth
             if (name.length > nbuf.length)
                 return false;
             foreach (i, ch; name)
-                nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            auto uname = cast(const(char)[]) nbuf[0 .. name.length];
-            switch (uname)
+                nbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+            auto qlname = cast(const(char)[]) nbuf[0 .. name.length];
+            switch (qlname)
             {
-            case "DEBUG":
+            case "debug":
                 if (qcmd.arr.length < 2 || !eqICDebug(qcmd.arr[1].str, "SLEEP"))
                     return false;
                 continue; // keyless but shippable (see the drain's exec handler)
-            case "MIGRATE", "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO",
-                 "FCALL", "FCALL_RO":
+            case "migrate", "eval", "evalsha", "eval_ro", "evalsha_ro",
+                 "fcall", "fcall_ro":
                 return false; // keyed but server-layer — cannot run on the drain
             default:
                 break;
             }
-            int opc;
-            immutable so = shardOwnerOf(qcmd, uname, opc);
+            immutable int opc = aclCmdIndex(qlname);
+            immutable so = shardOwnerOf(qcmd, opc, qlname);
             if (so == SHARD_CROSSSLOT || so < 0)
                 return false; // cross-slot, or keyless/server-layer
             if (owner < 0)
@@ -3355,19 +3348,13 @@ private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) noth
             auto name = qcmd.arr[0].str;
             char[16] nbuf = void;
             foreach (i, ch; name)
-                nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-            auto uname = cast(const(char)[]) nbuf[0 .. name.length];
+                nbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+            auto qlname = cast(const(char)[]) nbuf[0 .. name.length];
             uint flags = c.resp3 ? HOP_RESP3 : 0;
-            int opc;
-            if (uname == "DEBUG")
-                opc = aclCmdIndex("debug");
-            else
-            {
-                cast(void) shardOwnerOf(qcmd, uname, opc);
-                if (opc >= 0 && gCmdBlockingHop[opc]
-                        && isBlockingHopForm(opc, qcmd.arr[1 .. $]))
-                    flags |= HOP_BLOCKING | HOP_NOBLOCK; // one-shot form on the owner
-            }
+            immutable int opc = aclCmdIndex(qlname);
+            if (qlname != "debug" && opc >= 0 && gCmdBlockingHop[opc]
+                    && isBlockingHopForm(opc, qcmd.arr[1 .. $]))
+                flags |= HOP_BLOCKING | HOP_NOBLOCK; // one-shot form on the owner
             appendHopCmd(c.shardBc, qcmd, c.multiQueue.data[qs .. qpos],
                     cast(int)(cast(uint) opc | flags), cast(uint) c.dbp.db, cast(void*) p);
         }
@@ -3392,6 +3379,40 @@ private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) noth
     releaseShardPending(p);
     return true;
 }
+
+// IR-1: opcode → pure data command, served ENTIRELY by dispatch() — no case in
+// executeCommand's (or handleCommand's) server-layer string switch touches it.
+// The hot path skips the uppercase conversion and the string switch for these.
+// CONSERVATIVE whitelist: a data command missing here merely stays on the slow
+// path; NEVER add a command that has a `case` in either switch.
+private immutable bool[gCmdCats.length] gPureDispatch = () {
+    bool[gCmdCats.length] t;
+    foreach (i, c; gCmdCats)
+        foreach (name; ["set", "get", "incr", "decr", "incrby", "decrby",
+                "incrbyfloat", "append", "strlen", "getset", "getdel", "getex",
+                "setex", "psetex", "setnx", "setrange", "getrange", "mget",
+                "mset", "msetnx", "del", "unlink", "exists", "type", "touch",
+                "expire", "pexpire", "expireat", "pexpireat", "ttl", "pttl",
+                "persist", "expiretime", "pexpiretime", "lpush", "rpush",
+                "lpushx", "rpushx", "lpop", "rpop", "llen", "lrange", "lindex",
+                "lset", "linsert", "lrem", "ltrim", "lpos", "lmove",
+                "rpoplpush", "lmpop", "hset", "hget", "hdel", "hlen", "hmget",
+                "hmset", "hgetall", "hkeys", "hvals", "hexists", "hincrby",
+                "hincrbyfloat", "hsetnx", "hstrlen", "hrandfield", "sadd",
+                "srem", "sismember", "smismember", "scard", "smembers", "spop",
+                "srandmember", "smove", "sinter", "sunion", "sdiff",
+                "sinterstore", "sunionstore", "sdiffstore", "sintercard",
+                "zadd", "zrem", "zscore", "zmscore", "zcard", "zcount",
+                "zincrby", "zrange", "zrevrange", "zrangebyscore",
+                "zrevrangebyscore", "zrangebylex", "zrevrangebylex", "zrank",
+                "zrevrank", "zpopmin", "zpopmax", "zmpop", "zrandmember",
+                "xadd", "xlen", "xrange", "xrevrange", "xdel", "xack",
+                "setbit", "getbit", "bitcount", "bitpos", "pfadd", "pfcount",
+                "hscan", "sscan", "zscan", "ping", "echo"])
+            if (c.name == name)
+                t[i] = true;
+    return t;
+}();
 
 // CTFE: opcode → is a blocking-hop candidate (phase 2.5b). Pop family true
 // unconditionally; XREAD/XREADGROUP marked but need the BLOCK-keyword check
@@ -4332,6 +4353,12 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         else
             c.lastArgLen = 0;
     }
+    // IR-1: the bookkeeping above already lowercased the name — resolve the
+    // opcode ONCE from it; the pause/ACL gates and the transaction switch below
+    // are all rare (or gated) for a pure data command, which runs straight
+    // through to executeCommand with the opcode in hand.
+    auto lname = cast(const(char)[]) c.lastCmdBuf[0 .. c.lastCmdLen];
+    immutable int opcode = aclCmdIndex(lname);
 
     // CLIENT PAUSE barrier — before ACL/dispatch/AOF. A matching command (ALL, or a
     // write in WRITE mode) is buffered raw and replayed when the window lifts; CLIENT
@@ -4339,14 +4366,14 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
     // MULTI queuing is NOT barriered (commands still return QUEUED under a pause);
     // the transaction is instead held as a unit at EXEC iff it queued a write.
     // A pause is rare — keep it off the branch predictor's hot path (expect false).
-    if (expect(gPauseUntilMs != 0, false) && uname != "CLIENT" && c.id != gPauseIssuer)
+    if (expect(gPauseUntilMs != 0, false) && opcode != cmdIx!"client" && c.id != gPauseIssuer)
     {
         if (nowMs() >= gPauseUntilMs)
             gPauseUntilMs = 0; // window elapsed — run normally
         else
         {
             bool barrier;
-            if (uname == "EXEC")
+            if (opcode == cmdIx!"exec")
                 barrier = gPauseAll || c.multiHasWrite; // hold the whole txn
             else if (c.inMulti)
                 barrier = false; // let MULTI/queued commands reach the queue
@@ -4376,6 +4403,8 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
             return true;
     }
 
+    // IR-1 fast path: a pure data command has no case below.
+    if (opcode < 0 || !gPureDispatch[opcode])
     switch (uname)
     {
     case "SELECT":
@@ -5048,21 +5077,42 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
         repSimple(o, "QUEUED");
         return true;
     }
-    return executeCommand(c, cmd, rawCmd, o, arena);
+    return executeCommand(c, cmd, rawCmd, o, arena, opcode, lname);
 }
 
 /// Executes one non-transactional command: pub/sub and connection commands
 /// (which need the connection identity), scripting, persistence hooks, and
 /// the @nogc dispatch for everything else.
 private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] rawCmd,
-        ref ByteBuffer o, ref Arena arena) nothrow
+        ref ByteBuffer o, ref Arena arena, int preOpcode = int.min,
+        scope const(char)[] preLname = null) nothrow
 {
     auto name = cmd.arr[0].str;
     auto args = cmd.arr[1 .. $];
     char[16] nbuf = void;
     if (name.length > nbuf.length)
         return dispatch(cmd, *c.dbp, o, arena);
-    foreach (i, ch; name)
+    // IR-1 (bytecode campaign): ONE lowercase pass + ONE hash lookup resolves
+    // the opcode for the WHOLE command — routing, hop, dispatch, stats and the
+    // write/OOM classification all key off it. handleCommand usually hands both
+    // in (resolved off its lastCmdBuf bookkeeping); the EXEC replay and other
+    // internal callers let this head resolve them.
+    char[16] lnbuf = void;
+    const(char)[] lname;
+    int opcode;
+    if (preOpcode != int.min)
+    {
+        opcode = preOpcode;
+        lname = preLname;
+    }
+    else
+    {
+        foreach (i, ch; name)
+            lnbuf[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+        lname = cast(const(char)[]) lnbuf[0 .. name.length];
+        opcode = aclCmdIndex(lname);
+    }
+    foreach (i, ch; lname)
         nbuf[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
     auto uname = cast(string) nbuf[0 .. name.length];
 
@@ -5070,11 +5120,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // owner >= 0 => a keyed data command we DEFER to that shard (fired async below,
     // reaped in order at a flush point). owner < 0 => keyless / runs inline HERE, so
     // its reply must come AFTER any shard hops already in flight — reap them first to
-    // keep pipeline order. (Blocking/script/migrate ops are keyed but handled inline
-    // in the switch below; cross-shard support for those is a later phase — v1 runs
-    // them on the connection's own shard, see SHARDING.md.) Free when shards==1.
-    int shardOpcode = -1; // the resolved command index, reused as the hop opcode
-    immutable int shardOwner = sharded() ? shardOwnerOf(cmd, uname, shardOpcode) : -1;
+    // keep pipeline order. Free when shards==1.
+    int shardOpcode = opcode; // the resolved command index, reused as the hop opcode
+    immutable int shardOwner = sharded() ? shardOwnerOf(cmd, opcode, lname) : -1;
     if (shardOwner == SHARD_CROSSSLOT)
     {
         repError(o, "CROSSSLOT Keys in request don't hash to the same slot");
@@ -5252,6 +5300,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     }
 
+    // IR-1 fast path: a pure data command has no case below — skip the string
+    // switch entirely and fall to the shared routing/dispatch tail.
+    if (opcode < 0 || !gPureDispatch[opcode])
     switch (uname)
     {
     case "SSUBSCRIBE":
@@ -5648,16 +5699,9 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         // self-shard, nothing pending → fall through to the full local dispatch below.
     }
 
-    // Resolve the command's ACL index ONCE for the whole tail: write/OOM
-    // classification and commandstats all key off cidx instead of re-running a
-    // binary-searched string-switch (isWriteCommand / isDenyOomCommand /
-    // aclCmdIndex) on the same name two or three times per command.
-    char[24] lc = void; // nbuf is char[24]; longest command name is 20
-    foreach (i, ch; name)
-        lc[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
-    // the sharded router may have resolved the index already — never resolve twice
-    immutable cidx = shardOpcode >= 0 ? shardOpcode
-        : aclCmdIndex(cast(const(char)[]) lc[0 .. name.length]);
+    // IR-1: the opcode was resolved ONCE at the top — the whole tail (write/OOM
+    // classification, commandstats, prefetch, dispatch) keys off it.
+    immutable cidx = shardOpcode;
     {
         import dreads.acl : routeFirstKeyPos;
         immutable kp = routeFirstKeyPos(cidx);
