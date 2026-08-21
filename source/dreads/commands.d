@@ -680,9 +680,11 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             else
                 repSimple(o, "OK");
             ulong kept = keepttl && existing !is null ? existing.expireAtMs : 0;
-            immutable ulong oldTtl = existing !is null ? existing.expireAtMs : 0;
-            ks.setStr(args[0].str, args[1].str);
-            auto obj = ks.lookup(args[0].str);
+            // ONE hash+probe stores AND returns the slot (`existing` is dead
+            // after this — the upsert may grow/rehash the table)
+            ulong oldTtl;
+            bool isNewKey;
+            auto obj = ks.setStrGet(args[0].str, args[1].str, oldTtl, isNewKey);
             ulong newTtl = 0;
             if (absExpire >= 0)
                 newTtl = absExpire == 0 ? 1 : cast(ulong) absExpire;
@@ -718,10 +720,10 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         : "ERR invalid expire time in 'psetex' command");
                 break;
             }
-            auto prior = ks.lookup(args[0].str);
-            immutable ulong oldTtl = prior !is null ? prior.expireAtMs : 0;
-            ks.setStr(args[0].str, args[2].str);
-            auto obj = ks.lookup(args[0].str);
+            // ONE hash+probe (the old path was lookup + set + a third lookup)
+            ulong oldTtl;
+            bool isNewKey;
+            auto obj = ks.setStrGet(args[0].str, args[2].str, oldTtl, isNewKey);
             ks.retimeExpire(args[0].str, oldTtl, cast(ulong) absMs);
             obj.expireAtMs = cast(ulong) absMs;
             notifyKeyspaceEvent(NClass.str, "set", args[0].str);

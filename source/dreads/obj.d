@@ -799,6 +799,31 @@ public struct Keyspace
             dbAdd(k);
     }
 
+    /// SET's store with ONE hash+probe (hashtable campaign): insert-or-overwrite
+    /// and hand back the stored slot — the old path was set() + a fresh lookup()
+    /// (a third full hash of the same key just to write expireAtMs). `oldTtl`
+    /// reports the overwritten value's expire (0 when new/none) so the caller
+    /// can retime the expiry index without having looked the key up itself.
+    RObj* setStrGet(scope const(char)[] k, scope const(char)[] v,
+            out ulong oldTtl, out bool isNew) @nogc nothrow @trusted
+    {
+        import core.lifetime : moveEmplace;
+
+        bool existed;
+        auto p = d.upsert(k, existed);
+        if (existed)
+        {
+            oldTtl = p.expireAtMs;
+            p.free(); // dispose the overwritten value (same as HashMap.set does)
+        }
+        else
+            dbAdd(k);
+        auto nv = RObj.ofStr(v);
+        moveEmplace(nv, *p);
+        isNew = !existed;
+        return p;
+    }
+
     /// SET of an int-encoded value (INCR on a missing key).
     void setInt(scope const(char)[] k, long v) @nogc nothrow
     {
