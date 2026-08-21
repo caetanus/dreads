@@ -1187,6 +1187,21 @@ private struct WaiterQ
 // here is the same rehash double-free class as the conn registry was).
 private Dict!WaiterQ[NUM_DBS] gWaiters;
 
+// Fibers of THIS thread parked on gKeyActivity (the XREAD fan-out wait).
+// waitForActivity brackets it; the write-tails consult it so a write emits the
+// broadcast event ONLY when someone is actually parked — vibe's emit is not
+// free and this runs per WRITE (event-driven rule: only wake live waiters).
+// Safe on the cooperative loop: a waiter increments BEFORE its wait with no
+// yield in between, so a same-thread write can never miss a registered waiter.
+private int tKeyWaiters;
+
+// The gated XREAD fan-out wake (see tKeyWaiters).
+private void wakeKeyActivity() nothrow
+{
+    if (tKeyWaiters != 0)
+        cast(void) gKeyActivity.emit();
+}
+
 // The 16 logical databases THIS thread owns: its shard's partition under
 // sharding, the classic gDbs otherwise. The maintenance sweeps (active expire,
 // eviction) iterate this — sweeping gDbs under sharding touches keyspaces that
@@ -1781,7 +1796,7 @@ private void shardDrainLoop() nothrow
                             && reply.data[0] != '-')
                     {
                         gWriteEpoch++;
-                        cast(void) gKeyActivity.emit();
+                        wakeKeyActivity();
                         signalReadyKeys(cast(int) db, *myKeyspace(db));
                     }
                     // keyspace notifications the dispatch QUEUED (it is @nogc and
@@ -1914,7 +1929,7 @@ private void shardDrainLoop() nothrow
             }
             if (anyWrite)
             {
-                cast(void) gKeyActivity.emit();
+                wakeKeyActivity();
                 signalReadyKeys(cast(int) db0, *myKeyspace(db0));
             }
             if (gNotifyFlags)
@@ -3349,7 +3364,8 @@ private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) noth
             else
             {
                 cast(void) shardOwnerOf(qcmd, uname, opc);
-                if (isBlockingHopForm(uname, qcmd.arr[1 .. $]))
+                if (opc >= 0 && gCmdBlockingHop[opc]
+                        && isBlockingHopForm(opc, qcmd.arr[1 .. $]))
                     flags |= HOP_BLOCKING | HOP_NOBLOCK; // one-shot form on the owner
             }
             appendHopCmd(c.shardBc, qcmd, c.multiQueue.data[qs .. qpos],
@@ -3377,26 +3393,35 @@ private bool shardExecAsUnit(ref Conn c, ref ByteBuffer o, ref Arena arena) noth
     return true;
 }
 
-// Should this command hop to its key-owner shard as a BLOCKING serve (phase
-// 2.5b)? True for the pop family always (arg errors are surfaced by the owner)
-// and for XREAD/XREADGROUP only when a BLOCK keyword is present. Over-marking
-// is harmless: the owner's serveBlockingSwitch falls back to a plain dispatch
-// when the form turns out not to block (e.g. XREADGROUP without `>`).
-private bool isBlockingHopForm(scope const(char)[] uname, const(RVal)[] args) nothrow
+// CTFE: opcode → is a blocking-hop candidate (phase 2.5b). Pop family true
+// unconditionally; XREAD/XREADGROUP marked but need the BLOCK-keyword check
+// (isBlockingHopForm); WAIT/WAITAOF are AclCat.blocking but keyless — never
+// routed here. Indexed by shardOpcode: the hot path pays ONE array load per
+// keyed command instead of a string switch (measured 0.5% in shards=2 profile).
+private immutable bool[gCmdCats.length] gCmdBlockingHop = () {
+    bool[gCmdCats.length] t;
+    foreach (i, c; gCmdCats)
+        foreach (name; ["blpop", "brpop", "bzpopmin", "bzpopmax", "blmove",
+                "brpoplpush", "blmpop", "bzmpop", "xread", "xreadgroup"])
+            if (c.name == name)
+                t[i] = true;
+    return t;
+}();
+
+// The slow half of the gate, reached ONLY for marked opcodes: XREAD/XREADGROUP
+// block only when a BLOCK keyword is present (the pop family always does).
+// Over-marking is harmless: the owner's serveBlockingSwitch falls back to a
+// plain dispatch when the form turns out not to block.
+private bool isBlockingHopForm(int opcode, const(RVal)[] args) nothrow
 {
-    switch (uname)
-    {
-    case "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX",
-         "BLMOVE", "BRPOPLPUSH", "BLMPOP", "BZMPOP":
-        return true;
-    case "XREAD", "XREADGROUP":
-        foreach (ref a; args)
-            if (eqICDebug(a.str, "BLOCK"))
-                return true;
-        return false;
-    default:
-        return false;
-    }
+    import dreads.aclcat : cmdIx;
+
+    if (opcode != cmdIx!"xread" && opcode != cmdIx!"xreadgroup")
+        return true; // pop family: always a blocking form
+    foreach (ref a; args)
+        if (eqICDebug(a.str, "BLOCK"))
+            return true;
+    return false;
 }
 
 // Fire a BLOCKING command at its key-owner shard and wait SYNCHRONOUSLY for the
@@ -5214,7 +5239,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // past its block). Inside MULTI/EXEC the hop carries HOP_NOBLOCK: Redis
     // serves the one-shot equivalent (nil when empty) — but it must still be
     // served on the OWNER's keyspace, not this router's.
-    if (shardOwner >= 0 && isBlockingHopForm(uname, args))
+    if (shardOwner >= 0 && shardOpcode >= 0 && gCmdBlockingHop[shardOpcode]
+            && isBlockingHopForm(shardOpcode, args))
     {
         import dreads.shard : tShard;
 
@@ -5569,7 +5595,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             if (gScriptWrote)
             {
                 gWriteEpoch++;
-                cast(void) gKeyActivity.emit();
+                wakeKeyActivity();
                 signalReadyKeys(c.dbp.db, *c.dbp);
             }
             return true;
@@ -5715,7 +5741,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         if (isW)
         {
             gWriteEpoch++; // WATCH visibility
-            cast(void) gKeyActivity.emit(); // wake blocked XREAD readers (fan-out)
+            wakeKeyActivity(); // wake blocked XREAD readers (fan-out)
             signalReadyKeys(c.dbp.db, *c.dbp); // wake pop-family fronts
         }
         if (gAof.enabled)
@@ -6943,6 +6969,9 @@ private bool waitForActivity(Conn* c, ref int ec, ref long remainingMs, ulong ti
     // must be first to re-dispatch on a wake). A requester-side cancel wakes us
     // through ShardMsg.blockKick (the owner's drain emits gKeyActivity).
     auto slice = timeoutMs == 0 ? 3_600_000 : remainingMs;
+    tKeyWaiters++; // gates the write-tail emit (see wakeKeyActivity)
+    scope (exit)
+        tKeyWaiters--;
     auto before = MonoTime.currTime;
     ec = gKeyActivity.waitUninterruptible(msecs(slice), ec);
     if (timeoutMs != 0)
@@ -7557,7 +7586,7 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
                 if (gAof.enabled)
                     gAof.append(synth.data);
                 gWriteEpoch++;
-                cast(void) gKeyActivity.emit();
+                wakeKeyActivity();
                 return;
             }
         }
@@ -7789,7 +7818,7 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
             if (gAof.enabled)
                 gAof.append(synth.data);
             gWriteEpoch++;
-            cast(void) gKeyActivity.emit();
+            wakeKeyActivity();
             return;
         }
         if (!waitForActivity(&c, ec, remaining, timeoutMs))
@@ -7804,7 +7833,7 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
 private void logEffect(string verb, scope const(char)[] key) nothrow
 {
     gWriteEpoch++;
-    cast(void) gKeyActivity.emit();
+    wakeKeyActivity();
     if (!gAof.enabled)
         return;
     static ByteBuffer eff; // TLS

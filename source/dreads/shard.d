@@ -247,12 +247,15 @@ public ShardPending* acquireShardPending() nothrow @trusted
     auto p = tPendFree;
     if (p !is null)
     {
-        import core.atomic : atomicStore;
+        import core.atomic : atomicStore, MemoryOrder;
 
         tPendFree = p.next;
         p.ready = false;
         p.reply.clear();
-        atomicStore(p.cancel, cast(ubyte) 0); // reused slot: clear any stale cancel
+        // relaxed: the slot is not shared while free — a seq-cst store here is
+        // an implicit XCHG on x86 (~20+ cyc) on the PER-HOP hot path (measured
+        // +1.3pt in the shards=2 profile)
+        atomicStore!(MemoryOrder.raw)(p.cancel, cast(ubyte) 0);
         p.genq++;
         return p;
     }
