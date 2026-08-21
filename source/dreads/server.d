@@ -1813,7 +1813,7 @@ private void connSink(void* ctx, RcMsg* msg) nothrow
 private void shardDrainLoop() nothrow
 {
     import dreads.shard : myKeyspace, ShardMsg, ShardPending, shardWaitInbound,
-        shardDrainOnce, shardEnqueue, shardWake;
+        shardDrainOnce, shardEnqueue, shardWake, tShard;
     import dreads.det : refreshWall;
     import core.bitop : bsf;
 
@@ -2156,10 +2156,28 @@ private void shardDrainLoop() nothrow
         }
     }
 
+    // ADAPTIVE SPIN before parking (CCX campaign): at high N a shard runs well
+    // under capacity and parks constantly (measured 34.5k voluntary switches/s
+    // at shards=8 vs 3.8k at shards=4) — and EVERY park makes the next
+    // producer pay a futex syscall plus this consumer a scheduler wakeup, on
+    // top of the cross-CCX line transfers. Yield-polling keeps this fiber
+    // runnable: the event loop polls epoll with zero timeout (serve fibers
+    // keep running between yields — no starvation), `parked` is never
+    // published, and producers skip the wake entirely. The budget bounds the
+    // idle burn on a dedicated pinned core; an idle server still sleeps.
+    enum DRAIN_SPIN_BUDGET = 4096;
     while (true)
     {
         try
         {
+            {
+                import dreads.shard : gInbound;
+
+                auto inb = gInbound.length > tShard ? gInbound[tShard] : null;
+                int spins = 0;
+                while (inb !is null && !inb.anyReady() && spins++ < DRAIN_SPIN_BUDGET)
+                    yield();
+            }
             shardWaitInbound(); // park on the per-shard event ONLY when all lanes idle
             refreshWall(); // one clock read per drain pass (owner dispatches hopped cmds)
             replyTouch = 0; // requester shards we owe a batch + single wake this pass
