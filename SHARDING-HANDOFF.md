@@ -213,6 +213,13 @@ win, reverted (its 2.4% cycles needs a performance-governor cycle run to adjudic
 The bytecode IR's target is therefore PRECISE: the 1178-instr hop tax. The other axis is
 CCX-aware placement (cycles). IR is still marked "not yet greenlit" by the USER — ask.
 
+**OFFICIAL RE-BASELINE (2026-08-21, performance governor, `b6511d0`, best-of-3):** SET
+1→1.78M · 2→2.90M(81%) · 3→3.80M(71%) · 4→4.99M(70%) · 6→5.54M(52%) · 8→6.43M(45%);
+s1 trio SET 1.78 / GET 1.75 / INCR 1.78M (INCR +22% — the switch removal pays most on
+small payloads); GET@8 6.82M. vs valkey solo: s1 2.3×, s8 8.4×. In-CCX band (≤4) rose to
+70-81%; the cross-CCX cliff (52/45% at 6/8) + the hashtable (lookup ~23%) are THE two
+frontiers. Arbiter: s1 2300 / s2 2915 / s4 3388 instr/op.
+
 **IR GREENLIT + IR-1 LANDED (2026-08-20, branch `bytecode-ir`, `438a22d`):** opcode
 resolved once per command; both server-layer string switches gated behind the CTFE
 `gPureDispatch` whitelist (conservative — never add a command that has a switch case).
