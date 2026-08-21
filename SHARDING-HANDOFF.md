@@ -213,6 +213,20 @@ win, reverted (its 2.4% cycles needs a performance-governor cycle run to adjudic
 The bytecode IR's target is therefore PRECISE: the 1178-instr hop tax. The other axis is
 CCX-aware placement (cycles). IR is still marked "not yet greenlit" by the USER — ask.
 
+**AOF PER SHARD LANDED (2026-08-21, `705d26b`) — durability under sharding (phase 2.6):**
+one file per shard, owner-thread-only appends (per-key order correct by construction);
+shard 0 keeps the plain name, `.i` for the rest, `<name>.shards` sidecar. Drain logs
+hopped writes (verbatim or propagationOverride — now also CLEARED per section, fixing a
+pre-existing override leak). Boot replay AFTER shardInit, per-shard passes with
+gAllocShard switched (cross-allocator contract); layout mismatch (N changed / legacy) →
+re-route through the live router + compact + delete stale. Per-shard everysec fsync on
+the maintenance tick; BGREWRITEAOF broadcasts (slice-aware rewrite; ACL only in shard
+0's file). E2E: kill-9@4 ✓, reshard 4→2 ✓, legacy 1→4 ✓, rewrite ✓; expire_loadaof ALL
+PASS; sweep green; arbiter cost +8 instr with AOF off. STILL OPEN in persistence:
+SHUTDOWN flushes only the caller's shard (bounded everysec loss on other shards);
+script-effect sink appends on the script thread (slot-0 file, pre-existing race class);
+raft+sharding remains v-next ("raft group per shard" is the day-1 architecture note).
+
 **OFFICIAL RE-BASELINE (2026-08-21, performance governor, `b6511d0`, best-of-3):** SET
 1→1.78M · 2→2.90M(81%) · 3→3.80M(71%) · 4→4.99M(70%) · 6→5.54M(52%) · 8→6.43M(45%);
 s1 trio SET 1.78 / GET 1.75 / INCR 1.78M (INCR +22% — the switch removal pays most on
