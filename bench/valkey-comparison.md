@@ -169,3 +169,36 @@ Data ops ~1.25× median (up to 1.6×). Transactions 2×. AOF writes 1.15–1.73�
 **Pattern pub/sub ~28×** (the segment-tree matcher). Plain fan-out 6.7× (after the
 batched-write fix). One known gap: same-pattern fan-out. Same architecture as
 Valkey — single thread, jemalloc — so these are per-op-efficiency wins.
+
+## Dragonfly head-to-head (2026-08-21, dreads v0.5.0 vs dragonfly v1.40.1)
+
+Same box (Ryzen 3950X), same methodology both sides: server pinned to cores
+0..N-1, 4× redis-benchmark clients pinned to cores 8/10/12/14, `-c 25 -P 64
+-r 200000`, 3M ops per client, performance governor, best of 2-3. Dragonfly
+run as shipped (io_uring, `--proactor_threads N`, no persistence); dreads
+`--shards N` (epoll), AOF off. Both are dumb-client setups (single conn per
+client → internal cross-thread hops on both sides — the honest comparison;
+neither side gets a cluster-aware client).
+
+| op@threads | dreads    | dragonfly | dreads/dfly |
+|------------|-----------|-----------|-------------|
+| SET @1     | 1.78M     | 0.63M     | **2.8×**    |
+| SET @2     | 2.99M     | 1.29M     | 2.3×        |
+| SET @4     | 5.23M     | 2.53M     | 2.1×        |
+| SET @8     | **6.84M** | 4.26M     | 1.6×        |
+| GET @1     | 1.75M     | 0.72M     | 2.4×        |
+| GET @8     | 6.82M     | 4.71M     | 1.4×        |
+| INCR @1    | 1.78M     | 0.66M     | 2.7×        |
+| INCR @8    | 4.58M     | 4.62M     | **1.0× (tie)** |
+
+Reference on the same setup: valkey 9.1 solo = SET 768K / GET 948K.
+
+Reading: Dragonfly's SCALING efficiency is excellent (~85%/thread at 8, ours
+48%) but its per-thread baseline is ~2.8× lower, so dreads wins every point
+except INCR@8, where the curves cross to a statistical tie. Two implications:
+(1) our remaining upside is exactly the scaling curve (per-hop instruction
+tax + cross-CCX transfers — the bytecode-IR and hashtable campaigns); (2)
+INCR@8 is the sharpest probe of that gap: small payloads make the hop tax
+dominant. If per-shard efficiency reaches the 85-90% target at our per-core
+baseline, the 8-thread ceiling is ~12M — the margin Dragonfly cannot follow
+without tripling its per-core speed.
