@@ -204,6 +204,15 @@ per hop → relaxed) and isBlockingHopForm's per-keyed-command string switch (�
 notify work the drain now legitimately does. Powersave ladder: 1→1.61M · 2→2.30M(71%) ·
 4→4.20M(65%) · 6→5.03M(52%) · 8→5.72M(44%).
 
+**Ladder-decay DECOMPOSED (2026-08-20):** per-hop tax ≈ **+1178 instr** (hopped op =
+1.43× local), so eff(N) ≈ 1/(1+(1−1/N)·0.43) explains the curve to within a few points;
+the residue (+145@s4, +400@s8 instr; cyc 3.0k@s4→4.6k@s8) is drain-side + cross-CCX
+stalls (shardDrainLoop.handle 2.3%@s2 → 10.8%@s8). SO_REUSEPORT conn imbalance REFUTED
+(per-thread ticks 287/286/284/282 under s4 saturation). logTrace compile-out: ~0 instr
+win, reverted (its 2.4% cycles needs a performance-governor cycle run to adjudicate).
+The bytecode IR's target is therefore PRECISE: the 1178-instr hop tax. The other axis is
+CCX-aware placement (cycles). IR is still marked "not yet greenlit" by the USER — ask.
+
 **NEXT — the structural perf levers, on a performance-governor session:** (1) re-baseline
 the ladder officially; (2) the bytecode IR (kills commandRouteSlot 7-8% + owner re-parse +
 string dispatch — see "The big structural idea"); (3) the hashtable (Keyspace.lookup ~23%
