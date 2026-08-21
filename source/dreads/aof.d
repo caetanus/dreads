@@ -151,7 +151,15 @@ public struct Aof
 /// (aofLoad / loadSnapshot) restores each key to the db named by its SELECT.
 public void dumpAllKeyspaces(ref ByteBuffer buf) nothrow
 {
-    foreach (ref d; gDbs)
+    dumpKeyspaces(buf, gDbs[]);
+}
+
+/// Slice-aware dump (AOF-per-shard, phase 2.6): a shard's rewrite serialises
+/// ONLY its own 16-db partition. SELECT frames come from each keyspace's own
+/// `db` field, so the slice works for gDbs and for a gShardKs partition alike.
+public void dumpKeyspaces(ref ByteBuffer buf, Keyspace[] dbs) nothrow
+{
+    foreach (ref d; dbs)
     {
         if (d.d.length == 0)
             continue;
@@ -349,7 +357,8 @@ private void emitHashFieldTTLs(ref ByteBuffer buf, scope const(char)[] key, RObj
 /// BGREWRITEAOF: rewrites the log as the canonical rebuild command set.
 /// Runs synchronously — the event loop is single-threaded, so the keyspace
 /// cannot change under us. Reopens the live handle on success.
-public bool aofRewrite(ref Aof live, scope const(char)[] path) nothrow
+public bool aofRewrite(ref Aof live, scope const(char)[] path,
+        Keyspace[] dbs = null, bool emitGlobals = true) nothrow
 {
     import core.stdc.stdio : rename;
 
@@ -367,12 +376,19 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path) nothrow
         return false;
 
     ByteBuffer buf;
-    dumpAllKeyspaces(buf); // every non-empty db, SELECT-framed
+    if (dbs is null)
+        dumpAllKeyspaces(buf); // every non-empty db, SELECT-framed
+    else
+        dumpKeyspaces(buf, dbs); // this shard's partition only (AOF-per-shard)
     // ACL registry is global (not per-db): re-emit users so the compacted AOF
-    // still recreates them on replay.
-    import dreads.acl : aclDumpUsers;
+    // still recreates them on replay. Under AOF-per-shard only shard 0's file
+    // carries them (a per-shard copy would re-apply N times on boot).
+    if (emitGlobals)
+    {
+        import dreads.acl : aclDumpUsers;
 
-    aclDumpUsers(buf);
+        aclDumpUsers(buf);
+    }
     bool ioOk = buf.empty || fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
     fflush(f);
     version (Posix)
@@ -562,6 +578,118 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
     else if (!inb.empty)
         fprintf(stderr, "dreads: AOF has a truncated trailing command (%zu bytes ignored)\n",
                 inb.length);
+    return count;
+}
+
+/// AOF-per-shard replay (phase 2.6): load `path` into the 16-db slice `dbs`,
+/// applying ONLY the commands owned by `ownerShard` under `shardCount` shards
+/// (first-key slot routing — the SAME router the live path uses, so a file
+/// written under a different shard count re-shards correctly on boot).
+/// Keyless commands (ACL SETUSER, EVAL with no keys) apply only on shard 0;
+/// keyless WRITES that act on a whole database (FLUSHDB/FLUSHALL) apply on
+/// every shard's pass (each clears its own slice). SELECT frames re-point
+/// inside `dbs`. Returns commands APPLIED on this pass (skipped ones don't
+/// count), or -1 when the file exists but is unreadable.
+///
+/// ALLOCATOR CONTRACT: the caller must set gAllocShard = ownerShard around this
+/// call (boot, single-threaded) — every value stored into dbs must come from
+/// that shard's allocator, or the owning shard thread later frees a foreign
+/// block (the cross-allocator SIGSEGV class). The scratch buffers here are
+/// created and destroyed inside the call, under the same slot.
+public long aofLoadSharded(scope const(char)[] path, Keyspace[] dbs,
+        uint ownerShard, uint shardCount, bool applyGlobals = true) nothrow
+{
+    import dreads.acl : aclCmdIndex, commandRouteKeyIx;
+    import dreads.slots : keyToSlot;
+    import dreads.shard : shardOfSlot;
+    import dreads.aclcat : cmdIx;
+
+    char[512] zpath = void;
+    if (path.length == 0 || path.length >= zpath.length)
+        return -1;
+    zpath[0 .. path.length] = path;
+    zpath[path.length] = 0;
+    auto f = fopen(zpath.ptr, "rb");
+    if (f is null)
+        return 0; // nothing to replay
+
+    ByteBuffer inb;
+    ByteBuffer sink;
+    Arena arena;
+    long count = 0;
+    bool corrupt = false;
+    size_t curDb = 0;
+
+    for (;;)
+    {
+        auto space = inb.freeSpace(64 * 1024);
+        auto n = fread(space.ptr, 1, space.length, f);
+        if (n == 0)
+            break;
+        inb.grow(n);
+
+        size_t pos = 0;
+        for (;;)
+        {
+            RVal cmd;
+            auto st = parseValue(inb.data, pos, arena, cmd);
+            if (st == ParseStatus.incomplete)
+                break;
+            if (st == ParseStatus.protocolError)
+            {
+                corrupt = true;
+                break;
+            }
+            int selDb;
+            if (aofIsSelect(cmd, selDb))
+            {
+                curDb = cast(size_t) selDb;
+                continue;
+            }
+            // route: does this command belong to ownerShard?
+            bool apply = true;
+            if (shardCount > 1 && cmd.type == RType.Array && cmd.arr.length > 0)
+            {
+                auto name = cmd.arr[0].str;
+                char[16] lb = void;
+                if (name.length <= lb.length)
+                {
+                    foreach (i, ch; name)
+                        lb[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+                    auto lname = cast(const(char)[]) lb[0 .. name.length];
+                    immutable ci = aclCmdIndex(lname);
+                    auto k = commandRouteKeyIx(ci, cast(string) lname, cmd.arr);
+                    if (k !is null)
+                        apply = shardOfSlot(keyToSlot(k)) == ownerShard;
+                    else if (ci == cmdIx!"flushdb" || ci == cmdIx!"flushall")
+                        apply = true; // db-wide: every shard clears its own slice
+                    else
+                        apply = applyGlobals; // globals (ACL, keyless EVAL): see caller
+                }
+                else
+                    apply = applyGlobals;
+            }
+            if (apply && curDb < dbs.length)
+            {
+                replayCommand(cmd, dbs[curDb], sink, arena);
+                sink.clear();
+                count++;
+            }
+            arena.reset();
+            {
+                import dreads.commands : propagationOverride;
+
+                propagationOverride.clear();
+            }
+        }
+        inb.consume(pos);
+        if (corrupt)
+            break;
+    }
+    fclose(f);
+    if (corrupt)
+        fprintf(stderr, "dreads: AOF %s corrupt after %lld commands; stopped replay\n",
+                zpath.ptr, count);
     return count;
 }
 

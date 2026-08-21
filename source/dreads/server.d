@@ -87,8 +87,159 @@ private ref Keyspace gKeys() @property @nogc nothrow @trusted
 // Unsharded (shards=1) every conn lives on the main thread — identical to before.
 private PubSub gPubSub;
 private PubSub gShardPubSub; // single node: shard = plain, own namespace
-private __gshared Aof gAof;
+// AOF-per-shard (phase 2.6): one file per shard, owned and appended by that
+// shard's thread ONLY (share-nothing — a hopped write logs on its OWNER's file,
+// which is also what makes per-key ordering correct by construction: a key has
+// exactly one owner). Shard 0 keeps the plain configured filename, shards 1..
+// N-1 use `<name>.<i>`; a `<name>.shards` sidecar records the layout so a boot
+// under a DIFFERENT shard count re-routes every command through the live
+// router (aofLoadSharded) and compacts fresh per-shard files.
+private __gshared Aof[] gAofs;
+private __gshared Aof gAofFallback; // pre-boot / unit tests: a disabled sink
 private __gshared const(char)[] gAofPath;
+
+// Boot-time AOF setup (phase 2.6): discover the per-shard files, replay them
+// into the per-shard keyspaces, open the writers, and — when the shard count
+// CHANGED since the files were written (the `<path>.shards` sidecar) — re-route
+// every command through the live router and compact fresh per-shard files.
+//
+// ALLOCATOR CONTRACT: runs on the main thread BEFORE any shard thread exists.
+// Each replay pass sets gAllocShard to the target shard so every stored value
+// comes from the allocator its future owner thread will free into (a foreign
+// block is the cross-allocator SIGSEGV class). Scratch lives inside each
+// aofLoadSharded call, under the same slot.
+private bool setupAof(const(char)[] path) nothrow
+{
+    import core.stdc.stdio : fclose, fopen, fprintf, fscanf, remove, snprintf;
+
+    import dreads.alloc : gAllocShard;
+    import dreads.aof : aofLoadSharded, aofRewrite;
+    import dreads.shard : gShardCount, gShardKs;
+
+    immutable uint n = gShardCount > 1 ? gShardCount : 1;
+    Keyspace[] slice(uint i) @trusted nothrow
+    {
+        return sharded() ? gShardKs[i * NUM_DBS .. (i + 1) * NUM_DBS] : gDbs[];
+    }
+    // the layout the existing files were written under (absent sidecar = 1)
+    uint storedN = 1;
+    char[520] sb = void;
+    cast(void) snprintf(sb.ptr, sb.length, "%.*s.shards", cast(int) path.length, path.ptr);
+    if (auto f = fopen(sb.ptr, "rb"))
+    {
+        uint v;
+        if (fscanf(f, "%u", &v) == 1 && v >= 1 && v <= 1024)
+            storedN = v;
+        fclose(f);
+    }
+    immutable bool relayout = storedN != n;
+    immutable uint span = storedN > n ? storedN : n; // superset (crash-mid-migration safe)
+    char[520] nb = void;
+    long total = 0;
+    foreach (uint i; 0 .. n)
+    {
+        gAllocShard = i; // this pass's values belong to shard i's allocator
+        scope (exit)
+            gAllocShard = 0;
+        if (!relayout)
+        {
+            // layout matches: file i holds exactly shard i's commands
+            immutable r = aofLoadSharded(aofFileFor(path, i, nb[]), slice(i), i, n, true);
+            if (r < 0)
+            {
+                printf("dreads: cannot read AOF (shard %u)\n", i);
+                return false;
+            }
+            total += r;
+        }
+        else
+        {
+            // shard count changed: every old file may hold keys now owned by
+            // ANY shard — route every command through the live router. Globals
+            // (ACL) apply once, on the shard-0 pass.
+            foreach (uint fsrc; 0 .. span)
+            {
+                immutable r = aofLoadSharded(aofFileFor(path, fsrc, nb[]), slice(i),
+                        i, n, i == 0);
+                if (r < 0)
+                {
+                    printf("dreads: cannot read AOF (%u)\n", fsrc);
+                    return false;
+                }
+                total += r;
+            }
+        }
+    }
+    printf("dreads: AOF replayed %lld commands across %u shard(s)%s\n", total, n,
+            relayout ? " (re-sharded)".ptr : "".ptr);
+    gAofPath = path;
+    foreach (uint i; 0 .. n)
+        if (!gAofs[i].open(aofFileFor(path, i, nb[])))
+        {
+            printf("dreads: cannot open AOF for append (shard %u)\n", i);
+            return false;
+        }
+    if (relayout)
+    {
+        // compact each shard's file down to exactly its own keys, then drop the
+        // files of the old layout that no shard owns any more
+        foreach (uint i; 0 .. n)
+        {
+            gAllocShard = i;
+            scope (exit)
+                gAllocShard = 0;
+            if (!aofRewrite(gAofs[i], aofFileFor(path, i, nb[]), slice(i), i == 0))
+            {
+                printf("dreads: AOF re-shard rewrite failed (shard %u)\n", i);
+                return false;
+            }
+        }
+        foreach (uint j; n .. span)
+        {
+            char[520] zb = void;
+            cast(void) snprintf(zb.ptr, zb.length, "%.*s.%u",
+                    cast(int) path.length, path.ptr, j);
+            cast(void) remove(zb.ptr);
+        }
+    }
+    if (auto f = fopen(sb.ptr, "wb")) // sb still holds the sidecar path
+    {
+        fprintf(f, "%u\n", n);
+        fclose(f);
+    }
+    return true;
+}
+
+// THIS thread's AOF (its shard's own file; slot 0 when unsharded). The slot
+// is resolved ONCE per thread and cached in TLS — this sits on the per-write
+// tail, where the array indexing measured +14 instr/op.
+private Aof* tAof;
+
+private ref Aof myAof() @nogc nothrow @trusted
+{
+    import dreads.shard : tShard;
+
+    auto a = tAof;
+    if (a is null)
+    {
+        auto arr = gAofs;
+        a = arr.length ? &arr[tShard < arr.length ? tShard : 0] : &gAofFallback;
+        tAof = a;
+    }
+    return *a;
+}
+
+// The per-shard AOF filename: shard 0 = the configured path (shards=1 compat).
+private const(char)[] aofFileFor(return scope const(char)[] base, uint i, return scope char[] buf) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    if (i == 0)
+        return base;
+    immutable n = snprintf(buf.ptr, buf.length, "%.*s.%u",
+            cast(int) base.length, base.ptr, i);
+    return buf[0 .. n];
+}
 // THREAD-LOCAL (share-nothing rule): WATCH is v1 same-shard, and every write to a
 // key executes on its owner's thread (local or hopped) — so the epoch a WATCHer
 // compares moves on exactly the thread whose keyspace it watches. As __gshared,
@@ -138,7 +289,7 @@ public import dreads.obj : gPauseUntilMs, gPauseAll, gPauseIssuer;
 private LocalManualEvent gPauseEvt; // parked fibers wake on UNPAUSE / timeout
 // Replay re-entrancy guard (the CLIENT PAUSE heisenbug). replayPaused() drains a
 // connection's held commands through the normal pipeline, and that path does IO
-// (flushOut / gAof.flush) which yields — another connection's fiber can land a
+// (flushOut / myAof().flush) which yields — another connection's fiber can land a
 // fresh CLIENT PAUSE mid-drain. If that pause took effect while we're still
 // replaying, the remaining held commands would re-barrier against a window that
 // only exists because of the yield, and the emit/park ordering can strand a fiber.
@@ -229,22 +380,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
 
         gAclApplyHook = &aclApplyCanonical; // apply-path (replay/commit) ACL
     }
-    if (aofPath !is null)
-    {
-        auto replayed = aofLoad(aofPath, gKeys);
-        if (replayed < 0)
-        {
-            printf("dreads: cannot read AOF\n");
-            return 1;
-        }
-        printf("dreads: AOF replayed %lld commands\n", replayed);
-        gAofPath = aofPath;
-        if (!gAof.open(aofPath))
-        {
-            printf("dreads: cannot open AOF for append\n");
-            return 1;
-        }
-    }
+    // AOF replay is DEFERRED until after shardInit (phase 2.6): the keyspaces
+    // it loads into are per-shard, and each shard's values must come from that
+    // shard's allocator (see setupAof).
     gKeyActivity = createManualEvent();
     gPauseEvt = createManualEvent();
     {
@@ -289,6 +427,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         shardInit(gConfig.shards);
         if (gShardCount > 1)
             printf("dreads: %u shards\n", gShardCount);
+        gAofs = new Aof[](gShardCount > 1 ? gShardCount : 1);
+        if (aofPath !is null && !setupAof(aofPath))
+            return 1;
 
         if (gConfig.clusterEnabled)
         {
@@ -318,8 +459,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             import dreads.scripting : gScriptEffectSink, startLuaScriptPool;
 
             gScriptEffectSink = (scope const(ubyte)[] fx) @nogc nothrow {
-                if (gAof.enabled)
-                    gAof.append(fx);
+                if (myAof().enabled)
+                    myAof().append(fx);
             };
             // scripts run on a dedicated thread (off the event loop), so a
             // busy script can't stall the loop and SCRIPT KILL can reach it
@@ -385,10 +526,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             maintExpireTick(); // sweep the databases THIS thread owns
         }, true);
         cast(void) setTimer(1.seconds, delegate() @trusted nothrow {
-            maintEvictionTick(); // clock pin + LRU clock + eviction of OUR slice
+            maintEvictionTick(); // clock pin + LRU clock + eviction + AOF fsync
             releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
             pubsubTapExpire(nowMs()); // disarm the dashboard message tap if polling stopped
-            gAof.fsyncNow();
         }, true);
     }
     initReplication();
@@ -1707,8 +1847,9 @@ private void shardDrainLoop() nothrow
                 uint db;
                 bool blocking, resp3, noblock;
                 void* pend;
+                const(ubyte)[] rawSect;
                 if (decodeHopSection(p, pos, arena, cmd, opcode, db, blocking, resp3,
-                        noblock, pend))
+                        noblock, pend, rawSect))
                 {
                     if (blocking)
                     {
@@ -1755,6 +1896,19 @@ private void shardDrainLoop() nothrow
                     }
                     else if (opcode == cmdIx!"config")
                         configCmd(cmd.arr[1 .. $], reply); // only RESETSTAT is broadcast
+                    else if (opcode == cmdIx!"bgrewriteaof")
+                    {
+                        // rewrite THIS shard's file from THIS shard's keyspaces
+                        import dreads.shard : tShard;
+
+                        char[520] rb = void;
+                        if (!myAof().enabled || aofRewrite(myAof(),
+                                aofFileFor(gAofPath, tShard, rb[]), myDbSlice(),
+                                tShard == 0))
+                            repSimple(reply, "OK");
+                        else
+                            repError(reply, "ERR AOF rewrite failed");
+                    }
                     else if (opcode == cmdIx!"publish")
                         repInt(reply, gPubSub.publish(cmd.arr[1].str, cmd.arr[2].str));
                     else if (opcode == cmdIx!"spublish")
@@ -1798,7 +1952,21 @@ private void shardDrainLoop() nothrow
                         gWriteEpoch++;
                         wakeKeyActivity();
                         signalReadyKeys(cast(int) db, *myKeyspace(db));
+                        // AOF-per-shard (phase 2.6): the OWNER logs the hopped
+                        // write — same tail contract as the local path (an
+                        // effects override wins over the verbatim command).
+                        if (myAof().enabled)
+                        {
+                            if (!propagationOverride.empty)
+                                myAof().append(propagationOverride.data);
+                            else
+                                myAof().append(rawSect);
+                        }
                     }
+                    // A hopped command's propagation override must NEVER leak
+                    // into the next command this THREAD logs (serve loop and
+                    // drain share the TLS override).
+                    propagationOverride.clear();
                     // keyspace notifications the dispatch QUEUED (it is @nogc and
                     // cannot publish) — the serve loop flushes after each local
                     // command; the drain must do the same or a hopped write's
@@ -1876,8 +2044,9 @@ private void shardDrainLoop() nothrow
                 uint db;
                 bool blocking, resp3, noblock;
                 void* pend;
+                const(ubyte)[] rawSect;
                 if (!decodeHopSection(p, pos, arena, cmd, opcode, db, blocking,
-                        resp3, noblock, pend))
+                        resp3, noblock, pend, rawSect))
                 {
                     repError(reply, "ERR shard: malformed exec batch");
                     break;
@@ -1925,7 +2094,15 @@ private void shardDrainLoop() nothrow
                 {
                     gWriteEpoch++;
                     anyWrite = true;
+                    if (myAof().enabled) // per-section: replay-equivalent (v1
+                    {                    // doesn't wrap the txn in MULTI/EXEC)
+                        if (!propagationOverride.empty)
+                            myAof().append(propagationOverride.data);
+                        else
+                            myAof().append(rawSect);
+                    }
                 }
+                propagationOverride.clear();
             }
             if (anyWrite)
             {
@@ -2307,7 +2484,7 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
 // until the drain pops, exactly like the single-command descriptor was.
 private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref Arena arena,
         out RVal cmd, out int opcode, out uint db, out bool blocking, out bool resp3,
-        out bool noblock, out void* pend) @trusted nothrow
+        out bool noblock, out void* pend, out const(ubyte)[] rawOut) @trusted nothrow
 {
     if (payload.length - pos < 4)
         return false;
@@ -2328,6 +2505,7 @@ private bool decodeHopSection(scope const(ubyte)[] payload, ref size_t pos, ref 
     if (argc == 0 || sec.length < hdr)
         return false;
     auto raw = sec[hdr .. $];
+    rawOut = raw; // the original RESP bytes (the owner's AOF logs these verbatim)
     auto arr = arena.allocArray!RVal(argc);
     auto offs = sec.ptr + 16;
     foreach (i; 0 .. argc)
@@ -3781,7 +3959,7 @@ private void serveClient(TCPConnection tcp) nothrow
                 flushShardPending(*c, outb);
             if (c.pendingCount > 0)
                 flushPending(*c, outb);
-            gAof.flush();
+            myAof().flush();
             flushOut();
             if (outerReplay)
             {
@@ -3910,7 +4088,7 @@ private void serveClient(TCPConnection tcp) nothrow
                     flushShardPending(*c, outb);
                 if (c.pendingCount > 0)
                     flushPending(*c, outb);
-                gAof.flush();
+                myAof().flush();
                 flushOut();
             }
         }
@@ -4037,8 +4215,8 @@ private bool propagateAclLog(scope const(ubyte)[] logForm, ref ByteBuffer o) not
             return false;
         }
     }
-    else if (gAof.enabled)
-        gAof.append(logForm);
+    else if (myAof().enabled)
+        myAof().append(logForm);
     return true;
 }
 
@@ -5206,6 +5384,14 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
                 return true;
             }
         }
+        // BGREWRITEAOF (phase 2.6): each shard rewrites its OWN file, on its own
+        // thread (the rewrite reads that shard's keyspaces). gateOk merges +OK.
+        if (shardOpcode == cmdIx!"bgrewriteaof")
+        {
+            broadcastCommand(c, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd,
+                    BroadcastKind.gateOk, o);
+            return true;
+        }
         // INFO (phase 2.5c, workstream (d)): stats are TLS per shard — every
         // shard renders its own text (the drain's plain dispatch; its keyspace
         // section iterates that shard's own slice) and the merge sums the
@@ -5547,10 +5733,10 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "WAITAOF":
         {
-            gAof.flush();
-            gAof.fsyncNow();
+            myAof().flush();
+            myAof().fsyncNow();
             repArrayHeader(o, 2);
-            repInt(o, gAof.enabled ? 1 : 0);
+            repInt(o, myAof().enabled ? 1 : 0);
             repInt(o, 0);
             return true;
         }
@@ -5561,7 +5747,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             // AOF is enabled, and is a success NO-OP otherwise — never an error
             // (Redis itself allows BGREWRITEAOF regardless of `appendonly`, and the
             // durable state here is the Raft log, not a client-triggered AOF dump).
-            if (gAof.enabled && !aofRewrite(gAof, gAofPath))
+            if (myAof().enabled && !aofRewrite(myAof(), gAofPath))
                 repError(o, "ERR AOF rewrite failed");
             else
                 repSimple(o, "Background append only file rewriting started");
@@ -5583,8 +5769,8 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     case "BGSAVE":
         {
             // no RDB: durability is the AOF, so force it out
-            gAof.flush();
-            gAof.fsyncNow();
+            myAof().flush();
+            myAof().fsyncNow();
             if (uname.length == 4)
                 repSimple(o, "OK");
             else
@@ -5593,15 +5779,15 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "LASTSAVE":
         {
-            repInt(o, gAof.lastFsyncUnix);
+            repInt(o, myAof().lastFsyncUnix);
             return true;
         }
     case "SHUTDOWN":
         {
             import core.stdc.stdlib : exit;
 
-            gAof.flush();
-            gAof.fsyncNow();
+            myAof().flush();
+            myAof().fsyncNow();
             exit(0);
         }
     case "DEBUG":
@@ -5788,12 +5974,12 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             wakeKeyActivity(); // wake blocked XREAD readers (fan-out)
             signalReadyKeys(c.dbp.db, *c.dbp); // wake pop-family fronts
         }
-        if (gAof.enabled)
+        if (myAof().enabled)
         {
             if (!propagationOverride.empty)
-                gAof.append(propagationOverride.data);
+                myAof().append(propagationOverride.data);
             else if (pureWrite)
-                gAof.append(rawCmd);
+                myAof().append(rawCmd);
         }
         // CLIENT TRACKING: a write invalidates the cached copies of its keys; a
         // read by a tracking client records its keys. Gated by gTrackCount so a
@@ -6432,8 +6618,8 @@ private bool expireReap(scope const(char)[] key, ubyte db) @nogc nothrow
     if (gReplicator is null)
     {
         // standalone: the DEL is the master's own — log it, then delete locally.
-        if (gAof.enabled)
-            gAof.append(del.data);
+        if (myAof().enabled)
+            myAof().append(del.data);
         return true;
     }
     if (gReplicator.isLeader)
@@ -6535,8 +6721,8 @@ private bool evictOneVictim(ref Keyspace ks, bool volatileOnly, bool randomPick)
             cast(void) gReplicator.proposeServerWrite(delCmd.data, cast(ushort) ks.db);
             gExpireDelPending = true; // wake the consumer on the next timer tick
         }
-        else if (gAof.enabled)
-            gAof.append(delCmd.data);
+        else if (myAof().enabled)
+            myAof().append(delCmd.data);
     }
     notifyKeyspaceEvent(NClass.evicted, "evicted", victim);
     if (gTrackCount) // CLIENT TRACKING: an evicted key invalidates cached copies
@@ -6634,6 +6820,10 @@ private void maintEvictionTick() @trusted nothrow
     flushPendingNotify(); // deliver any events the eviction cycle queued
     if (gTrackCount)
         flushTrackingInval(0);
+    // AOF-per-shard: each shard fsyncs its OWN file (the "everysec" contract,
+    // now per shard — this tick runs on every shard thread and on main).
+    myAof().flush();
+    myAof().fsyncNow();
 }
 
 private void runEvictionCycle() nothrow
@@ -6948,13 +7138,13 @@ private void migrateCommand(ref Conn c, const(RVal)[] arr, ref ByteBuffer o) not
             auto k = keybuf[ki];
             c.dbp.del(k);
             gWriteEpoch++;
-            if (gAof.enabled)
+            if (myAof().enabled)
             {
                 delCmd.clear();
                 repArrayHeader(delCmd, 2);
                 repBulk(delCmd, "DEL");
                 repBulk(delCmd, k);
-                gAof.append(delCmd.data);
+                myAof().append(delCmd.data);
             }
         }
     }
@@ -7627,8 +7817,8 @@ private void blockingRetry(ref Conn c, const(RVal)[] parts, string verb,
             if (rep != nil)
             {
                 o.append(attempt.data);
-                if (gAof.enabled)
-                    gAof.append(synth.data);
+                if (myAof().enabled)
+                    myAof().append(synth.data);
                 gWriteEpoch++;
                 wakeKeyActivity();
                 return;
@@ -7859,8 +8049,8 @@ private void xreadgroupBlock(ref Conn c, const(RVal)[] args, size_t blockAt,
         {
             // served: a `>` delivery advanced the cursor + PEL — reply, log, wake
             o.append(attempt.data);
-            if (gAof.enabled)
-                gAof.append(synth.data);
+            if (myAof().enabled)
+                myAof().append(synth.data);
             gWriteEpoch++;
             wakeKeyActivity();
             return;
@@ -7878,14 +8068,14 @@ private void logEffect(string verb, scope const(char)[] key) nothrow
 {
     gWriteEpoch++;
     wakeKeyActivity();
-    if (!gAof.enabled)
+    if (!myAof().enabled)
         return;
     static ByteBuffer eff; // TLS
     eff.clear();
     repArrayHeader(eff, 2);
     repBulk(eff, verb);
     repBulk(eff, key);
-    gAof.append(eff.data);
+    myAof().append(eff.data);
 }
 
 private void unregisterMonitor(Conn* c) nothrow
