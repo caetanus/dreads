@@ -213,7 +213,17 @@ win, reverted (its 2.4% cycles needs a performance-governor cycle run to adjudic
 The bytecode IR's target is therefore PRECISE: the 1178-instr hop tax. The other axis is
 CCX-aware placement (cycles). IR is still marked "not yet greenlit" by the USER — ask.
 
-**NEXT — the structural perf levers, on a performance-governor session:** (1) re-baseline
+**IR GREENLIT + IR-1 LANDED (2026-08-20, branch `bytecode-ir`, `438a22d`):** opcode
+resolved once per command; both server-layer string switches gated behind the CTFE
+`gPureDispatch` whitelist (conservative — never add a command that has a switch case).
+Arbiter: s1 2834→2453 (−13.4%), s2 3059 (< pre-2.5b's 3246 even WITH the owner-side
+correctness work), s4 3530. Powersave ladder: 1→1.85M · 2→2.76M · 4→4.90M · 8→6.39M —
+all-time machine records (old official s8 5.76M was AT performance governor). Full sweep
+green @1/@4. NEXT: IR-2 (parse loop emits the hop descriptor ONCE — appendHopCmd still
+rebuilds arg offsets per hop), IR-3 (lazy uname in handleCommand, serve-loop plumbing),
+then re-baseline at performance governor. The hashtable campaign (lookup ~23%) follows.
+
+**Older context — the perf levers list:** (1) re-baseline
 the ladder officially; (2) the bytecode IR (kills commandRouteSlot 7-8% + owner re-parse +
 string dispatch — see "The big structural idea"); (3) the hashtable (Keyspace.lookup ~23%
 at s2); (4) vibe-core logTrace ~2-3% sits in the read path of BOTH builds — a vibe build
