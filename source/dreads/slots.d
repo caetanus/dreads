@@ -22,11 +22,31 @@ private immutable ushort[256] crc16tab = () {
     return t;
 }();
 
+// Slicing-by-4 companion tables: crc16x[k][x] = the CRC of byte x followed by
+// k zero bytes. A 16-bit register is fully absorbed by the first two bytes of a
+// 4-byte block, so the four lookups are INDEPENDENT — the per-byte serial
+// dependency chain (the measured hot loop of commandRouteSlot: ~78% of its
+// samples) becomes 4 parallel loads + 3 XORs per 4 bytes.
+private immutable ushort[256][4] crc16x = () {
+    ushort[256][4] t;
+    foreach (x; 0 .. 256)
+        t[0][x] = crc16tab[x];
+    foreach (k; 1 .. 4)
+        foreach (x; 0 .. 256)
+            t[k][x] = cast(ushort)((t[k - 1][x] << 8) ^ crc16tab[(t[k - 1][x] >> 8) & 0xFF]);
+    return t;
+}();
+
 ushort crc16(scope const(ubyte)[] buf) @nogc nothrow pure @safe
 {
     ushort crc = 0;
-    foreach (b; buf)
-        crc = cast(ushort)((crc << 8) ^ crc16tab[((crc >> 8) ^ b) & 0xFF]);
+    size_t i = 0;
+    for (; i + 4 <= buf.length; i += 4)
+        crc = cast(ushort)(crc16x[3][((crc >> 8) ^ buf[i]) & 0xFF]
+                ^ crc16x[2][(crc ^ buf[i + 1]) & 0xFF]
+                ^ crc16x[1][buf[i + 2]] ^ crc16x[0][buf[i + 3]]);
+    for (; i < buf.length; i++)
+        crc = cast(ushort)((crc << 8) ^ crc16tab[((crc >> 8) ^ buf[i]) & 0xFF]);
     return crc;
 }
 
