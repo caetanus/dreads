@@ -213,6 +213,15 @@ win, reverted (its 2.4% cycles needs a performance-governor cycle run to adjudic
 The bytecode IR's target is therefore PRECISE: the 1178-instr hop tax. The other axis is
 CCX-aware placement (cycles). IR is still marked "not yet greenlit" by the USER — ask.
 
+**DRAIN SPIN-YIELD LANDED (2026-08-21, `be71f14`):** the 6/8-shard cliff was half FUTEX
+TAX — 34.5k voluntary cs/s at s8 (drain parking between batches: producer futex + consumer
+sched wakeup per batch). Drain yield-polls a bounded budget before parking (event loop
+polls epoll@0, serve fibers unaffected, producers skip the wake). Parks 36,681→106 per
+6M-op run; idle still sleeps. Ladder: s2 2.99M(84%) · s4 5.23M(73%) · s6 5.74M(54%) ·
+s8 6.84M(48%). Also REFUTED this session (memory): drain batch-prefetch (−4% rps — OoO
+already overlaps the misses; annotate pile-ups are latency shadows) and fnv1a→XXH64
+(+26 instr on 16B keys). Hashtable gains are now STRUCTURAL-only (bucketized layout).
+
 **AOF PER SHARD LANDED (2026-08-21, `705d26b`) — durability under sharding (phase 2.6):**
 one file per shard, owner-thread-only appends (per-key order correct by construction);
 shard 0 keeps the plain name, `.i` for the rest, `<name>.shards` sidecar. Drain logs
