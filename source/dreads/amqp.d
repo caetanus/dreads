@@ -796,6 +796,69 @@ package const(ubyte)[] propsHeaders(return scope const(ubyte)[] props) @nogc not
     return props[i .. i + n];
 }
 
+/// Parse the `expiration` basic property (a shortstr of decimal milliseconds;
+/// property-flags bit 8). 0 = absent/invalid. Walks the properties that precede
+/// it in the flags order: content-type, content-encoding, headers (field
+/// table), delivery-mode + priority (one octet each), correlation-id, reply-to.
+package long propsExpiration(scope const(ubyte)[] props) @nogc nothrow
+{
+    if (props.length < 2)
+        return 0;
+    immutable flags = (cast(ushort) props[0] << 8) | props[1];
+    size_t i = 2;
+    static bool skipShort(scope const(ubyte)[] p, ref size_t j) @nogc nothrow
+    {
+        if (j + 1 > p.length)
+            return false;
+        j += 1 + p[j];
+        return j <= p.length;
+    }
+
+    if (flags & 0x8000) // content-type
+        if (!skipShort(props, i))
+            return 0;
+    if (flags & 0x4000) // content-encoding
+        if (!skipShort(props, i))
+            return 0;
+    if (flags & 0x2000) // headers: u32 length + table
+    {
+        if (i + 4 > props.length)
+            return 0;
+        immutable n = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        i += 4 + n;
+        if (i > props.length)
+            return 0;
+    }
+    if (flags & 0x1000) // delivery-mode: octet
+        i += 1;
+    if (flags & 0x0800) // priority: octet
+        i += 1;
+    if (flags & 0x0400) // correlation-id
+        if (!skipShort(props, i))
+            return 0;
+    if (flags & 0x0200) // reply-to
+        if (!skipShort(props, i))
+            return 0;
+    if (!(flags & 0x0100)) // no expiration property
+        return 0;
+    if (i + 1 > props.length)
+        return 0;
+    immutable len = props[i];
+    i += 1;
+    if (i + len > props.length)
+        return 0;
+    long v = 0;
+    foreach (k; 0 .. len)
+    {
+        immutable ch = props[i + k];
+        if (ch < '0' || ch > '9')
+            return 0; // non-numeric expiration -> treat as unset
+        v = v * 10 + (ch - '0');
+    }
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Connection / channel state
 
@@ -1774,19 +1837,30 @@ private long queueTtl(scope const(char)[] q) nothrow @trusted
 /// the publish time; older records report 0 = never expire lazily.)
 private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
 {
-    if (ttlMs <= 0)
-        return false;
     long pm;
     int dths;
     const(char)[] rk;
     const(ubyte)[] props, body_;
     splitRecord(blob, pm, dths, rk, props, body_);
+    // effective TTL = the SMALLER of the queue x-message-ttl and the message's
+    // own `expiration` property (RabbitMQ semantics), ignoring a 0 (unset) on
+    // either side. A per-message expiration expires even on a queue with no
+    // x-message-ttl (lazily at delivery; the active reaper only sweeps queues
+    // that have a queue-level TTL).
+    immutable msgTtl = propsExpiration(props);
+    long ttl;
+    if (ttlMs > 0 && msgTtl > 0)
+        ttl = ttlMs < msgTtl ? ttlMs : msgTtl;
+    else
+        ttl = ttlMs > 0 ? ttlMs : msgTtl;
+    if (ttl <= 0)
+        return false;
     // compare as `published <= now - ttl` (NOT `now > published + ttl`): the
     // sum form overflows i64 for a client-supplied huge x-message-ttl and
     // wraps negative, falsely expiring fresh messages. `now - ttl` underflows
     // to negative for such a ttl -> pm(>0) <= negative is false -> never
     // expires, the correct reading of a ~290-million-year TTL.
-    return pm > 0 && pm <= cast(long) nowMs() - ttlMs;
+    return pm > 0 && pm <= cast(long) nowMs() - ttl;
 }
 
 /// Route an (already-stored) record to `queue`'s dead-letter exchange, keeping
