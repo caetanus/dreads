@@ -101,6 +101,22 @@ private void putI32(ref ByteBuffer o, int v) @nogc nothrow
     o.appendByte(cast(char)(v & 0xFF));
 }
 
+// Overwrite a previously-reserved i32 count field in place (big-endian). Used to
+// BACKPATCH a count-prefixed array to the ACTUAL number of entries emitted, so an
+// early exit (the response ceiling, or a truncated request tripping !r.ok) can't
+// advertise more entries than are present — which would underflow the requesting
+// client's decoder and desync only that connection.
+private void patchI32(ref ByteBuffer o, size_t off, int v) @nogc nothrow
+{
+    auto d = o.data;
+    if (off + 4 > d.length)
+        return;
+    d[off] = cast(ubyte)(cast(uint) v >> 24);
+    d[off + 1] = cast(ubyte)(cast(uint) v >> 16);
+    d[off + 2] = cast(ubyte)(cast(uint) v >> 8);
+    d[off + 3] = cast(ubyte)(v & 0xFF);
+}
+
 private void putI64(ref ByteBuffer o, long v) @nogc nothrow
 {
     putI32(o, cast(int)(v >> 32));
@@ -554,7 +570,9 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
     immutable suppress = acks == 0;
     immutable respStart = o.length;
     immutable ntopics = safeCount(r.i32());
+    immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
+    int emittedTopics = 0;
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok)
@@ -562,7 +580,10 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         putStr(o, topic);
+        immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
+        emittedTopics++;
+        int emittedParts = 0;
         foreach (_2; 0 .. nparts)
         {
             if (!r.ok)
@@ -665,14 +686,17 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 }
             }
             if (o.length - respStart > KAFKA_MAX_RESP)
-                continue; // response ceiling: stop emitting per-partition results
+                continue; // response ceiling: skip this entry (count is backpatched)
             putI32(o, part);
             putI16(o, err);
             putI64(o, baseOffset < 0 ? 0 : baseOffset);
             if (ver >= 2)
                 putI64(o, -1); // log_append_time (CreateTime in use)
+            emittedParts++;
         }
+        patchI32(o, partsCountOff, emittedParts); // count == entries actually emitted
     }
+    patchI32(o, topicsCountOff, emittedTopics);
     if (ver >= 1)
         putI32(o, 0); // throttle_ms
     return suppress;
@@ -688,7 +712,9 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
+    immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
+    int emittedTopics = 0;
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok)
@@ -696,7 +722,10 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         putStr(o, topic);
+        immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
+        emittedTopics++;
+        int emittedParts = 0;
         foreach (_2; 0 .. nparts)
         {
             if (!r.ok)
@@ -768,15 +797,20 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             d3[recAt + 1] = cast(ubyte)(rsz >> 16);
             d3[recAt + 2] = cast(ubyte)(rsz >> 8);
             d3[recAt + 3] = cast(ubyte)(rsz & 0xFF);
+            emittedParts++;
         }
+        patchI32(o, partsCountOff, emittedParts); // count == entries actually emitted
     }
+    patchI32(o, topicsCountOff, emittedTopics);
 }
 
 private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     cast(void) r.i32(); // replica_id
     immutable ntopics = safeCount(r.i32());
+    immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
+    int emittedTopics = 0;
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok)
@@ -784,7 +818,10 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         putStr(o, topic);
+        immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
+        emittedTopics++;
+        int emittedParts = 0;
         foreach (_2; 0 .. nparts)
         {
             if (!r.ok)
@@ -815,8 +852,11 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 putI32(o, 1); // v0: array of offsets
                 putI64(o, off);
             }
+            emittedParts++;
         }
+        patchI32(o, partsCountOff, emittedParts); // count == entries actually emitted
     }
+    patchI32(o, topicsCountOff, emittedTopics);
 }
 
 private auto asChars(const(ubyte)[] b) @nogc nothrow
