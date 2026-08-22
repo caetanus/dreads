@@ -51,6 +51,10 @@ private enum int KAFKA_MAX_ARRAY = 65536;
 private enum size_t KAFKA_MAX_TOPIC = 249;
 /// Trim response/input buffers back to this after a spike.
 private enum size_t KAFKA_BUF_KEEP = 4 << 20;
+/// Cap on records in ONE produce partition: bounds the crc32 work + the single
+/// variadic RPUSH (a 64MB frame of 18-byte records = ~3.7M crc32 calls with no
+/// yield = a cooperative CPU stall of the whole shard thread).
+private enum int KAFKA_MAX_RECORDS = 1 << 20;
 /// Absolute per-request response ceiling. safeCount bounds each array count,
 /// but nparts×ntopics (65536×65536) repeated emission still builds a multi-GB
 /// reply that aborts the allocator (broker death). Once the body passes this,
@@ -222,6 +226,8 @@ private long pushRecords(scope const(char)[] key, scope const(char)[][] blobs) n
     foreach (i, b; blobs)
         argv[2 + i] = b;
     gKafkaExec(argv[0 .. blobs.length + 2], rb);
+    if (argv.length > 65536)
+        argv = null; // don't pin a huge scratch array after one big request
     auto d = rb.data;
     if (d.length < 2 || d[0] != ':')
         return -1;
@@ -441,7 +447,11 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         break;
 
     case API_PRODUCE:
-        handleProduce(r, apiVer, o);
+        if (handleProduce(r, apiVer, o))
+        {
+            o.truncate(sizeAt); // acks=0: consume the request, send nothing
+            return;
+        }
         break;
 
     case API_FETCH:
@@ -525,14 +535,18 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 // We store [size i32][crc..value] (WITHOUT the offset) as the list record;
 // Fetch prepends the real offset per record — the CRC covers magic..value, so
 // the stored bytes replay verbatim.
-private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+/// Returns true when the producer set acks=0 and expects NO response bytes
+/// (the caller rolls the response back — emitting one makes the client match a
+/// stale correlation id against no in-flight request and disconnect).
+private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     if (ver >= 1)
     {
     }
     immutable acks = r.i16();
     cast(void) r.i32(); // timeout
-    cast(void) acks;
+    immutable suppress = acks == 0;
+    immutable respStart = o.length;
     immutable ntopics = safeCount(r.i32());
     putI32(o, ntopics);
     foreach (_; 0 .. ntopics)
@@ -564,6 +578,11 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             size_t i = 0;
             while (i + 12 <= records.length)
             {
+                if (nrec >= KAFKA_MAX_RECORDS)
+                {
+                    err = E_CORRUPT; // too many records in one partition set
+                    break;
+                }
                 immutable msz = (cast(uint) records[i + 8] << 24)
                     | (cast(uint) records[i + 9] << 16)
                     | (cast(uint) records[i + 10] << 8) | records[i + 11];
@@ -626,11 +645,17 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 immutable newLen = pushRecords(kb.data.asChars, slices[0 .. nrec]);
                 if (blobArena.capacity > KAFKA_BUF_KEEP)
                     blobArena.trim(KAFKA_BUF_KEEP); // a 64MB set must not pin
+                if (offs.length > 131072)
+                    offs = null; // release the scratch after a large set
+                if (slices.length > 65536)
+                    slices = null;
                 if (newLen < 0)
                     err = E_CORRUPT;
                 else
                     baseOffset = newLen - cast(long) nrec;
             }
+            if (o.length - respStart > KAFKA_MAX_RESP)
+                continue; // response ceiling: stop emitting per-partition results
             putI32(o, part);
             putI16(o, err);
             putI64(o, baseOffset < 0 ? 0 : baseOffset);
@@ -640,6 +665,7 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
     }
     if (ver >= 1)
         putI32(o, 0); // throttle_ms
+    return suppress;
 }
 
 private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
