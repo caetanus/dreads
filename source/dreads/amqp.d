@@ -1538,8 +1538,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 auto tag = r.shortStr();
                 immutable noWait = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                // cap the map: basic.cancel needs neither an open channel nor a
+                // completed handshake, so a flood of unique bogus tags would
+                // otherwise grow this per-conn AA without bound (RAM DoS). Legit
+                // pending cancels never exceed the live-consumer count (both
+                // capped at AMQP_MAX_CONSUMERS) and each is removed on the
+                // consumer's exit, so a healthy connection never hits the cap.
                 try
-                    c.cancelledTags[tag.idup] = true;
+                    if (c.cancelledTags.length < AMQP_MAX_CONSUMERS)
+                        c.cancelledTags[tag.idup] = true;
                 catch (Exception)
                 {
                 }
@@ -2022,6 +2029,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 atomicOp!"-="(gAmqpConsumers, 1);
                 if (cc.consumerCount > 0)
                     cc.consumerCount--;
+                // drop our own cancel marker so a healthy connection's
+                // cancelledTags doesn't accumulate one dead entry per
+                // consume/cancel cycle (it's only needed until we've seen it).
+                // AA.remove on a string key is nothrow — no try/catch (which a
+                // scope(exit) can't contain anyway).
+                cc.cancelledTags.remove(tt);
             }
             ByteBuffer kb;
             kb.append("amq.q.");
