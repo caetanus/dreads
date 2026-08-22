@@ -271,9 +271,19 @@ GET@8 is up from 9.8M at the last campaign checkpoint.
 
 | metric | dreads | mosquitto 2 (tuned) |
 |---|---:|---:|
-| acked pub, no subscribers | **8.33M msg/s** | 76.2K (109×) |
-| acked pub, 1 live subscriber | **4.55M msg/s** | 74.3K (61×) |
-| end-to-end deliveries | **2.12M msg/s** | subscriber dropped |
+| acked pub, no subscribers | **7.94M msg/s** | 76.2K (104×) |
+| acked pub, 1 live subscriber | **5.83M msg/s** | 74.3K (78×) |
+| end-to-end, sustained 3s window | **3.79M msg/s** | subscriber dropped |
+
+(Post-hardening numbers — full 3.1.1 validation on every packet costs ~5%
+on the no-sub path and the per-connection writer-fiber redesign GAINED 28%
+on the live-subscriber path. The end-to-end number uses the honest metric:
+deliveries counted over a sustained window starting at the first delivery,
+under a continuous flood; the earlier 2.12M silently included the idle gap
+before the publisher started, and burst-drain runs can report absurd rates.
+Slow subscribers now shed QoS-0 load at a 64MB outbox cap instead of
+stalling anything — mosquitto's answer to the same overload is dropping the
+subscriber entirely.)
 
 ### AMQP 0-9-1 (publisher confirms, window 256; 1 core each)
 

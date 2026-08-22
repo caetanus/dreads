@@ -15,15 +15,25 @@ module dreads.mqtt;
 //   - retained messages are broadcast-replicated to every thread's local map
 //     (rare writes, local reads at SUBSCRIBE time).
 //
-// v1 scope (documented): QoS 0 delivery, QoS 1 publishes (PUBACK on receipt),
-// clean sessions only (CONNACK session-present=0), retained messages, no
-// keepalive enforcement (TCP death is detected by the read loop), overlapping
-// subscriptions may deliver duplicates (the 3.1.1 spec permits this).
+// Scope: QoS 0 delivery, QoS 1 publishes (PUBACK on receipt), QoS 2 publishes
+// (full PUBREC/PUBREL/PUBCOMP receive handshake with packet-id dedup;
+// deliveries themselves go out at QoS 0), clean sessions only (CONNACK
+// session-present=0), retained messages, no keepalive enforcement (TCP death
+// is detected by the read loop), overlapping subscriptions may deliver
+// duplicates (the 3.1.1 spec permits this).
+//
+// Delivery writes: each connection owns a WRITER FIBER draining a
+// double-buffered outbox. Deliverers (local publisher fibers and the shard
+// drain's fan-in) only append + signal — they NEVER touch the socket, so a
+// slow subscriber blocks nothing but itself, and no fiber yields while
+// holding a slice of a buffer another fiber can grow (the classic
+// append-during-write use-after-free).
 
 import core.atomic : atomicLoad, atomicOp, MemoryOrder;
 
+import vibe.core.core : runTask;
 import vibe.core.net : TCPConnection;
-import vibe.core.sync : TaskMutex;
+import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
 import dreads.mem : ByteBuffer;
 
@@ -41,24 +51,50 @@ public final class MqttConn
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
     uint gen; // bumped on disconnect: stale trie entries self-invalidate
-    // Delivery outbox: publishes matched to this conn accumulate here and are
-    // flushed ONCE per publish batch (mqttFlushDirty) — a write syscall per
-    // DELIVERY throttled the E2E rate to ~135k msg/s. Same-thread only (every
-    // deliverer — local publisher fibers and the drain's fan-in — runs on this
-    // conn's own shard thread), so no lock guards the buffer; only the socket
-    // write takes wlock.
+    // Delivery outbox pair: deliverers append to `obox` and signal `flushEvt`;
+    // the conn's writer fiber swaps obox<->wbox (no yield in between) and
+    // writes wbox. All deliverers run on this conn's own shard thread, so the
+    // buffers need no lock — and because the writer only ever writes from
+    // wbox, an append during a blocked write grows a DIFFERENT buffer.
+    // A write syscall per DELIVERY throttled E2E to ~135k msg/s; batching
+    // happens naturally here (everything accumulated during one write goes
+    // out in the next).
     ByteBuffer obox;
+    ByteBuffer wbox;
+    LocalManualEvent flushEvt;
     bool dirty;
+    bool closed; // serve fiber sets on exit; writer fiber then drains + stops
+    // QoS2 receive state: packet ids between PUBLISH(qos2) and PUBREL. Dedup:
+    // a retransmitted qos2 PUBLISH with an id already here is PUBRECed but
+    // NOT redelivered (exactly-once toward the subscriber side).
+    ushort[] q2pids;
+    // Filters this conn subscribed (idup'd): torn down on disconnect so trie
+    // entries and gMqttSubTotal don't leak under connect/subscribe churn.
+    const(char)[][] filters;
 
     this(TCPConnection c) nothrow
     {
         tcp = c;
         try
+        {
             wlock = new TaskMutex;
+            flushEvt = createManualEvent();
+        }
         catch (Exception)
-            assert(false, "mqtt: mutex alloc failed");
+            assert(false, "mqtt: conn alloc failed");
     }
 }
+
+/// Per-subscriber outbox cap: past this, further QoS-0 deliveries to the slow
+/// subscriber are DROPPED (spec-legal for QoS 0) instead of growing memory
+/// without bound. Counted in gMqttDropped. Sized to absorb a real burst
+/// (mosquitto's answer to the same burst is dropping the whole subscriber);
+/// a persistently slow reader still converges to bounded memory.
+private enum size_t MQTT_OBOX_CAP = 64 << 20;
+/// Largest accepted remaining-length. The varint allows 256MB; accepting that
+/// from an unauthenticated socket is an invitation. Oversized frame = close.
+private enum uint MQTT_MAX_PACKET = 16 << 20;
+public __gshared ulong gMqttDropped; // deliveries dropped at full outboxes
 
 // ---------------------------------------------------------------------------
 // Topic trie (THREAD-LOCAL). Segment-split on '/'; `+` matches exactly one
@@ -208,8 +244,12 @@ private void trieMatch(TrieNode n, scope const(char)[] topic, size_t i,
 {
     if (n is null || outN >= outSubs.length)
         return;
-    foreach (ref e; n.hash)
-        addLive(e, outSubs, outN);
+    // [MQTT-4.7.2-1] a topic starting with '$' must not match a wildcard at
+    // the FIRST level: at the root, skip both the '#' pile and the '+' child.
+    immutable dollarRoot = i == 0 && topic.length != 0 && topic[0] == '$';
+    if (!dollarRoot)
+        foreach (ref e; n.hash)
+            addLive(e, outSubs, outN);
     if (i > topic.length)
     {
         foreach (ref e; n.subs)
@@ -227,7 +267,8 @@ private void trieMatch(TrieNode n, scope const(char)[] topic, size_t i,
     catch (Exception)
     {
     }
-    trieMatch(n.plus, topic, next, outSubs, outN);
+    if (!dollarRoot)
+        trieMatch(n.plus, topic, next, outSubs, outN);
 }
 
 private void addLive(ref SubEntry e, ref MqttConn[64] outSubs, ref size_t outN) @trusted nothrow
@@ -247,6 +288,16 @@ private void addLive(ref SubEntry e, ref MqttConn[64] outSubs, ref size_t outN) 
 /// Does `filter` match `topic`? (retained-message delivery at SUBSCRIBE time.)
 package bool mqttFilterMatches(scope const(char)[] filter, scope const(char)[] topic) @nogc nothrow
 {
+    // [MQTT-4.7.2-1]: wildcards never match the first level of a '$' topic
+    if (topic.length != 0 && topic[0] == '$')
+    {
+        size_t fe0 = 0;
+        while (fe0 < filter.length && filter[fe0] != '/')
+            fe0++;
+        auto f0 = filter[0 .. fe0];
+        if (f0 == "#" || f0 == "+")
+            return false;
+    }
     size_t fi = 0, ti = 0;
     for (;;)
     {
@@ -276,10 +327,50 @@ package bool mqttFilterMatches(scope const(char)[] filter, scope const(char)[] t
     }
 }
 
+/// [MQTT-3.3.2-2] a PUBLISH topic NAME: non-empty, no wildcards, no NUL.
+package bool mqttValidTopicName(scope const(char)[] t) @nogc nothrow
+{
+    if (t.length == 0)
+        return false;
+    foreach (ch; t)
+        if (ch == '+' || ch == '#' || ch == '\0')
+            return false;
+    return true;
+}
+
+/// [MQTT-4.7.1] a topic FILTER: non-empty, no NUL; '+' and '#' only as whole
+/// segments; '#' only as the last segment. ("a//b" — empty levels — is legal.)
+package bool mqttValidFilter(scope const(char)[] f) @nogc nothrow
+{
+    if (f.length == 0)
+        return false;
+    size_t i = 0;
+    for (;;)
+    {
+        size_t e = i;
+        while (e < f.length && f[e] != '/')
+            e++;
+        auto seg = f[i .. e];
+        foreach (ch; seg)
+        {
+            if (ch == '\0')
+                return false;
+            if ((ch == '+' || ch == '#') && seg.length != 1)
+                return false;
+        }
+        if (seg == "#" && e < f.length)
+            return false;
+        if (e >= f.length)
+            return true;
+        i = e + 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire codec (3.1.1)
 
 private enum ubyte PT_CONNECT = 1, PT_CONNACK = 2, PT_PUBLISH = 3, PT_PUBACK = 4,
+        PT_PUBREC = 5, PT_PUBREL = 6, PT_PUBCOMP = 7,
         PT_SUBSCRIBE = 8, PT_SUBACK = 9, PT_UNSUBSCRIBE = 10, PT_UNSUBACK = 11,
         PT_PINGREQ = 12, PT_PINGRESP = 13, PT_DISCONNECT = 14;
 
@@ -367,6 +458,13 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     buildPublish(pkt, topic, payload, false);
     foreach (s; subs[0 .. n])
     {
+        if (s.closed)
+            continue;
+        if (s.obox.length + pkt.length > MQTT_OBOX_CAP)
+        {
+            gMqttDropped++; // QoS0: dropping at a full outbox is spec-legal
+            continue;
+        }
         s.obox.append(pkt.data);
         if (!s.dirty)
         {
@@ -382,27 +480,82 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
 
 private MqttConn[] tDirty; // TLS: conns with pending deliveries this batch
 
-/// Flush every accumulated delivery outbox — called once per publish batch
-/// (the publisher's serve loop after its parse pass, and the drain after a
-/// fan-in pass). One write per touched subscriber per batch.
+/// Wake the writer fiber of every conn touched this batch — called once per
+/// publish batch (the publisher's serve loop after its parse pass, and the
+/// drain after a fan-in pass). CONTAINS NO YIELD: emit only schedules, so
+/// tDirty cannot be mutated under this loop and the drain fiber can never be
+/// parked on a subscriber's socket (one slow MQTT client used to stall the
+/// whole shard's cross-shard traffic from here).
 public void mqttFlushDirty() nothrow @trusted
 {
     if (tDirty.length == 0)
         return;
     foreach (c; tDirty)
     {
-        if (!c.obox.empty)
-        {
-            sendTo(c, c.obox.data);
-            c.obox.clear();
-        }
         c.dirty = false;
+        try
+            c.flushEvt.emit();
+        catch (Exception)
+        {
+        }
     }
     tDirty.length = 0;
     try
         (cast(MqttConn[]) tDirty).assumeSafeAppend;
     catch (Exception)
     {
+    }
+}
+
+/// Bitwise buffer swap: ByteBuffer disables copying; a raw byte swap is
+/// correct here (no interior self-pointers) and guaranteed yield-free.
+private void swapBufs(ref ByteBuffer a, ref ByteBuffer b) @nogc nothrow @trusted
+{
+    import core.stdc.string : memcpy;
+
+    ubyte[ByteBuffer.sizeof] t = void;
+    memcpy(t.ptr, &a, ByteBuffer.sizeof);
+    memcpy(&a, &b, ByteBuffer.sizeof);
+    memcpy(&b, t.ptr, ByteBuffer.sizeof);
+}
+
+/// The per-connection writer fiber: drains the outbox for as long as the conn
+/// lives. Only THIS fiber writes deliveries, so a blocked write blocks only
+/// this subscriber; deliverers append to `obox` while a write is in flight
+/// on `wbox`.
+private void mqttWriter(MqttConn c) nothrow
+{
+    for (;;)
+    {
+        while (c.obox.empty && !c.closed)
+        {
+            immutable ec = () @trusted {
+                try
+                    return c.flushEvt.emitCount;
+                catch (Exception)
+                    return 0;
+            }();
+            if (!c.obox.empty || c.closed)
+                break;
+            try
+                c.flushEvt.wait(ec);
+            catch (Exception)
+            {
+            }
+        }
+        if (c.obox.empty)
+        {
+            if (c.closed)
+                return;
+            continue;
+        }
+        swapBufs(c.obox, c.wbox); // no yield between check and swap
+        if (!sendTo(c, c.wbox.data))
+        {
+            c.closed = true; // dead socket: stop delivering
+            return;
+        }
+        c.wbox.clear();
     }
 }
 
@@ -417,7 +570,7 @@ private void buildPublish(ref ByteBuffer o, scope const(char)[] topic,
     o.append(payload);
 }
 
-private void sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
+private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 {
     try
     {
@@ -425,10 +578,10 @@ private void sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
         scope (exit)
             c.wlock.unlock();
         c.tcp.write(bytes);
+        return true;
     }
     catch (Exception)
-    {
-    }
+        return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,8 +595,18 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     {
     }
     auto c = new MqttConn(tcp);
+    try
+        cast(void) runTask(&mqttWriter, c);
+    catch (Exception)
+        return;
     static void closeQuiet(MqttConn cc) nothrow
     {
+        cc.closed = true; // writer fiber drains what's left, then exits
+        try
+            cc.flushEvt.emit();
+        catch (Exception)
+        {
+        }
         try
             cc.tcp.close();
         catch (Exception)
@@ -453,8 +616,15 @@ public void serveMqttClient(TCPConnection tcp) nothrow
 
     scope (exit)
     {
-        c.gen++; // invalidate every trie entry of this conn (lazily skipped)
-        closeQuiet(c);
+        // tear down subscriptions for real (not just lazily): under
+        // connect/subscribe churn the lazy-gen scheme leaked trie entries and
+        // pinned gMqttSubTotal above zero forever, keeping the idle-skin
+        // fan-out gate open.
+        foreach (f; c.filters)
+            trieUnsubscribe(f, c);
+        c.filters = null;
+        c.gen++; // invalidate any remaining trie entries (lazily skipped)
+        closeQuiet(c); // sets closed + wakes the writer fiber to drain and exit
     }
     ByteBuffer inb;
     ByteBuffer outb;
@@ -493,7 +663,15 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             size_t hp = pos + 1;
             uint rem;
             if (!decodeVarint(d, hp, rem))
+            {
+                // 4 continuation bytes present = malformed varint, not merely
+                // an incomplete one: close instead of waiting forever
+                if (d.length - (pos + 1) >= 4)
+                    return;
                 break; // incomplete header
+            }
+            if (rem > MQTT_MAX_PACKET)
+                return; // oversized frame: refuse to buffer it
             if (hp + rem > d.length)
                 break; // incomplete body
             immutable ubyte h = d[pos];
@@ -519,23 +697,46 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     }
 }
 
-// Returns false to close the connection.
+// Returns false to close the connection. Validation posture: anything the
+// 3.1.1 spec marks "MUST close the Network Connection" closes; malformed
+// SUBSCRIBE filters that are merely unusable get SUBACK failure 0x80.
 private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         ref ByteBuffer o) nothrow @trusted
 {
     immutable type = h >> 4;
-    final switch (type)
+    immutable fl = h & 0x0F;
+    // [MQTT-3.1.0-1] the first packet MUST be CONNECT
+    if (!c.connected && type != PT_CONNECT)
+        return false;
+    switch (type)
     {
     case PT_CONNECT:
         {
+            if (c.connected)
+                return false; // [MQTT-3.1.0-2] second CONNECT: protocol error
+            if (fl != 0)
+                return false;
             size_t i = 0;
             const(char)[] proto;
             if (!rdStr(p, i, proto) || i >= p.length)
                 return false;
             immutable level = p[i++];
+            // [MQTT-3.1.2-1] unknown protocol name: close WITHOUT a CONNACK;
+            // known name with wrong level: CONNACK rc=1, then close
+            if (proto != "MQTT" && proto != "MQIsdp")
+                return false;
+            immutable okPair = (proto == "MQTT" && level == 4)
+                || (proto == "MQIsdp" && level == 3);
             if (i >= p.length)
                 return false;
             immutable flags = p[i++];
+            if (flags & 0x01)
+                return false; // [MQTT-3.1.2-3] reserved flag MUST be 0
+            immutable willQos = (flags >> 3) & 0x3;
+            if (willQos == 3)
+                return false; // [MQTT-3.1.2-14]
+            if (!(flags & 0x04) && (flags & 0x38))
+                return false; // [MQTT-3.1.2-11/13/15] will qos/retain w/o will
             i += 2; // keepalive (unenforced v1)
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
@@ -545,6 +746,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             {
                 const(char)[] wt, wm;
                 if (!rdStr(p, i, wt) || !rdStr(p, i, wm))
+                    return false;
+                if (!mqttValidTopicName(wt))
                     return false;
             }
             if (flags & 0x80)
@@ -559,24 +762,26 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (!rdStr(p, i, pw))
                     return false;
             }
-            c.connected = true;
-            // CONNACK: session-present=0, rc=0 (3.1 level 3 and 3.1.1 level 4 both accepted)
+            c.connected = okPair;
+            // CONNACK: session-present=0
             o.appendByte(cast(char)(PT_CONNACK << 4));
             o.appendByte(cast(char) 2);
             o.appendByte(cast(char) 0);
-            o.appendByte(cast(char)(level == 3 || level == 4 ? 0 : 1));
-            return level == 3 || level == 4;
+            o.appendByte(cast(char)(okPair ? 0 : 1));
+            return okPair;
         }
     case PT_PUBLISH:
         {
-            if (!c.connected)
-                return false;
             immutable qos = (h >> 1) & 0x3;
+            if (qos == 3)
+                return false; // [MQTT-3.3.1-4] both QoS bits set: close
             immutable retain = (h & 1) != 0;
             size_t i = 0;
             const(char)[] topic;
             if (!rdStr(p, i, topic))
                 return false;
+            if (!mqttValidTopicName(topic))
+                return false; // [MQTT-3.3.2-2] wildcard/empty/NUL topic: close
             ushort pid = 0;
             if (qos > 0)
             {
@@ -584,13 +789,45 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false;
                 pid = cast(ushort)((p[i] << 8) | p[i + 1]);
                 i += 2;
+                if (pid == 0)
+                    return false; // [MQTT-2.3.1-1]
             }
             auto payload = cast(const(char)[]) p[i .. $];
+            if (qos == 2)
+            {
+                // dedup: a retransmit of an in-flight qos2 id is acked again
+                // but NOT redelivered
+                bool dup = false;
+                foreach (q; c.q2pids)
+                    if (q == pid)
+                    {
+                        dup = true;
+                        break;
+                    }
+                if (!dup)
+                {
+                    if (c.q2pids.length >= 1024)
+                        return false; // receive-window abuse
+                    gMqttMessages++;
+                    mqttDeliverLocal(topic, payload, retain);
+                    if (gMqttFanout !is null)
+                        gMqttFanout(topic, payload, retain);
+                    try
+                        c.q2pids ~= pid;
+                    catch (Exception)
+                        return false;
+                }
+                o.appendByte(cast(char)(PT_PUBREC << 4));
+                o.appendByte(cast(char) 2);
+                o.appendByte(cast(char)(pid >> 8));
+                o.appendByte(cast(char)(pid & 0xFF));
+                return true;
+            }
             gMqttMessages++;
             mqttDeliverLocal(topic, payload, retain);
             if (gMqttFanout !is null)
                 gMqttFanout(topic, payload, retain);
-            if (qos >= 1) // QoS1: ack on receipt; QoS2 (unsupported) acked as 1
+            if (qos == 1)
             {
                 o.appendByte(cast(char)(PT_PUBACK << 4));
                 o.appendByte(cast(char) 2);
@@ -599,26 +836,65 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             }
             return true;
         }
+    case PT_PUBREL:
+        {
+            // completes the qos2 receive handshake
+            if (fl != 0x02 || p.length < 2)
+                return false; // [MQTT-3.6.1-1]
+            immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            size_t w = 0;
+            foreach (q; c.q2pids)
+                if (q != pid)
+                    c.q2pids[w++] = q;
+            c.q2pids.length = w;
+            o.appendByte(cast(char)(PT_PUBCOMP << 4));
+            o.appendByte(cast(char) 2);
+            o.appendByte(cast(char)(pid >> 8));
+            o.appendByte(cast(char)(pid & 0xFF));
+            return true;
+        }
     case PT_SUBSCRIBE:
         {
-            if (!c.connected || p.length < 2)
+            if (fl != 0x02)
+                return false; // [MQTT-3.8.1-1]
+            if (p.length < 2)
                 return false;
             immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            if (pid == 0)
+                return false; // [MQTT-2.3.1-1]
             size_t i = 2;
+            // NO-YIELD window: these TLS scratch arrays are filled and
+            // consumed without any suspension point in between
             static ubyte[64] granted = void;
             size_t ng = 0;
             static const(char)[][64] filters;
-            while (i < p.length && ng < granted.length)
+            while (i < p.length)
             {
+                if (ng >= granted.length)
+                    return false; // >64 filters in one packet: refuse
                 const(char)[] filter;
                 if (!rdStr(p, i, filter) || i >= p.length)
                     return false;
                 immutable reqQos = p[i++];
-                cast(void) reqQos;
+                if (reqQos > 2)
+                    return false; // [MQTT-3.8.3-4]
+                if (!mqttValidFilter(filter))
+                {
+                    granted[ng] = 0x80; // unusable filter: SUBACK failure
+                    filters[ng++] = null;
+                    continue;
+                }
                 trieSubscribe(filter, c, 0);
+                try
+                    c.filters ~= filter.idup; // disconnect teardown list
+                catch (Exception)
+                {
+                }
                 filters[ng] = filter;
                 granted[ng++] = 0; // v1: everything granted at QoS 0
             }
+            if (ng == 0)
+                return false; // [MQTT-3.8.3-3] at least one filter required
             o.appendByte(cast(char)(PT_SUBACK << 4));
             encodeVarint(o, cast(uint)(2 + ng));
             o.appendByte(cast(char)(pid >> 8));
@@ -629,7 +905,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             try
                 foreach (topic, payload; gRetained)
                     foreach (f; filters[0 .. ng])
-                        if (mqttFilterMatches(f, topic))
+                        if (f !is null && mqttFilterMatches(f, topic))
                         {
                             buildPublish(o, topic, payload, true);
                             break;
@@ -641,17 +917,30 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         }
     case PT_UNSUBSCRIBE:
         {
-            if (!c.connected || p.length < 2)
+            if (fl != 0x02)
+                return false; // [MQTT-3.10.1-1]
+            if (p.length < 2)
                 return false;
             immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            if (pid == 0)
+                return false;
             size_t i = 2;
+            bool any = false;
             while (i < p.length)
             {
                 const(char)[] filter;
                 if (!rdStr(p, i, filter))
                     return false;
+                any = true;
                 trieUnsubscribe(filter, c);
+                size_t w = 0;
+                foreach (f; c.filters)
+                    if (f != filter)
+                        c.filters[w++] = f;
+                c.filters.length = w;
             }
+            if (!any)
+                return false; // [MQTT-3.10.3-2]
             o.appendByte(cast(char)(PT_UNSUBACK << 4));
             o.appendByte(cast(char) 2);
             o.appendByte(cast(char)(pid >> 8));
@@ -659,17 +948,20 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             return true;
         }
     case PT_PINGREQ:
+        if (fl != 0)
+            return false;
         o.appendByte(cast(char)(PT_PINGRESP << 4));
         o.appendByte(cast(char) 0);
         return true;
     case PT_DISCONNECT:
         return false;
-    case PT_CONNACK:
-    case PT_PUBACK:
-    case PT_SUBACK:
-    case PT_UNSUBACK:
-    case PT_PINGRESP:
-        return true; // client->server echoes of server packets: tolerate
+    default:
+        // types 0 and 15 are reserved; CONNACK/PUBACK/PUBREC/PUBCOMP/SUBACK/
+        // UNSUBACK/PINGRESP are server->client only (we never send QoS>0 out,
+        // so none is ever legitimate inbound). This default also replaces a
+        // final-switch that turned any of them into a runtime SwitchError —
+        // one PUBREL used to crash the whole server.
+        return false;
     }
 }
 
@@ -703,4 +995,31 @@ unittest // filter matching semantics
     assert(mqttFilterMatches("+/b", "a/b"));
     assert(!mqttFilterMatches("+/b", "a/c"));
     assert(!mqttFilterMatches("b/+", "a/b"));
+}
+
+unittest // [MQTT-4.7.2-1] '$' topics never match root-level wildcards
+{
+    assert(!mqttFilterMatches("#", "$SYS/broker/load"));
+    assert(!mqttFilterMatches("+/broker/load", "$SYS/broker/load"));
+    assert(mqttFilterMatches("$SYS/#", "$SYS/broker/load"));
+    assert(mqttFilterMatches("$SYS/+/load", "$SYS/broker/load"));
+}
+
+unittest // topic-name and filter validation
+{
+    assert(mqttValidTopicName("a/b/c"));
+    assert(mqttValidTopicName("/"));
+    assert(!mqttValidTopicName(""));
+    assert(!mqttValidTopicName("a/+/c"));
+    assert(!mqttValidTopicName("a/#"));
+    assert(!mqttValidTopicName("a\0b"));
+    assert(mqttValidFilter("a/+/c"));
+    assert(mqttValidFilter("a/#"));
+    assert(mqttValidFilter("#"));
+    assert(mqttValidFilter("a//b"));
+    assert(!mqttValidFilter(""));
+    assert(!mqttValidFilter("a/#/b"));
+    assert(!mqttValidFilter("a+"));
+    assert(!mqttValidFilter("+a"));
+    assert(!mqttValidFilter("a/b#"));
 }
