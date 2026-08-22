@@ -89,11 +89,21 @@ private enum ExType : ubyte
     headers = 3,
 }
 
+/// Global monotonic sequence stamped on every control-plane op. The ctl maps
+/// are broadcast-replicated across shards over INDEPENDENT SPSC lanes, so a
+/// bind racing an unbind (or a declare racing a delete) from two origin shards
+/// arrives in different orders at different shards. An LWW-element-set
+/// (per-element seq + tombstone) converges regardless of arrival order: apply
+/// an op only when its seq beats the element's stored seq.
+public shared ulong gAmqpCtlSeq;
+
 private struct Binding
 {
     string queue;
     string key; // binding/routing key
     immutable(ubyte)[] args; // raw binding-arguments table (headers exchanges)
+    ulong seq; // ctl seq of the last bind/unbind on this element
+    bool alive = true; // false = tombstone (unbound), retained for seq-gating
 }
 
 private struct QueueMeta
@@ -106,6 +116,9 @@ private struct QueueMeta
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
 
 private ExType[string] gExchanges; // TLS
+/// Last op seq per exchange NAME. A deleted exchange is removed from gExchanges
+/// but keeps its seq here (tombstone) so a stale lower-seq declare is rejected.
+private ulong[string] gExchangeSeq; // TLS
 private Binding[][string] gBindings; // TLS: exchange -> bindings
 
 /// AMQP topic match: dot-separined; `*` = exactly one word, `#` = zero+ words.
@@ -177,9 +190,13 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
     try
     {
         size_t i = 0;
-        if (p.length < 1)
+        if (p.length < 9)
             return;
         immutable op = p[i++];
+        ulong seq = 0; // global ctl order (LWW-element-set)
+        foreach (k; 0 .. 8)
+            seq = (seq << 8) | p[i + k];
+        i += 8;
         const(char)[] rd()
         {
             if (i + 2 > p.length)
@@ -199,12 +216,16 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         {
             ExType t = a == "fanout" ? ExType.fanout : a == "topic" ? ExType.topic
                 : a == "headers" ? ExType.headers : ExType.direct;
+            if (auto sp = (cast(string) ex) in gExchangeSeq)
+                if (seq <= *sp)
+                    return; // stale vs a newer declare/delete on this name
             if ((cast(string) ex) !in gExchanges && gExchanges.length >= AMQP_MAX_EXCHANGES)
             {
                 atomicOp!"+="(gAmqpCtlDrops, 1);
                 return;
             }
             gExchanges[ex] = t;
+            gExchangeSeq[ex] = seq;
         }
         else if (op == 2)
         {
@@ -212,21 +233,26 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             auto extra = rd(); // raw binding args table (may be empty)
             auto exb = extra is null ? null : cast(immutable(ubyte)[]) extra.idup;
             auto lst = ex in gBindings;
-            // dedup: identical (queue,key,args) must not stack — otherwise a
-            // repeated queue.bind fans N duplicate deliveries and grows every
-            // shard's binding list without bound (amplification DoS)
             if (lst !is null)
             {
+                // existing element (live or tombstone): revive/update if newer
                 foreach (ref bd; *lst)
                     if (bd.queue == a && bd.key == b && bd.args == exb)
+                    {
+                        if (seq > bd.seq)
+                        {
+                            bd.seq = seq;
+                            bd.alive = true;
+                        }
                         return;
+                    }
                 if ((*lst).length >= AMQP_MAX_BINDINGS)
                 {
                     atomicOp!"+="(gAmqpBindingDrops, 1);
                     return;
                 }
             }
-            gBindings[ex] ~= Binding(a, b, exb);
+            gBindings[ex] ~= Binding(a, b, exb, seq, true);
         }
         else if (op == 3) // queue metadata: ex=queue, a=dlx, b=dlrk, ttl(i64 BE)
         {
@@ -259,20 +285,24 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         {
             auto b = rd().idup;
             if (auto lst = ex in gBindings)
-            {
-                size_t w = 0;
                 foreach (ref bd; *lst)
-                    if (!(bd.queue == a && bd.key == b))
-                        (*lst)[w++] = bd;
-                (*lst).length = w;
-            }
+                    if (bd.queue == a && bd.key == b && seq > bd.seq)
+                    {
+                        bd.seq = seq; // tombstone: a stale re-bind can't revive it
+                        bd.alive = false;
+                    }
         }
         else if (op == 5) // exchange.delete: ex=exchange
         {
             try
             {
+                if (auto sp = (cast(string) ex) in gExchangeSeq)
+                    if (seq <= *sp)
+                        return; // stale vs a newer declare/delete
                 gExchanges.remove(cast(string) ex);
-                gBindings.remove(cast(string) ex);
+                gExchangeSeq[ex] = seq; // tombstone seq (rejects a stale declare)
+                // bindings under a deleted exchange are inert (routeTo needs the
+                // exchange); leave them so a concurrent bind's LWW state is kept
             }
             catch (Exception)
             {
@@ -305,6 +335,9 @@ private void ctlBroadcast(ubyte op, scope const(char)[] ex, scope const(char)[] 
             cbBusy = false;
     cbp.clear();
     cbp.appendByte(cast(char) op);
+    immutable ulong seq = atomicOp!"+="(gAmqpCtlSeq, 1);
+    foreach (k; 0 .. 8)
+        cbp.appendByte(cast(char)(seq >> ((7 - k) * 8)));
     void put(scope const(char)[] s)
     {
         cbp.appendByte(cast(char)(s.length >> 8));
@@ -398,21 +431,22 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         {
         case ExType.fanout:
             foreach (ref bd; *bl)
-                sink(bd.queue);
+                if (bd.alive)
+                    sink(bd.queue);
             break;
         case ExType.direct:
             foreach (ref bd; *bl)
-                if (bd.key == rkey)
+                if (bd.alive && bd.key == rkey)
                     sink(bd.queue);
             break;
         case ExType.topic:
             foreach (ref bd; *bl)
-                if (amqpTopicMatches(bd.key, rkey))
+                if (bd.alive && amqpTopicMatches(bd.key, rkey))
                     sink(bd.queue);
             break;
         case ExType.headers:
             foreach (ref bd; *bl)
-                if (headersMatch(bd.args, msgHeaders))
+                if (bd.alive && headersMatch(bd.args, msgHeaders))
                     sink(bd.queue);
             break;
         }
