@@ -189,23 +189,24 @@ neither side gets a cluster-aware client).
 | GET @1     | 1.75M     | 0.72M     | 2.4×        |
 | GET @8     | **9.81M** | 4.71M     | **2.1×**    |
 | INCR @1    | 1.78M     | 0.66M     | 2.7×        |
-| INCR @8    | 7.02M     | 4.62M     | 1.5×        |
+| INCR @8    | **8.06M** | 4.62M     | 1.7×        |
 
 Reference on the same setup: valkey 9.1 solo = SET 768K / GET 948K.
 
 (An earlier revision of this table reported INCR@8 as a tie at 4.58M and
 GET@8 as 6.82M — BOTH were measurement errors, kept here as a warning: the
 INCR/GET@8 dreads runs had silently picked up a DEBUG build of bin/dreads,
-and GET@8 was additionally CLIENT-bound — 4 benchmark procs cap out around
-7-8M; GET@8 needs 5 client procs (cores 8/9/10/12/14, three spare for the
-loopback softirq — 6+ clients REGRESS from softirq starvation). Dragonfly's
-numbers sit well under the 4-client cap and were unaffected.)
+and GET/INCR@8 were additionally CLIENT-bound — 4 benchmark procs cap out
+around 7-8M; anything above needs 5 client procs (cores 8/9/10/12/14, three
+spare for the loopback softirq — 6+ clients REGRESS from softirq
+starvation). SET@8 is genuinely server-bound (4 and 5 clients agree).
+Dragonfly's numbers sit well under the 4-client cap and were unaffected.)
 
 Reading: Dragonfly's per-thread scaling percentage is excellent (~85% at 8,
 ours 48-70% depending on op) but its per-thread baseline is ~2.8× lower, so
 dreads wins EVERY point, 1.5-2.8×. The honest scaling metric — marginal
 throughput per added core — also favors dreads (SET: +0.72M/core vs +0.52M).
 Their flat ~4.3-4.7M across ALL ops at 8 threads suggests a coordination/IO
-ceiling; ours still varies by op (6.8-9.8M), i.e. bound by per-op cost, not
+ceiling; ours still varies by op (6.8-9.8M; per-shard efficiency SET 48% / INCR 57% / GET 70%), i.e. bound by per-op cost, not
 by the fabric. Remaining upside: the per-hop tax (bytecode-IR) and the
 hashtable; at the 85-90%/shard target our 8-thread ceiling is ~12M.
