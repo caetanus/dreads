@@ -796,13 +796,17 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     buildPublish(pkt, topic, payload, false);
     bool pktV5built = false; // build the v5 variant lazily (only if a v5 sub matches)
     // Deliver one message to one matched subscriber (QoS/no-local/RAP-aware).
-    void deliverTo(ref Match m) @trusted nothrow
+    // Returns TRUE iff the message was actually queued to the subscriber — a
+    // shared-subscription round-robin uses this to FALL THROUGH to the next group
+    // member when the chosen one is ineligible (no-local-publisher, obox full, or
+    // over maxPktSize), so a message is never lost for the whole group.
+    bool deliverTo(ref Match m) @trusted nothrow
     {
         auto s = m.c;
         if (s.closed)
-            return;
+            return false;
         if (m.noLocal && s is publisher)
-            return; // v5 no-local: don't echo the publisher's own message back
+            return false; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
         // v5 outbound topic alias: map this topic to a short alias for a client
         // that advertised topic-alias-maximum. First delivery of a topic REGISTERS
@@ -895,7 +899,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
-                    return;
+                    return false;
                 }
                 s.obox.append(q1.data);
                 recordAlias(); // registration is now queued: safe to remember it
@@ -918,7 +922,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     {
                     }
                 }
-                return;
+                return true;
             }
             // window saturated -> deliver at QoS0
         }
@@ -932,7 +936,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
-                return;
+                return false;
             }
             s.obox.append(q1.data);
             recordAlias();
@@ -947,7 +951,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
-                return;
+                return false;
             }
             s.obox.append(q1.data);
             recordAlias();
@@ -965,7 +969,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     || s.obox.length + plen > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
-                return;
+                return false;
             }
             s.obox.append(v5 ? pktV5.data : pkt.data);
         }
@@ -978,59 +982,51 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
             }
         }
+        return true; // queued to the subscriber
     }
 
-    // Pass 1: deliver to every NORMAL subscriber; tally shared subs per group.
-    static size_t[string] groupCount; // TLS, reused
+    // Pass 1: deliver to every NORMAL subscriber; collect shared members per group
+    // (their indices into tMatchBuf, in match order) for the round-robin below.
+    static size_t[][string] groupIdx; // TLS, reused: group -> member indices
     bool anyShared = false;
-    foreach (ref m; tMatchBuf[0 .. tMatchLen])
+    try
+        foreach (ref lst; groupIdx.byValue)
+            lst.length = 0; // reset lengths, keep capacity (reuse across messages)
+    catch (Exception)
+    {
+    }
+    foreach (i, ref m; tMatchBuf[0 .. tMatchLen])
     {
         if (m.shareGroup.length == 0)
-            deliverTo(m);
+            cast(void) deliverTo(m);
         else
         {
             anyShared = true;
             try
-                groupCount[m.shareGroup] = groupCount.get(m.shareGroup, 0) + 1;
+                groupIdx.require(m.shareGroup, null) ~= i;
             catch (Exception)
             {
             }
         }
     }
-    // Pass 2: shared subscriptions — ONE member of each group receives the
-    // message, chosen round-robin across deliveries (load balancing).
+    // Pass 2: shared subscriptions — ONE member of each group receives the message,
+    // chosen round-robin. FALL THROUGH to the next member (in RR order, wrapping)
+    // when the chosen one is ineligible (no-local-publisher / obox full / over
+    // maxPktSize) so a message is never lost for the whole group.
     if (anyShared)
     {
-        static size_t[string] groupPos; // TLS
-        foreach (ref m; tMatchBuf[0 .. tMatchLen])
-        {
-            if (m.shareGroup.length == 0)
-                continue;
-            size_t cnt, pos, rr;
-            try
-            {
-                cnt = groupCount.get(m.shareGroup, 0);
-                pos = groupPos.get(m.shareGroup, 0);
-                rr = gShareRR.get(m.shareGroup, 0);
-            }
-            catch (Exception)
-            {
-            }
-            if (cnt != 0 && pos == rr % cnt)
-                deliverTo(m);
-            try
-                groupPos[m.shareGroup] = pos + 1;
-            catch (Exception)
-            {
-            }
-        }
         try
-        {
-            foreach (g, _; groupCount)
-                gShareRR[g] = gShareRR.get(g, 0) + 1; // advance for next message
-            groupCount.clear();
-            groupPos.clear();
-        }
+            foreach (g, ref idxs; groupIdx)
+            {
+                immutable cnt = idxs.length;
+                if (cnt == 0)
+                    continue;
+                immutable rr = gShareRR.get(g, 0);
+                foreach (k; 0 .. cnt)
+                    if (deliverTo(tMatchBuf[idxs[(rr + k) % cnt]]))
+                        break; // delivered to an eligible member — stop
+                gShareRR[g] = rr + 1; // rotate the start for the next message
+            }
         catch (Exception)
         {
         }
@@ -2357,6 +2353,16 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         }
                         actualFilter = a;
                         shareGroup = g;
+                        // [MQTT-3.8.3-4] no-local (bit 2) on a SHARED subscription
+                        // is a Protocol Error — reject this filter (the round-robin
+                        // also falls through an ineligible member as a safety net).
+                        if (optByte & 0x04)
+                        {
+                            granted[ng] = 0x80;
+                            retainOk[ng] = false;
+                            filters[ng++] = null;
+                            continue;
+                        }
                     }
                 }
                 if (!mqttValidFilter(actualFilter) || c.filters.length >= MQTT_MAX_SUBS)
