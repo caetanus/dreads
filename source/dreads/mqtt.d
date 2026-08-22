@@ -184,6 +184,8 @@ private struct SubEntry
     // bits4-5 retain-handling (v3 subs: 0 = deliver-all, clear-retain, send-retained)
     string shareGroup; // v5 shared subscription ($share/<group>/...): one member
     // of the group gets each message (round-robin). Empty = a normal subscription.
+    uint subId; // v5 subscription-identifier (0x0B): echoed on every PUBLISH this
+    // subscription delivers, so the client can correlate. 0 = none.
 }
 
 private final class TrieNode
@@ -232,7 +234,7 @@ private TrieNode trieRoot() nothrow @trusted
 // appending instead was both a spec violation (duplicate deliveries) and an
 // amplification DoS. Returns true when a NEW entry was created.
 private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts,
-        string shareGroup = null) @trusted nothrow
+        string shareGroup = null, uint subId = 0) @trusted nothrow
 {
     // identity is (conn, gen, shareGroup): a normal sub and a shared sub (or two
     // different groups) to the same filter are DISTINCT subscriptions.
@@ -241,10 +243,11 @@ private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts,
         {
             e.qos = qos;
             e.opts = opts;
+            e.subId = subId; // a re-subscribe updates the identifier
             return false;
         }
     try
-        a ~= SubEntry(c, c.gen, qos, opts, shareGroup);
+        a ~= SubEntry(c, c.gen, qos, opts, shareGroup, subId);
     catch (Exception)
         return false;
     atomicOp!"+="(gMqttSubTotal, 1);
@@ -254,7 +257,7 @@ private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts,
 // Split-walk `filter` creating nodes, then upsert the entry at the terminal.
 // Returns true when a NEW subscription was created (false = replaced/failed).
 private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
-        ubyte opts = 0, string shareGroup = null) @trusted nothrow
+        ubyte opts = 0, string shareGroup = null, uint subId = 0) @trusted nothrow
 {
     try
     {
@@ -268,7 +271,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
                 e++;
             auto seg = filter[i .. e];
             if (seg == "#")
-                return upsertEntry(n.hash, c, qos, opts, shareGroup);
+                return upsertEntry(n.hash, c, qos, opts, shareGroup, subId);
             TrieNode next;
             if (seg == "+")
             {
@@ -288,7 +291,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
                 }
             }
             if (e >= filter.length)
-                return upsertEntry(next.subs, c, qos, opts, shareGroup);
+                return upsertEntry(next.subs, c, qos, opts, shareGroup, subId);
             n = next;
             i = e + 1;
         }
@@ -365,6 +368,7 @@ private struct Match // one matched subscriber + its granted qos (fused so the
     bool noLocal; // v5 no-local: don't echo the publisher's own message back
     bool rap; // v5 retain-as-published: keep the publisher's retain flag
     string shareGroup; // v5 shared sub group ("" = normal, deliver to all)
+    uint subId; // v5 subscription-identifier to echo on delivery (0 = none)
 }
 
 private Match[] tMatchBuf;
@@ -421,7 +425,7 @@ private void addLive(ref SubEntry e) @trusted nothrow
             return;
     }
     tMatchBuf[tMatchLen++] = Match(e.c, e.qos, (e.opts & 0x04) != 0,
-            (e.opts & 0x08) != 0, e.shareGroup);
+            (e.opts & 0x08) != 0, e.shareGroup, e.subId);
 }
 
 /// Does `filter` match `topic`? (retained-message delivery at SUBSCRIBE time.)
@@ -774,6 +778,19 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         if (m.noLocal && s is publisher)
             return; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
+        // v5 subscription-identifier: prefix a 0x0B property onto THIS subscriber's
+        // property block (per-sub, so it can't reuse the pooled v5 packet below).
+        // The common no-subId case leaves `props` untouched — zero extra work.
+        static ByteBuffer sidBuf;
+        const(char)[] dprops = props;
+        if (v5 && m.subId != 0)
+        {
+            sidBuf.clear();
+            sidBuf.appendByte(0x0B);
+            encodeVarint(sidBuf, m.subId);
+            sidBuf.append(props);
+            dprops = cast(const(char)[]) sidBuf.data;
+        }
         // v5 retain-as-published keeps the publisher's retain flag; otherwise a
         // forwarded delivery clears retain [MQTT-3.3.1-9].
         immutable delRetain = m.rap && retain;
@@ -792,9 +809,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 q1.clear();
                 if (effQos == 2)
-                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5, props);
+                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5, dprops);
                 else
-                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5, props);
+                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5, dprops);
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
@@ -829,7 +846,20 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // rare (retain-as-published, QoS0): the shared packet has retain=0,
             // so build a one-off with the retain bit set
             q1.clear();
-            buildPublish(q1, topic, payload, true, v5, props);
+            buildPublish(q1, topic, payload, true, v5, dprops);
+            if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+            {
+                atomicOp!"+="(gMqttDropped, 1);
+                return;
+            }
+            s.obox.append(q1.data);
+        }
+        else if (v5 && m.subId != 0)
+        {
+            // per-sub subscription-identifier: distinct property block, so build a
+            // one-off instead of the pooled v5 packet
+            q1.clear();
+            buildPublish(q1, topic, payload, false, true, dprops);
             if (s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
@@ -1387,6 +1417,52 @@ private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i, out ush
             break;
         default:
             return false; // unknown CONNECT property id: malformed
+        }
+    }
+    i = end;
+    return true;
+}
+
+// Parse a v5 SUBSCRIBE property block at p[i], extracting the subscription-
+// identifier (0x0B) and skipping user-property (0x26) — the only two properties
+// valid on SUBSCRIBE. A subscription-identifier of 0 is a protocol error
+// [MQTT-3.8.2.1-2]; any other property id is malformed. Bounded by `end`.
+private bool mqttParseSubProps(scope const(ubyte)[] p, ref size_t i, out uint subId) @nogc nothrow
+{
+    subId = 0;
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    immutable end = i + plen;
+    if (end > p.length)
+        return false;
+    while (i < end)
+    {
+        immutable id = p[i++];
+        switch (id)
+        {
+        case 0x0B: // subscription-identifier: varint 1..268435455
+            uint v;
+            if (!decodeVarint(p, i, v) || i > end)
+                return false;
+            if (v == 0)
+                return false; // [MQTT-3.8.2.1-2] a 0 identifier is a protocol error
+            subId = v;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return false;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return false;
+                i += n;
+            }
+            break;
+        default:
+            return false; // only subscription-identifier + user-property are legal
         }
     }
     i = end;
@@ -2018,8 +2094,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             size_t i = 2;
             immutable v5 = c.protoVer == 5;
             // v5 SUBSCRIBE properties (subscription-identifier, user-props) sit
-            // after the packet-id; skipped now.
-            if (v5 && !mqttSkipProps(p, i))
+            // after the packet-id. The subscription-identifier is echoed on every
+            // PUBLISH this SUBSCRIBE's filters deliver, so the client can tell
+            // which subscription matched.
+            uint subId = 0;
+            if (v5 && !mqttParseSubProps(p, i, subId))
                 return false;
             // NO-YIELD window: these TLS scratch arrays are filled and
             // consumed without any suspension point in between
@@ -2097,7 +2176,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                     }
                 immutable isNew = trieSubscribe(actualFilter, c, grant,
-                        cast(ubyte)(v5 ? optByte : 0), sg);
+                        cast(ubyte)(v5 ? optByte : 0), sg, subId);
                 if (!isNew)
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
                 // retain-handling (opts bits 4-5): 0 = always send retained on
