@@ -238,3 +238,28 @@ Their flat ~4.3-4.7M across ALL ops at 8 threads suggests a coordination/IO
 ceiling; ours still varies by op (6.8-9.8M; per-shard efficiency SET 48% / INCR 57% / GET 70%), i.e. bound by per-op cost, not
 by the fabric. Remaining upside: the per-hop tax (bytecode-IR) and the
 hashtable; at the 85-90%/shard target our 8-thread ceiling is ~12M.
+
+## MQTT skin vs Eclipse Mosquitto (2026-08-21)
+
+Same box (see the bench-box section), both brokers pinned to core 0, driven
+by the SAME load generator (`bench/mqttload.d` — a pipelined QoS-1 publisher
+with a 256-message inflight window counting PUBACKs, plus a delivery-counting
+subscriber; identical binary against both brokers). Mosquitto 2.x (official
+docker image) tuned for fairness: `max_inflight_messages 0`,
+`max_queued_messages 0`, `set_tcp_nodelay true`. dreads: `--mqtt-port 1883`,
+single shard.
+
+| metric (1 core, QoS1 window 256, 16B payload) | dreads MQTT skin | mosquitto | |
+|---|---:|---:|---:|
+| acked publish rate, 1 subscriber attached | **4.16M msg/s** | 77.6K | **54×** |
+| end-to-end deliveries to that subscriber   | **2.04M msg/s** | (subscriber dropped under load) | — |
+| acked publish rate, no subscribers          | **8.3M msg/s**  | 76.8K | 108× |
+
+Notes: mosquitto disconnects the QoS-0 subscriber under this load (a legal
+QoS-0 overload response), so its end-to-end number does not exist at this
+rate. The dreads skin delivers 2M msg/s to a live subscriber on ONE core —
+the same engine, threads and share-nothing fabric that serve RESP (`the
+Redis tables above`): MQTT here is a protocol face, not a separate broker.
+Correctness: wildcard (`+`/`#`) overlap, retained-message delivery to late
+subscribers on other shard threads, and QoS1 acks verified with paho-mqtt
+at shards=4.

@@ -2212,6 +2212,12 @@ private void shardDrainLoop() nothrow
             refreshWall(); // one clock read per drain pass (owner dispatches hopped cmds)
             replyTouch = 0; // requester shards we owe a batch + single wake this pass
             cast(void) shardDrainOnce!handle();
+            {
+                // MQTT fan-in deliveries accumulated this pass flush here
+                import dreads.mqtt : mqttFlushDirty;
+
+                mqttFlushDirty();
+            }
             // ship each requester's coalesced reply batch, then its ONE wake
             while (replyTouch)
             {
