@@ -621,6 +621,12 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
                     continue;
                 if (bd.toExchange)
                 {
+                    // Check the depth cap in the PARENT, BEFORE marking visited: a
+                    // child that would only be reached at a capped depth expands
+                    // NOTHING, so marking it here would wrongly block a later,
+                    // SHALLOWER path from expanding it (an under-delivery bug).
+                    if (depth + 1 > AMQP_MAX_EXCHANGE_HOPS)
+                        continue;
                     if (seen(bd.queue))
                         continue; // already expanded this exchange: cycle/diamond
                     try
@@ -1111,6 +1117,10 @@ private final class AmqpConn
     size_t consumerCount; // live basic.consume fibers (per-conn cap)
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     bool hbStarted;  // the sender fiber is spawned exactly once
+    uint frameMax = AMQP_FRAME_MAX; // NEGOTIATED max frame size (from tune-ok): we
+    // MUST NOT emit a frame larger than this, so a client that negotiated a smaller
+    // frame-max doesn't see an over-size body frame (a fatal framing error to a
+    // spec-strict receiver). Chunk size for bodies = frameMax - 8.
 
     this(TCPConnection c) nothrow
     {
@@ -1363,8 +1373,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         case 31: // tune-ok: channel-max u16, frame-max u32, heartbeat u16
             {
                 cast(void) r.u16(); // channel-max (we accept the client's)
-                cast(void) r.u16();
-                cast(void) r.u16(); // frame-max hi/lo halves of the u32
+                immutable fm = r.u32(); // frame-max (u32): the client's negotiated max
+                // honor it (bounded to [4096, our proposal]); 0 = "no limit" per
+                // spec, so fall back to our own max. Prevents emitting a body frame
+                // larger than a down-negotiating client's frame-max.
+                c.frameMax = fm == 0 ? AMQP_FRAME_MAX
+                    : (fm < 4096 ? 4096 : (fm > AMQP_FRAME_MAX ? AMQP_FRAME_MAX : fm));
                 immutable hb = r.u16(); // NEGOTIATED heartbeat interval, seconds
                 // Send at half the negotiated interval so the client always
                 // sees a frame within its dead-peer window (2× interval).
@@ -1702,7 +1716,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         putShortStr(b, grk); // original routing key
                         putU32(b, cast(uint)(remaining < 0 ? 0 : remaining));
                     });
-                    emitContent(o, chan, pay.data);
+                    emitContent(o, chan, pay.data, c.frameMax);
                 }
                 else
                     method(o, chan, 60, 72, (ref ByteBuffer b) @nogc nothrow {
@@ -2021,7 +2035,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
                 putShortStr(b, exn);
                 putShortStr(b, rkn);
             });
-            emitContent(o, chan, tp.record);
+            emitContent(o, chan, tp.record, c.frameMax);
             atomicOp!"+="(gAmqpReturned, 1);
         }
     }
@@ -2269,7 +2283,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             putShortStr(b, exn);
             putShortStr(b, rkn);
         });
-        emitContent(o, chan, cast(const(ubyte)[]) payload);
+        emitContent(o, chan, cast(const(ubyte)[]) payload, c.frameMax);
         atomicOp!"+="(gAmqpReturned, 1);
     }
     if (ch.confirmMode)
@@ -2284,7 +2298,8 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     }
 }
 
-private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blob) nothrow
+private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blob,
+        uint frameMax = AMQP_FRAME_MAX) nothrow
 {
     long pm0;
     int dths0;
@@ -2308,7 +2323,7 @@ private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blo
     // drops the connection with a NoneType body_size error). A body larger than
     // the advertised frame-max (131072) is split so no single frame exceeds it
     // (each frame = 8 bytes of framing + payload, so payload <= frame-max - 8).
-    enum size_t bodyChunk = AMQP_FRAME_MAX - 8;
+    immutable size_t bodyChunk = frameMax - 8; // frameMax is clamped >= 4096
     size_t off = 0;
     while (off < body_.length)
     {
@@ -2904,7 +2919,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         putShortStr(b, ""); // exchange (not stored in the record)
                         putShortStr(b, drk); // original routing key, not the queue name
                     });
-                    emitContent(ob, chn, pay.data);
+                    emitContent(ob, chn, pay.data, cc.frameMax);
                     burst++;
                 }
                 if (burst == 0)
