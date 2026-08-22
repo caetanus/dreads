@@ -296,7 +296,7 @@ subscriber entirely.)
 
 | metric | dreads | Apache Kafka 3.7 |
 |---|---:|---:|
-| acked produce (CRC-validated) | **3.70M msg/s** | 515K (7.2×) |
+| acked produce (CRC-validated) | **4.20M msg/s** | 515K (8.2×) |
 | fetch (drain from 0) | **21.5M msg/s** | 2.57M (8.4×) |
 
 Durability footnote from this sweep: Apache acked 6,000,000 produces but
