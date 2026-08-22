@@ -1474,9 +1474,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         catch (Exception)
                         {
                         }
+                    immutable redlv = recordRedelivered(pay.data);
                     method(o, chan, 60, 71, (ref ByteBuffer b) @nogc nothrow {
                         putU64(b, gtag);
-                        b.appendByte(0); // redelivered
+                        b.appendByte(redlv ? 1 : 0); // redelivered
                         putShortStr(b, "");
                         putShortStr(b, "");
                         putU32(b, cast(uint)(remaining < 0 ? 0 : remaining));
@@ -1697,7 +1698,7 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
         foreach (k; 0 .. 8)
             pm = (pm << 8) | blob[4 + k];
         publishMs = pm;
-        deaths = blob[12];
+        deaths = blob[12] & 0x7F; // bit 7 is the redelivered flag, not a death
         immutable rl = (cast(size_t) blob[13] << 8) | blob[14];
         if (15 + rl + 4 <= blob.length)
         {
@@ -1745,6 +1746,31 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
     }
     props = null;
     body_ = blob;
+}
+
+/// The redelivered flag ([basic.deliver]/[basic.get-ok]: message was delivered
+/// before) lives in bit 7 of the v3 deaths byte — deaths caps at 16 so the high
+/// bits are free, and splitRecord masks it off the count. Set on requeue only;
+/// a fresh publish and a dead-lettered copy (rebuilt by buildRecord, no bit 7)
+/// both read false, matching RabbitMQ (dead-letter starts a fresh delivery).
+private bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
+{
+    return blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A'
+        && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
+}
+
+/// Copy `blob` into `dst` with the v3 redelivered bit set (for requeue). A
+/// non-v3 record (bare RESP-side value) has no flag slot and passes through.
+private void markRedelivered(ref ByteBuffer dst, scope const(ubyte)[] blob) @nogc nothrow @trusted
+{
+    dst.clear();
+    dst.append(cast(const(char)[]) blob);
+    if (blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A'
+            && blob[2] == 'M' && blob[3] == 'Q')
+    {
+        auto d = cast(ubyte[]) dst.data;
+        d[12] |= 0x80;
+    }
 }
 
 private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
@@ -1872,8 +1898,10 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
             {
                 static ByteBuffer kb6; // TLS
                 queueKey(u.queue, kb6);
+                static ByteBuffer rq6; // TLS: redelivered-marked copy
+                markRedelivered(rq6, u.blob);
                 if (gAmqpPushFront !is null)
-                    gAmqpPushFront(kb6.data.asChars, u.blob.asChars);
+                    gAmqpPushFront(kb6.data.asChars, rq6.data.asChars);
             }
         c.unacked.clear();
     }
@@ -1907,8 +1935,12 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
     if (requeue)
     {
         queueKey(u.queue, kb4);
+        // mark the requeued copy redelivered so the next delivery sets the flag
+        // (both TLS buffers are consumed by gAmqpPushFront before its yield)
+        static ByteBuffer rq4; // TLS
+        markRedelivered(rq4, u.blob);
         if (gAmqpPushFront !is null)
-            gAmqpPushFront(kb4.data.asChars, u.blob.asChars);
+            gAmqpPushFront(kb4.data.asChars, rq4.data.asChars);
         return;
     }
     deadLetter(u.queue, u.blob);
@@ -2200,10 +2232,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         catch (Exception)
                         {
                         }
+                    immutable redlv = recordRedelivered(pay.data);
                     method(ob, chn, 60, 60, (ref ByteBuffer b) @nogc nothrow {
                         putShortStr(b, tt);
                         putU64(b, tg);
-                        b.appendByte(0);
+                        b.appendByte(redlv ? 1 : 0); // redelivered
                         putShortStr(b, "");
                         putShortStr(b, qq);
                     });
