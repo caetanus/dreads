@@ -947,6 +947,18 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
                 return false;
+            // [MQTT-3.1.3-4/-9] the server MAY reject an unacceptable ClientId
+            // with CONNACK 0x02. Cap the length (spec suggests 1-23): a huge
+            // ClientId would otherwise be idup'd AND broadcast to every shard on
+            // the takeover path — a per-CONNECT cross-shard amplification DoS.
+            if (clientId.length > 256)
+            {
+                o.appendByte(cast(char)(PT_CONNACK << 4));
+                o.appendByte(cast(char) 2);
+                o.appendByte(cast(char) 0);
+                o.appendByte(cast(char) 2); // identifier rejected
+                return false;
+            }
             // [MQTT-3.1.3-8] empty ClientId REQUIRES CleanSession=1: refuse
             // rc=0x02 (we run clean-only, but the refusal is still mandated)
             if (clientId.length == 0 && !(flags & 0x02))
