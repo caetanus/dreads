@@ -2044,6 +2044,7 @@ private void shardDrainLoop() nothrow
                 }
                 else // rare wide shard id: unbatched reply, immediate wake
                 {
+                    myAof().flush(); // durable before this immediate confirm ships
                     shardEnqueue(cast(uint) meta, reply.data, pend, 0, ShardMsg.reply);
                     shardWake(cast(uint) meta);
                 }
@@ -2163,6 +2164,7 @@ private void shardDrainLoop() nothrow
                 flushPendingNotify();
             if (pend0 !is null)
             {
+                myAof().flush(); // durable before the EXEC reply ships
                 shardEnqueue(cast(uint) meta, reply.data, pend0, 0, ShardMsg.reply);
                 shardWake(cast(uint) meta);
             }
