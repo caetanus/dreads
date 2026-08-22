@@ -239,6 +239,64 @@ ceiling; ours still varies by op (6.8-9.8M; per-shard efficiency SET 48% / INCR 
 by the fabric. Remaining upside: the per-hop tax (bytecode-IR) and the
 hashtable; at the 85-90%/shard target our 8-thread ceiling is ~12M.
 
+## Full sweep — every protocol, one session (2026-08-22)
+
+All numbers re-measured back-to-back on the bench box (see the spec section
+above), release build `e12572e`+, performance governor, one server core
+unless stated, pinned clients, port-ownership verified with `ss` before
+every run (see the 9092 trap note). Best of the runs shown; same load
+generator binary for both sides in every protocol.
+
+### RESP, single thread (4 pinned clients, -c 25 -P 64)
+
+| op | dreads | valkey 9.1.1 | Dragonfly (1 thread) |
+|---|---:|---:|---:|
+| SET  | **1.86M** | 958K (1.9×) | 631K (2.9×) |
+| GET  | **1.82M** | 1.33M (1.4×) | 736K (2.5×) |
+| INCR | **1.91M** | 1.30M (1.5×) | 680K (2.8×) |
+
+### RESP, sharded ladder (SET; 8-shard points use 5 clients)
+
+| threads | dreads | Dragonfly |
+|---:|---:|---:|
+| 1 | 1.80M | 631K |
+| 2 | 2.81M | 1.23M |
+| 4 | 5.04M | 2.44M |
+| 8 | **8.03M** | 4.04M |
+
+At 8 threads: GET **10.4M** vs 4.59M (2.3×), INCR **8.18M** vs 4.13M (2.0×).
+GET@8 is up from 9.8M at the last campaign checkpoint.
+
+### MQTT (QoS1 acked, window 256, 16B; 1 core each)
+
+| metric | dreads | mosquitto 2 (tuned) |
+|---|---:|---:|
+| acked pub, no subscribers | **8.33M msg/s** | 76.2K (109×) |
+| acked pub, 1 live subscriber | **4.55M msg/s** | 74.3K (61×) |
+| end-to-end deliveries | **2.12M msg/s** | subscriber dropped |
+
+### AMQP 0-9-1 (publisher confirms, window 256; 1 core each)
+
+| metric | dreads | RabbitMQ 3 |
+|---|---:|---:|
+| confirmed publish | **1.11M msg/s** | 32.4K (34×) |
+| end-to-end (concurrent pub+consume) | **708K msg/s** | 40.6K (17×) |
+
+### Kafka (6M msgs, acks=1, 32 msgs/request; dreads 1 core, Apache 2 cores)
+
+| metric | dreads | Apache Kafka 3.7 |
+|---|---:|---:|
+| acked produce | **4.32M msg/s** | 515K (8.4×) |
+| fetch (drain from 0) | **21.5M msg/s** | 2.57M (8.4×) |
+
+Durability footnote from this sweep: Apache acked 6,000,000 produces but
+its log retained 5,998,816 (acks=1 semantics — 1,184 acked messages gone
+after a clean container stop); the load client now reads the high
+watermark from fetch responses and stops at the real end instead of
+spinning. dreads retained all 6,000,128 acked records (count is the 32-per
+-request rounding), replayable through the same per-shard AOF that backs
+RESP/MQTT/AMQP.
+
 ## MQTT skin vs Eclipse Mosquitto (2026-08-21)
 
 Same box (see the bench-box section), both brokers pinned to core 0, driven

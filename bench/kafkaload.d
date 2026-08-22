@@ -229,7 +229,10 @@ int main(string[] args)
             i += 4; // partition
             immutable err = (r[i] << 8) | r[i + 1];
             i += 2;
-            i += 8; // hw
+            long hw = 0; // partition high watermark, from the response itself
+            foreach (k; 0 .. 8)
+                hw = (hw << 8) | r[i + k];
+            i += 8;
             immutable rsz = rdU32(r, i);
             i += 4;
             if (err != 0 && err != 1)
@@ -251,7 +254,18 @@ int main(string[] args)
                 i += 12 + msz;
             }
             if (got == 0)
-                continue; // poll again (message not yet visible)
+            {
+                // acks=1 brokers may ack more than the log retains (Apache:
+                // 6,000,000 acked, 5,998,816 stored): an empty response AT
+                // the high watermark means the log is drained — stop instead
+                // of spinning on offsets that will never exist.
+                if (off >= hw)
+                {
+                    printf("kafka sub: log drained at hw=%lld (asked %lld)\n", hw, n);
+                    break;
+                }
+                continue;
+            } // poll again (message not yet visible)
             off += got;
             seen += got;
         }
