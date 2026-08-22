@@ -1559,9 +1559,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         // (monotonic across channels), so without the u.chn filter
                         // a multiple-ack would over-ack sibling channels' lower
                         // tags -> their messages silently dropped from unacked.
+                        // [basic.ack] delivery-tag 0 + multiple=1 acks ALL
+                        // outstanding (on this channel); otherwise up-to-and-
+                        // including tag. tags start at 1, so tag==0 must not be
+                        // compared with t<=tag (that matches nothing).
                         ulong[] drop;
                         foreach (t, ref u; c.unacked)
-                            if (t <= tag && u.chan == chan)
+                            if ((tag == 0 || t <= tag) && u.chan == chan)
                                 drop ~= t;
                         foreach (t; drop)
                             c.unacked.remove(t);
@@ -1596,8 +1600,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         // so the u.chn filter stops cross-channel over-nack)
                         ulong[] all;
                         foreach (t, ref u; c.unacked)
-                            if (t <= tag && u.chan == chan)
-                                all ~= t;
+                            if ((tag == 0 || t <= tag) && u.chan == chan)
+                                all ~= t; // tag 0 + multiple = ALL outstanding
                         // preserve delivery order on redelivery: tags are
                         // monotonic (delivery order), but the AA yields them in
                         // hash order. requeue pushes to the FRONT, so settle
