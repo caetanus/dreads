@@ -89,6 +89,7 @@ public final class MqttConn
     // ones carry an empty topic + the alias (resolved here). Bounded by the
     // topic-alias-maximum we advertise in CONNACK.
     string[ushort] inAlias;
+    size_t inAliasBytes; // running size of the aliased topics (byte cap)
     // Read deadline: a BOUNDED default until CONNECT arrives (a client that
     // opens TCP and never sends CONNECT must be reaped — pre-handshake
     // slowloris), then re-armed to 1.5x the CONNECT keepalive (0 kA = max).
@@ -160,8 +161,11 @@ private size_t tRetainedBytes; // TLS: payload bytes currently in gRetained
 /// (unlimited re-subscribe was a memory + delivery-amplification DoS).
 private enum size_t MQTT_MAX_SUBS = 4096;
 /// v5 topic-alias-maximum we advertise: the largest alias a client may use when
-/// publishing to us (also bounds the per-conn inbound alias table).
-private enum ushort MQTT_TOPIC_ALIAS_MAX = 8192;
+/// publishing to us (also bounds the per-conn inbound alias table by COUNT).
+private enum ushort MQTT_TOPIC_ALIAS_MAX = 1024;
+/// ...and by BYTES: an aliased topic is idup'd (up to ~64KB), so the count cap
+/// alone would let one conn pin MAX*64KB; this bounds the whole table.
+private enum size_t MQTT_MAX_ALIAS_BYTES = 1 << 20; // 1MB of aliased topics/conn
 
 // ---------------------------------------------------------------------------
 // Topic trie (THREAD-LOCAL). Segment-split on '/'; `+` matches exactly one
@@ -1439,11 +1443,26 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         return false; // [MQTT-3.3.2-4] alias out of range
                     if (topic.length != 0)
                     {
-                        // first use: register alias -> topic (validate the topic)
+                        // first use: register alias -> topic (validate the topic).
+                        // Byte-capped: an idup'd topic is up to ~64KB; without a
+                        // byte bound a client could pin MAX*64KB with distinct
+                        // aliases (a per-conn RAM DoS). On overwrite, discount the
+                        // old topic's bytes first.
                         if (!mqttValidTopicName(topic))
                             return false;
                         try
-                            c.inAlias[pp.topicAlias] = topic.idup;
+                        {
+                            size_t oldLen = 0;
+                            if (auto oa = pp.topicAlias in c.inAlias)
+                                oldLen = (*oa).length;
+                            if (c.inAliasBytes + topic.length - oldLen <= MQTT_MAX_ALIAS_BYTES)
+                            {
+                                c.inAlias[pp.topicAlias] = topic.idup;
+                                c.inAliasBytes = c.inAliasBytes + topic.length - oldLen;
+                            }
+                            // else over budget: skip the mapping (a later resolve
+                            // of this alias then closes the connection)
+                        }
                         catch (Exception)
                         {
                         }
