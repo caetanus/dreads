@@ -103,6 +103,20 @@ public struct ByteBuffer
         len = 0;
     }
 
+    /// Deterministically free the backing block NOW, on the calling thread.
+    /// The destructor also frees, but a GC-finalized owner runs it on
+    /// whichever thread triggered the collection — and these blocks belong to
+    /// per-thread freelists, so cross-thread finalization poisons another
+    /// shard's allocator. Long-lived buffers owned by GC objects MUST be
+    /// released explicitly from their owning thread; ~this then no-ops.
+    void release() @nogc nothrow @trusted
+    {
+        if (ptr !is null)
+            ConnAllocator.instance.deallocate((cast(void*) ptr)[0 .. cap]);
+        ptr = null;
+        len = cap = 0;
+    }
+
     /// Drops everything past the first n bytes (n must be <= length). Used to
     /// roll back a reply that CLIENT REPLY OFF/SKIP suppresses.
     void truncate(size_t n) @nogc nothrow

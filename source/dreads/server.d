@@ -2635,20 +2635,36 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
         return;
     if (!retain && atomicLoad!(MemoryOrder.raw)(gMqttSubTotal) == 0)
         return;
+    // shardEnqueue YIELDS under lane backpressure; if another publisher fiber
+    // on this thread enters meanwhile, a single static staging buffer would
+    // be cleared/reallocated under the parked fiber's feet (its lane slices
+    // would then replay foreign or freed bytes). Fast path keeps the reused
+    // TLS buffer; reentrant callers pay a fresh local one.
     static ByteBuffer mb; // TLS staging
-    mb.clear();
+    static bool mbBusy;
+    ByteBuffer local;
+    ByteBuffer* buf = &local;
+    if (!mbBusy)
+    {
+        mbBusy = true;
+        buf = &mb;
+    }
+    scope (exit)
+        if (buf is &mb)
+            mbBusy = false;
+    buf.clear();
     immutable size_t len = 3 + topic.length + msg.length;
-    auto space = mb.freeSpace(len)[0 .. len];
+    auto space = buf.freeSpace(len)[0 .. len];
     space[0] = retain ? 1 : 0;
     space[1] = cast(ubyte)(topic.length >> 8);
     space[2] = cast(ubyte)(topic.length & 0xFF);
     space[3 .. 3 + topic.length] = cast(const(ubyte)[]) topic[];
     space[3 + topic.length .. $] = cast(const(ubyte)[]) msg[];
-    mb.grow(len);
+    buf.grow(len);
     foreach (uint s2; 0 .. gShardCount)
         if (s2 != tShard)
         {
-            shardEnqueue(s2, mb.data, null, tShard, ShardMsg.mqttPub);
+            shardEnqueue(s2, buf.data, null, tShard, ShardMsg.mqttPub);
             shardWake(s2);
         }
 }
