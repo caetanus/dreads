@@ -9,7 +9,11 @@
 //
 //   ldc2 -O2 bench/mqttload.d -of mqttload
 //   ./mqttload pub  <host> <port> <topic> <nmsgs> [payloadLen] [window]
-//   ./mqttload sub  <host> <port> <filter> <nmsgs>
+//   ./mqttload sub  <host> <port> <filter> <nmsgs> [durationMs]
+//     with durationMs: SUSTAINED-rate mode — count deliveries for that long
+//     starting at the FIRST delivery (drops upstream simply don't arrive);
+//     without: count-to-N mode (burst drains report absurd rates — a windowed
+//     run is the honest end-to-end number)
 module mqttload;
 
 import core.stdc.stdio : printf;
@@ -184,16 +188,14 @@ int main(string[] args)
         long seen = 0;
         size_t rlen = 0;
         bool started = false;
+        immutable long durMs = args.length > 6 ? args[6].to!long : 0;
         StopWatch sw;
         while (seen < n)
         {
+            if (durMs > 0 && started && sw.peek.total!"msecs" >= durMs)
+                break;
             auto r = s.receive(rbuf[rlen .. $]);
             assert(r > 0, "broker closed");
-            if (!started)
-            {
-                sw = StopWatch(AutoStart.yes);
-                started = true;
-            }
             rlen += r;
             size_t pos = 0;
             while (pos < rlen)
@@ -203,7 +205,18 @@ int main(string[] args)
                 if (!decodeVarint(rbuf[0 .. rlen], hp, rem) || hp + rem > rlen)
                     break;
                 if ((rbuf[pos] >> 4) == 3)
+                {
+                    // clock starts at the FIRST DELIVERY — the first bytes on
+                    // this socket are the SUBACK, which arrives during the
+                    // idle gap before the publisher even starts (that gap
+                    // used to be silently counted into the E2E denominator)
+                    if (!started)
+                    {
+                        sw = StopWatch(AutoStart.yes);
+                        started = true;
+                    }
                     seen++;
+                }
                 pos = hp + rem;
             }
             if (pos > 0)
