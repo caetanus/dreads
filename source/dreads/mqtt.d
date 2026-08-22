@@ -1442,6 +1442,8 @@ private bool mqttParseSubProps(scope const(ubyte)[] p, ref size_t i, out uint su
         switch (id)
         {
         case 0x0B: // subscription-identifier: varint 1..268435455
+            if (subId != 0)
+                return false; // [MQTT-3.8.2.1-2] more than one is a protocol error
             uint v;
             if (!decodeVarint(p, i, v) || i > end)
                 return false;
@@ -2261,21 +2263,31 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     foreach (fi, f; filters[0 .. ng])
                         if (f !is null && retainOk[fi] && mqttFilterMatches(f, topic))
                         {
-                            // re-emit a DECREMENTED message-expiry ahead of the
-                            // stored (expiry-stripped) props, for v5 subscribers.
+                            // v5 outgoing props: the subscription-identifier
+                            // (retained delivered at SUBSCRIBE time also carries
+                            // it) then a DECREMENTED message-expiry, ahead of the
+                            // stored (expiry-stripped) props.
                             const(char)[] outProps = r.props;
-                            if (v5 && r.hasExpiry)
+                            if (v5 && (subId != 0 || r.hasExpiry))
                             {
                                 static ByteBuffer pb;
                                 pb.clear();
-                                immutable long remS = (r.deadline - nowRt).total!"seconds";
-                                immutable uint rem = remS <= 0 ? 0
-                                    : (remS > uint.max ? uint.max : cast(uint) remS);
-                                pb.appendByte(cast(char) 0x02);
-                                pb.appendByte(cast(char)(rem >> 24));
-                                pb.appendByte(cast(char)(rem >> 16));
-                                pb.appendByte(cast(char)(rem >> 8));
-                                pb.appendByte(cast(char) rem);
+                                if (subId != 0)
+                                {
+                                    pb.appendByte(cast(char) 0x0B);
+                                    encodeVarint(pb, subId);
+                                }
+                                if (r.hasExpiry)
+                                {
+                                    immutable long remS = (r.deadline - nowRt).total!"seconds";
+                                    immutable uint rem = remS <= 0 ? 0
+                                        : (remS > uint.max ? uint.max : cast(uint) remS);
+                                    pb.appendByte(cast(char) 0x02);
+                                    pb.appendByte(cast(char)(rem >> 24));
+                                    pb.appendByte(cast(char)(rem >> 16));
+                                    pb.appendByte(cast(char)(rem >> 8));
+                                    pb.appendByte(cast(char) rem);
+                                }
                                 pb.append(r.props);
                                 outProps = cast(const(char)[]) pb.data;
                             }
