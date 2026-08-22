@@ -1624,6 +1624,33 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 return true;
             }
+        case 100: // recover-async (deprecated): requeue unacked, NO reply
+        case 110: // recover: requeue this channel's unacked, reply recover-ok
+            {
+                cast(void) r.u8(); // requeue bit — we always requeue to the front
+                try
+                {
+                    // requeue every unacked delivery on THIS channel, FIFO-
+                    // preserving (descending tag -> pushFront leaves ascending at
+                    // the head), each marked redelivered by settleNegative. A
+                    // client stuck without recover-ok used to hang forever.
+                    import std.algorithm.sorting : sort;
+
+                    ulong[] all;
+                    foreach (t, ref u; c.unacked)
+                        if (u.chan == chan)
+                            all ~= t;
+                    sort!"a > b"(all);
+                    foreach (t; all)
+                        settleNegative(c, t, true);
+                }
+                catch (Exception)
+                {
+                }
+                if (mth == 110)
+                    method(o, chan, 60, 111); // recover-ok
+                return true;
+            }
         case 10: // qos: prefetch-size u32, prefetch-count u16, global bit
             {
                 cast(void) r.u32(); // prefetch-size (byte window: unsupported)
