@@ -2527,7 +2527,7 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
 // stored blob is already verbatim wire bytes ([size i32][MessageSet v1
 // message]); the offset is implicit (= list index), stamped here on the fly.
 private int kafkaFetchDirect(scope const(char)[] key, long from, int maxN,
-        size_t budget, long startOff, ref ByteBuffer o) nothrow @trusted
+        scope int delegate(scope const(ubyte)[] blob) @nogc nothrow sink) nothrow @trusted
 {
     import dreads.shard : tShard, shardOfSlot;
     import dreads.slots : keyToSlot;
@@ -2565,26 +2565,11 @@ private int kafkaFetchDirect(scope const(char)[] key, long from, int maxN,
         ce.kh = kh;
         ce.h = ListSeekHint.init;
     }
-    long off = startOff;
     int cnt = 0;
-    immutable start = o.length;
     cast(void) obj.list.walkRangeHinted(ce.h, from, cast(size_t) maxN,
             (const(char)[] v) @nogc nothrow {
-        if (o.length - start > budget)
-            return 1; // budget filled: stop the walk early
-        ubyte[8] ob = void;
-        immutable ulong u = cast(ulong) off;
-        ob[0] = cast(ubyte)(u >> 56);
-        ob[1] = cast(ubyte)(u >> 48);
-        ob[2] = cast(ubyte)(u >> 40);
-        ob[3] = cast(ubyte)(u >> 32);
-        ob[4] = cast(ubyte)(u >> 24);
-        ob[5] = cast(ubyte)(u >> 16);
-        ob[6] = cast(ubyte)(u >> 8);
-        ob[7] = cast(ubyte)(u & 0xFF);
-        o.append(ob[]);
-        o.append(cast(const(ubyte)[]) v);
-        off++;
+        if (sink(cast(const(ubyte)[]) v) != 0)
+            return 1; // sink asked to stop (budget filled)
         cnt++;
         return 0;
     });

@@ -75,8 +75,8 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
 {
     switch (apiKey)
     {
-    case API_PRODUCE: return 2;
-    case API_FETCH: return 3;
+    case API_PRODUCE: return 3;
+    case API_FETCH: return 4;
     case API_LIST_OFFSETS: return 1;
     case API_METADATA: return 1;
     case API_API_VERSIONS: return 0;
@@ -134,6 +134,16 @@ private struct Rd
     const(ubyte)[] p;
     size_t i;
     bool ok = true;
+
+    byte i8() @nogc nothrow
+    {
+        if (i + 1 > p.length)
+        {
+            ok = false;
+            return 0;
+        }
+        return cast(byte) p[i++];
+    }
 
     short i16() @nogc nothrow
     {
@@ -257,13 +267,15 @@ private long pushRecords(scope const(char)[] key, scope const(char)[][] blobs) n
     return v;
 }
 
-/// Direct owner-shard fetch fast path (installed by dreads.server): appends
-/// [offset i64][stored blob] per record straight into `o` — no synthesized
-/// RESP, no LRANGE reply parse, no per-record re-copy. Walks the packed list
-/// segment in cache order. Returns records appended, or -1 when this thread
-/// doesn't own the key (caller falls back to the LRANGE data-plane path).
+/// Direct owner-shard fetch fast path (installed by dreads.server): calls
+/// `sink(blob)` per stored record, walking the packed list segment in cache
+/// order — no synthesized RESP, no LRANGE reply parse. The sink returns non-zero
+/// to stop early (budget filled) and does the offset-prefixing + wire encoding
+/// (v1 verbatim/down-convert or v2 batch) so the format stays in kafka.d.
+/// Returns records visited, or -1 when this thread doesn't own the key (caller
+/// falls back to the LRANGE data-plane path).
 public __gshared int function(scope const(char)[] key, long from, int maxN,
-        size_t budget, long startOff, ref ByteBuffer o) nothrow gKafkaFetchRaw;
+        scope int delegate(scope const(ubyte)[] blob) @nogc nothrow sink) nothrow gKafkaFetchRaw;
 /// Direct owner-shard list length; -1 = not owner (fall back to LLEN).
 public __gshared long function(scope const(char)[] key) nothrow gKafkaLenRaw;
 
@@ -455,8 +467,8 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
             putI16(o2, hi);
         }
 
-        row(o, API_PRODUCE, 0, 2);
-        row(o, API_FETCH, 0, 3);
+        row(o, API_PRODUCE, 0, 3);
+        row(o, API_FETCH, 0, 4);
         row(o, API_LIST_OFFSETS, 0, 1);
         row(o, API_METADATA, 0, 1);
         row(o, API_API_VERSIONS, 0, 0);
@@ -562,9 +574,8 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 /// stale correlation id against no in-flight request and disconnect).
 private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (ver >= 1)
-    {
-    }
+    if (ver >= 3)
+        cast(void) r.str(); // transactional_id (nullable) — ignored (no txn support)
     immutable acks = r.i16();
     cast(void) r.i32(); // timeout
     immutable suppress = acks == 0;
@@ -606,6 +617,35 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             static size_t[] offs; // (start,len) pairs into blobArena
             blobArena.clear();
             size_t nrec = 0;
+            // A v2 RecordBatch (magic byte at offset 16 == 2) and a v1 MessageSet
+            // both put the magic at offset 16; branch on it. v2 carries headers.
+            immutable bool isV2Batch = records.length >= 17 && records[16] == 2;
+            if (isV2Batch)
+            {
+                bool decErr = false;
+                immutable dn = decodeV2Batch(cast(const(ubyte)[]) records, (long ts,
+                        scope const(ubyte)[] k, bool kn, scope const(ubyte)[] v, bool vn,
+                        scope const(ubyte)[] hdr) nothrow{
+                    if (nrec >= KAFKA_MAX_RECORDS)
+                    {
+                        decErr = true;
+                        return;
+                    }
+                    if (offs.length < (nrec + 1) * 2)
+                        offs.length = (nrec + 1) * 2;
+                    offs[nrec * 2] = blobArena.length;
+                    putInternalRec(blobArena, ts, k, kn, v, vn, hdr);
+                    offs[nrec * 2 + 1] = blobArena.length - offs[nrec * 2];
+                    nrec++;
+                });
+                if (dn < 0 || decErr)
+                {
+                    err = E_CORRUPT;
+                    nrec = 0;
+                }
+            }
+            else
+            {
             size_t i = 0;
             while (i + 12 <= records.length)
             {
@@ -666,6 +706,7 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 nrec++;
                 i += 12 + msz;
             }
+            }
             if (err == E_NONE && nrec > 0 && validTopic(topic) && part >= 0)
             {
                 if (slices.length < nrec)
@@ -713,6 +754,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     cast(void) r.i32(); // min_bytes
     if (ver >= 3)
         cast(void) r.i32(); // max_bytes (whole request)
+    if (ver >= 4)
+        cast(void) r.i8(); // isolation_level (read_uncommitted assumed)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
@@ -762,40 +805,87 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             putI32(o, part);
             putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
             putI64(o, hw); // high watermark
-            // records: rebuild [offset][stored blob] until ~partMax bytes
+            if (ver >= 4)
+            {
+                putI64(o, hw); // last_stable_offset (no transactions => == hw)
+                putI32(o, 0); // aborted_transactions: empty array
+            }
+            // records: re-encode stored blobs per fetch version — v0-v3 as a v1
+            // MessageSet (down-converting v2-origin blobs, dropping headers),
+            // v4+ as ONE RecordBatch v2 (carrying headers).
             immutable recAt = o.length;
             putI32(o, 0); // records byte size, patched below
             if (!bad && !overCap && fetchOff < hw)
             {
-                // budget: partMax bytes, capped count
-                int maxN = 16384; // deep batches: fewer walks per fetch
-                long off = fetchOff;
-                size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
-                int direct = -1;
-                if (gKafkaFetchRaw !is null)
-                    direct = gKafkaFetchRaw(key, fetchOff, maxN,
-                            budget, fetchOff, o);
-                if (direct > 0)
+                immutable int maxN = 16384; // deep batches: fewer walks per fetch
+                immutable size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
+                immutable startLen = o.length;
+                import core.atomic : atomicOp;
+
+                if (ver >= 4)
                 {
-                    import core.atomic : atomicOp;
-                    atomicOp!"+="(gKafkaFetched, cast(ulong) direct);
+                    // collect stored blobs for the range (slices stay valid: the
+                    // owner-shard walk is synchronous with no yield), emit ONE batch
+                    static const(ubyte)[][] fblobs; // TLS, pre-sized to maxN
+                    if (fblobs.length < cast(size_t) maxN)
+                        fblobs.length = maxN;
+                    size_t nb = 0, fbytes = 0;
+                    int direct = -1;
+                    if (gKafkaFetchRaw !is null)
+                        direct = gKafkaFetchRaw(key, fetchOff, maxN,
+                                (scope const(ubyte)[] blob) @nogc nothrow{
+                            if (nb >= cast(size_t) maxN || (nb > 0 && fbytes + blob.length > budget))
+                                return 1;
+                            fblobs[nb++] = blob;
+                            fbytes += blob.length;
+                            return 0;
+                        });
+                    if (direct < 0)
+                    {
+                        nb = 0;
+                        fbytes = 0;
+                        cast(void) rangeRecords(key, fetchOff, maxN,
+                                (scope const(ubyte)[] blob) nothrow{
+                            if (nb < cast(size_t) maxN && (nb == 0 || fbytes + blob.length <= budget))
+                            {
+                                fblobs[nb++] = blob;
+                                fbytes += blob.length;
+                            }
+                        });
+                    }
+                    if (nb > 0)
+                    {
+                        encodeV2BatchFromInternal(o, fetchOff, fblobs[0 .. nb]);
+                        atomicOp!"+="(gKafkaFetched, cast(ulong) nb);
+                    }
                 }
-                if (direct < 0)
+                else
                 {
-                    immutable startLen = o.length;
-                    bool first = true;
-                    cast(void) rangeRecords(key, fetchOff, maxN,
-                            (scope const(ubyte)[] blob) nothrow {
-                        // check the budget BEFORE appending (was after: a single
-                        // large record always blew past a tiny partMax); always
-                        // emit at least one so a consumer makes progress
-                        if (!first && o.length - startLen + 8 + blob.length > budget)
-                            return;
-                        first = false;
-                        putI64(o, off);
-                        o.append(blob); // [size i32][message] stored verbatim
-                        off++;
-                    });
+                    long off = fetchOff;
+                    int direct = -1;
+                    if (gKafkaFetchRaw !is null)
+                        direct = gKafkaFetchRaw(key, fetchOff, maxN,
+                                (scope const(ubyte)[] blob) @nogc nothrow{
+                            if (off > fetchOff && o.length - startLen > budget)
+                                return 1; // budget filled (always emit at least one)
+                            emitV1Record(o, off, blob);
+                            off++;
+                            return 0;
+                        });
+                    if (direct > 0)
+                        atomicOp!"+="(gKafkaFetched, cast(ulong) direct);
+                    if (direct < 0)
+                    {
+                        bool first = true;
+                        cast(void) rangeRecords(key, fetchOff, maxN,
+                                (scope const(ubyte)[] blob) nothrow{
+                            if (!first && o.length - startLen + 8 + blob.length > budget)
+                                return;
+                            first = false;
+                            emitV1Record(o, off, blob);
+                            off++;
+                        });
+                    }
                 }
             }
             // patch records size
@@ -1243,7 +1333,7 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
 /// Encode stored records (internal or v1 blobs) as ONE RecordBatch v2 at
 /// baseOffset — the Fetch v4+ emit path.
 private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
-        scope const(ubyte)[][] blobs) nothrow
+        scope const(ubyte)[][] blobs) @nogc nothrow
 {
     static ByteBuffer bodyB; // TLS: attributes..end (the CRC-covered region)
     static ByteBuffer rbuf; // TLS: one record body
@@ -1315,6 +1405,37 @@ private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
     putI32(o, cast(int) crc);
     o.append(bodyB.data);
     patchI32(o, blenOff, cast(int)(4 + 1 + 4 + bodyB.length));
+}
+
+/// Emit one record as a v1 MessageSet entry `[offset i64][size i32][message]`
+/// — the Fetch v0-v3 path. A legacy v1 blob is copied verbatim (the fast, common
+/// case); an internal v2 blob is down-converted to v1, DROPPING headers (v1 has
+/// no header field — the standard broker down-conversion for old clients).
+private void emitV1Record(ref ByteBuffer o, long offset, scope const(ubyte)[] blob) @nogc nothrow
+{
+    if (blob.length >= 1 && blob[0] == KREC_TAG)
+    {
+        auto rr = parseStoredRec(blob);
+        static ByteBuffer m; // TLS: message body magic..value (for CRC)
+        m.clear();
+        m.appendByte(1); // magic = 1
+        m.appendByte(0); // attributes
+        putI64(m, rr.ok ? rr.ts : -1);
+        putBytesI32(m, rr.key, rr.keyNull || !rr.ok);
+        putBytesI32(m, rr.val, rr.valNull || !rr.ok);
+        auto dg = crc32Of(cast(const(ubyte)[]) m.data); // little-endian digest
+        immutable uint crc = (cast(uint) dg[3] << 24) | (cast(uint) dg[2] << 16) | (
+                cast(uint) dg[1] << 8) | dg[0];
+        putI64(o, offset);
+        putI32(o, cast(int)(4 + m.length)); // message size = crc(4) + body
+        putI32(o, cast(int) crc); // crc (big-endian on the wire)
+        o.append(m.data);
+    }
+    else
+    {
+        putI64(o, offset);
+        o.append(blob); // stored `[size i32][v1 message]` verbatim
+    }
 }
 
 unittest // v2 batch codec round-trip: internal blobs -> encode -> decode -> back
