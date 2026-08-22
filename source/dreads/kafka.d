@@ -375,6 +375,10 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
         {
             try
             {
+                import dreads.amqp : gAmqpAofFlush;
+
+                if (gAmqpAofFlush !is null)
+                    gAmqpAofFlush(); // AOF durable before acks=1 reaches the producer
                 wlock.lock();
                 scope (exit)
                     wlock.unlock();
