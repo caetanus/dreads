@@ -5,7 +5,6 @@ else
 {
     int main(string[] args)
     {
-        import core.memory : GC;
         import core.stdc.stdio : fwrite, stdout;
 
         import dreads.config : gConfig, loadConfig, applyDirective;
@@ -141,12 +140,16 @@ else
         enableAnsi(); // Windows: interpret the banner's ANSI escapes (no-op on POSIX)
         fwrite(logo.ptr, 1, logo.length, stdout);
 
-        // Neither the data plane (malloc'd arenas) nor the Raft path (automem
-        // malloc vectors, pooled pending slots, malloc log) allocates on the GC
-        // heap per operation, so disabling the collector is safe under
-        // sustained load: vibe-core's own allocations are one-time / per
-        // connection (bounded), not per request. This guarantees no GC pauses.
-        GC.disable();
+        // The data plane (malloc'd arenas) and the Raft path (automem malloc
+        // vectors, pooled pending slots, malloc log) are GC-FREE per operation
+        // by construction, so the collector is driven only by the CONTROL plane
+        // (per-connection objects, AAs) — infrequent relative to requests. We
+        // therefore leave the GC ENABLED: it must run to reclaim those control-
+        // plane allocations. A previous global GC.disable() here was a bug — it
+        // never collected the per-connection objects, so connection open/close
+        // churn leaked ~8-9 KB/conn forever (a slow memory-exhaustion vector,
+        // confirmed by adversarial connection-churn fuzzing). GC-free hot paths
+        // stay GC-free regardless; only the GC-normal places get collected.
 
         return runServer(gConfig.port, gConfig.appendonly ? gConfig.appendfilename : null, cliLock);
     }

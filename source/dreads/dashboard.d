@@ -8,11 +8,13 @@ version (DreadsDashboard):
 
 // Built-in web dashboard — OPT-IN (`dashboard yes`, off by default). Runs on its
 // OWN thread with an isolated vibe event loop, so it never shares fibers with the
-// data-plane loop. Because the server runs under GC.disable (a collection would
-// stop-the-world every thread, incl. the data plane), everything here is written
-// @nogc: static/stack buffers, no per-request GC allocation. HTTP + WebSocket are
-// hand-rolled on listenTCP (vibe-core has no HTTP server, and vibe-d's GC use is
-// exactly what we must avoid).
+// data-plane loop. A GC collection is stop-the-world across EVERY thread (incl.
+// the data plane), so to keep dashboard traffic from ever triggering a hot-path
+// pause everything here is written @nogc: static/stack buffers, no per-request GC
+// allocation. (The server itself runs with the GC ENABLED — it must collect the
+// control plane — but the collector is driven only by control-plane allocation,
+// not by this thread.) HTTP + WebSocket are hand-rolled on listenTCP (vibe-core
+// has no HTTP server, and vibe-d's GC use is exactly what we must avoid).
 //
 // Phase 1 (this file, first increment): thread lifecycle + a minimal HTTP handler
 // serving a placeholder page. Live metrics over WebSocket + the embedded React UI
@@ -49,7 +51,7 @@ private __gshared ushort gDashPort;
 // ---- metrics seqlock: single writer (main-loop timer) -> many readers (WS conns) ----
 // A latest-value snapshot. The writer bumps gMSeq odd before writing and even after;
 // a reader copies the buffer and retries if the seq moved (torn read). No ManualEvent
-// (its emit isn't @nogc — an alloc under GC.disable would never be collected).
+// (its emit isn't @nogc — this thread stays alloc-free so it never adds GC pressure).
 private __gshared ubyte[8192] gMBuf;
 private __gshared size_t gMLen;
 private shared uint gMSeq;
