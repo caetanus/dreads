@@ -555,8 +555,8 @@ private bool rdStr(scope const(ubyte)[] p, ref size_t i, out const(char)[] s) @n
 
 // Hooks installed by server.d (avoids a server import cycle): fan a publish
 // out to the other shards / count stats.
-public __gshared void delegate(scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ulong seq, ubyte pubQos) nothrow gMqttFanout;
+public __gshared void delegate(scope const(char)[] topic, scope const(char)[] payload,
+        bool retain, ulong seq, ubyte pubQos, scope const(char)[] props) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
 private shared ulong gMqttStartMs;
@@ -645,7 +645,8 @@ public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trust
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
 public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
-        bool retain, ulong seq, ubyte pubQos = 0, MqttConn publisher = null) nothrow @trusted
+        bool retain, ulong seq, ubyte pubQos = 0, MqttConn publisher = null,
+        scope const(char)[] props = null) nothrow @trusted
 {
     if (retain)
     {
@@ -731,9 +732,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 q1.clear();
                 if (effQos == 2)
-                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5);
+                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5, props);
                 else
-                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5);
+                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5, props);
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
@@ -768,7 +769,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // rare (retain-as-published, QoS0): the shared packet has retain=0,
             // so build a one-off with the retain bit set
             q1.clear();
-            buildPublish(q1, topic, payload, true, v5);
+            buildPublish(q1, topic, payload, true, v5, props);
             if (s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
@@ -781,7 +782,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             if (v5 && !pktV5built)
             {
                 pktV5.clear();
-                buildPublish(pktV5, topic, payload, false, true);
+                buildPublish(pktV5, topic, payload, false, true, props);
                 pktV5built = true;
             }
             immutable plen = v5 ? pktV5.length : pkt.length;
@@ -971,48 +972,78 @@ private void closeTcp(MqttConn c) nothrow
     }
 }
 
+/// Byte length of `v` encoded as a remaining-length varint (1-4 bytes).
+private uint varintSize(uint v) @nogc nothrow pure
+{
+    if (v < 128)
+        return 1;
+    if (v < 16384)
+        return 2;
+    if (v < 2097152)
+        return 3;
+    return 4;
+}
+
 private void buildPublish(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, bool v5 = false) @nogc nothrow
+        scope const(char)[] payload, bool retain, bool v5 = false,
+        scope const(char)[] props = null) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | (retain ? 1 : 0))); // QoS 0 out
-    encodeVarint(o, cast(uint)(2 + topic.length + (v5 ? 1 : 0) + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length
+            + (v5 ? varintSize(cast(uint) props.length) + props.length : 0)
+            + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
-    if (v5)
-        o.appendByte(0); // v5 empty property block
+    if (v5) // v5 property block: length varint + the forwarded properties
+    {
+        encodeVarint(o, cast(uint) props.length);
+        o.append(props);
+    }
     o.append(payload);
 }
 
 /// QoS1 PUBLISH (DUP=0): fixed header 0x32|retain, then topic, packet-id, payload.
 private void buildPublishQos1(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false) @nogc nothrow
+        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false,
+        scope const(char)[] props = null) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x02 | (retain ? 1 : 0)));
-    encodeVarint(o, cast(uint)(2 + topic.length + 2 + (v5 ? 1 : 0) + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2
+            + (v5 ? varintSize(cast(uint) props.length) + props.length : 0)
+            + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
     o.appendByte(cast(char)(pid >> 8));
     o.appendByte(cast(char)(pid & 0xFF));
     if (v5)
-        o.appendByte(0); // v5 empty property block
+    {
+        encodeVarint(o, cast(uint) props.length);
+        o.append(props);
+    }
     o.append(payload);
 }
 
 /// QoS2 PUBLISH (DUP=0): fixed header 0x34|retain, then topic, packet-id, payload.
 private void buildPublishQos2(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false) @nogc nothrow
+        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false,
+        scope const(char)[] props = null) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x04 | (retain ? 1 : 0)));
-    encodeVarint(o, cast(uint)(2 + topic.length + 2 + (v5 ? 1 : 0) + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2
+            + (v5 ? varintSize(cast(uint) props.length) + props.length : 0)
+            + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
     o.appendByte(cast(char)(pid >> 8));
     o.appendByte(cast(char)(pid & 0xFF));
     if (v5)
-        o.appendByte(0); // v5 empty property block
+    {
+        encodeVarint(o, cast(uint) props.length);
+        o.append(props);
+    }
     o.append(payload);
 }
 
@@ -1086,7 +1117,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
         immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
         mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
         if (gMqttFanout !is null)
-            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq, 0);
+            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq, 0, null);
         c.willTopic = null;
     }
     // wake OTHER subscribers whose outboxes this connection's last batch filled
@@ -1234,11 +1265,16 @@ private struct PubProps
 }
 
 // Parse an MQTT 5 PUBLISH property block at p[i], extracting topic-alias and
-// message-expiry and correctly skipping every other typed property. Advances i
-// to the end of the block. Every read is bounded by `end` (= i + declared
-// length, itself bounded by p.length) so a malformed block can't read OOB.
-private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProps pp) @nogc nothrow
+// message-expiry, and building into `fwd` the FORWARDABLE properties (everything
+// EXCEPT topic-alias, which is per-hop, and subscription-identifier, which the
+// broker assigns) so a delivery can replay content-type / response-topic /
+// correlation-data / user-property / payload-format to the subscriber. Advances
+// i to the end of the block; every read is bounded by `end` (itself <= p.length)
+// so a malformed block can't read OOB.
+private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProps pp,
+        ref ByteBuffer fwd) @nogc nothrow
 {
+    fwd.clear();
     uint plen;
     if (!decodeVarint(p, i, plen))
         return false;
@@ -1247,7 +1283,9 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
         return false;
     while (i < end)
     {
+        immutable propStart = i; // the id byte, for a verbatim forward copy
         immutable id = p[i++];
+        bool forward = true;
         switch (id)
         {
         case 0x01: // payload-format-indicator: 1 byte
@@ -1263,12 +1301,13 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
             pp.hasExpiry = true;
             i += 4;
             break;
-        case 0x23: // topic-alias: u16
+        case 0x23: // topic-alias: u16 — per-hop, NOT forwarded
             if (i + 2 > end)
                 return false;
             pp.topicAlias = cast(ushort)((p[i] << 8) | p[i + 1]);
             pp.hasAlias = true;
             i += 2;
+            forward = false;
             break;
         case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data:
             // a 2-byte length prefix then that many bytes
@@ -1280,10 +1319,11 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
                 return false;
             i += n;
             break;
-        case 0x0B: // subscription-identifier: varint (not valid inbound; tolerate)
+        case 0x0B: // subscription-identifier: varint — broker-assigned, NOT forwarded
             uint sv;
             if (!decodeVarint(p, i, sv) || i > end)
                 return false;
+            forward = false;
             break;
         case 0x26: // user-property: two length-prefixed strings
             foreach (_; 0 .. 2)
@@ -1300,6 +1340,8 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
         default:
             return false; // unknown property id in a PUBLISH: malformed
         }
+        if (forward)
+            fwd.append(cast(const(char)[]) p[propStart .. i]);
     }
     i = end;
     return true;
@@ -1534,11 +1576,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (pid == 0)
                     return false; // [MQTT-2.3.1-1]
             }
+            const(char)[] props; // v5 forwardable properties (round-tripped to subs)
             if (v5)
             {
                 PubProps pp;
-                if (!mqttParsePubProps(p, i, pp))
+                static ByteBuffer fwdProps; // TLS: consumed by deliver+fanout (no yield)
+                if (!mqttParsePubProps(p, i, pp, fwdProps))
                     return false;
+                props = cast(const(char)[]) fwdProps.data;
                 if (pp.hasAlias)
                 {
                     if (pp.topicAlias == 0 || pp.topicAlias > MQTT_TOPIC_ALIAS_MAX)
@@ -1613,9 +1658,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                         atomicOp!"+="(gMqttMessages, 1);
                         immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                        mqttDeliverLocal(topic, payload, retain, rseq, qos, c);
+                        mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
                         if (gMqttFanout !is null)
-                            gMqttFanout(topic, payload, retain, rseq, qos);
+                            gMqttFanout(topic, payload, retain, rseq, qos, props);
                     }
                     try
                         c.q2pids ~= pid;
@@ -1632,9 +1677,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             {
                 atomicOp!"+="(gMqttMessages, 1);
                 immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                mqttDeliverLocal(topic, payload, retain, rseq, qos, c);
+                mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
                 if (gMqttFanout !is null)
-                    gMqttFanout(topic, payload, retain, rseq, qos);
+                    gMqttFanout(topic, payload, retain, rseq, qos, props);
             }
             if (qos == 1)
             {
