@@ -170,6 +170,34 @@ Data ops ~1.25× median (up to 1.6×). Transactions 2×. AOF writes 1.15–1.73�
 batched-write fix). One known gap: same-pattern fan-out. Same architecture as
 Valkey — single thread, jemalloc — so these are per-op-efficiency wins.
 
+## Bench box (all 2026-08-21 sections below)
+
+AMD Ryzen 9 3950X (Zen 2, 16C/32T, 4× 4-core CCX, 16 MB L3 per CCX, HT
+siblings N↔N+16), 62 GiB DDR4, Linux 7.1.8-1-MANJARO, performance governor,
+default mitigations ON, SMT unused for benching (physical cores only: server
+on 0..N-1, clients on 8..15). Clients: `redis-benchmark -c 25 -P 64
+-r 200000`, 4 pinned processes summed; results above ~7M rps need 5 client
+processes (cores 8/9/10/12/14 — leave 3 cores free for loopback softirq; 6+
+client procs REGRESS). dreads: LDC release (verify it — a debug binary costs
+~40%!). Valkey 9.1.1: distro jemalloc build, `--save '' --appendonly no
+--io-threads 1`. Dragonfly v1.40.1: official release binary, io_uring,
+`--proactor_threads N`.
+
+## Single-threaded head-to-head (2026-08-21, unified methodology)
+
+Both pinned to one core, scripts: `scratchpad/bench/h2h.sh` pattern (server
+core 0, clients 8/10/12/14, 2M ops each):
+
+| Command | dreads | Valkey 9.1.1 | ratio |
+|---|---:|---:|---:|
+| SET | 1.86M | 0.83M | 2.2× |
+| LPUSH | 2.11M | 1.06M | 2.0× |
+| HSET | 1.62M | 0.81M | 2.0× |
+| SADD | 1.65M | 1.08M | 1.5× |
+| GET | 1.70M | 1.22M | 1.4× |
+| INCR | 1.58M | 1.26M | 1.3× |
+| ZADD (single growing zset) | 0.42M | 0.35M | 1.2× |
+
 ## Dragonfly head-to-head (2026-08-21, dreads v0.5.0 vs dragonfly v1.40.1)
 
 Same box (Ryzen 3950X), same methodology both sides: server pinned to cores

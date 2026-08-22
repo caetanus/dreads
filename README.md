@@ -154,34 +154,41 @@ from taking that first result seriously once the answer looked like *yes*.
 
 > *don't worry about a thing...* 🐦🐦🐦
 
-A fair head-to-head: same host, same `redis-benchmark` invocation, both
-single-threaded, pinned, jemalloc, persistence off — dreads (LDC release) vs
-**Valkey 9.1.0** (`--save '' --appendonly no --io-threads 1`), `-P 16`, 50
-connections, 1M requests each, median of repeated runs. Numbers are
-machine-specific — re-run `bench/run.sh` on your box.
+All numbers in this section come from ONE machine, one methodology, measured
+the same day (2026-08-21), server and clients pinned to disjoint physical
+cores, no hyperthread siblings used:
 
-| Command (`-P 16`, 50 conns) | dreads median | Valkey 9.1 median | |
+> **Bench box:** AMD Ryzen 9 3950X (Zen 2, 16 cores / 32 threads, 4× 4-core
+> CCX with 16 MB L3 each), 62 GiB DDR4, Linux 7.1.8 (Manjaro), performance
+> governor, default mitigations ON. Clients: `redis-benchmark -c 25 -P 64
+> -r 200000`, 4 pinned processes summed (5 for results above ~7M rps — four
+> clients saturate there). dreads: LDC release, AOF off. Valkey 9.1.1:
+> distro build (jemalloc), `--save '' --appendonly no --io-threads 1`.
+
+Single-threaded head-to-head — both servers pinned to one core:
+
+| Command | dreads | Valkey 9.1.1 | |
 |---|---:|---:|---:|
-| GET | **1.59M rps** | 1.25M | 1.27× |
-| SET | **1.48M** | 1.01M | 1.47× |
-| SADD | **1.43M** | 1.19M | 1.20× |
-| INCR | **1.40M** | 1.24M | 1.13× |
-| LPUSH | **1.36M** | 1.07M | 1.26× |
-| HSET | **1.32M** | 1.04M | 1.27× |
-| ZADD | **1.30M** | 1.01M | 1.28× |
+| SET | **1.86M rps** | 0.83M | 2.2× |
+| LPUSH | **2.11M** | 1.06M | 2.0× |
+| HSET | **1.62M** | 0.81M | 2.0× |
+| SADD | **1.65M** | 1.08M | 1.5× |
+| GET | **1.70M** | 1.22M | 1.4× |
+| INCR | **1.58M** | 1.26M | 1.3× |
+| ZADD (one growing zset) | **0.42M** | 0.35M | 1.2× |
 
-dreads leads on every command (1.1–1.5×) — the D + zero-GC + per-command arena
-engine simply does less work per request. Unpipelined throughput is round-trip
-bound on both sides (~95–100k rps); the pipelined numbers show the real
-per-command cost.
+dreads leads on every command (1.2–2.2×) — the D + zero-GC + per-command
+arena engine does less work per request. Unpipelined throughput is
+round-trip bound on both sides; pipelined numbers show the real per-command
+cost. Reproduce with the scripts referenced in
+[bench/valkey-comparison.md](bench/valkey-comparison.md).
 
 ### Sharded: one process, N cores
 
 `--shards N` runs a full thread-per-core engine: N SO_REUSEPORT routers, one
-keyspace shard per thread, cross-shard commands hop over SPSC rings. Same
-16-core box (Ryzen 3950X), `redis-benchmark -P 64`, dumb clients (no
-cluster-awareness — every client hits a random router and ~(1−1/N) of
-commands pay an internal hop):
+keyspace shard per thread, cross-shard commands hop over per-pair SPSC rings.
+Same box and methodology as above; dumb clients (no cluster-awareness — every
+client hits a random router and ~(1−1/N) of commands pay an internal hop):
 
 | shards | SET | GET | INCR |
 |---:|---:|---:|---:|
@@ -190,8 +197,9 @@ commands pay an internal hop):
 | 4 | 5.23M | — | — |
 | 8 | **6.84M** | **9.81M** | **8.06M** |
 
-Same box, same clients, against **Dragonfly v1.40.1** (as shipped: io_uring,
-`--proactor_threads N`) — the same thread-per-core architecture:
+Same box, same clients, same day, against **Dragonfly v1.40.1** (official
+release binary, as shipped: io_uring, `--proactor_threads N`, pinned to the
+same cores) — the same thread-per-core architecture:
 
 | op@8 threads | dreads | dragonfly | |
 |---|---:|---:|---:|
