@@ -1828,31 +1828,59 @@ public void amqpTtlSweep() nothrow @trusted
         static ByteBuffer kb; // TLS
         static ByteBuffer head; // TLS
         static ByteBuffer popped; // TLS
-        foreach (q, meta; gQueueMeta)
+        // SNAPSHOT the TTL queue names first (yield-free): the processing loop
+        // below calls deadLetter, whose cross-shard DLX push YIELDS, and
+        // gQueueMeta is mutated by every AMQP fiber's queue.declare on this
+        // thread — holding its foreach iterator across that yield would be a
+        // use-after-invalidation (a concurrent declare rehashes the AA).
+        static string[] ttlQ; // TLS scratch
+        size_t nq = 0;
+        foreach (q, ref meta; gQueueMeta)
         {
             if (meta.ttlMs <= 0)
                 continue;
+            if (ttlQ.length <= nq)
+                ttlQ.length = nq + 8;
+            ttlQ[nq++] = q;
+        }
+        foreach (qi; 0 .. nq)
+        {
+            auto q = ttlQ[qi];
+            // re-read the meta (a declare during a prior queue's yield may have
+            // changed it; a delete leaves it absent -> skip)
+            auto mp = q in gQueueMeta;
+            if (mp is null || mp.ttlMs <= 0)
+                continue;
+            immutable ttl = mp.ttlMs;
+            // COPY the key to the stack: deadLetter() below yields (cross-shard
+            // DLX push), and the TLS `kb` would be clobbered by a concurrent
+            // fiber's queueKey during that park -> the next peek/pop would hit a
+            // DIFFERENT queue. The stack copy survives the yield.
             queueKey(q, kb);
-            if (!gAmqpOwns(kb.data.asChars))
+            char[8 + 256 + 4] keyStore = void; // "amq.q." + queue name
+            immutable klen = kb.length <= keyStore.length ? kb.length : keyStore.length;
+            keyStore[0 .. klen] = cast(const(char)[]) kb.data[0 .. klen];
+            auto key = cast(const(char)[]) keyStore[0 .. klen];
+            if (!gAmqpOwns(key))
                 continue; // only the list's owner reaps it
             int reaped = 0;
             while (reaped < 4096) // bound the work per queue per tick
             {
                 head.clear();
-                if (!gAmqpPeekHead(kb.data.asChars, head))
+                if (!gAmqpPeekHead(key, head))
                     break; // empty queue
-                if (!isExpired(head.data, meta.ttlMs))
+                if (!isExpired(head.data, ttl))
                     break; // head is fresh -> everything behind it is younger
                 popped.clear();
-                if (!gAmqpPop(kb.data.asChars, popped))
+                if (!gAmqpPop(key, popped))
                     break;
                 // defensive: if a consumer raced between peek and pop and the
                 // popped record is NOT actually expired, put it back and stop
                 // (peek+pop are yield-free self-shard, so this should not fire)
-                if (!isExpired(popped.data, meta.ttlMs))
+                if (!isExpired(popped.data, ttl))
                 {
                     if (gAmqpPushFront !is null)
-                        gAmqpPushFront(kb.data.asChars, popped.data.asChars);
+                        gAmqpPushFront(key, popped.data.asChars);
                     break;
                 }
                 deadLetter(q, popped.data); // DLX route or drop (no DLX)
