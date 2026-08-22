@@ -1311,9 +1311,33 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 catch (Exception)
                 {
                 }
-                pay.clear();
-                bool got = gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay);
-                if (!got)
+                // BURST drain: up to 64 messages per socket write — a delivery
+                // per write capped the consumer at ~137k msg/s (measured)
+                ob.clear();
+                int burst = 0;
+                while (burst < 64)
+                {
+                    pay.clear();
+                    if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
+                        break;
+                    immutable tg = cc.nextTag++;
+                    if (!na)
+                        try
+                            cc.unacked[tg] = Unacked(qq, pay.data.idup);
+                        catch (Exception)
+                        {
+                        }
+                    method(ob, chn, 60, 60, (ref ByteBuffer b) @nogc nothrow {
+                        putShortStr(b, tt);
+                        putU64(b, tg);
+                        b.appendByte(0);
+                        putShortStr(b, "");
+                        putShortStr(b, qq);
+                    });
+                    emitContent(ob, chn, pay.data);
+                    burst++;
+                }
+                if (burst == 0)
                 {
                     try
                         sleep(1.msecs);
@@ -1321,22 +1345,6 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         return;
                     continue;
                 }
-                ob.clear();
-                immutable tg = cc.nextTag++;
-                if (!na)
-                    try
-                        cc.unacked[tg] = Unacked(qq, pay.data.idup);
-                    catch (Exception)
-                    {
-                    }
-                method(ob, chn, 60, 60, (ref ByteBuffer b) @nogc nothrow {
-                    putShortStr(b, tt);
-                    putU64(b, tg);
-                    b.appendByte(0);
-                    putShortStr(b, "");
-                    putShortStr(b, qq);
-                });
-                emitContent(ob, chn, pay.data);
                 sendTo(cc, ob.data);
             }
         }, c, chan, qs, ts, noAck);
