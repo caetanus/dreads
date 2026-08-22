@@ -196,7 +196,7 @@ const line = (label, stroke) => ({ label, stroke, width: 1.6, points: { show: fa
 
 function useMetrics() {
   const [snap, setSnap] = useState({ live: false, cur: null, ops: null, mem: null })
-  const buf = useRef({ prev: null, t: [], cmds: [], str: [], list: [], stream: [], pub: [], mem: [] })
+  const buf = useRef({ prev: null, t: [], cmds: [], str: [], list: [], stream: [], pub: [], mem: [], mqtt: [], amqp: [], kprod: [], kfetch: [] })
   useEffect(() => {
     let ws, stop = false
     const push = (a, v) => { a.push(v); if (a.length > WINDOW) a.shift() }
@@ -213,11 +213,18 @@ function useMetrics() {
           push(d.t, m.t / 1000); push(d.cmds, rate(m.cmds, prev.cmds)); push(d.str, rate(m.str, prev.str))
           push(d.list, rate(m.list, prev.list)); push(d.stream, rate(m.stream, prev.stream))
           push(d.pub, rate(m.pub, prev.pub)); push(d.mem, m.mem / 1048576)
+          const mq = m.mqtt || {}, pmq = prev.mqtt || {}, aq = m.amqp || {}, paq = prev.amqp || {}
+          const kf = m.kafka || {}, pkf = prev.kafka || {}
+          push(d.mqtt, rate(mq.msgs || 0, pmq.msgs || 0))
+          push(d.amqp, rate(aq.msgs || 0, paq.msgs || 0))
+          push(d.kprod, rate(kf.produced || 0, pkf.produced || 0))
+          push(d.kfetch, rate(kf.fetched || 0, pkf.fetched || 0))
         }
         d.prev = m
         setSnap({ live: true, cur: m,
           ops: [d.t.slice(), d.cmds.slice(), d.str.slice(), d.list.slice(), d.stream.slice(), d.pub.slice()],
-          mem: [d.t.slice(), d.mem.slice()] })
+          mem: [d.t.slice(), d.mem.slice()],
+          proto: [d.t.slice(), d.mqtt.slice(), d.amqp.slice(), d.kprod.slice(), d.kfetch.slice()] })
       }
     }
     connect()
@@ -251,6 +258,29 @@ function Overview({ snap }) {
       <div class="panel"><div class="title">Memory (MB) &mdash; {bytes(m.mem)}{mm ? ' / ' + bytes(mm) : ' / ∞'}</div>
         <div class="bar"><div class="fill" style={{ width: (mm ? pct : 4) + '%' }} /></div>
         {snap.mem && <Chart data={snap.mem} height={150} series={[{}, line('used', '#2f81f7')]} />}</div>
+      <Protocols snap={snap} />
+    </div>
+  )
+}
+
+// ---------- Protocols: MQTT / AMQP / Kafka faces over the same core ----------
+const rateP = (s, i) => (s.proto && s.proto[i] && s.proto[i].length ? s.proto[i][s.proto[i].length - 1] : 0)
+
+function Protocols({ snap }) {
+  const m = snap.cur || {}, mq = m.mqtt || {}, aq = m.amqp || {}, kf = m.kafka || {}
+  return (
+    <div>
+      <div class="cards">
+        <Stat k="MQTT publish/s" v={fmt(rateP(snap, 1))} sub={fmt(mq.msgs || 0) + ' msgs · ' + (mq.subs || 0) + ' subs'} />
+        <Stat k="AMQP publish/s" v={fmt(rateP(snap, 2))} sub={fmt(aq.msgs || 0) + ' msgs · ' + (aq.consumers || 0) + ' consumers'} />
+        <Stat k="Kafka produce/s" v={fmt(rateP(snap, 3))} sub={fmt(kf.produced || 0) + ' produced'} />
+        <Stat k="Kafka fetch/s" v={fmt(rateP(snap, 4))} sub={fmt(kf.fetched || 0) + ' fetched'} />
+        <Stat k="MQTT dropped" v={fmt(mq.drop || 0)} sub="QoS0 slow-consumer" />
+        <Stat k="AMQP returned" v={fmt(aq.returned || 0)} sub="mandatory · no route" />
+      </div>
+      <div class="panel"><div class="title">Protocol throughput / sec &mdash; one engine, four faces</div>
+        {snap.proto && <Chart data={snap.proto} series={[{}, line('mqtt', '#f778ba'),
+          line('amqp', '#d29922'), line('kafka.prod', '#3fb950'), line('kafka.fetch', '#2f81f7')]} />}</div>
     </div>
   )
 }

@@ -44,6 +44,7 @@ public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
 public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
+public shared ulong gAmqpMessages; // total basic.publish records routed (dashboard)
 public shared ulong gAmqpReturned; // mandatory publishes returned (no route)
 public shared ulong gAmqpBindingDrops; // duplicate/over-cap bindings refused
 
@@ -1592,6 +1593,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(ch.pub.props.data);
+    atomicOp!"+="(gAmqpMessages, 1);
     int routed = 0;
     routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, (string q) nothrow {
         static ByteBuffer kb3; // TLS

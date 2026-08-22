@@ -96,15 +96,32 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
     foreach (ref db; gDbs)
         keys += db.length;
 
+    // multi-protocol skin counters (MQTT/AMQP/Kafka share the same core; the
+    // dashboard charts each face's throughput alongside RESP)
+    import dreads.mqtt : gMqttMessages, gMqttSubTotal, gMqttDropped;
+    import dreads.amqp : gAmqpMessages, gAmqpConsumers, gAmqpReturned;
+    import dreads.kafka : gKafkaProduced, gKafkaFetched;
+
     int n = snprintf(dst.ptr, dst.length,
         `{"t":%llu,"mem":%llu,"maxmem":%llu,"clients":%lld,"blocked":%lld,`
         ~ `"expired":%llu,"evicted":%llu,"cmds":%llu,"keys":%llu,"str":%llu,`
-        ~ `"list":%llu,"stream":%llu,"pub":%llu,"channels":%zu,"patterns":%zu,"db":[`,
+        ~ `"list":%llu,"stream":%llu,"pub":%llu,"channels":%zu,"patterns":%zu,`
+        ~ `"mqtt":{"msgs":%llu,"subs":%lld,"drop":%llu},`
+        ~ `"amqp":{"msgs":%llu,"consumers":%lld,"returned":%llu},`
+        ~ `"kafka":{"produced":%llu,"fetched":%llu},"db":[`,
         cast(ulong) nowMs(), cast(ulong) usedMemory(), cast(ulong) gConfig.maxmemory,
         cast(long) gConnectedClients,
         cast(long) atomicLoad!(MemoryOrder.raw)(gBlockedClients), cast(ulong) gExpiredKeys,
         cast(ulong) gEvictedKeys, total, keys, sumCalls(STR_CMDS), sumCalls(LIST_CMDS),
-        sumCalls(STREAM_CMDS), cast(ulong) gPubMessages, channels, patterns);
+        sumCalls(STREAM_CMDS), cast(ulong) gPubMessages, channels, patterns,
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttMessages),
+        cast(long) atomicLoad!(MemoryOrder.raw)(gMqttSubTotal),
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttDropped),
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gAmqpMessages),
+        cast(long) atomicLoad!(MemoryOrder.raw)(gAmqpConsumers),
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gAmqpReturned),
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaProduced),
+        cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaFetched));
     if (n < 0)
         return 0;
     size_t p = n;
