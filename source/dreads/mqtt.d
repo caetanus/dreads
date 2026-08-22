@@ -173,6 +173,12 @@ public shared ulong gMqttRetainedDropped; // retained stores refused at the caps
 /// unauthenticated publisher must not be able to grow every shard's heap
 /// without bound. Refusals count in gMqttRetainedDropped.
 private enum size_t MQTT_MAX_RETAINED_TOPICS = 65536;
+// A retained TOMBSTONE (empty-payload) exists only to gate a concurrent stale SET
+// that a reordered SPSC lane delivers AFTER the delete — a sub-second window. It
+// gets a generous TTL so mqttExpireRetained reaps it: without one, an empty-retain
+// flood to distinct never-set topics permanently fills the topic-count cap and the
+// broker refuses all future retained SETs, never self-healing. 60s >> lane latency.
+private enum long MQTT_TOMBSTONE_TTL_S = 60;
 private enum size_t MQTT_MAX_RETAINED_BYTES = 256 << 20;
 private size_t tRetainedBytes; // TLS: payload bytes currently in gRetained
 /// Per-connection subscription cap: past this SUBSCRIBE gets SUBACK 0x80
@@ -724,7 +730,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 immutable oldLen = old.payload.length + old.props.length;
                 if (payload.length == 0)
                 {
-                    gRetained[cast(string) topic] = Retained(null, seq); // tombstone
+                    // tombstone (delete): TTL'd so the sweep reaps it (see above)
+                    gRetained[cast(string) topic] = Retained(null, seq, null,
+                            MonoTime.currTime + dur!"seconds"(MQTT_TOMBSTONE_TTL_S), true);
                     tRetainedBytes -= oldLen;
                 }
                 else
@@ -744,9 +752,12 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 if (payload.length == 0)
                 {
-                    // tombstone on an absent topic: seq-stamped, topic-count-capped
+                    // tombstone on an absent topic: seq-stamped, topic-count-capped,
+                    // and TTL'd so an empty-retain flood to distinct topics can't
+                    // permanently pin the cap (the sweep reaps it after the TTL)
                     if (gRetained.length < MQTT_MAX_RETAINED_TOPICS)
-                        gRetained[topic.idup] = Retained(null, seq);
+                        gRetained[topic.idup] = Retained(null, seq, null,
+                                MonoTime.currTime + dur!"seconds"(MQTT_TOMBSTONE_TTL_S), true);
                     else
                         atomicOp!"+="(gMqttRetainedDropped, 1);
                 }
