@@ -1868,10 +1868,21 @@ private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blo
     else
         putU16(o, 0); // no properties
     frameFinish(o, at);
-    // BODY frame (single — frame-max is honored implicitly for bench payloads)
-    frameStart(o, FRAME_BODY, chan, at);
-    o.append(body_);
-    frameFinish(o, at);
+    // BODY frames: an EMPTY body emits NO body frame (a spurious zero-length
+    // body frame after body-size=0 desyncs a strict client's parser — pika
+    // drops the connection with a NoneType body_size error). A body larger than
+    // the advertised frame-max (131072) is split so no single frame exceeds it
+    // (each frame = 8 bytes of framing + payload, so payload <= frame-max - 8).
+    enum size_t bodyChunk = AMQP_FRAME_MAX - 8;
+    size_t off = 0;
+    while (off < body_.length)
+    {
+        immutable end = body_.length - off > bodyChunk ? off + bodyChunk : body_.length;
+        frameStart(o, FRAME_BODY, chan, at);
+        o.append(body_[off .. end]);
+        frameFinish(o, at);
+        off = end;
+    }
 }
 
 /// A dying connection returns everything unacked to the FRONT of its queue —
