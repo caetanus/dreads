@@ -90,6 +90,9 @@ public final class MqttConn
     // topic-alias-maximum we advertise in CONNACK.
     string[ushort] inAlias;
     size_t inAliasBytes; // running size of the aliased topics (byte cap)
+    ushort sendMax = 0xFFFF; // v5 receive-maximum the CLIENT advertised: the max
+    // QoS1/2 messages we may have in flight toward it (flow control). Default =
+    // no limit beyond our own window.
     // Read deadline: a BOUNDED default until CONNECT arrives (a client that
     // opens TCP and never sends CONNECT must be reaped — pre-handshake
     // slowloris), then re-armed to 1.5x the CONNECT keepalive (0 kA = max).
@@ -724,9 +727,12 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         if (effQos >= 1)
         {
             // QoS1/2: assign a packet-id and track it in flight (a saturated
-            // window degrades this delivery to QoS0)
+            // window degrades this delivery to QoS0). The window is our own cap
+            // tightened by the client's v5 receive-maximum (flow control): we must
+            // not hold more unacked QoS1/2 toward it than it advertised.
+            immutable size_t win = s.sendMax < MQTT_QOS1_WINDOW ? s.sendMax : MQTT_QOS1_WINDOW;
             ushort pid = 0;
-            if (s.inflight.length + s.outQos2.length < MQTT_QOS1_WINDOW)
+            if (s.inflight.length + s.outQos2.length < win)
                 pid = nextDeliveryPid(s);
             if (pid != 0)
             {
@@ -1255,6 +1261,69 @@ private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
     return true;
 }
 
+// Parse a v5 CONNECT property block at p[i], extracting receive-maximum (0x21)
+// and correctly skipping every other CONNECT property by type. Advances i to the
+// end; every read is bounded by `end` (<= p.length) so a malformed block can't
+// read OOB. recvMax stays 0 if absent (caller treats 0 as "no client limit").
+private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i, out ushort recvMax) @nogc nothrow
+{
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    immutable end = i + plen;
+    if (end > p.length)
+        return false;
+    while (i < end)
+    {
+        immutable id = p[i++];
+        switch (id)
+        {
+        case 0x11, 0x27: // session-expiry-interval u32, maximum-packet-size u32
+            if (i + 4 > end)
+                return false;
+            i += 4;
+            break;
+        case 0x21, 0x22: // receive-maximum u16, topic-alias-maximum u16
+            if (i + 2 > end)
+                return false;
+            if (id == 0x21)
+                recvMax = cast(ushort)((p[i] << 8) | p[i + 1]);
+            i += 2;
+            break;
+        case 0x17, 0x19: // request-problem-info, request-response-info: 1 byte
+            if (i + 1 > end)
+                return false;
+            i += 1;
+            break;
+        case 0x15, 0x16: // authentication-method string, authentication-data binary
+            if (i + 2 > end)
+                return false;
+            immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > end)
+                return false;
+            i += n;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return false;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return false;
+                i += n;
+            }
+            break;
+        default:
+            return false; // unknown CONNECT property id: malformed
+        }
+    }
+    i = end;
+    return true;
+}
+
 // The v5 PUBLISH properties we consume (the rest are correctly skipped by type).
 private struct PubProps
 {
@@ -1459,9 +1528,18 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             i += 2;
             c.readDeadline = ka == 0 ? Duration.max : (ka * 1500).msecs;
             // v5 CONNECT properties (session-expiry, receive-max, ...) follow the
-            // keepalive; parsed-and-skipped for now.
-            if (c.protoVer == 5 && !mqttSkipProps(p, i))
-                return false;
+            // keepalive. We extract receive-maximum (flow control on how many
+            // QoS1/2 we may hold in flight toward this client) and correctly skip
+            // the rest by type. A present receive-maximum of 0 is a protocol error
+            // per [MQTT-3.3.4-9]; we treat it leniently as "no client limit".
+            if (c.protoVer == 5)
+            {
+                ushort recvMax;
+                if (!mqttParseConnectProps(p, i, recvMax))
+                    return false;
+                if (recvMax != 0)
+                    c.sendMax = recvMax;
+            }
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
                 return false;
