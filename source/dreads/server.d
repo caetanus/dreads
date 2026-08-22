@@ -572,6 +572,19 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }, listenOpts);
         printf("dreads AMQP skin on port %u\n", cast(uint) gConfig.amqpPort);
     }
+    if (gConfig.kafkaPort != 0)
+    {
+        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort;
+
+        gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
+            amqpDataExec(args, reply); // the generic RESP-over-data-plane exec
+        };
+        gKafkaPort = gConfig.kafkaPort;
+        cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
+            serveKafkaClient(conn);
+        }, listenOpts);
+        printf("dreads Kafka skin on port %u\n", cast(uint) gConfig.kafkaPort);
+    }
     // sharded: main thread becomes shard 0 (this listener is its router); spawn the
     // other N-1 shard threads, each its own SO_REUSEPORT listener + drain. No-op when
     // shards==1. The listenTCP above already opened shard 0's listener on `port`.
@@ -4017,6 +4030,18 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         try
             cast(void) listenTCP(gConfig.amqpPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveAmqpClient(conn);
+            }, sopts);
+        catch (Exception)
+        {
+        }
+    }
+    if (gConfig.kafkaPort != 0)
+    {
+        import dreads.kafka : serveKafkaClient;
+
+        try
+            cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveKafkaClient(conn);
             }, sopts);
         catch (Exception)
         {
