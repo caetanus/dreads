@@ -348,11 +348,16 @@ config; dreads `--amqp-port 5672`, single shard, AOF off.
 Every dreads publish traverses the REAL data plane: the queue is a list in
 the shard's keyspace (`LRANGE amq.q.<name>` shows it from the RESP side),
 which is why queues survive kill -9 via the per-shard AOF with zero
-AMQP-specific persistence code — verified: 10 queued messages with
-properties recovered in order after a SIGKILL. Feature surface validated
-with pika at shards=4: topic/direct/fanout/HEADERS exchanges, property
-passthrough, publisher confirms, ack/nack/reject with requeue,
-dead-lettering via x-dead-letter-exchange, consumer cancel, heartbeats.
+AMQP-specific persistence code. Durability granularity: a publish is flushed
+to the OS per network batch **before its `basic.ack`/confirm is sent** — on
+the owner shard when the queue is cross-shard — so a `kill -9` loses at most
+the in-flight batch, never an already-confirmed message. Verified at shards=4
+with cross-shard queues: 200 confirmed publishes across 20 queues recovered
+in order (with properties) after an immediate SIGKILL, no wait. Feature
+surface validated with pika at shards=4: topic/direct/fanout/HEADERS
+exchanges, property passthrough, publisher confirms, ack/nack/reject with
+requeue, dead-lettering via x-dead-letter-exchange (original routing key),
+x-message-ttl with dead-letter-on-expiry, consumer cancel, heartbeats.
 
 ## Kafka skin vs Apache Kafka 3.7 (2026-08-21)
 
@@ -376,7 +381,10 @@ assignment is atomic with the append and every skin (RESP, MQTT, AMQP,
 Kafka) shares the exact same write tail, AOF included: a partition IS a
 list (`LRANGE kafka.t.<topic>.<p>` shows the records from the RESP side),
 and produced messages survive kill -9 with zero Kafka-specific persistence
-code. Fetch initially LOST to the incumbent (1.94M vs 2.56M: Kafka serves
+code — the AOF is flushed to the OS per batch before the `acks=1` response,
+on the owner shard for a cross-shard partition, so an immediate SIGKILL
+loses no acked record (verified: 200 across 10 topics at shards=4). Fetch
+initially LOST to the incumbent (1.94M vs 2.56M: Kafka serves
 contiguous log segments via sendfile, while a naive skin re-walked the list
 per fetch — O(offset) seek per request, quadratic over a partition drain).
 Two structural fixes closed it and then some: (1) a direct owner-shard read
