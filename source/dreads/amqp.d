@@ -138,6 +138,37 @@ private ExType[string] gExchanges; // TLS
 private ulong[string] gExchangeSeq; // TLS
 private Binding[][string] gBindings; // TLS: exchange -> bindings
 
+/// The AMQP 0-9-1 default exchanges exist on every vhost with NO explicit
+/// declare (the nameless "" exchange is handled specially in routeTo). Without
+/// this, publishing to amq.topic/amq.direct/... found no gExchanges entry and
+/// silently dropped every message. gExchanges is TLS, so seed each shard thread
+/// once; routeTo only runs on a thread that has an AMQP connection (which ran
+/// this), so per-connection-thread seeding covers every routing path. Not
+/// broadcast — every shard seeds the SAME fixed types, so no divergence.
+private void seedWellKnownExchanges() nothrow
+{
+    static bool seeded;
+    if (seeded)
+        return;
+    seeded = true;
+    try
+    {
+        if ("amq.direct" !in gExchanges)
+            gExchanges["amq.direct"] = ExType.direct;
+        if ("amq.fanout" !in gExchanges)
+            gExchanges["amq.fanout"] = ExType.fanout;
+        if ("amq.topic" !in gExchanges)
+            gExchanges["amq.topic"] = ExType.topic;
+        if ("amq.headers" !in gExchanges)
+            gExchanges["amq.headers"] = ExType.headers;
+        if ("amq.match" !in gExchanges) // amq.match is the headers-exchange alias
+            gExchanges["amq.match"] = ExType.headers;
+    }
+    catch (Exception)
+    {
+    }
+}
+
 /// AMQP topic match: dot-separined; `*` = exactly one word, `#` = zero+ words.
 package bool amqpTopicMatches(scope const(char)[] pattern, scope const(char)[] key) @nogc nothrow
 {
@@ -1164,6 +1195,7 @@ private void method(ref ByteBuffer o, ushort chan, ushort cls, ushort mth,
 
 public void serveAmqpClient(TCPConnection tcp) nothrow
 {
+    seedWellKnownExchanges(); // once per shard thread: the mandated amq.* defaults
     try
         tcp.tcpNoDelay = true;
     catch (Exception)
