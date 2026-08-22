@@ -2563,7 +2563,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -2611,6 +2611,11 @@ private void amqpInstallHooks() nothrow
             i++;
         }
         return v;
+    };
+    gAmqpDelKey = (scope const(char)[] key) nothrow {
+        static ByteBuffer rbd; // TLS
+        const(char)[][2] a = ["del", key];
+        amqpDataExec(a[], rbd);
     };
     gAmqpCtlFanout = (scope const(ubyte)[] ctl) nothrow {
         import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake,
