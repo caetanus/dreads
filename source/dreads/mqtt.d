@@ -45,6 +45,11 @@ import dreads.mem : ByteBuffer;
 // fan-out (same trick as pubsub.gSubTotal).
 public shared long gMqttSubTotal;
 
+/// Deadline for a freshly-accepted socket to complete CONNECT. Without it a
+/// client that opens TCP and never speaks pins a serve fiber + writer fiber +
+/// MqttConn forever (unauthenticated pre-handshake slowloris).
+private enum Duration MQTT_CONNECT_TIMEOUT = 30.seconds;
+
 /// One MQTT connection (fiber-owned). The write mutex serializes deliveries
 /// from publisher fibers on the same thread with the conn's own replies.
 public final class MqttConn
@@ -66,7 +71,10 @@ public final class MqttConn
     LocalManualEvent flushEvt;
     bool dirty;
     bool closed; // serve fiber sets on exit; writer fiber then drains + stops
-    Duration readDeadline = Duration.max; // 1.5x CONNECT keepalive (0 kA = max)
+    // Read deadline: a BOUNDED default until CONNECT arrives (a client that
+    // opens TCP and never sends CONNECT must be reaped — pre-handshake
+    // slowloris), then re-armed to 1.5x the CONNECT keepalive (0 kA = max).
+    Duration readDeadline = MQTT_CONNECT_TIMEOUT;
     // QoS2 receive state: packet ids between PUBLISH(qos2) and PUBREL. Dedup:
     // a retransmitted qos2 PUBLISH with an id already here is PUBRECed but
     // NOT redelivered (exactly-once toward the subscriber side).
@@ -686,9 +694,12 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
         trieUnsubscribe(f, c);
     c.filters = null;
     c.gen++; // invalidate any remaining trie entries (lazily skipped)
-    // deliveries queued before a protocol-error/DISCONNECT return would
-    // otherwise strand in their outboxes (PUBLISH+DISCONNECT in one read batch
-    // is the standard fire-and-forget client pattern)
+    // wake OTHER subscribers whose outboxes this connection's last batch filled
+    // (PUBLISH+DISCONNECT coalesced in one read batch is the standard
+    // fire-and-forget pattern; their writers are alive and deliver). This
+    // connection's OWN obox is best-effort dropped — closeTcp below runs before
+    // the join, so its writer's final send finds a closed socket (spec-legal
+    // QoS-0 drop on disconnect).
     mqttFlushDirty();
     c.closed = true;
     try
