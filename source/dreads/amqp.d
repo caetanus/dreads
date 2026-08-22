@@ -321,13 +321,30 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         else if (op == 4) // queue.unbind: ex=exchange, a=queue, b=routing-key
         {
             auto b = rd().idup;
-            if (auto lst = ex in gBindings)
+            auto lst = ex in gBindings;
+            if (lst !is null)
+            {
+                bool found = false;
                 foreach (ref bd; *lst)
-                    if (bd.queue == a && bd.key == b && !bd.toExchange && seq > bd.seq)
+                    if (bd.queue == a && bd.key == b && !bd.toExchange)
                     {
-                        bd.seq = seq; // tombstone: a stale re-bind can't revive it
-                        bd.alive = false;
+                        found = true;
+                        if (seq > bd.seq)
+                        {
+                            bd.seq = seq; // tombstone: a stale re-bind can't revive it
+                            bd.alive = false;
+                        }
                     }
+                // an unbind that ARRIVES BEFORE the bind it cancels (independent
+                // SPSC lanes reorder across shards) must still leave a seq-stamped
+                // tombstone; else the later LOWER-seq bind is appended live and the
+                // shards permanently split-brain. Append one (capped, args=null —
+                // unbind matches by queue+key, same as the existing-element case).
+                if (!found && (*lst).length < AMQP_MAX_BINDINGS)
+                    *lst ~= Binding(a, b, null, seq, false);
+            }
+            else if (gBindings.length < AMQP_MAX_EXCHANGES)
+                gBindings[ex] = [Binding(a, b, null, seq, false)];
         }
         else if (op == 6) // exchange.bind: ex=source, a=dest exchange, b=rk
         {
@@ -363,13 +380,26 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         else if (op == 7) // exchange.unbind: ex=source, a=dest exchange, b=rk
         {
             auto b = rd().idup;
-            if (auto lst = ex in gBindings)
+            auto lst = ex in gBindings;
+            if (lst !is null)
+            {
+                bool found = false;
                 foreach (ref bd; *lst)
-                    if (bd.queue == a && bd.key == b && bd.toExchange && seq > bd.seq)
+                    if (bd.queue == a && bd.key == b && bd.toExchange)
                     {
-                        bd.seq = seq;
-                        bd.alive = false;
+                        found = true;
+                        if (seq > bd.seq)
+                        {
+                            bd.seq = seq;
+                            bd.alive = false;
+                        }
                     }
+                // same reorder hazard as queue.unbind: tombstone an unseen e2e bind
+                if (!found && (*lst).length < AMQP_MAX_BINDINGS)
+                    *lst ~= Binding(a, b, null, seq, false, true); // toExchange
+            }
+            else if (gBindings.length < AMQP_MAX_EXCHANGES)
+                gBindings[ex] = [Binding(a, b, null, seq, false, true)];
         }
         else if (op == 5) // exchange.delete: ex=exchange
         {
@@ -540,9 +570,25 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
             {
             }
         }
+        // Exchange visited-set: expand each exchange AT MOST ONCE per publish so a
+        // binding graph (a cycle A->B->A, or a diamond) can't blow up to N^depth
+        // work — the depth cap alone bounds path LENGTH, not total work, and a
+        // yield-free `collect` monopolizing the shard on one publish is a freeze
+        // DoS. Slices are stable for this yield-free walk (gBindings keys / the
+        // idup'd dest-exchange names), so no idup. Reused TLS: seeded per publish;
+        // a reentrant routeTo (during sink's yield) refills it after we're done
+        // with it, which is harmless (collect never reads it across a yield).
+        static const(char)[][] visited;
+        bool seen(scope const(char)[] cx) nothrow
+        {
+            foreach (v; visited)
+                if (v == cx)
+                    return true;
+            return false;
+        }
         // Collect matching destinations, recursing through exchange-to-exchange
-        // bindings (bd.toExchange). depth-bounded so a binding cycle can't loop
-        // forever; add() dedups queues reached via multiple paths.
+        // bindings (bd.toExchange). visited-guarded (above) AND depth-bounded;
+        // add() dedups queues reached via multiple paths.
         void collect(scope const(char)[] cx, int depth) nothrow
         {
             if (depth > AMQP_MAX_EXCHANGE_HOPS)
@@ -574,12 +620,24 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
                 if (!m)
                     continue;
                 if (bd.toExchange)
+                {
+                    if (seen(bd.queue))
+                        continue; // already expanded this exchange: cycle/diamond
+                    try
+                        visited ~= bd.queue;
+                    catch (Exception)
+                    {
+                    }
                     collect(bd.queue, depth + 1); // route into the destination exchange
+                }
                 else
                     add(bd.queue);
             }
         }
 
+        visited.length = 0; // origin `ex` isn't seeded (it's not recursed-into): it
+        // may be re-expanded at most once via a cycle, every other exchange exactly
+        // once — total expansions <= E+1, so the walk is polynomial, never N^depth.
         collect(ex, 0);
         foreach (q; *dests)
             sink(q); // yields per queue; dests is stable (reentrants use destLocal)
