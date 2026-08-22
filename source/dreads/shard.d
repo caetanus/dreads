@@ -190,6 +190,10 @@ public enum ShardMsg : uint
     // ITS thread's local gPubSub subscribers. (Client PUBLISH itself travels
     // as a broadcast `cmd` instead — it needs the summed receiver-count reply.)
     pub = 3,
+    // MQTT publish fan-out (the MQTT skin, see dreads.mqtt): fire-and-forget
+    // [u8 retain][u16 topicLen][topic][payload]; the receiving drain delivers
+    // to ITS thread's local topic trie (and retained map when retain is set).
+    mqttPub = 5,
     // A same-slot MULTI/EXEC shipped as ONE unit (phase 2.5d): the coalesced
     // sections are the queued commands; the owner's drain executes them
     // back-to-back WITHOUT yielding (the transaction is atomic on its shard)
