@@ -41,6 +41,14 @@ public final class MqttConn
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
     uint gen; // bumped on disconnect: stale trie entries self-invalidate
+    // Delivery outbox: publishes matched to this conn accumulate here and are
+    // flushed ONCE per publish batch (mqttFlushDirty) — a write syscall per
+    // DELIVERY throttled the E2E rate to ~135k msg/s. Same-thread only (every
+    // deliverer — local publisher fibers and the drain's fan-in — runs on this
+    // conn's own shard thread), so no lock guards the buffer; only the socket
+    // write takes wlock.
+    ByteBuffer obox;
+    bool dirty;
 
     this(TCPConnection c) nothrow
     {
@@ -354,11 +362,48 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     trieMatch(gTrieRoot, topic, 0, subs, n);
     if (n == 0)
         return;
-    static ByteBuffer pkt; // TLS: built once per publish, written to each sub
+    static ByteBuffer pkt; // TLS: built once per publish, appended to each sub
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
     foreach (s; subs[0 .. n])
-        sendTo(s, pkt.data);
+    {
+        s.obox.append(pkt.data);
+        if (!s.dirty)
+        {
+            s.dirty = true;
+            try
+                tDirty ~= s;
+            catch (Exception)
+            {
+            }
+        }
+    }
+}
+
+private MqttConn[] tDirty; // TLS: conns with pending deliveries this batch
+
+/// Flush every accumulated delivery outbox — called once per publish batch
+/// (the publisher's serve loop after its parse pass, and the drain after a
+/// fan-in pass). One write per touched subscriber per batch.
+public void mqttFlushDirty() nothrow @trusted
+{
+    if (tDirty.length == 0)
+        return;
+    foreach (c; tDirty)
+    {
+        if (!c.obox.empty)
+        {
+            sendTo(c, c.obox.data);
+            c.obox.clear();
+        }
+        c.dirty = false;
+    }
+    tDirty.length = 0;
+    try
+        (cast(MqttConn[]) tDirty).assumeSafeAppend;
+    catch (Exception)
+    {
+    }
 }
 
 private void buildPublish(ref ByteBuffer o, scope const(char)[] topic,
@@ -391,6 +436,11 @@ private void sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 
 public void serveMqttClient(TCPConnection tcp) nothrow
 {
+    try
+        tcp.tcpNoDelay = true; // PUBACK/deliveries are tiny — Nagle throttles
+    catch (Exception)          // the QoS1 window to ~6k msg/s (measured)
+    {
+    }
     auto c = new MqttConn(tcp);
     static void closeQuiet(MqttConn cc) nothrow
     {
@@ -449,13 +499,21 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             immutable ubyte h = d[pos];
             auto body_ = d[hp .. hp + rem];
             if (!handlePacket(c, h, body_, outb))
-                return; // protocol error or DISCONNECT
-            if (!outb.empty)
             {
-                sendTo(c, outb.data);
-                outb.clear();
+                if (!outb.empty) // flush any acks built before the close
+                    sendTo(c, outb.data);
+                return; // protocol error or DISCONNECT
             }
             pos = hp + rem;
+        }
+        // ONE write per read batch (RESP-style pipelining): a windowed QoS1
+        // publisher's acks coalesce instead of paying a syscall per packet —
+        // and this batch's DELIVERIES flush once per subscriber, not per msg
+        mqttFlushDirty();
+        if (!outb.empty)
+        {
+            sendTo(c, outb.data);
+            outb.clear();
         }
         inb.consume(pos);
     }
