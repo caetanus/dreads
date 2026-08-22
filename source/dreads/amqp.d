@@ -240,7 +240,12 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 return;
             }
             gExchanges[ex] = t;
-            gExchangeSeq[ex] = seq;
+            // bound the seq map: gExchanges shrinks on delete but gExchangeSeq
+            // KEEPS a tombstone (rejects a stale declare), so declare+delete of
+            // unique names would grow it without bound (per-shard, replicated).
+            // Cap NEW keys like gQueueMeta self-caps; existing keys still update.
+            if ((cast(string) ex) in gExchangeSeq || gExchangeSeq.length < AMQP_MAX_EXCHANGES)
+                gExchangeSeq[ex] = seq;
         }
         else if (op == 2)
         {
@@ -266,6 +271,19 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     atomicOp!"+="(gAmqpBindingDrops, 1);
                     return;
                 }
+            }
+            else if (gBindings.length >= AMQP_MAX_EXCHANGES)
+            {
+                // cap the NUMBER of bound-exchange keys, not just the per-exchange
+                // list length: queue.bind does NOT require the exchange to exist,
+                // so a flood of binds to unique (undeclared) exchange names would
+                // otherwise grow gBindings' key set without bound — and it's
+                // replicated to EVERY shard via ctlBroadcast (an amplified,
+                // per-shard RAM DoS with attacker-chosen keys). AMQP_MAX_EXCHANGES
+                // is the right bound: legit binds only target declared exchanges,
+                // which are already capped there.
+                atomicOp!"+="(gAmqpBindingDrops, 1);
+                return;
             }
             gBindings[ex] ~= Binding(a, b, exb, seq, true);
         }
@@ -315,7 +333,10 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     if (seq <= *sp)
                         return; // stale vs a newer declare/delete
                 gExchanges.remove(cast(string) ex);
-                gExchangeSeq[ex] = seq; // tombstone seq (rejects a stale declare)
+                // tombstone (usually an update — declare recorded the key); the
+                // cap guard mirrors the declare so a delete can't grow it either
+                if ((cast(string) ex) in gExchangeSeq || gExchangeSeq.length < AMQP_MAX_EXCHANGES)
+                    gExchangeSeq[ex] = seq; // rejects a stale later declare
                 // bindings under a deleted exchange are inert (routeTo needs the
                 // exchange); leave them so a concurrent bind's LWW state is kept
             }
