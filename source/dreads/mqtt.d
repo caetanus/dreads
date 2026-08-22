@@ -33,7 +33,7 @@ module dreads.mqtt;
 
 import core.atomic : atomicLoad, atomicOp, MemoryOrder;
 
-import core.time : Duration, msecs, seconds;
+import core.time : Duration, msecs, seconds, MonoTime, dur;
 
 import vibe.core.core : runTask, Task;
 import vibe.core.net : TCPConnection;
@@ -203,6 +203,10 @@ private struct Retained
 {
     const(char)[] payload;
     ulong seq;
+    const(char)[] props; // v5 forwardable props with message-expiry (0x02) STRIPPED
+    // out (re-emitted decremented on replay per [MQTT-3.3.2-5]); null for v3/no-props
+    MonoTime deadline; // when this retained message expires; valid iff hasExpiry
+    bool hasExpiry; // v5 message-expiry-interval was present: evict + decrement
 }
 
 private Retained[string] gRetained; // TLS: topic -> retained value (replicated)
@@ -666,30 +670,51 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             }
             else if (old !is null)
             {
-                immutable oldLen = old.payload.length;
+                // both payload AND stored props count against the byte cap (the
+                // byte-cap lesson: a topic-count cap over variable props is no RAM
+                // bound); the old entry's props are discounted on replace.
+                immutable oldLen = old.payload.length + old.props.length;
                 if (payload.length == 0)
                 {
                     gRetained[cast(string) topic] = Retained(null, seq); // tombstone
                     tRetainedBytes -= oldLen;
                 }
-                else if (tRetainedBytes - oldLen + payload.length <= MQTT_MAX_RETAINED_BYTES)
-                {
-                    gRetained[cast(string) topic] = Retained(payload.idup, seq);
-                    tRetainedBytes += payload.length - oldLen;
-                }
                 else
-                    atomicOp!"+="(gMqttRetainedDropped, 1);
+                {
+                    Retained r = makeRetained(payload, seq, props);
+                    immutable newLen = r.payload.length + r.props.length;
+                    if (tRetainedBytes - oldLen + newLen <= MQTT_MAX_RETAINED_BYTES)
+                    {
+                        gRetained[cast(string) topic] = r;
+                        tRetainedBytes += newLen - oldLen;
+                    }
+                    else
+                        atomicOp!"+="(gMqttRetainedDropped, 1);
+                }
             }
             else // new topic
             {
-                if (gRetained.length < MQTT_MAX_RETAINED_TOPICS
-                        && tRetainedBytes + payload.length <= MQTT_MAX_RETAINED_BYTES)
+                if (payload.length == 0)
                 {
-                    gRetained[topic.idup] = Retained(payload.length ? payload.idup : null, seq);
-                    tRetainedBytes += payload.length;
+                    // tombstone on an absent topic: seq-stamped, topic-count-capped
+                    if (gRetained.length < MQTT_MAX_RETAINED_TOPICS)
+                        gRetained[topic.idup] = Retained(null, seq);
+                    else
+                        atomicOp!"+="(gMqttRetainedDropped, 1);
                 }
                 else
-                    atomicOp!"+="(gMqttRetainedDropped, 1);
+                {
+                    Retained r = makeRetained(payload, seq, props);
+                    immutable newLen = r.payload.length + r.props.length;
+                    if (gRetained.length < MQTT_MAX_RETAINED_TOPICS
+                            && tRetainedBytes + newLen <= MQTT_MAX_RETAINED_BYTES)
+                    {
+                        gRetained[topic.idup] = r;
+                        tRetainedBytes += newLen;
+                    }
+                    else
+                        atomicOp!"+="(gMqttRetainedDropped, 1);
+                }
             }
         }
         catch (Exception)
@@ -1416,6 +1441,100 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
     return true;
 }
 
+// Copy a (broker-built, well-formed) PUBLISH property block into `out_` omitting
+// any message-expiry-interval (0x02), and return the expiry seconds via `expiry`
+// (0 = none). Retained storage keeps the expiry as an absolute deadline instead,
+// re-emitting a DECREMENTED 0x02 on replay per [MQTT-3.3.2-5]. Bounded like the
+// parser (defensive: this block is our own, but never read past its end).
+private void stripExpiryProp(scope const(char)[] props, ref ByteBuffer out_,
+        out uint expiry) @nogc nothrow @trusted
+{
+    out_.clear();
+    expiry = 0;
+    auto p = cast(const(ubyte)[]) props;
+    size_t i = 0;
+    immutable end = p.length;
+    while (i < end)
+    {
+        immutable propStart = i;
+        immutable id = p[i++];
+        switch (id)
+        {
+        case 0x01: // payload-format-indicator: 1 byte
+            if (i + 1 > end)
+                return;
+            i += 1;
+            break;
+        case 0x02: // message-expiry-interval: u32 — extracted, NOT copied
+            if (i + 4 > end)
+                return;
+            expiry = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                | (cast(uint) p[i + 2] << 8) | p[i + 3];
+            i += 4;
+            continue; // skip the append below: 0x02 is stored as a deadline
+        case 0x23: // topic-alias: u16 (should not appear in a forwardable block)
+            if (i + 2 > end)
+                return;
+            i += 2;
+            break;
+        case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data
+            if (i + 2 > end)
+                return;
+            immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > end)
+                return;
+            i += n;
+            break;
+        case 0x0B: // subscription-identifier: varint
+            uint sv;
+            if (!decodeVarint(p, i, sv) || i > end)
+                return;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return;
+                i += n;
+            }
+            break;
+        default:
+            return; // unknown id (shouldn't happen — we built this block)
+        }
+        out_.append(props[propStart .. i]);
+    }
+}
+
+// Build a Retained value for a SET: idup the payload, strip+store the forwardable
+// props (message-expiry becomes an absolute deadline). Called only on the cold
+// retained-publish path, inside the caller's try/catch.
+private Retained makeRetained(scope const(char)[] payload, ulong seq,
+        scope const(char)[] props) @trusted
+{
+    Retained r;
+    r.payload = payload.length ? payload.idup : null;
+    r.seq = seq;
+    if (props.length)
+    {
+        static ByteBuffer sb;
+        uint exp;
+        stripExpiryProp(props, sb, exp);
+        if (sb.length)
+            r.props = (cast(const(char)[]) sb.data).idup;
+        if (exp != 0)
+        {
+            r.deadline = MonoTime.currTime + dur!"seconds"(exp);
+            r.hasExpiry = true;
+        }
+    }
+    return r;
+}
+
 // CONNACK for either protocol version. v5 adds a reason code (0x00 = Success,
 // 0x80+ = failure) and an (empty, for now) property block; v3 uses the legacy
 // return code. `code` is already in the caller's version's encoding.
@@ -1943,22 +2062,67 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             foreach (g; granted[0 .. ng])
                 o.appendByte(cast(char) g); // grant/reason: QoS 0/1/2 or 0x80 failure
             // retained messages matching the new filters, delivered after SUBACK
+            immutable nowRt = MonoTime.currTime; // one clock read for the scan
+            const(char)[][32] expiredBuf; // expired topics to evict after the loop
+            size_t nExpired = 0;
             try
                 foreach (topic, r; gRetained)
                 {
                     if (r.payload.length == 0)
                         continue; // tombstone (deleted retained): never delivered
+                    // v5 message-expiry: a retained message past its deadline is
+                    // dropped, not delivered [MQTT-3.3.2-5], and evicted below.
+                    if (r.hasExpiry && nowRt >= r.deadline)
+                    {
+                        if (nExpired < expiredBuf.length)
+                            expiredBuf[nExpired++] = topic;
+                        continue;
+                    }
                     if (o.length > MQTT_OBOX_CAP)
                         break; // bounded replay burst (retained is QoS0/best-effort)
                     foreach (fi, f; filters[0 .. ng])
                         if (f !is null && retainOk[fi] && mqttFilterMatches(f, topic))
                         {
-                            buildPublish(o, topic, r.payload, true, v5);
+                            // re-emit a DECREMENTED message-expiry ahead of the
+                            // stored (expiry-stripped) props, for v5 subscribers.
+                            const(char)[] outProps = r.props;
+                            if (v5 && r.hasExpiry)
+                            {
+                                static ByteBuffer pb;
+                                pb.clear();
+                                immutable long remS = (r.deadline - nowRt).total!"seconds";
+                                immutable uint rem = remS <= 0 ? 0
+                                    : (remS > uint.max ? uint.max : cast(uint) remS);
+                                pb.appendByte(cast(char) 0x02);
+                                pb.appendByte(cast(char)(rem >> 24));
+                                pb.appendByte(cast(char)(rem >> 16));
+                                pb.appendByte(cast(char)(rem >> 8));
+                                pb.appendByte(cast(char) rem);
+                                pb.append(r.props);
+                                outProps = cast(const(char)[]) pb.data;
+                            }
+                            buildPublish(o, topic, r.payload, true, v5, outProps);
                             break;
                         }
                 }
             catch (Exception)
             {
+            }
+            // evict the expired retained topics discovered during the scan (done
+            // after iterating so we don't mutate the AA mid-foreach)
+            foreach (t; expiredBuf[0 .. nExpired])
+            {
+                try
+                {
+                    if (auto rr = t in gRetained)
+                    {
+                        tRetainedBytes -= rr.payload.length + rr.props.length;
+                        gRetained.remove(cast(string) t);
+                    }
+                }
+                catch (Exception)
+                {
+                }
             }
             return true;
         }
