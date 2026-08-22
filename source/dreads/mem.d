@@ -38,6 +38,22 @@ public struct ByteBuffer
         return len == 0;
     }
 
+    @property size_t capacity() const @nogc nothrow
+    {
+        return cap;
+    }
+
+    /// Free the backing block if it grew past `keepCap` (a one-time burst must
+    /// not pin a large reservation on an otherwise-idle buffer). Contents are
+    /// dropped; the next append reallocates small. No-op below the threshold.
+    void trim(size_t keepCap) @nogc nothrow @trusted
+    {
+        if (cap > keepCap)
+            release();
+        else
+            len = 0;
+    }
+
     /// Current contents (valid until the next mutation).
     inout(ubyte)[] data() inout @nogc nothrow
     {
