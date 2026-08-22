@@ -39,6 +39,7 @@ public __gshared void delegate(scope const(char)[] key, scope const(char)[] payl
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushFront;
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
+public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
 public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
@@ -55,6 +56,17 @@ enum ulong AMQP_MAX_BODY = 128UL << 20;
 enum size_t AMQP_DEFAULT_PREFETCH = 20000;
 /// Bindings per exchange, per shard (each is replicated to every thread).
 enum size_t AMQP_MAX_BINDINGS = 4096;
+/// Per-shard caps on control-plane cardinality (each is replicated to every
+/// thread, so an uncapped declare is a 1->N memory amplification DoS).
+enum size_t AMQP_MAX_EXCHANGES = 65536;
+enum size_t AMQP_MAX_QUEUEMETA = 65536;
+/// Per-connection caps.
+enum size_t AMQP_MAX_CHANNELS = 2047;   // matches the advertised channel-max
+enum size_t AMQP_MAX_CONSUMERS = 4096;
+/// A dead-letter is dropped once it has been dead-lettered this many times
+/// (the x-death hop count) — bounds an A->X->A dead-letter cycle.
+enum int AMQP_MAX_DEATHS = 16;
+public shared ulong gAmqpCtlDrops; // control-plane declares refused at a cap
 
 /// Queue key namespace: visible from RESP on purpose (cross-protocol is a
 /// feature — `LRANGE amq.q.tasks 0 -1` shows the queue).
@@ -185,6 +197,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         {
             ExType t = a == "fanout" ? ExType.fanout : a == "topic" ? ExType.topic
                 : a == "headers" ? ExType.headers : ExType.direct;
+            if ((cast(string) ex) !in gExchanges && gExchanges.length >= AMQP_MAX_EXCHANGES)
+            {
+                atomicOp!"+="(gAmqpCtlDrops, 1);
+                return;
+            }
             gExchanges[ex] = t;
         }
         else if (op == 2)
@@ -212,6 +229,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         else if (op == 3) // queue metadata: ex=queue, a=dlx, b=dlrk
         {
             auto b = rd().idup;
+            if ((cast(string) ex) !in gQueueMeta && gQueueMeta.length >= AMQP_MAX_QUEUEMETA)
+            {
+                atomicOp!"+="(gAmqpCtlDrops, 1);
+                return;
+            }
             gQueueMeta[ex] = QueueMeta(a, b);
         }
         else if (op == 4) // queue.unbind: ex=exchange, a=queue, b=routing-key
@@ -685,8 +707,9 @@ private struct Channel
 private struct Unacked
 {
     string queue;
-    const(ubyte)[] blob; // stored record (props+body), for requeue/dead-letter
+    const(ubyte)[] blob; // stored record (rk+props+body), for requeue/dead-letter
     ushort chan; // owning channel: channel.close requeues just this channel's
+    int deaths; // reserved for a future x-death header hop count (loop bound)
 }
 
 private final class AmqpConn
@@ -701,6 +724,7 @@ private final class AmqpConn
     ulong nextCtag = 1; // server-assigned consumer tags (unique per connection)
     size_t prefetch;    // basic.qos prefetch-count (0 = AMQP_DEFAULT_PREFETCH)
     bool[ushort] closedChans; // channel.close'd: consumer fibers on it must exit
+    size_t consumerCount; // live basic.consume fibers (per-conn cap)
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     bool hbStarted;  // the sender fiber is spawned exactly once
 
@@ -979,6 +1003,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         switch (mth)
         {
         case 10: // open
+            if (chan !in c.chans && c.chans.length >= AMQP_MAX_CHANNELS)
+                return false; // channel-max exceeded: close the connection
             try
                 c.chans[chan] = Channel(true);
             catch (Exception)
@@ -1030,6 +1056,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             method(o, chan, 40, 11);
             return true;
         }
+        if (mth == 20) // delete
+        {
+            cast(void) r.u16();
+            auto ex = r.shortStr();
+            ctlBroadcast(5, ex, "", ""); // op 5: drop the exchange + its bindings
+            method(o, chan, 40, 21); // delete-ok
+            return true;
+        }
         return true;
     case 50: // queue
         switch (mth)
@@ -1074,6 +1108,32 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 method(o, chan, 50, 21);
                 return true;
             }
+        case 50: // unbind
+            {
+                cast(void) r.u16();
+                auto q = r.shortStr();
+                auto ex = r.shortStr();
+                auto rk = r.shortStr();
+                cast(void) r.tableRaw(); // arguments (ignored on unbind)
+                ctlBroadcast(4, ex, q, rk); // op 4: drop the matching binding
+                method(o, chan, 50, 51); // unbind-ok
+                return true;
+            }
+        case 40: // delete
+            {
+                cast(void) r.u16();
+                auto q = r.shortStr();
+                cast(void) r.u8(); // if-unused/if-empty/no-wait bits
+                static ByteBuffer dk; // TLS
+                queueKey(q, dk);
+                immutable n = gAmqpLen !is null ? gAmqpLen(dk.data.asChars) : 0;
+                if (gAmqpDelKey !is null)
+                    gAmqpDelKey(dk.data.asChars); // DEL the backing list
+                method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
+                    putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
+                });
+                return true;
+            }
         default:
             return true;
         }
@@ -1108,11 +1168,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u16();
                 auto q = r.shortStr();
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                // a no-ack=false get also consumes prefetch: don't let millions
+                // of un-acked gets pin RAM (the consumer path already caps this)
+                immutable getLimit = c.prefetch ? c.prefetch : AMQP_DEFAULT_PREFETCH;
+                bool getFull = false;
+                try
+                    getFull = !getNoAck && c.unacked.length >= getLimit;
+                catch (Exception)
+                {
+                }
                 static ByteBuffer kb2; // TLS
                 queueKey(q, kb2);
                 static ByteBuffer pay; // TLS
                 pay.clear();
-                if (gAmqpPop !is null && gAmqpPop(kb2.data.asChars, pay))
+                if (!getFull && gAmqpPop !is null && gAmqpPop(kb2.data.asChars, pay))
                 {
                     immutable remaining = gAmqpLen !is null ? gAmqpLen(kb2.data.asChars) : 0;
                     immutable gtag = c.nextTag++;
@@ -1121,7 +1190,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // workflow could neither ack nor requeue (message lost)
                     if (!getNoAck)
                         try
-                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan);
+                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0);
                         catch (Exception)
                         {
                         }
@@ -1169,6 +1238,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     tagbuf[0 .. tn] = tag[0 .. tn];
                     tg = cast(const(char)[]) tagbuf[0 .. tn];
                 }
+                if (c.consumerCount >= AMQP_MAX_CONSUMERS)
+                    return false; // consumer flood: close the connection
                 method(o, chan, 60, 21, (ref ByteBuffer b) @nogc nothrow {
                     putShortStr(b, tg);
                 });
@@ -1288,18 +1359,45 @@ private auto asChars(const(ubyte)[] b) @nogc nothrow
 // Queue record framing: [\x01 'A' 'M' 'Q'][u32 propLen][props][body].
 // A record WITHOUT the magic (e.g. LPUSHed from the RESP side — cross-protocol
 // ingest is a feature) is treated as a bare body with empty properties.
-private void buildRecord(ref ByteBuffer o, scope const(ubyte)[] props,
-        scope const(ubyte)[] body_) @nogc nothrow
+// Record v2 ("\x02AMQ"): [magic 4][u16 rkLen][rk][u32 propLen][props][body].
+// v2 carries the ORIGINAL routing key so dead-lettering can re-route by it
+// (RabbitMQ's default), which neither a consumer nor basic.get can otherwise
+// recover from the stored bytes. splitRecord still reads legacy v1
+// ("\x01AMQ", no rk) and bare (magic-less) records.
+private void buildRecord(ref ByteBuffer o, scope const(char)[] rkey,
+        scope const(ubyte)[] props, scope const(ubyte)[] body_) @nogc nothrow
 {
-    o.append("\x01AMQ");
+    o.append("\x02AMQ");
+    immutable rl = rkey.length > 0xFFFF ? 0xFFFF : rkey.length;
+    o.appendByte(cast(char)(rl >> 8));
+    o.appendByte(cast(char)(rl & 0xFF));
+    o.append(rkey[0 .. rl]);
     putU32(o, cast(uint) props.length);
     o.append(props);
     o.append(body_);
 }
 
-package void splitRecord(scope const(ubyte)[] blob, out const(ubyte)[] props,
-        out const(ubyte)[] body_) @nogc nothrow
+package void splitRecord(scope const(ubyte)[] blob, out const(char)[] rkey,
+        out const(ubyte)[] props, out const(ubyte)[] body_) @nogc nothrow
 {
+    if (blob.length >= 6 && blob[0] == 0x02 && blob[1] == 'A' && blob[2] == 'M'
+            && blob[3] == 'Q')
+    {
+        immutable rl = (cast(size_t) blob[4] << 8) | blob[5];
+        if (6 + rl + 4 <= blob.length)
+        {
+            rkey = cast(const(char)[]) blob[6 .. 6 + rl];
+            immutable po = 6 + rl;
+            immutable pl = (cast(size_t) blob[po] << 24) | (cast(size_t) blob[po + 1] << 16)
+                | (cast(size_t) blob[po + 2] << 8) | blob[po + 3];
+            if (po + 4 + pl <= blob.length)
+            {
+                props = blob[po + 4 .. po + 4 + pl];
+                body_ = blob[po + 4 + pl .. $];
+                return;
+            }
+        }
+    }
     if (blob.length >= 8 && blob[0] == 0x01 && blob[1] == 'A' && blob[2] == 'M'
             && blob[3] == 'Q')
     {
@@ -1338,7 +1436,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         if (rec is &recStatic)
             recBusy = false;
     rec.clear();
-    buildRecord(*rec, ch.pub.props.data, ch.pub.payload.data);
+    buildRecord(*rec, ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(ch.pub.props.data);
     int routed = 0;
@@ -1378,8 +1476,9 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
 
 private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blob) nothrow
 {
+    const(char)[] rkey0;
     const(ubyte)[] props, body_;
-    splitRecord(blob, props, body_);
+    splitRecord(blob, rkey0, props, body_);
     // content HEADER frame — the publisher's property block replays VERBATIM
     // (content-type, headers, correlation-id ... survive the queue)
     size_t at;
@@ -1474,9 +1573,14 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
     }
     if (meta.dlx.length == 0)
         return; // no dead-letter exchange: drop
+    if (u.deaths >= AMQP_MAX_DEATHS)
+        return; // dead-letter cycle (A->X->A ...): drop instead of looping
+    const(char)[] origRk;
     const(ubyte)[] props, body_;
-    splitRecord(u.blob, props, body_);
-    auto rk = meta.dlrk.length ? meta.dlrk : u.queue;
+    splitRecord(u.blob, origRk, props, body_);
+    // RabbitMQ default: the dead-lettered message keeps its ORIGINAL routing
+    // key (recovered from the v2 record) unless x-dead-letter-routing-key set
+    auto rk = meta.dlrk.length ? meta.dlrk : (origRk.length ? origRk : u.queue);
     auto blob = u.blob.asChars;
     routeTo(meta.dlx, rk, propsHeaders(props), (string q) nothrow {
         static ByteBuffer kb5; // TLS
@@ -1501,10 +1605,15 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     catch (Exception)
         return;
     atomicOp!"+="(gAmqpConsumers, 1);
+    c.consumerCount++;
     try
         cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na) nothrow {
             scope (exit)
+            {
                 atomicOp!"-="(gAmqpConsumers, 1);
+                if (cc.consumerCount > 0)
+                    cc.consumerCount--;
+            }
             ByteBuffer kb;
             kb.append("amq.q.");
             kb.append(qq);
@@ -1551,10 +1660,25 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     pay.clear();
                     if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
                         break;
+                    // the pop's cross-shard hop yielded; if the channel/conn was
+                    // torn down during that park, put the record back at the
+                    // FRONT and stop rather than deliver on a dead channel
+                    bool gone = cc.closing;
+                    try
+                        gone = gone || (chn in cc.closedChans) !is null;
+                    catch (Exception)
+                    {
+                    }
+                    if (gone)
+                    {
+                        if (gAmqpPushFront !is null)
+                            gAmqpPushFront(kb.data.asChars, pay.data.asChars);
+                        break;
+                    }
                     immutable tg = cc.nextTag++;
                     if (!na)
                         try
-                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn);
+                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0);
                         catch (Exception)
                         {
                         }
@@ -1580,7 +1704,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             }
         }, c, chan, qs, ts, noAck);
     catch (Exception)
+    {
         atomicOp!"-="(gAmqpConsumers, 1);
+        if (c.consumerCount > 0)
+            c.consumerCount--;
+    }
 }
 
 // Heartbeat sender: a fiber emitting a heartbeat frame every 15s while the
