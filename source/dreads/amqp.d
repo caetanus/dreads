@@ -1496,7 +1496,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     {
                         if (isExpired(pay.data, getTtl))
                         {
-                            deadLetter(q, pay.data);
+                            deadLetter(q, pay.data, "expired");
                             pay.clear();
                             drained++;
                             continue;
@@ -2044,7 +2044,7 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             gAmqpPushFront(kb4.data.asChars, rq4.data.asChars);
         return;
     }
-    deadLetter(u.queue, u.blob);
+    deadLetter(u.queue, u.blob, "rejected");
 }
 
 /// The queue's x-message-ttl in ms (0 = none). Looked up per delivery.
@@ -2092,7 +2092,135 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
 /// Route an (already-stored) record to `queue`'s dead-letter exchange, keeping
 /// the original routing key unless x-dead-letter-routing-key overrides it.
 /// Shared by nack/reject (settleNegative) and TTL expiry at delivery.
-private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob) nothrow @trusted
+// --- x-death header (RabbitMQ dead-letter provenance a DLX consumer reads for
+// poison-message handling: count, reason, queue, ...) ---
+private void patchU32(ref ByteBuffer o, size_t at, uint v) @nogc nothrow @trusted
+{
+    auto d = cast(ubyte[]) o.data;
+    if (at + 4 <= d.length)
+    {
+        d[at] = cast(ubyte)(v >> 24);
+        d[at + 1] = cast(ubyte)(v >> 16);
+        d[at + 2] = cast(ubyte)(v >> 8);
+        d[at + 3] = cast(ubyte)(v & 0xFF);
+    }
+}
+
+private void xtStr(ref ByteBuffer o, scope const(char)[] key, scope const(char)[] val) @nogc nothrow
+{
+    o.appendByte(cast(char) key.length);
+    o.append(key);
+    o.appendByte('S');
+    putU32(o, cast(uint) val.length);
+    o.append(val);
+}
+
+/// Encode the `x-death` headers entry: [keyLen]["x-death"]['A'] array of one
+/// table {count 'l', reason/queue/exchange 'S', routing-keys 'A', }.
+private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] reason,
+        scope const(char)[] queue, scope const(char)[] rk) @nogc nothrow
+{
+    o.appendByte(cast(char) 7);
+    o.append("x-death");
+    o.appendByte('A'); // array
+    immutable arrAt = o.length;
+    putU32(o, 0);
+    immutable arrStart = o.length;
+    o.appendByte('F'); // one table element
+    immutable tblAt = o.length;
+    putU32(o, 0);
+    immutable tblStart = o.length;
+    o.appendByte(cast(char) 5);
+    o.append("count");
+    o.appendByte('l');
+    putU64(o, cast(ulong) count);
+    xtStr(o, "reason", reason);
+    xtStr(o, "queue", queue);
+    xtStr(o, "exchange", ""); // original exchange isn't stored in the record
+    o.appendByte(cast(char) 12);
+    o.append("routing-keys");
+    o.appendByte('A');
+    immutable rkAt = o.length;
+    putU32(o, 0);
+    immutable rkStart = o.length;
+    o.appendByte('S');
+    putU32(o, cast(uint) rk.length);
+    o.append(rk);
+    patchU32(o, rkAt, cast(uint)(o.length - rkStart));
+    patchU32(o, tblAt, cast(uint)(o.length - tblStart));
+    patchU32(o, arrAt, cast(uint)(o.length - arrStart));
+}
+
+/// Rebuild `props` with `xentry` prepended to the headers table (creating the
+/// headers property if absent). Every other property survives verbatim. On any
+/// malformed length the tail is copied as-is (best-effort, never OOB).
+private void mergeXDeath(ref ByteBuffer dst, scope const(ubyte)[] props,
+        scope const(ubyte)[] xentry) @nogc nothrow @trusted
+{
+    dst.clear();
+    if (props.length < 2)
+    {
+        dst.appendByte(cast(char) 0x20); // flags 0x2000 (headers only)
+        dst.appendByte(cast(char) 0x00);
+        putU32(dst, cast(uint) xentry.length);
+        dst.append(cast(const(char)[]) xentry);
+        return;
+    }
+    immutable flags = (cast(ushort) props[0] << 8) | props[1];
+    size_t i = 2;
+    immutable nf = cast(ushort)(flags | 0x2000);
+    dst.appendByte(cast(char)(nf >> 8));
+    dst.appendByte(cast(char)(nf & 0xFF));
+    // content-type, then content-encoding: copy each shortstr verbatim
+    if (flags & 0x8000)
+    {
+        if (i >= props.length || i + 1 + props[i] > props.length)
+        {
+            dst.append(cast(const(char)[]) props[i .. $]);
+            return;
+        }
+        immutable seg = 1 + props[i];
+        dst.append(cast(const(char)[]) props[i .. i + seg]);
+        i += seg;
+    }
+    if (flags & 0x4000)
+    {
+        if (i >= props.length || i + 1 + props[i] > props.length)
+        {
+            dst.append(cast(const(char)[]) props[i .. $]);
+            return;
+        }
+        immutable seg = 1 + props[i];
+        dst.append(cast(const(char)[]) props[i .. i + seg]);
+        i += seg;
+    }
+    const(ubyte)[] existing;
+    if (flags & 0x2000)
+    {
+        if (i + 4 > props.length)
+        {
+            dst.append(cast(const(char)[]) props[i .. $]);
+            return;
+        }
+        immutable hl = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        i += 4;
+        if (i + hl > props.length)
+        {
+            dst.append(cast(const(char)[]) props[i - 4 .. $]);
+            return;
+        }
+        existing = props[i .. i + hl];
+        i += hl;
+    }
+    putU32(dst, cast(uint)(xentry.length + existing.length));
+    dst.append(cast(const(char)[]) xentry);
+    dst.append(cast(const(char)[]) existing);
+    dst.append(cast(const(char)[]) props[i .. $]); // delivery-mode onward verbatim
+}
+
+private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
+        scope const(char)[] reason) nothrow @trusted
 {
     QueueMeta meta;
     try
@@ -2133,10 +2261,18 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob) no
     scope (exit)
         if (dlrec is &dlrecStatic)
             dlrecBusy = false;
+    // augment the props with an x-death header (count = deaths+1, this queue,
+    // the original routing key). TLS buffers, consumed by buildRecord before the
+    // routeTo yield below (like the queue-key buffers).
+    static ByteBuffer xbuf; // TLS: the x-death header entry
+    static ByteBuffer paug; // TLS: props + x-death
+    xbuf.clear();
+    buildXDeathEntry(xbuf, deaths + 1, reason, queue, origRk);
+    mergeXDeath(paug, props, xbuf.data);
     dlrec.clear();
-    buildRecord(*dlrec, pm, deaths + 1, origRk, props, body_);
+    buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_);
     auto blobc = dlrec.data.asChars;
-    routeTo(meta.dlx, rk, propsHeaders(props), (string q) nothrow {
+    routeTo(meta.dlx, rk, propsHeaders(paug.data), (string q) nothrow {
         static ByteBuffer kb5; // TLS
         queueKey(q, kb5);
         if (gAmqpPush !is null)
@@ -2215,7 +2351,7 @@ public void amqpTtlSweep() nothrow @trusted
                         gAmqpPushFront(key, popped.data.asChars);
                     break;
                 }
-                deadLetter(q, popped.data); // DLX route or drop (no DLX)
+                deadLetter(q, popped.data, "expired"); // DLX route or drop (no DLX)
                 reaped++;
             }
         }
@@ -2307,7 +2443,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     // pass (it yields between bursts).
                     if (isExpired(pay.data, queueTtl(qq)))
                     {
-                        deadLetter(qq, pay.data);
+                        deadLetter(qq, pay.data, "expired");
                         burst++;
                         continue;
                     }
