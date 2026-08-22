@@ -78,6 +78,18 @@ public struct Aof
         zpath[0 .. path.length] = path;
         zpath[path.length] = 0;
         f = fopen(zpath.ptr, "ab");
+        if (f !is null)
+        {
+            // UNBUFFERED: the AOF already batches in its own `pending` buffer, so
+            // stdio's buffer adds nothing AND hides where a write error surfaces
+            // (a full-buffered stream defers the real write — and its ENOSPC — to
+            // fflush, past flush()'s short-write check). Unbuffered makes fwrite a
+            // direct write(): its return reflects exactly what reached the fd, so
+            // the partial-write consume(wrote) path is actually correct.
+            import core.stdc.stdio : setvbuf, _IONBF;
+
+            cast(void) setvbuf(f, null, _IONBF, 0);
+        }
         lastDb = -1; // fresh handle: the first append re-emits its SELECT
         return f !is null;
     }
