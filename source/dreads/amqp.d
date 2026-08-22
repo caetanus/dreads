@@ -115,11 +115,12 @@ public shared ulong gAmqpCtlSeq;
 
 private struct Binding
 {
-    string queue;
+    string queue; // destination: a queue name, or an exchange name if toExchange
     string key; // binding/routing key
     immutable(ubyte)[] args; // raw binding-arguments table (headers exchanges)
     ulong seq; // ctl seq of the last bind/unbind on this element
     bool alive = true; // false = tombstone (unbound), retained for seq-gating
+    bool toExchange; // exchange-to-exchange binding: route recurses into `queue`
 }
 
 private struct QueueMeta
@@ -256,9 +257,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             auto lst = ex in gBindings;
             if (lst !is null)
             {
-                // existing element (live or tombstone): revive/update if newer
+                // existing element (live or tombstone): revive/update if newer.
+                // !toExchange so a queue-bind can't collide with an exchange-bind
+                // of the same name.
                 foreach (ref bd; *lst)
-                    if (bd.queue == a && bd.key == b && bd.args == exb)
+                    if (bd.queue == a && bd.key == b && bd.args == exb && !bd.toExchange)
                     {
                         if (seq > bd.seq)
                         {
@@ -320,9 +323,51 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             auto b = rd().idup;
             if (auto lst = ex in gBindings)
                 foreach (ref bd; *lst)
-                    if (bd.queue == a && bd.key == b && seq > bd.seq)
+                    if (bd.queue == a && bd.key == b && !bd.toExchange && seq > bd.seq)
                     {
                         bd.seq = seq; // tombstone: a stale re-bind can't revive it
+                        bd.alive = false;
+                    }
+        }
+        else if (op == 6) // exchange.bind: ex=source, a=dest exchange, b=rk
+        {
+            auto b = rd().idup;
+            auto extra = rd();
+            auto exb = extra is null ? null : cast(immutable(ubyte)[]) extra.idup;
+            auto lst = ex in gBindings;
+            if (lst !is null)
+            {
+                foreach (ref bd; *lst)
+                    if (bd.queue == a && bd.key == b && bd.args == exb && bd.toExchange)
+                    {
+                        if (seq > bd.seq)
+                        {
+                            bd.seq = seq;
+                            bd.alive = true;
+                        }
+                        return;
+                    }
+                if ((*lst).length >= AMQP_MAX_BINDINGS)
+                {
+                    atomicOp!"+="(gAmqpBindingDrops, 1);
+                    return;
+                }
+            }
+            else if (gBindings.length >= AMQP_MAX_EXCHANGES)
+            {
+                atomicOp!"+="(gAmqpBindingDrops, 1);
+                return;
+            }
+            gBindings[ex] ~= Binding(a, b, exb, seq, true, true); // toExchange
+        }
+        else if (op == 7) // exchange.unbind: ex=source, a=dest exchange, b=rk
+        {
+            auto b = rd().idup;
+            if (auto lst = ex in gBindings)
+                foreach (ref bd; *lst)
+                    if (bd.queue == a && bd.key == b && bd.toExchange && seq > bd.seq)
+                    {
+                        bd.seq = seq;
                         bd.alive = false;
                     }
         }
@@ -488,37 +533,54 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         {
             foreach (d; *dests)
                 if (d == q)
-                    return; // this queue already matched another binding
+                    return; // this queue already matched another binding/path
             try
                 *dests ~= q;
             catch (Exception)
             {
             }
         }
-
-        final switch (*t)
+        // Collect matching destinations, recursing through exchange-to-exchange
+        // bindings (bd.toExchange). depth-bounded so a binding cycle can't loop
+        // forever; add() dedups queues reached via multiple paths.
+        void collect(scope const(char)[] cx, int depth) nothrow
         {
-        case ExType.fanout:
-            foreach (ref bd; *bl)
-                if (bd.alive)
+            if (depth > AMQP_MAX_EXCHANGE_HOPS)
+                return;
+            auto ct = (cast(string) cx) in gExchanges;
+            auto cbl = (cast(string) cx) in gBindings;
+            if (ct is null || cbl is null)
+                return;
+            foreach (ref bd; *cbl)
+            {
+                if (!bd.alive)
+                    continue;
+                bool m;
+                final switch (*ct)
+                {
+                case ExType.fanout:
+                    m = true;
+                    break;
+                case ExType.direct:
+                    m = bd.key == rkey;
+                    break;
+                case ExType.topic:
+                    m = amqpTopicMatches(bd.key, rkey);
+                    break;
+                case ExType.headers:
+                    m = headersMatch(bd.args, msgHeaders);
+                    break;
+                }
+                if (!m)
+                    continue;
+                if (bd.toExchange)
+                    collect(bd.queue, depth + 1); // route into the destination exchange
+                else
                     add(bd.queue);
-            break;
-        case ExType.direct:
-            foreach (ref bd; *bl)
-                if (bd.alive && bd.key == rkey)
-                    add(bd.queue);
-            break;
-        case ExType.topic:
-            foreach (ref bd; *bl)
-                if (bd.alive && amqpTopicMatches(bd.key, rkey))
-                    add(bd.queue);
-            break;
-        case ExType.headers:
-            foreach (ref bd; *bl)
-                if (bd.alive && headersMatch(bd.args, msgHeaders))
-                    add(bd.queue);
-            break;
+            }
         }
+
+        collect(ex, 0);
         foreach (q; *dests)
             sink(q); // yields per queue; dests is stable (reentrants use destLocal)
     }
@@ -952,6 +1014,8 @@ private struct TxSettle
 /// a message body reaches AMQP_MAX_BODY (128MB), so 100k of them would be
 /// terabytes; the count cap only guards the tiny settle structs.
 private enum size_t AMQP_MAX_TX = 100_000;
+/// Max exchange-to-exchange hops a message routes through (cycle/depth bound).
+private enum int AMQP_MAX_EXCHANGE_HOPS = 10;
 private enum size_t AMQP_MAX_TX_BYTES = 256UL << 20; // 256MB of buffered pubs/tx
 
 private struct Channel
@@ -1334,6 +1398,30 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             auto ex = r.shortStr();
             ctlBroadcast(5, ex, "", ""); // op 5: drop the exchange + its bindings
             method(o, chan, 40, 21); // delete-ok
+            return true;
+        }
+        if (mth == 30) // bind (exchange-to-exchange): dest, source, rk, args
+        {
+            cast(void) r.u16();
+            auto dest = r.shortStr();
+            auto source = r.shortStr();
+            auto rk = r.shortStr();
+            cast(void) r.u8(); // no-wait
+            auto bindArgs = r.tableRaw();
+            ctlBroadcast(6, source, dest, rk, bindArgs); // op 6: source -> dest exch
+            method(o, chan, 40, 31); // bind-ok
+            return true;
+        }
+        if (mth == 40) // unbind (exchange-to-exchange)
+        {
+            cast(void) r.u16();
+            auto dest = r.shortStr();
+            auto source = r.shortStr();
+            auto rk = r.shortStr();
+            cast(void) r.u8(); // no-wait
+            cast(void) r.tableRaw();
+            ctlBroadcast(7, source, dest, rk); // op 7: drop the e2e binding
+            method(o, chan, 40, 51); // unbind-ok
             return true;
         }
         return true;
