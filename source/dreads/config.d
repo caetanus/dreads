@@ -12,6 +12,7 @@ public struct Config
     bool appendonly = false;
     ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     ushort amqpPort = 0; // AMQP 0-9-1 skin listener (0 = disabled); e.g. 5672
+    ushort kafkaPort = 0; // Kafka skin listener (0 = disabled); e.g. 9092
     string appendfilename = "dreads.aof";
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
@@ -178,6 +179,12 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "port":
         try
             cfg.port = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "kafka-port":
+        try
+            cfg.kafkaPort = value.to!ushort;
         catch (Exception)
             return false;
         return true;
