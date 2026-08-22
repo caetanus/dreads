@@ -28,6 +28,7 @@ import vibe.core.net : TCPConnection;
 import vibe.core.sync : TaskMutex;
 
 import dreads.mem : ByteBuffer;
+import std.digest.crc : crc32Of;
 
 /// Data-plane hook installed by server.d: execute a synthesized RESP command
 /// (args[1] is the routing key) on the owner shard, reply RESP bytes.
@@ -40,6 +41,39 @@ private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
+
+/// Hard bound on any wire array count (topics/partitions/records). Kafka
+/// counts are SIGNED i32; a hostile 0x7FFFFFFF made the response-building
+/// foreach run ~2.1e9 times, each iteration appending to the reply until the
+/// allocator aborts the whole broker. A real request names a handful.
+private enum int KAFKA_MAX_ARRAY = 65536;
+/// Longest accepted topic name (Kafka's own limit is 249).
+private enum size_t KAFKA_MAX_TOPIC = 249;
+/// Trim response/input buffers back to this after a spike.
+private enum size_t KAFKA_BUF_KEEP = 4 << 20;
+
+/// Clamp a wire array count to a safe iteration bound (negative or absurd -> 0).
+private int safeCount(int n) @nogc nothrow pure
+{
+    return (n < 0 || n > KAFKA_MAX_ARRAY) ? 0 : n;
+}
+
+/// Highest request version we actually parse for each api key (must match the
+/// ApiVersions table). A higher version has a DIFFERENT wire layout, so parsing
+/// it at the pinned dialect shifts every field — that misparse fed the count
+/// OOM above. Reject instead.
+private short maxApiVer(short apiKey) @nogc nothrow pure
+{
+    switch (apiKey)
+    {
+    case API_PRODUCE: return 2;
+    case API_FETCH: return 3;
+    case API_LIST_OFFSETS: return 1;
+    case API_METADATA: return 1;
+    case API_API_VERSIONS: return 0;
+    default: return 0;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // wire helpers
@@ -136,6 +170,19 @@ private struct Rd
         i += n;
         return b;
     }
+}
+
+/// Valid topic name for the flat keyspace key kafka.t.<topic>.<p>: non-empty,
+/// bounded, and no '.'/control bytes that would make (topic="a.5",p=0) and
+/// (topic="a",p=5) collide on the same list key.
+private bool validTopic(scope const(char)[] t) @nogc nothrow pure
+{
+    if (t.length == 0 || t.length > KAFKA_MAX_TOPIC)
+        return false;
+    foreach (ch; t)
+        if (ch == '.' || ch == ' ' || cast(ubyte) ch < 0x21)
+            return false;
+    return true;
 }
 
 // partition key: kafka.t.<topic>.<p>
@@ -324,9 +371,11 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
             }
             catch (Exception)
                 return;
-            outb.clear();
+            outb.trim(KAFKA_BUF_KEEP); // a 64MB fetch/produce spike must not pin
         }
         inb.consume(pos);
+        if (inb.empty && inb.capacity > KAFKA_BUF_KEEP)
+            inb.trim(KAFKA_BUF_KEEP);
     }
 }
 
@@ -345,6 +394,21 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
     putI32(o, 0);
     putI32(o, corr);
     immutable bodyAt = o.length;
+
+    // A version beyond what we parse has a shifted layout; parsing it at the
+    // pinned dialect misreads counts (OOM) — reject with the error shell. (The
+    // ApiVersions dance already tells honest clients our max.)
+    if (apiKey != API_API_VERSIONS && apiVer > maxApiVer(apiKey))
+    {
+        putI16(o, E_UNSUPPORTED_VERSION);
+        auto de = cast(ubyte[]) o.data;
+        immutable esz = o.length - sizeAt - 4;
+        de[sizeAt] = cast(ubyte)(esz >> 24);
+        de[sizeAt + 1] = cast(ubyte)(esz >> 16);
+        de[sizeAt + 2] = cast(ubyte)(esz >> 8);
+        de[sizeAt + 3] = cast(ubyte)(esz & 0xFF);
+        return;
+    }
 
     switch (apiKey)
     {
@@ -408,16 +472,17 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     // request: [topics: array of string] (null/empty = all — we answer only
     // named topics; a fresh producer always names what it wants)
-    int ntopics = r.i32();
+    immutable ntopics = safeCount(r.i32());
     static const(char)[][64] topics;
     size_t nt = 0;
-    if (ntopics > 0)
-        foreach (_; 0 .. ntopics)
-        {
-            auto t = r.str();
-            if (nt < topics.length && t !is null)
-                topics[nt++] = t;
-        }
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto t = r.str();
+        if (nt < topics.length && t !is null && validTopic(t))
+            topics[nt++] = t;
+    }
 
     // brokers: just us
     putI32(o, 1);
@@ -463,21 +528,27 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
     immutable acks = r.i16();
     cast(void) r.i32(); // timeout
     cast(void) acks;
-    immutable ntopics = r.i32();
-    putI32(o, ntopics < 0 ? 0 : ntopics);
-    foreach (_; 0 .. (ntopics < 0 ? 0 : ntopics))
+    immutable ntopics = safeCount(r.i32());
+    putI32(o, ntopics);
+    foreach (_; 0 .. ntopics)
     {
+        if (!r.ok)
+            break;
         auto topic = r.str();
-        immutable nparts = r.i32();
+        immutable nparts = safeCount(r.i32());
         putStr(o, topic);
-        putI32(o, nparts < 0 ? 0 : nparts);
-        foreach (_2; 0 .. (nparts < 0 ? 0 : nparts))
+        putI32(o, nparts);
+        foreach (_2; 0 .. nparts)
         {
+            if (!r.ok)
+                break;
             immutable part = r.i32();
             auto records = r.bytesI32();
             long baseOffset = -1;
             short err = E_NONE;
-            static ByteBuffer kb; // TLS
+            if (!validTopic(topic) || part < 0)
+                err = E_UNKNOWN_TOPIC;
+            static ByteBuffer kb; // TLS (consumed into `raw` before any hop yield)
             partKey(topic, part, kb);
             // collect the whole message set, ONE atomic variadic RPUSH
             static ByteBuffer blobArena; // TLS: all records back-to-back
@@ -494,10 +565,35 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 if (i + 12 + msz > records.length)
                     break;
                 auto msg = records[i + 12 .. i + 12 + msz];
-                if (msz >= 6 && (msg[5] & 0x07) != 0)
+                if (msz < 6)
+                {
+                    err = E_CORRUPT; // too short to hold crc+magic+attrs
+                    break;
+                }
+                if (msg[4] != 1)
+                {
+                    err = E_CORRUPT; // not MessageSet v1 magic (a v2 RecordBatch
+                    break;           // walked as v1 would store garbage)
+                }
+                if ((msg[5] & 0x07) != 0)
                 {
                     err = E_CORRUPT; // compressed sets unsupported in v1
                     break;
+                }
+                // validate the stored CRC (crc32 over magic..value = msg[4..]);
+                // an unchecked bad CRC is a poison pill that aborts every
+                // consumer of the partition on replay
+                {
+                    auto want = (cast(uint) msg[0] << 24) | (cast(uint) msg[1] << 16)
+                        | (cast(uint) msg[2] << 8) | msg[3];
+                    auto dg = crc32Of(msg[4 .. $]); // ubyte[4], little-endian digest
+                    immutable uint got = (cast(uint) dg[3] << 24) | (cast(uint) dg[2] << 16)
+                        | (cast(uint) dg[1] << 8) | dg[0];
+                    if (got != want)
+                    {
+                        err = E_CORRUPT;
+                        break;
+                    }
                 }
                 if (offs.length < (nrec + 1) * 2)
                     offs.length = (nrec + 1) * 2;
@@ -508,7 +604,7 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 nrec++;
                 i += 12 + msz;
             }
-            if (err == E_NONE && nrec > 0)
+            if (err == E_NONE && nrec > 0 && validTopic(topic) && part >= 0)
             {
                 if (slices.length < nrec)
                     slices.length = nrec;
@@ -539,33 +635,42 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     cast(void) r.i32(); // min_bytes
     if (ver >= 3)
         cast(void) r.i32(); // max_bytes (whole request)
-    immutable ntopics = r.i32();
+    immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
-    putI32(o, ntopics < 0 ? 0 : ntopics);
-    foreach (_; 0 .. (ntopics < 0 ? 0 : ntopics))
+    putI32(o, ntopics);
+    foreach (_; 0 .. ntopics)
     {
+        if (!r.ok)
+            break;
         auto topic = r.str();
-        immutable nparts = r.i32();
+        immutable nparts = safeCount(r.i32());
         putStr(o, topic);
-        putI32(o, nparts < 0 ? 0 : nparts);
-        foreach (_2; 0 .. (nparts < 0 ? 0 : nparts))
+        putI32(o, nparts);
+        foreach (_2; 0 .. nparts)
         {
+            if (!r.ok)
+                break;
             immutable part = r.i32();
             immutable fetchOff = r.i64();
             immutable partMax = r.i32();
-            static ByteBuffer kb2; // TLS
+            // STACK-local key: partLen()'s cross-shard hop YIELDS, and a shared
+            // TLS buffer would be overwritten by another fetch fiber's partKey
+            // during the park -> we'd then serve a DIFFERENT partition/topic to
+            // this client (cross-tenant leak). A per-partition local survives.
+            ByteBuffer kb2;
             partKey(topic, part, kb2);
             long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb2.data.asChars) : -1;
             if (hw < 0)
                 hw = partLen(kb2.data.asChars);
+            immutable bad = fetchOff < 0 || fetchOff > hw || !validTopic(topic) || part < 0;
             putI32(o, part);
-            putI16(o, fetchOff > hw ? E_OFFSET_OUT_OF_RANGE : E_NONE);
+            putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
             putI64(o, hw); // high watermark
             // records: rebuild [offset][stored blob] until ~partMax bytes
             immutable recAt = o.length;
             putI32(o, 0); // records byte size, patched below
-            if (fetchOff < hw)
+            if (!bad && fetchOff < hw)
             {
                 // budget: partMax bytes, capped count
                 int maxN = 16384; // deep batches: fewer walks per fetch
@@ -578,10 +683,15 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                 if (direct < 0)
                 {
                     immutable startLen = o.length;
+                    bool first = true;
                     cast(void) rangeRecords(kb2.data.asChars, fetchOff, maxN,
                             (scope const(ubyte)[] blob) nothrow {
-                        if (o.length - startLen > budget)
-                            return; // budget exhausted: stop appending
+                        // check the budget BEFORE appending (was after: a single
+                        // large record always blew past a tiny partMax); always
+                        // emit at least one so a consumer makes progress
+                        if (!first && o.length - startLen + 8 + blob.length > budget)
+                            return;
+                        first = false;
                         putI64(o, off);
                         o.append(blob); // [size i32][message] stored verbatim
                         off++;
@@ -602,21 +712,25 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     cast(void) r.i32(); // replica_id
-    immutable ntopics = r.i32();
-    putI32(o, ntopics < 0 ? 0 : ntopics);
-    foreach (_; 0 .. (ntopics < 0 ? 0 : ntopics))
+    immutable ntopics = safeCount(r.i32());
+    putI32(o, ntopics);
+    foreach (_; 0 .. ntopics)
     {
+        if (!r.ok)
+            break;
         auto topic = r.str();
-        immutable nparts = r.i32();
+        immutable nparts = safeCount(r.i32());
         putStr(o, topic);
-        putI32(o, nparts < 0 ? 0 : nparts);
-        foreach (_2; 0 .. (nparts < 0 ? 0 : nparts))
+        putI32(o, nparts);
+        foreach (_2; 0 .. nparts)
         {
+            if (!r.ok)
+                break;
             immutable part = r.i32();
             immutable ts = r.i64();
             if (ver == 0)
                 cast(void) r.i32(); // max_num_offsets (v0)
-            static ByteBuffer kb3; // TLS
+            ByteBuffer kb3; // stack-local: safe across partLen's hop yield
             partKey(topic, part, kb3);
             long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb3.data.asChars) : -1;
             if (hw < 0)
