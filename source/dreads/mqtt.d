@@ -45,6 +45,15 @@ import dreads.mem : ByteBuffer;
 // fan-out (same trick as pubsub.gSubTotal).
 public shared long gMqttSubTotal;
 
+/// Monotonic per-CONNECT stamp: the newest session with a given clientId wins
+/// the takeover race across shards (convergence, like gMqttRetainSeq).
+public shared ulong gMqttConnGen;
+/// THIS shard's live clientId -> conn map (share-nothing).
+private MqttConn[string] gLocalClients; // TLS
+/// Broadcast a (clientId, connGen) takeover to every OTHER shard (installed by
+/// server.d). Null when unsharded.
+public __gshared void delegate(scope const(char)[] clientId, ulong gen) nothrow gMqttConnBcast;
+
 /// Deadline for a freshly-accepted socket to complete CONNECT. Without it a
 /// client that opens TCP and never speaks pins a serve fiber + writer fiber +
 /// MqttConn forever (unauthenticated pre-handshake slowloris).
@@ -82,6 +91,12 @@ public final class MqttConn
     // Filters this conn subscribed (idup'd): torn down on disconnect so trie
     // entries and gMqttSubTotal don't leak under connect/subscribe churn.
     const(char)[][] filters;
+    // Client identity for [MQTT-3.1.4-2] takeover: a new CONNECT with the same
+    // (non-empty) clientId must disconnect the existing session. connGen is a
+    // global monotonic stamp so the NEWEST connection wins regardless of the
+    // order the cross-shard takeover broadcasts arrive (the retained-seq lesson).
+    string clientId;
+    ulong connGen;
 
     this(TCPConnection c) nothrow
     {
@@ -486,6 +501,43 @@ public __gshared void delegate(scope const(char)[] topic,
         scope const(char)[] payload, bool retain, ulong seq) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 
+/// Close a local session a NEWER CONNECT (gen) superseded. Same-thread, so the
+/// map access is unlocked. Setting closed + waking the socket makes the victim's
+/// serve fiber observe the close on its next read and run its normal teardown.
+private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @trusted
+{
+    try
+    {
+        if (auto pc = clientId in gLocalClients)
+        {
+            auto victim = *pc;
+            if (victim !is null && victim.connGen < gen)
+            {
+                victim.closed = true;
+                try
+                    victim.flushEvt.emit();
+                catch (Exception)
+                {
+                }
+                try
+                    victim.tcp.close(); // wakes its serve fiber -> teardown
+                catch (Exception)
+                {
+                }
+            }
+        }
+    }
+    catch (Exception)
+    {
+    }
+}
+
+/// A CONNECT on another shard took over `clientId` (drain's mqttConnect fan-in).
+public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trusted
+{
+    takeoverLocal(clientId, gen);
+}
+
 /// Deliver `topic`/`payload` to THIS thread's matching subscribers, and update
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
@@ -714,6 +766,18 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     foreach (f; c.filters)
         trieUnsubscribe(f, c);
     c.filters = null;
+    // drop our clientId registration, but only if a NEWER session hasn't
+    // already replaced us in the map (identity check)
+    if (c.clientId.length != 0)
+        try
+        {
+            if (auto pc = c.clientId in gLocalClients)
+                if (*pc is c)
+                    gLocalClients.remove(c.clientId);
+        }
+        catch (Exception)
+        {
+        }
     c.gen++; // invalidate any remaining trie entries (lazily skipped)
     // wake OTHER subscribers whose outboxes this connection's last batch filled
     // (PUBLISH+DISCONNECT coalesced in one read batch is the standard
@@ -915,6 +979,30 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false;
             }
             c.connected = okPair;
+            // [MQTT-3.1.4-2] takeover: a non-empty clientId displaces any
+            // existing session with the same id — locally now, and on the other
+            // shards via a broadcast. connGen (global monotonic) makes the
+            // newest win regardless of broadcast arrival order.
+            if (okPair && clientId.length != 0)
+            {
+                immutable g = atomicOp!"+="(gMqttConnGen, 1);
+                c.connGen = g;
+                try
+                    c.clientId = clientId.idup;
+                catch (Exception)
+                    c.clientId = null;
+                if (c.clientId.length != 0)
+                {
+                    takeoverLocal(c.clientId, g);
+                    try
+                        gLocalClients[c.clientId] = c;
+                    catch (Exception)
+                    {
+                    }
+                    if (gMqttConnBcast !is null)
+                        gMqttConnBcast(c.clientId, g);
+                }
+            }
             // CONNACK: session-present=0
             o.appendByte(cast(char)(PT_CONNACK << 4));
             o.appendByte(cast(char) 2);

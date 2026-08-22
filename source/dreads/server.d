@@ -551,7 +551,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // one listener per shard thread (shard 0 = here; the rest in
         // shardThreadEntry), fibers per connection on the accepting thread
         import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal;
-        import dreads.mqtt : gMqttSubTotal;
+        import dreads.mqtt : gMqttSubTotal, gMqttConnBcast;
 
         cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
             serveMqttClient(conn);
@@ -559,6 +559,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
                 bool retain, ulong seq) nothrow {
             shardMqttFanout(topic, payload, retain, seq);
+        };
+        gMqttConnBcast = (scope const(char)[] clientId, ulong gen) nothrow {
+            shardMqttConnBcast(clientId, gen);
         };
         printf("dreads MQTT skin on port %u\n", cast(uint) gConfig.mqttPort);
     }
@@ -2176,6 +2179,19 @@ private void shardDrainLoop() nothrow
 
             amqpApplyCtl(p);
         }
+        else if (cast(ShardMsg) kind == ShardMsg.mqttConnect)
+        {
+            // MQTT client-id takeover fan-in: close our older session for the id
+            import dreads.mqtt : mqttTakeover;
+
+            if (p.length >= 8)
+            {
+                ulong gen = 0;
+                foreach (k; 0 .. 8)
+                    gen = (gen << 8) | p[k];
+                mqttTakeover(cast(const(char)[]) p[8 .. $], gen);
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.mqttPub)
         {
             // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
@@ -2690,6 +2706,29 @@ private void amqpInstallHooks() nothrow
 // skin — same fabric and gating pattern as shardPubFanout). Wire:
 // [u8 retain][u16 topicLen][topic][payload]. Retained messages fan out even
 // with zero subscribers (every thread's retained map must converge).
+// Broadcast an MQTT client-id takeover to every OTHER shard ([MQTT-3.1.4-2]).
+// Wire: [u64 gen BE][clientId]. Each shard closes its own older session for id.
+private void shardMqttConnBcast(scope const(char)[] clientId, ulong gen) nothrow
+{
+    import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake, ShardMsg, sharded;
+
+    if (!sharded())
+        return;
+    ByteBuffer mb;
+    immutable size_t len = 8 + clientId.length;
+    auto space = mb.freeSpace(len)[0 .. len];
+    foreach (k; 0 .. 8)
+        space[k] = cast(ubyte)(gen >> ((7 - k) * 8));
+    space[8 .. $] = cast(const(ubyte)[]) clientId[];
+    mb.grow(len);
+    foreach (uint s2; 0 .. gShardCount)
+        if (s2 != tShard)
+        {
+            shardEnqueue(s2, mb.data, null, tShard, ShardMsg.mqttConnect);
+            shardWake(s2);
+        }
+}
+
 private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
         bool retain, ulong seq) nothrow
 {
