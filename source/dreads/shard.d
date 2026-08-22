@@ -194,6 +194,10 @@ public enum ShardMsg : uint
     // [u8 retain][u16 topicLen][topic][payload]; the receiving drain delivers
     // to ITS thread's local topic trie (and retained map when retain is set).
     mqttPub = 5,
+    // AMQP skin control-plane replication (exchange declares / queue binds):
+    // fire-and-forget, applied to every thread's local registry (dreads.amqp
+    // amqpApplyCtl). Queue DATA travels the normal keyed data plane instead.
+    amqpCtl = 6,
     // A same-slot MULTI/EXEC shipped as ONE unit (phase 2.5d): the coalesced
     // sections are the queued commands; the owner's drain executes them
     // back-to-back WITHOUT yielding (the transaction is atomic on its shard)

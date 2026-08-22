@@ -562,6 +562,16 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         };
         printf("dreads MQTT skin on port %u\n", cast(uint) gConfig.mqttPort);
     }
+    if (gConfig.amqpPort != 0)
+    {
+        import dreads.amqp : serveAmqpClient;
+
+        amqpInstallHooks();
+        cast(void) listenTCP(gConfig.amqpPort, delegate(TCPConnection conn) @trusted nothrow {
+            serveAmqpClient(conn);
+        }, listenOpts);
+        printf("dreads AMQP skin on port %u\n", cast(uint) gConfig.amqpPort);
+    }
     // sharded: main thread becomes shard 0 (this listener is its router); spawn the
     // other N-1 shard threads, each its own SO_REUSEPORT listener + drain. No-op when
     // shards==1. The listenTCP above already opened shard 0's listener on `port`.
@@ -2134,6 +2144,13 @@ private void shardDrainLoop() nothrow
                 shardWake(cast(uint) meta);
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.amqpCtl)
+        {
+            // AMQP skin control plane: replicate the declare/bind locally
+            import dreads.amqp : amqpApplyCtl;
+
+            amqpApplyCtl(p);
+        }
         else if (cast(ShardMsg) kind == ShardMsg.mqttPub)
         {
             // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
@@ -2346,6 +2363,158 @@ private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) n
             shardEnqueue(s2, pb.data, null, tShard, ShardMsg.pub);
             shardWake(s2);
         }
+}
+
+// --- AMQP skin plumbing -----------------------------------------------------
+// The AMQP skin's queues ARE lists in the keyspace: these helpers execute a
+// synthesized RESP command through the SAME data plane every client write uses
+// — self-shard direct dispatch (with the full write tail: epoch, wakes, AOF)
+// or a synchronous cross-shard hop. Runs on AMQP connection fibers.
+private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) nothrow @trusted
+{
+    import dreads.acl : aclCmdIndex;
+    import dreads.commands : cmdWriteByIdx;
+    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+        shardEnqueue, shardWake, ShardMsg, shardOfSlot;
+    import dreads.slots : keyToSlot;
+
+    static ByteBuffer raw; // TLS: the synthesized RESP bytes
+    raw.clear();
+    repArrayHeader(raw, args.length);
+    foreach (a; args)
+        repBulk(raw, a);
+    static Arena arena; // TLS scratch
+    arena.reset();
+    RVal cmd;
+    size_t pp = 0;
+    if (parseValue(raw.data, pp, arena, cmd) != ParseStatus.ok)
+        return;
+    immutable opcode = aclCmdIndex(args[0]);
+    immutable owner = sharded() ? cast(int) shardOfSlot(keyToSlot(args[1])) : cast(int) tShard;
+    reply.clear();
+    if (!sharded() || cast(uint) owner == tShard)
+    {
+        gRespProto = 2;
+        gWriteNoOp = false;
+        cast(void) dispatch(cmd, *(sharded() ? myKeyspace2(0) : &gDbs[0]), reply, arena, 0, opcode);
+        if (cmdWriteByIdx(opcode) && !gWriteNoOp && reply.length && reply.data[0] != '-')
+        {
+            gWriteEpoch++;
+            wakeKeyActivity();
+            signalReadyKeys(0, *(sharded() ? myKeyspace2(0) : &gDbs[0]));
+            if (myAof().enabled)
+            {
+                import dreads.commands : propagationOverride;
+
+                if (!propagationOverride.empty)
+                    myAof().append(propagationOverride.data);
+                else
+                    myAof().append(raw.data);
+            }
+        }
+        {
+            import dreads.commands : propagationOverride;
+
+            propagationOverride.clear();
+        }
+        if (gNotifyFlags)
+            flushPendingNotify();
+        return;
+    }
+    // cross-shard: synchronous hop (AMQP fibers may block; the drain delivers)
+    auto p = acquireShardPending();
+    static ByteBuffer hb; // TLS
+    hb.clear();
+    appendHopCmd(hb, cmd, raw.data, opcode, 0, cast(void*) p);
+    shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.cmd);
+    shardWake(cast(uint) owner);
+    while (!p.ready)
+    {
+        immutable ec = p.done.emitCount;
+        if (p.ready)
+            break;
+        try
+            p.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    reply.append(p.reply.data);
+    releaseShardPending(p);
+}
+
+// myKeyspace under a different name to dodge the local import shadowing above
+private Keyspace* myKeyspace2(uint db) nothrow @trusted
+{
+    import dreads.shard : myKeyspace;
+
+    return myKeyspace(db);
+}
+
+private void amqpInstallHooks() nothrow
+{
+    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpCtlFanout;
+
+    gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
+        static ByteBuffer rb; // TLS
+        const(char)[][3] a = ["rpush", key, payload];
+        amqpDataExec(a[], rb);
+    };
+    gAmqpPushFront = (scope const(char)[] key, scope const(char)[] payload) nothrow {
+        static ByteBuffer rbf; // TLS
+        const(char)[][3] a = ["lpush", key, payload]; // requeue goes to the FRONT
+        amqpDataExec(a[], rbf);
+    };
+    gAmqpPop = (scope const(char)[] key, ref ByteBuffer outPayload) nothrow {
+        static ByteBuffer rb2; // TLS
+        const(char)[][2] a = ["lpop", key];
+        amqpDataExec(a[], rb2);
+        // parse $N\r\n<payload>\r\n (nil = $-1)
+        auto d = rb2.data;
+        if (d.length < 4 || d[0] != '$' || d[1] == '-')
+            return false;
+        size_t i = 1;
+        size_t n = 0;
+        while (i < d.length && d[i] != '\r')
+        {
+            n = n * 10 + (d[i] - '0');
+            i++;
+        }
+        i += 2;
+        if (i + n > d.length)
+            return false;
+        outPayload.append(d[i .. i + n]);
+        return true;
+    };
+    gAmqpLen = (scope const(char)[] key) nothrow {
+        static ByteBuffer rb3; // TLS
+        const(char)[][2] a = ["llen", key];
+        amqpDataExec(a[], rb3);
+        auto d = rb3.data;
+        if (d.length < 2 || d[0] != ':')
+            return 0L;
+        long v = 0;
+        size_t i = 1;
+        while (i < d.length && d[i] >= '0' && d[i] <= '9')
+        {
+            v = v * 10 + (d[i] - '0');
+            i++;
+        }
+        return v;
+    };
+    gAmqpCtlFanout = (scope const(ubyte)[] ctl) nothrow {
+        import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake,
+            ShardMsg, sharded;
+
+        if (!sharded())
+            return;
+        foreach (uint s2; 0 .. gShardCount)
+            if (s2 != tShard)
+            {
+                shardEnqueue(s2, ctl, null, tShard, ShardMsg.amqpCtl);
+                shardWake(s2);
+            }
+    };
 }
 
 // Fan an MQTT publish out to every OTHER shard's local topic trie (the MQTT
@@ -3836,6 +4005,18 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         try
             cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveMqttClient(conn);
+            }, sopts);
+        catch (Exception)
+        {
+        }
+    }
+    if (gConfig.amqpPort != 0)
+    {
+        import dreads.amqp : serveAmqpClient;
+
+        try
+            cast(void) listenTCP(gConfig.amqpPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveAmqpClient(conn);
             }, sopts);
         catch (Exception)
         {
