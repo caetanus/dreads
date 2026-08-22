@@ -579,6 +579,8 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             break;
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break; // truncated mid-topic: don't emit a phantom (zeroed) topic entry
         putStr(o, topic);
         immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
@@ -590,6 +592,8 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 break;
             immutable part = r.i32();
             auto records = r.bytesI32();
+            if (!r.ok)
+                break; // truncated mid-partition: don't emit/store a phantom entry
             long baseOffset = -1;
             short err = E_NONE;
             if (!validTopic(topic) || part < 0)
@@ -721,6 +725,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             break;
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break; // truncated mid-topic: don't emit a phantom (zeroed) topic entry
         putStr(o, topic);
         immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
@@ -733,6 +739,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable part = r.i32();
             immutable fetchOff = r.i64();
             immutable partMax = r.i32();
+            if (!r.ok)
+                break; // truncated mid-partition: don't emit a phantom entry
             // Build the key in a reused TLS buffer, then COPY it to a stack
             // array: partLen()'s cross-shard hop YIELDS, and using the TLS
             // buffer after the park would read a key another fetch fiber
@@ -817,6 +825,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             break;
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break; // truncated mid-topic: don't emit a phantom (zeroed) topic entry
         putStr(o, topic);
         immutable partsCountOff = o.length; // backpatched to emittedParts below
         putI32(o, nparts);
@@ -830,6 +840,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             immutable ts = r.i64();
             if (ver == 0)
                 cast(void) r.i32(); // max_num_offsets (v0)
+            if (!r.ok)
+                break; // truncated mid-partition: don't emit a phantom entry
             static ByteBuffer kb3build; // TLS scratch (pre-yield only)
             partKey(topic, part, kb3build);
             char[8 + KAFKA_MAX_TOPIC + 16] k3store = void;
