@@ -1475,11 +1475,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         {
                         }
                     immutable redlv = recordRedelivered(pay.data);
+                    auto grk = recordRoutingKey(pay.data);
                     method(o, chan, 60, 71, (ref ByteBuffer b) @nogc nothrow {
                         putU64(b, gtag);
                         b.appendByte(redlv ? 1 : 0); // redelivered
-                        putShortStr(b, "");
-                        putShortStr(b, "");
+                        putShortStr(b, ""); // exchange (not stored in the record)
+                        putShortStr(b, grk); // original routing key
                         putU32(b, cast(uint)(remaining < 0 ? 0 : remaining));
                     });
                     emitContent(o, chan, pay.data);
@@ -1757,6 +1758,20 @@ private bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
 {
     return blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A'
         && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
+}
+
+/// The ORIGINAL routing key a message was published with ([basic.deliver] /
+/// [basic.get-ok] must carry it — topic consumers parse it). Stored in the v3
+/// record; for a default-exchange publish it already equals the queue name, so
+/// this is correct in both cases (a bare RESP-side value yields "").
+private const(char)[] recordRoutingKey(return scope const(ubyte)[] blob) @nogc nothrow
+{
+    long pm;
+    int d;
+    const(char)[] rk;
+    const(ubyte)[] props, body_;
+    splitRecord(blob, pm, d, rk, props, body_);
+    return rk;
 }
 
 /// Copy `blob` into `dst` with the v3 redelivered bit set (for requeue). A
@@ -2233,12 +2248,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         {
                         }
                     immutable redlv = recordRedelivered(pay.data);
+                    auto drk = recordRoutingKey(pay.data);
                     method(ob, chn, 60, 60, (ref ByteBuffer b) @nogc nothrow {
                         putShortStr(b, tt);
                         putU64(b, tg);
                         b.appendByte(redlv ? 1 : 0); // redelivered
-                        putShortStr(b, "");
-                        putShortStr(b, qq);
+                        putShortStr(b, ""); // exchange (not stored in the record)
+                        putShortStr(b, drk); // original routing key, not the queue name
                     });
                     emitContent(ob, chn, pay.data);
                     burst++;
