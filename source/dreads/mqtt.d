@@ -82,6 +82,8 @@ public final class MqttConn
     LocalManualEvent flushEvt;
     bool dirty;
     bool closed; // serve fiber sets on exit; writer fiber then drains + stops
+    ubyte protoVer = 4; // MQTT protocol level: 4 = 3.1.1, 5 = 5.0 (v5 packets
+    // carry a property block; v5 CONNACK/SUBACK use reason codes)
     // Read deadline: a BOUNDED default until CONNECT arrives (a client that
     // opens TCP and never sends CONNECT must be reaped — pre-handshake
     // slowloris), then re-armed to 1.5x the CONNECT keepalive (0 kA = max).
@@ -670,15 +672,18 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     // QoS0 packet built ONCE and shared (the hot path); QoS1 subscribers get a
     // per-conn packet with their own packet-id (a separate, slower branch that
     // does NOT touch the QoS0 fast path).
-    static ByteBuffer pkt; // TLS: the shared QoS0 publish
+    static ByteBuffer pkt; // TLS: the shared QoS0 publish (v3)
+    static ByteBuffer pktV5; // TLS: the shared QoS0 publish (v5, empty props)
     static ByteBuffer q1; // TLS: a per-subscriber QoS1 publish
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
+    bool pktV5built = false; // build the v5 variant lazily (only if a v5 sub matches)
     foreach (ref m; tMatchBuf[0 .. tMatchLen])
     {
         auto s = m.c;
         if (s.closed)
             continue;
+        immutable v5 = s.protoVer == 5;
         // effective delivery QoS = min(publish QoS, this subscription's grant)
         immutable effQos = pubQos < m.qos ? pubQos : m.qos;
         if (effQos >= 1)
@@ -693,9 +698,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 q1.clear();
                 if (effQos == 2)
-                    buildPublishQos2(q1, topic, payload, false, pid);
+                    buildPublishQos2(q1, topic, payload, false, pid, v5);
                 else
-                    buildPublishQos1(q1, topic, payload, false, pid);
+                    buildPublishQos1(q1, topic, payload, false, pid, v5);
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
@@ -725,12 +730,19 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             }
             // fall through: window saturated -> deliver at QoS0
         }
-        if (s.obox.length + pkt.length > MQTT_OBOX_CAP)
+        if (v5 && !pktV5built)
+        {
+            pktV5.clear();
+            buildPublish(pktV5, topic, payload, false, true);
+            pktV5built = true;
+        }
+        immutable plen = v5 ? pktV5.length : pkt.length;
+        if (s.obox.length + plen > MQTT_OBOX_CAP)
         {
             atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
             continue;
         }
-        s.obox.append(pkt.data);
+        s.obox.append(v5 ? pktV5.data : pkt.data);
         if (!s.dirty)
         {
             s.dirty = true;
@@ -851,41 +863,47 @@ private void closeTcp(MqttConn c) nothrow
 }
 
 private void buildPublish(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain) @nogc nothrow
+        scope const(char)[] payload, bool retain, bool v5 = false) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | (retain ? 1 : 0))); // QoS 0 out
-    encodeVarint(o, cast(uint)(2 + topic.length + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length + (v5 ? 1 : 0) + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
+    if (v5)
+        o.appendByte(0); // v5 empty property block
     o.append(payload);
 }
 
 /// QoS1 PUBLISH (DUP=0): fixed header 0x32|retain, then topic, packet-id, payload.
 private void buildPublishQos1(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ushort pid) @nogc nothrow
+        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x02 | (retain ? 1 : 0)));
-    encodeVarint(o, cast(uint)(2 + topic.length + 2 + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2 + (v5 ? 1 : 0) + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
     o.appendByte(cast(char)(pid >> 8));
     o.appendByte(cast(char)(pid & 0xFF));
+    if (v5)
+        o.appendByte(0); // v5 empty property block
     o.append(payload);
 }
 
 /// QoS2 PUBLISH (DUP=0): fixed header 0x34|retain, then topic, packet-id, payload.
 private void buildPublishQos2(ref ByteBuffer o, scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ushort pid) @nogc nothrow
+        scope const(char)[] payload, bool retain, ushort pid, bool v5 = false) @nogc nothrow
 {
     o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x04 | (retain ? 1 : 0)));
-    encodeVarint(o, cast(uint)(2 + topic.length + 2 + payload.length));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2 + (v5 ? 1 : 0) + payload.length));
     o.appendByte(cast(char)(topic.length >> 8));
     o.appendByte(cast(char)(topic.length & 0xFF));
     o.append(topic);
     o.appendByte(cast(char)(pid >> 8));
     o.appendByte(cast(char)(pid & 0xFF));
+    if (v5)
+        o.appendByte(0); // v5 empty property block
     o.append(payload);
 }
 
@@ -1083,6 +1101,43 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     }
 }
 
+// Skip an MQTT 5 property block at p[i]: a varint length then that many bytes.
+// v5 FOUNDATION: properties are parsed-and-ignored for now; individual ones are
+// honored incrementally (topic-alias, message-expiry, user-props, ...). Returns
+// false on a malformed/truncated block.
+private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
+{
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    if (i + plen > p.length)
+        return false;
+    i += plen;
+    return true;
+}
+
+// CONNACK for either protocol version. v5 adds a reason code (0x00 = Success,
+// 0x80+ = failure) and an (empty, for now) property block; v3 uses the legacy
+// return code. `code` is already in the caller's version's encoding.
+private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
+        ubyte code) @nogc nothrow
+{
+    o.appendByte(cast(char)(PT_CONNACK << 4));
+    if (protoVer == 5)
+    {
+        o.appendByte(cast(char) 3); // remaining: ack-flags + reason + prop-len
+        o.appendByte(cast(char)(sessionPresent ? 1 : 0));
+        o.appendByte(cast(char) code);
+        o.appendByte(cast(char) 0); // property length 0
+    }
+    else
+    {
+        o.appendByte(cast(char) 2);
+        o.appendByte(cast(char)(sessionPresent ? 1 : 0));
+        o.appendByte(cast(char) code);
+    }
+}
+
 // Returns false to close the connection. Validation posture: anything the
 // 3.1.1 spec marks "MUST close the Network Connection" closes; malformed
 // SUBSCRIBE filters that are merely unusable get SUBACK failure 0x80.
@@ -1111,8 +1166,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // known name with wrong level: CONNACK rc=1, then close
             if (proto != "MQTT" && proto != "MQIsdp")
                 return false;
-            immutable okPair = (proto == "MQTT" && level == 4)
+            immutable okPair = (proto == "MQTT" && (level == 4 || level == 5))
                 || (proto == "MQIsdp" && level == 3);
+            if (okPair && level == 5)
+                c.protoVer = 5;
             if (i >= p.length)
                 return false;
             immutable flags = p[i++];
@@ -1134,6 +1191,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             immutable ka = cast(ushort)((p[i] << 8) | p[i + 1]);
             i += 2;
             c.readDeadline = ka == 0 ? Duration.max : (ka * 1500).msecs;
+            // v5 CONNECT properties (session-expiry, receive-max, ...) follow the
+            // keepalive; parsed-and-skipped for now.
+            if (c.protoVer == 5 && !mqttSkipProps(p, i))
+                return false;
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
                 return false;
@@ -1143,25 +1204,23 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // the takeover path — a per-CONNECT cross-shard amplification DoS.
             if (clientId.length > 256)
             {
-                o.appendByte(cast(char)(PT_CONNACK << 4));
-                o.appendByte(cast(char) 2);
-                o.appendByte(cast(char) 0);
-                o.appendByte(cast(char) 2); // identifier rejected
+                // v3 rc=2 identifier-rejected; v5 reason 0x85 client-id-not-valid
+                mqttConnack(o, c.protoVer, false, c.protoVer == 5 ? 0x85 : 2);
                 return false;
             }
             // [MQTT-3.1.3-8] empty ClientId REQUIRES CleanSession=1: refuse
-            // rc=0x02 (we run clean-only, but the refusal is still mandated)
+            // (we run clean-only, but the refusal is still mandated)
             if (clientId.length == 0 && !(flags & 0x02))
             {
-                o.appendByte(cast(char)(PT_CONNACK << 4));
-                o.appendByte(cast(char) 2);
-                o.appendByte(cast(char) 0);
-                o.appendByte(cast(char) 2);
+                mqttConnack(o, c.protoVer, false, c.protoVer == 5 ? 0x85 : 2);
                 return false;
             }
             // will topic/message, then username/password per flags
             if (flags & 0x04)
             {
+                // v5: will properties precede the will topic in the payload
+                if (c.protoVer == 5 && !mqttSkipProps(p, i))
+                    return false;
                 const(char)[] wt, wm;
                 if (!rdStr(p, i, wt) || !rdStr(p, i, wm))
                     return false;
@@ -1220,11 +1279,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         gMqttConnBcast(c.clientId, g);
                 }
             }
-            // CONNACK: session-present=0
-            o.appendByte(cast(char)(PT_CONNACK << 4));
-            o.appendByte(cast(char) 2);
-            o.appendByte(cast(char) 0);
-            o.appendByte(cast(char)(okPair ? 0 : 1));
+            // CONNACK: session-present=0 (clean sessions only); reason/rc 0 on
+            // success, else unacceptable-protocol-version
+            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1);
             return okPair;
         }
     case PT_PUBLISH:
@@ -1249,6 +1306,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (pid == 0)
                     return false; // [MQTT-2.3.1-1]
             }
+            // v5: PUBLISH properties (topic-alias, message-expiry, user-props,
+            // ...) sit between the variable header and the payload; skipped now.
+            if (c.protoVer == 5 && !mqttSkipProps(p, i))
+                return false;
             auto payload = cast(const(char)[]) p[i .. $];
             // [MQTT reserved] $-topics belong to the broker: a CLIENT publish to
             // one (e.g. spoofing $SYS/broker/messages) is dropped — not delivered,
@@ -1377,6 +1438,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (pid == 0)
                 return false; // [MQTT-2.3.1-1]
             size_t i = 2;
+            immutable v5 = c.protoVer == 5;
+            // v5 SUBSCRIBE properties (subscription-identifier, user-props) sit
+            // after the packet-id; skipped now.
+            if (v5 && !mqttSkipProps(p, i))
+                return false;
             // NO-YIELD window: these TLS scratch arrays are filled and
             // consumed without any suspension point in between
             static ubyte[64] granted = void;
@@ -1389,7 +1455,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 const(char)[] filter;
                 if (!rdStr(p, i, filter) || i >= p.length)
                     return false;
-                immutable reqQos = p[i++];
+                immutable optByte = p[i++];
+                // v5 subscription options: bits 0-1 QoS, 2 no-local, 3 retain-as-
+                // published, 4-5 retain-handling, 6-7 reserved (MUST be 0). v3:
+                // the whole byte is the requested QoS. (no-local/RAP/retain-
+                // handling honored incrementally.)
+                if (v5 && (optByte & 0xC0))
+                    return false; // [MQTT-3.8.3-4] reserved bits set
+                immutable reqQos = cast(ubyte)(v5 ? (optByte & 0x03) : optByte);
                 if (reqQos > 2)
                     return false; // [MQTT-3.8.3-4]
                 if (!mqttValidFilter(filter) || c.filters.length >= MQTT_MAX_SUBS)
@@ -1422,11 +1495,13 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (ng == 0)
                 return false; // [MQTT-3.8.3-3] at least one filter required
             o.appendByte(cast(char)(PT_SUBACK << 4));
-            encodeVarint(o, cast(uint)(2 + ng));
+            encodeVarint(o, cast(uint)(2 + (v5 ? 1 : 0) + ng));
             o.appendByte(cast(char)(pid >> 8));
             o.appendByte(cast(char)(pid & 0xFF));
+            if (v5)
+                o.appendByte(0); // v5 property length 0 (before the reason codes)
             foreach (g; granted[0 .. ng])
-                o.appendByte(cast(char) g);
+                o.appendByte(cast(char) g); // grant/reason: QoS 0/1/2 or 0x80 failure
             // retained messages matching the new filters, delivered after SUBACK
             try
                 foreach (topic, r; gRetained)
@@ -1438,7 +1513,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     foreach (f; filters[0 .. ng])
                         if (f !is null && mqttFilterMatches(f, topic))
                         {
-                            buildPublish(o, topic, r.payload, true);
+                            buildPublish(o, topic, r.payload, true, v5);
                             break;
                         }
                 }
@@ -1457,13 +1532,16 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (pid == 0)
                 return false;
             size_t i = 2;
-            bool any = false;
+            immutable v5 = c.protoVer == 5;
+            if (v5 && !mqttSkipProps(p, i)) // v5 UNSUBSCRIBE properties (user-props)
+                return false;
+            size_t nf = 0;
             while (i < p.length)
             {
                 const(char)[] filter;
                 if (!rdStr(p, i, filter))
                     return false;
-                any = true;
+                nf++;
                 if (!mqttValidFilter(filter))
                     continue; // ack it, but never trie-walk a malformed filter
                 trieUnsubscribe(filter, c);
@@ -1473,12 +1551,25 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         c.filters[w++] = f;
                 c.filters.length = w;
             }
-            if (!any)
+            if (nf == 0)
                 return false; // [MQTT-3.10.3-2]
             o.appendByte(cast(char)(PT_UNSUBACK << 4));
-            o.appendByte(cast(char) 2);
-            o.appendByte(cast(char)(pid >> 8));
-            o.appendByte(cast(char)(pid & 0xFF));
+            if (v5)
+            {
+                // v5 UNSUBACK: property block + one reason code per filter
+                encodeVarint(o, cast(uint)(2 + 1 + nf));
+                o.appendByte(cast(char)(pid >> 8));
+                o.appendByte(cast(char)(pid & 0xFF));
+                o.appendByte(0); // property length 0
+                foreach (_; 0 .. nf)
+                    o.appendByte(0); // 0x00 = success
+            }
+            else
+            {
+                o.appendByte(cast(char) 2);
+                o.appendByte(cast(char)(pid >> 8));
+                o.appendByte(cast(char)(pid & 0xFF));
+            }
             return true;
         }
     case PT_PINGREQ:
@@ -1488,8 +1579,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         o.appendByte(cast(char) 0);
         return true;
     case PT_DISCONNECT:
-        c.willTopic = null; // [MQTT-3.1.2-8/3.14.4-3] a clean DISCONNECT drops the will
-        c.willPayload = null;
+        // [MQTT-3.14.4-3] a clean DISCONNECT drops the will. v5 adds a reason
+        // code: 0x04 = "disconnect with will message" KEEPS it (teardown fires
+        // it); any other reason (and all of v3) clears it.
+        if (!(c.protoVer == 5 && p.length >= 1 && p[0] == 0x04))
+        {
+            c.willTopic = null;
+            c.willPayload = null;
+        }
         return false;
     default:
         // types 0 and 15 are reserved; CONNACK/SUBACK/UNSUBACK/PINGRESP are
