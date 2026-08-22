@@ -929,12 +929,37 @@ private struct PendingPub
     ByteBuffer props; // property-flags + property-list from the content header
 }
 
+// A transaction (tx.select) buffers publishes and settles on the channel and
+// applies them atomically on tx.commit (or drops them on tx.rollback).
+private struct TxPub
+{
+    string exchange;
+    string rkey;
+    bool mandatory;
+    immutable(ubyte)[] record; // the framed record, ready to route on commit
+}
+
+private struct TxSettle
+{
+    ulong tag;
+    ubyte kind; // 0 = ack, 1 = nack, 2 = reject
+    bool multiple;
+    bool requeue;
+}
+
+/// Cap the buffered work of one open transaction (unbounded would be a RAM DoS:
+/// a client that tx.selects and never commits).
+private enum size_t AMQP_MAX_TX = 100_000;
+
 private struct Channel
 {
     bool open;
     bool confirmMode;
     ulong confirmSeq; // next publish seq (delivery-tag for basic.ack confirms)
     PendingPub pub;
+    bool txMode; // tx.select: buffer pubs/settles until tx.commit
+    TxPub[] txPubs;
+    TxSettle[] txSettles;
 }
 
 private struct Unacked
@@ -1576,6 +1601,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 immutable tag = r.u64();
                 immutable multiple = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                if (auto tch = chan in c.chans)
+                    if (tch.txMode)
+                    {
+                        if (tch.txSettles.length < AMQP_MAX_TX)
+                            try
+                                tch.txSettles ~= TxSettle(tag, 0, multiple, false);
+                            catch (Exception)
+                            {
+                            }
+                        return true; // applied on tx.commit
+                    }
                 try
                 {
                     if (multiple)
@@ -1609,6 +1645,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 immutable tag = r.u64();
                 immutable requeue = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                if (auto tch = chan in c.chans)
+                    if (tch.txMode)
+                    {
+                        if (tch.txSettles.length < AMQP_MAX_TX)
+                            try
+                                tch.txSettles ~= TxSettle(tag, 2, false, requeue);
+                            catch (Exception)
+                            {
+                            }
+                        return true;
+                    }
                 settleNegative(c, tag, requeue);
                 return true;
             }
@@ -1618,6 +1665,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable bits2 = r.ok && r.i < p.length ? p[r.i] : 0;
                 immutable multiple = (bits2 & 1) != 0;
                 immutable requeue = (bits2 & 2) != 0;
+                if (auto tch = chan in c.chans)
+                    if (tch.txMode)
+                    {
+                        if (tch.txSettles.length < AMQP_MAX_TX)
+                            try
+                                tch.txSettles ~= TxSettle(tag, 1, multiple, requeue);
+                            catch (Exception)
+                            {
+                            }
+                        return true;
+                    }
                 try
                 {
                     if (multiple)
@@ -1730,9 +1788,118 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             return true;
         }
         return true;
+    case 90: // tx (transactions)
+        {
+            auto ch = chan in c.chans;
+            if (ch is null)
+                return true;
+            if (mth == 10) // select
+            {
+                ch.txMode = true;
+                method(o, chan, 90, 11); // select-ok
+            }
+            else if (mth == 20) // commit: apply buffered pubs + settles atomically
+            {
+                commitTx(c, chan, *ch, o);
+                method(o, chan, 90, 21); // commit-ok
+            }
+            else if (mth == 30) // rollback: drop the buffers (acks stay un-applied
+            {                    //  -> messages remain unacked / redeliverable)
+                ch.txPubs = null;
+                ch.txSettles = null;
+                method(o, chan, 90, 31); // rollback-ok
+            }
+            return true;
+        }
     default:
         return true;
     }
+}
+
+/// Apply a channel's buffered transaction (tx.commit): route the buffered
+/// publishes then apply the buffered acks/nacks/rejects, then clear the buffers.
+private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
+{
+    foreach (ref tp; ch.txPubs)
+    {
+        long pm;
+        int d;
+        const(char)[] rk;
+        const(ubyte)[] props, body_;
+        splitRecord(tp.record, pm, d, rk, props, body_);
+        auto payload = tp.record.asChars;
+        int routed = 0;
+        routeTo(tp.exchange, tp.rkey, propsHeaders(props), (string q) nothrow {
+            static ByteBuffer kbT; // TLS
+            queueKey(q, kbT);
+            if (gAmqpPush !is null)
+                gAmqpPush(kbT.data.asChars, payload);
+            routed++;
+        });
+        atomicOp!"+="(gAmqpMessages, 1);
+        if (tp.mandatory && routed == 0)
+        {
+            auto exn = tp.exchange;
+            auto rkn = tp.rkey;
+            method(o, chan, 60, 50, (ref ByteBuffer b) @nogc nothrow {
+                putU16(b, 312);
+                putShortStr(b, "NO_ROUTE");
+                putShortStr(b, exn);
+                putShortStr(b, rkn);
+            });
+            emitContent(o, chan, tp.record);
+            atomicOp!"+="(gAmqpReturned, 1);
+        }
+    }
+    foreach (ref ts; ch.txSettles)
+    {
+        if (ts.kind == 0) // ack
+        {
+            try
+            {
+                if (ts.multiple)
+                {
+                    ulong[] drop;
+                    foreach (t, ref u; c.unacked)
+                        if ((ts.tag == 0 || t <= ts.tag) && u.chan == chan)
+                            drop ~= t;
+                    foreach (t; drop)
+                        c.unacked.remove(t);
+                }
+                else
+                    c.unacked.remove(ts.tag);
+            }
+            catch (Exception)
+            {
+            }
+        }
+        else // nack (1) / reject (2)
+        {
+            if (ts.multiple)
+            {
+                ulong[] all;
+                try
+                    foreach (t, ref u; c.unacked)
+                        if ((ts.tag == 0 || t <= ts.tag) && u.chan == chan)
+                            all ~= t;
+                catch (Exception)
+                {
+                }
+                import std.algorithm.sorting : sort;
+
+                if (ts.requeue)
+                    sort!"a > b"(all);
+                else
+                    sort!"a < b"(all);
+                foreach (t; all)
+                    settleNegative(c, t, ts.requeue);
+            }
+            else
+                settleNegative(c, ts.tag, ts.requeue);
+        }
+    }
+    ch.txPubs = null;
+    ch.txSettles = null;
 }
 
 private auto asChars(const(ubyte)[] b) @nogc nothrow
@@ -1886,6 +2053,18 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             recBusy = false;
     rec.clear();
     buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
+    if (ch.txMode)
+    {
+        // transaction: buffer the framed publish; it routes on tx.commit and is
+        // discarded on tx.rollback. exchange/rkey are already idup'd strings.
+        if (ch.txPubs.length < AMQP_MAX_TX)
+            try
+                ch.txPubs ~= TxPub(ch.pub.exchange, ch.pub.rkey, mandatory, rec.data.idup);
+            catch (Exception)
+            {
+            }
+        return;
+    }
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(ch.pub.props.data);
     atomicOp!"+="(gAmqpMessages, 1);
