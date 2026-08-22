@@ -611,6 +611,35 @@ public void mqttPublishSys() nothrow @trusted
     mqttFlushDirty();
 }
 
+/// Maintenance sweep (per-shard tick): drop every retained message past its v5
+/// message-expiry deadline, so expired-but-unscanned entries can't pin the
+/// retained byte/topic caps between SUBSCRIBEs (the SUBSCRIBE-time eviction is
+/// opportunistic and capped; this is the hard bound). gRetained is TLS, so each
+/// shard reaps its own replica. Allocates only when something is actually
+/// expired (the `expired` list stays null on the common no-op path).
+public void mqttExpireRetained() @trusted nothrow
+{
+    if (gRetained.length == 0)
+        return;
+    immutable now = MonoTime.currTime;
+    const(char)[][] expired; // local: no static buffer to pin idup'd keys
+    try
+    {
+        foreach (topic, ref r; gRetained)
+            if (r.hasExpiry && now >= r.deadline)
+                expired ~= topic; // collect; never mutate the AA mid-foreach
+        foreach (t; expired)
+            if (auto rr = t in gRetained)
+            {
+                tRetainedBytes -= rr.payload.length + rr.props.length;
+                gRetained.remove(cast(string) t);
+            }
+    }
+    catch (Exception)
+    {
+    }
+}
+
 /// Close a local session a NEWER CONNECT (gen) superseded. Same-thread, so the
 /// map access is unlocked. Setting closed + waking the socket makes the victim's
 /// serve fiber observe the close on its next read and run its normal teardown.
