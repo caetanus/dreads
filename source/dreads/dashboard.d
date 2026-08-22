@@ -122,7 +122,11 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gAmqpReturned),
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaProduced),
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaFetched));
-    if (n < 0)
+    // snprintf returns the WOULD-HAVE-written length: on truncation n >= dst.length,
+    // so `p = n` would point past the buffer and the next snprintf's `dst.length - p`
+    // underflows to a huge size_t at an OOB pointer. Provably unreachable with today's
+    // fixed ~690B field set, but guard it so growing the block can't open an OOB write.
+    if (n < 0 || cast(size_t) n >= dst.length)
         return 0;
     size_t p = n;
     foreach (i; 0 .. NUM_DBS)
@@ -133,7 +137,7 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
         p += m;
     }
     int e = snprintf(dst.ptr + p, dst.length - p, "]}");
-    if (e > 0)
+    if (e > 0 && p + cast(size_t) e < dst.length)
         p += e;
     return p;
 }
