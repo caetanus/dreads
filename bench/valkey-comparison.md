@@ -300,7 +300,7 @@ single shard, pinned to core 0 (ONE core). 16B payloads.
 | metric | dreads Kafka skin (1 core) | Apache Kafka 3.7 (2 cores) | |
 |---|---:|---:|---:|
 | acked produce rate (acks=1)   | **4.44M msg/s** | 645K | **6.9×** |
-| fetch (consume from offset 0) | **1.94M msg/s** | 2.56M | 0.76× |
+| fetch (consume from offset 0) | **23.4M msg/s** | 2.56M | **9.1×** |
 
 A produce request's whole message set lands as ONE atomic variadic RPUSH on
 the owner shard — the batch's base offset is `new length - count`, so offset
@@ -308,9 +308,21 @@ assignment is atomic with the append and every skin (RESP, MQTT, AMQP,
 Kafka) shares the exact same write tail, AOF included: a partition IS a
 list (`LRANGE kafka.t.<topic>.<p>` shows the records from the RESP side),
 and produced messages survive kill -9 with zero Kafka-specific persistence
-code. Fetch is the one place the incumbent still wins: Kafka serves
-contiguous log segments (sendfile), while the skin re-walks a list per
-fetch — the planned segment/IR-log-backed partition closes that gap.
+code. Fetch initially LOST to the incumbent (1.94M vs 2.56M: Kafka serves
+contiguous log segments via sendfile, while a naive skin re-walked the list
+per fetch — O(offset) seek per request, quadratic over a partition drain).
+Two structural fixes closed it and then some: (1) a direct owner-shard read
+path (walk the packed list segment and append `[offset][stored record]`
+straight into the response buffer — no synthesized-RESP LRANGE round trip,
+no reply parse, no per-record re-copy; offsets are implicit list indices,
+stamped on the fly), and (2) a resume cursor (`ListSeekHint`): a sequential
+consumer's next fetch starts walking at the byte position where the last
+one stopped, epoch-validated against the segment's buffer address and the
+list's lifetime push/pop counters, so ANY mutation that could shift bytes
+or indices degrades the cursor to a plain head walk — never to wrong
+bytes (verified: LPOP from the RESP side mid-consumption, then reseek).
+12M-record drain: 512ms. One core, ~4 of 5 runs land 22.4-23.4M; the
+occasional ~4.6M run is the known loopback-softirq placement lottery.
 
 Bench-trap note (recorded so nobody repeats it): the Apache container binds
 `127.0.0.1:9092` (specific address) while dreads binds `*:9092` — BOTH

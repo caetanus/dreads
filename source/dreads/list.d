@@ -202,6 +202,43 @@ public struct DList
     {
         return seg.opApply(dg);
     }
+
+    /// walkRange with a caller-held resume cursor: a sequential reader (Kafka
+    /// fetch) pays O(cnt) per call instead of O(start+cnt). The hint is valid
+    /// only if nothing moved bytes or shifted indices since it was taken:
+    /// pushBack keeps both (grow changes bufPtr or head, which walkCursor
+    /// detects); any front/rebuild mutation changes bufPtr or the lifetime
+    /// counters. A stale hint degrades to a plain head walk, never to wrong
+    /// bytes.
+    int walkRangeHinted(ref ListSeekHint h, long start, size_t cnt,
+            scope int delegate(const(char)[] v) @nogc nothrow dg) const @nogc nothrow @trusted
+    {
+        immutable n = cast(long) seg.length;
+        long s = start < 0 ? start + n : start;
+        if (s < 0 || s >= n)
+            return 0;
+        if (h.buf !is seg.bufPtr || h.enq != enq_ || h.deq != deq_)
+        {
+            h.off = 0;
+            h.idx = size_t.max; // force the head fallback inside walkCursor
+        }
+        immutable r = seg.walkCursor(h.off, h.idx, cast(size_t) s, cnt, dg);
+        h.buf = seg.bufPtr;
+        h.enq = enq_;
+        h.deq = deq_;
+        return r;
+    }
+}
+
+/// Resume cursor for DList.walkRangeHinted. Plain data; zero-init = no hint
+/// (the first call does the head walk and primes it).
+public struct ListSeekHint
+{
+    const(void)* buf;
+    uint off;
+    size_t idx;
+    ulong enq;
+    ulong deq;
 }
 
 unittest // push/pop both ends

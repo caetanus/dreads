@@ -225,6 +225,47 @@ struct Segment
         return 0;
     }
 
+    /// The backing block's address — an epoch token for cursor-resumable walks
+    /// (any grow/slide/rebuild changes it or `head`). Never dereference.
+    @property const(void)* bufPtr() const @nogc nothrow @trusted
+    {
+        return cast(const(void)*) buf;
+    }
+
+    /// Cursor-resumable walkRange (the Kafka-fetch seek killer): (off, idx) is
+    /// an in/out byte-cursor hint — `off` MUST be the byte offset of entry
+    /// `idx`, as returned by a previous call whose epoch the CALLER validated
+    /// (DList.walkRangeHinted does). An unusable hint (idx > start, or off
+    /// outside [head, tail)) falls back to a head seek. On return the hint
+    /// points one past the last entry REACHED, so a sequential reader pays
+    /// O(cnt) per call instead of O(start + cnt). Early stop by dg (nonzero)
+    /// leaves the hint AT the undelivered entry — the natural resume point.
+    int walkCursor(ref uint off, ref size_t idx, size_t start, size_t cnt2,
+            scope int delegate(const(char)[] v) @nogc nothrow dg) const @nogc nothrow @trusted
+    {
+        if (idx > start || off < head || off >= tail)
+        {
+            off = head;
+            idx = 0;
+        }
+        while (idx < start && off < tail)
+        {
+            off += OVH + rd32(buf + off);
+            idx++;
+        }
+        immutable end = start + cnt2 <= this.cnt ? start + cnt2 : this.cnt;
+        while (idx < end)
+        {
+            immutable len = rd32(buf + off);
+            auto r = dg(cast(const(char)[]) buf[off + HDR .. off + HDR + len]);
+            if (r)
+                return r;
+            off += OVH + len;
+            idx++;
+        }
+        return 0;
+    }
+
     /// Random access (LINDEX/LSET) — O(i) forward walk. Bounded per segment.
     const(char)[] opIndex(size_t i) const @nogc nothrow @trusted
     {
