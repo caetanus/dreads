@@ -198,6 +198,11 @@ public enum ShardMsg : uint
     // fire-and-forget, applied to every thread's local registry (dreads.amqp
     // amqpApplyCtl). Queue DATA travels the normal keyed data plane instead.
     amqpCtl = 6,
+
+    /// MQTT client-id takeover ([MQTT-3.1.4-2]): a CONNECT with a non-empty
+    /// clientId broadcasts (clientId, connGen) so every other shard closes its
+    /// older session for that id. Payload: [u64 gen][clientId].
+    mqttConnect = 7,
     // A same-slot MULTI/EXEC shipped as ONE unit (phase 2.5d): the coalesced
     // sections are the queued commands; the owner's drain executes them
     // back-to-back WITHOUT yielding (the transaction is atomic on its shard)
