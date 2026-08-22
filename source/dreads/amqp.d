@@ -61,6 +61,7 @@ public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (futur
 public shared ulong gAmqpMessages; // total basic.publish records routed (dashboard)
 public shared ulong gAmqpReturned; // mandatory publishes returned (no route)
 public shared ulong gAmqpBindingDrops; // duplicate/over-cap bindings refused
+private shared ulong gAmqpQueueGen; // counter for server-generated queue names
 
 /// Advertised frame-max (connection.tune). A frame larger than this is a
 /// framing error: refuse instead of buffering an attacker-chosen u32 of bytes.
@@ -1310,6 +1311,27 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto q = r.shortStr();
                 cast(void) r.u8(); // passive/durable/exclusive/auto-delete/no-wait bits
                 auto argsTbl = r.tableRaw();
+                // [queue.declare] an EMPTY name means the server assigns a unique
+                // one and returns it (the RPC reply-queue / temporary-queue
+                // pattern). STACK-local (not TLS) so the name survives the
+                // ctlBroadcast yield below. The queue itself needs no explicit
+                // creation — it's a keyspace list, usable as soon as it's named.
+                char[256] qbuf = void;
+                const(char)[] qq;
+                if (q.length == 0)
+                {
+                    import core.stdc.stdio : snprintf;
+
+                    immutable n = snprintf(qbuf.ptr, qbuf.length, "amq.gen-%llu",
+                            cast(ulong) atomicOp!"+="(gAmqpQueueGen, 1));
+                    qq = cast(const(char)[]) qbuf[0 .. n];
+                }
+                else
+                {
+                    immutable qn = q.length <= qbuf.length ? q.length : qbuf.length;
+                    qbuf[0 .. qn] = q[0 .. qn];
+                    qq = cast(const(char)[]) qbuf[0 .. qn];
+                }
                 if (argsTbl !is null && argsTbl.length)
                 {
                     auto dlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
@@ -1320,18 +1342,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         ubyte[8] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
-                        ctlBroadcast(3, q, dlx is null ? "" : dlx,
+                        ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
                 }
                 static ByteBuffer kb; // TLS
-                queueKey(q, kb);
+                queueKey(qq, kb);
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
-                // copy q before building the reply (r points into inb)
-                static char[256] qcopy = void;
-                auto qn = q.length <= qcopy.length ? q.length : qcopy.length;
-                qcopy[0 .. qn] = q[0 .. qn];
-                auto qq = cast(const(char)[]) qcopy[0 .. qn];
                 method(o, chan, 50, 11, (ref ByteBuffer b) @nogc nothrow {
                     putShortStr(b, qq);
                     putU32(b, cast(uint)(cnt < 0 ? 0 : cnt));
