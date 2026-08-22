@@ -1273,13 +1273,28 @@ public void serveMqttClient(TCPConnection tcp) nothrow
                 break; // incomplete header
             }
             if (rem > MQTT_MAX_PACKET)
-                return; // oversized frame: refuse to buffer it
+            {
+                // oversized frame: refuse to buffer it. Tell a connected v5
+                // client why (Packet Too Large) before dropping the socket.
+                if (c.connected && c.protoVer == 5)
+                    mqttServerDisconnect(outb, 0x95);
+                if (!outb.empty)
+                    sendTo(c, outb.data);
+                return;
+            }
             if (hp + rem > d.length)
                 break; // incomplete body
             immutable ubyte h = d[pos];
             auto body_ = d[hp .. hp + rem];
             if (!handlePacket(c, h, body_, outb))
             {
+                // v5: on a protocol-error close of an ESTABLISHED session, send a
+                // server DISCONNECT with a reason so the client isn't left to
+                // infer a bare TCP reset. A clean client DISCONNECT (which also
+                // returns false) needs none; a failed/absent CONNECT is answered
+                // by CONNACK (c.connected is still false there), not DISCONNECT.
+                if (c.connected && c.protoVer == 5 && (h >> 4) != PT_DISCONNECT)
+                    mqttServerDisconnect(outb, 0x82); // Protocol Error
                 if (!outb.empty) // flush any acks built before the close
                     sendTo(c, outb.data);
                 return; // protocol error or DISCONNECT
@@ -1588,6 +1603,19 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
         o.appendByte(cast(char)(sessionPresent ? 1 : 0));
         o.appendByte(cast(char) code);
     }
+}
+
+// A v5 server-initiated DISCONNECT (type 14): tell the client WHY we are closing
+// before we drop the socket, instead of a bare TCP reset. Fixed header 0xE0,
+// remaining length 2 = [reason-code][property-length 0]. v3.1.1 has no server
+// DISCONNECT, so callers must gate this on protoVer == 5. Common reasons:
+// 0x82 Protocol Error, 0x81 Malformed Packet, 0x95 Packet Too Large.
+private void mqttServerDisconnect(ref ByteBuffer o, ubyte reason) @nogc nothrow
+{
+    o.appendByte(cast(char)(PT_DISCONNECT << 4));
+    o.appendByte(cast(char) 2); // remaining length
+    o.appendByte(cast(char) reason);
+    o.appendByte(cast(char) 0); // property length 0
 }
 
 // Parse a v5 shared-subscription filter "$share/<group>/<filter>". Returns true
