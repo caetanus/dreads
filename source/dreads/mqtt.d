@@ -507,7 +507,7 @@ public __gshared void delegate(scope const(char)[] topic,
         scope const(char)[] payload, bool retain, ulong seq) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
-private __gshared ulong gMqttStartMs;
+private shared ulong gMqttStartMs;
 
 /// Publish the $SYS/broker/* broker-monitoring topics to THIS shard's local
 /// subscribers (a de-facto MQTT standard; mosquitto-compatible). Called ~every
@@ -517,15 +517,15 @@ private __gshared ulong gMqttStartMs;
 /// `$SYS/#` match while keeping `#`/`+` from matching $-topics.
 public void mqttPublishSys() nothrow @trusted
 {
-    import core.atomic : atomicLoad, MemoryOrder;
+    import core.atomic : atomicLoad, atomicStore, MemoryOrder;
     import dreads.stream : nowMs;
     import core.stdc.stdio : snprintf;
 
     if (atomicLoad!(MemoryOrder.raw)(gMqttSubTotal) == 0)
         return; // nobody subscribed to anything -> skip (idle-skin cost = 0)
     immutable now = nowMs();
-    if (gMqttStartMs == 0)
-        gMqttStartMs = now;
+    if (atomicLoad!(MemoryOrder.raw)(gMqttStartMs) == 0)
+        atomicStore!(MemoryOrder.raw)(gMqttStartMs, now);
     static char[32] nb = void;
     void pub(scope const(char)[] topic, scope const(char)[] payload) nothrow
     {
@@ -539,7 +539,7 @@ public void mqttPublishSys() nothrow @trusted
 
     const(char)[] v;
     pub("$SYS/broker/version", "dreads MQTT 3.1.1");
-    num(nb, (now - gMqttStartMs) / 1000, v);
+    num(nb, (now - atomicLoad!(MemoryOrder.raw)(gMqttStartMs)) / 1000, v);
     pub("$SYS/broker/uptime", v);
     num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttMessages), v);
     pub("$SYS/broker/messages/received", v);
@@ -834,7 +834,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     // left willTopic set (a clean DISCONNECT cleared it) -> publish it now, the
     // same path a live PUBLISH takes (local delivery + cross-shard fan-out +
     // retained if the will-retain flag was set).
-    if (c.willTopic.length != 0)
+    if (c.connected && c.willTopic.length != 0)
     {
         immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
         mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
@@ -1040,6 +1040,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false;
                 if (!mqttValidTopicName(wt))
                     return false;
+                if (wt.length != 0 && wt[0] == '$')
+                    return false; // [MQTT reserved] a client will can't target $SYS/*
                 // stored for publish on abnormal disconnect; will-QoS (bits
                 // 3-4) is delivered at QoS 0 like every other delivery, will
                 // -retain (bit 5) is honored
@@ -1121,6 +1123,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false; // [MQTT-2.3.1-1]
             }
             auto payload = cast(const(char)[]) p[i .. $];
+            // [MQTT reserved] $-topics belong to the broker: a CLIENT publish to
+            // one (e.g. spoofing $SYS/broker/messages) is dropped — not delivered,
+            // fanned, or retained — but still acked so the client isn't confused.
+            immutable clientReserved = topic.length != 0 && topic[0] == '$';
             if (qos == 2)
             {
                 // dedup: a retransmit of an in-flight qos2 id is acked again
@@ -1136,11 +1142,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 {
                     if (c.q2pids.length >= 1024)
                         return false; // receive-window abuse
-                    atomicOp!"+="(gMqttMessages, 1);
-                    immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                    mqttDeliverLocal(topic, payload, retain, rseq);
-                    if (gMqttFanout !is null)
-                        gMqttFanout(topic, payload, retain, rseq);
+                    if (!clientReserved)
+                    {
+                        atomicOp!"+="(gMqttMessages, 1);
+                        immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+                        mqttDeliverLocal(topic, payload, retain, rseq);
+                        if (gMqttFanout !is null)
+                            gMqttFanout(topic, payload, retain, rseq);
+                    }
                     try
                         c.q2pids ~= pid;
                     catch (Exception)
@@ -1152,11 +1161,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 o.appendByte(cast(char)(pid & 0xFF));
                 return true;
             }
-            atomicOp!"+="(gMqttMessages, 1);
-            immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-            mqttDeliverLocal(topic, payload, retain, rseq);
-            if (gMqttFanout !is null)
-                gMqttFanout(topic, payload, retain, rseq);
+            if (!clientReserved)
+            {
+                atomicOp!"+="(gMqttMessages, 1);
+                immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+                mqttDeliverLocal(topic, payload, retain, rseq);
+                if (gMqttFanout !is null)
+                    gMqttFanout(topic, payload, retain, rseq);
+            }
             if (qos == 1)
             {
                 o.appendByte(cast(char)(PT_PUBACK << 4));
