@@ -10,6 +10,7 @@ public struct Config
 {
     ushort port = 6379;
     bool appendonly = false;
+    ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     string appendfilename = "dreads.aof";
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
@@ -176,6 +177,12 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "port":
         try
             cfg.port = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "mqtt-port":
+        try
+            cfg.mqttPort = value.to!ushort;
         catch (Exception)
             return false;
         return true;

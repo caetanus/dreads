@@ -545,6 +545,23 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         serveClient(conn);
     }, listenOpts);
     printf("dreads listening on port %u\n", cast(uint) port);
+    if (gConfig.mqttPort != 0)
+    {
+        // the MQTT skin (dreads.mqtt): same SO_REUSEPORT share-nothing model,
+        // one listener per shard thread (shard 0 = here; the rest in
+        // shardThreadEntry), fibers per connection on the accepting thread
+        import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal;
+        import dreads.mqtt : gMqttSubTotal;
+
+        cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
+            serveMqttClient(conn);
+        }, listenOpts);
+        gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
+                bool retain) nothrow {
+            shardMqttFanout(topic, payload, retain);
+        };
+        printf("dreads MQTT skin on port %u\n", cast(uint) gConfig.mqttPort);
+    }
     // sharded: main thread becomes shard 0 (this listener is its router); spawn the
     // other N-1 shard threads, each its own SO_REUSEPORT listener + drain. No-op when
     // shards==1. The listenTCP above already opened shard 0's listener on `port`.
@@ -2117,6 +2134,19 @@ private void shardDrainLoop() nothrow
                 shardWake(cast(uint) meta);
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.mqttPub)
+        {
+            // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
+            import dreads.mqtt : mqttDeliverLocal;
+
+            if (p.length >= 3)
+            {
+                immutable size_t tl = (cast(size_t) p[1] << 8) | p[2];
+                if (3 + tl <= p.length)
+                    mqttDeliverLocal(cast(const(char)[]) p[3 .. 3 + tl],
+                            cast(const(char)[]) p[3 + tl .. $], p[0] != 0);
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.pub)
         {
             // cross-shard keyspace notification / script publish (phase 2.5c):
@@ -2308,6 +2338,40 @@ private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) n
         if (s2 != tShard)
         {
             shardEnqueue(s2, pb.data, null, tShard, ShardMsg.pub);
+            shardWake(s2);
+        }
+}
+
+// Fan an MQTT publish out to every OTHER shard's local topic trie (the MQTT
+// skin — same fabric and gating pattern as shardPubFanout). Wire:
+// [u8 retain][u16 topicLen][topic][payload]. Retained messages fan out even
+// with zero subscribers (every thread's retained map must converge).
+private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
+        bool retain) nothrow
+{
+    import core.atomic : atomicLoad, MemoryOrder;
+
+    import dreads.mqtt : gMqttSubTotal;
+    import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake, ShardMsg, sharded;
+
+    if (!sharded())
+        return;
+    if (!retain && atomicLoad!(MemoryOrder.raw)(gMqttSubTotal) == 0)
+        return;
+    static ByteBuffer mb; // TLS staging
+    mb.clear();
+    immutable size_t len = 3 + topic.length + msg.length;
+    auto space = mb.freeSpace(len)[0 .. len];
+    space[0] = retain ? 1 : 0;
+    space[1] = cast(ubyte)(topic.length >> 8);
+    space[2] = cast(ubyte)(topic.length & 0xFF);
+    space[3 .. 3 + topic.length] = cast(const(ubyte)[]) topic[];
+    space[3 + topic.length .. $] = cast(const(ubyte)[]) msg[];
+    mb.grow(len);
+    foreach (uint s2; 0 .. gShardCount)
+        if (s2 != tShard)
+        {
+            shardEnqueue(s2, mb.data, null, tShard, ShardMsg.mqttPub);
             shardWake(s2);
         }
 }
@@ -3758,6 +3822,18 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         }, sopts);
     catch (Exception)
     {
+    }
+    if (gConfig.mqttPort != 0)
+    {
+        import dreads.mqtt : serveMqttClient;
+
+        try
+            cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveMqttClient(conn);
+            }, sopts);
+        catch (Exception)
+        {
+        }
     }
     // per-shard maintenance (phase 2.5c): each shard reaps its OWN expired keys
     // and evicts from its OWN partition, on its own event loop
