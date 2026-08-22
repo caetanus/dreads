@@ -241,7 +241,19 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 atomicOp!"+="(gAmqpCtlDrops, 1);
                 return;
             }
-            gQueueMeta[ex] = QueueMeta(a, b, ttl);
+            // merge, don't clobber: a redeclare that sets only ttl must not
+            // erase a previously-configured DLX (and vice-versa)
+            QueueMeta qm = QueueMeta(a, b, ttl);
+            if (auto ex0 = (cast(string) ex) in gQueueMeta)
+            {
+                if (a.length == 0)
+                    qm.dlx = ex0.dlx;
+                if (b.length == 0)
+                    qm.dlrk = ex0.dlrk;
+                if (ttl == 0)
+                    qm.ttlMs = ex0.ttlMs;
+            }
+            gQueueMeta[ex] = qm;
         }
         else if (op == 4) // queue.unbind: ex=exchange, a=queue, b=routing-key
         {
@@ -650,18 +662,29 @@ package long tableGetInt(scope const(ubyte)[] t, scope const(char)[] key) @nogc 
             return true;
         switch (ty)
         {
-        case 'b', 'B':
+        case 'b': // signed octet
             if (v.length >= 1) found = cast(byte) v[0];
             break;
-        case 'U', 'u':
+        case 'B': // unsigned octet
+            if (v.length >= 1) found = cast(long) v[0];
+            break;
+        case 'U': // signed short
             if (v.length >= 2) found = cast(short)((v[0] << 8) | v[1]);
             break;
-        case 'I', 'i':
+        case 'u': // unsigned short
+            if (v.length >= 2) found = (cast(long) v[0] << 8) | v[1];
+            break;
+        case 'I': // signed int
             if (v.length >= 4)
                 found = cast(int)((cast(uint) v[0] << 24) | (cast(uint) v[1] << 16)
                     | (cast(uint) v[2] << 8) | v[3]);
             break;
-        case 'l', 'L':
+        case 'i': // unsigned int
+            if (v.length >= 4)
+                found = (cast(long) v[0] << 24) | (cast(long) v[1] << 16)
+                    | (cast(long) v[2] << 8) | v[3];
+            break;
+        case 'l', 'L': // long (signed)
             if (v.length >= 8)
                 foreach (n; 0 .. 8)
                     found = (found << 8) | v[n];
@@ -1234,17 +1257,23 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getTtl = queueTtl(q);
                 bool getHit = false;
                 if (!getFull && gAmqpPop !is null)
-                    while (gAmqpPop(kb2.data.asChars, pay))
+                {
+                    int drained = 0;
+                    // bound the expired-head drain so a queue full of expired
+                    // messages can't stall the serve fiber in one get
+                    while (drained < 4096 && gAmqpPop(kb2.data.asChars, pay))
                     {
                         if (isExpired(pay.data, getTtl))
                         {
                             deadLetter(q, pay.data);
                             pay.clear();
+                            drained++;
                             continue;
                         }
                         getHit = true;
                         break;
                     }
+                }
                 if (getHit)
                 {
                     immutable remaining = gAmqpLen !is null ? gAmqpLen(kb2.data.asChars) : 0;
@@ -1428,11 +1457,12 @@ private auto asChars(const(ubyte)[] b) @nogc nothrow
 // (RabbitMQ's default), which neither a consumer nor basic.get can otherwise
 // recover from the stored bytes. splitRecord still reads legacy v1
 // ("\x01AMQ", no rk) and bare (magic-less) records.
-private void buildRecord(ref ByteBuffer o, long publishMs, scope const(char)[] rkey,
-        scope const(ubyte)[] props, scope const(ubyte)[] body_) @nogc nothrow
+private void buildRecord(ref ByteBuffer o, long publishMs, int deaths,
+        scope const(char)[] rkey, scope const(ubyte)[] props, scope const(ubyte)[] body_) @nogc nothrow
 {
     o.append("\x03AMQ");
     putU64(o, cast(ulong) publishMs); // wall-clock ms at publish (0 = unknown)
+    o.appendByte(cast(char)(deaths > 255 ? 255 : (deaths < 0 ? 0 : deaths))); // x-death hop count
     immutable rl = rkey.length > 0xFFFF ? 0xFFFF : rkey.length;
     o.appendByte(cast(char)(rl >> 8));
     o.appendByte(cast(char)(rl & 0xFF));
@@ -1443,20 +1473,22 @@ private void buildRecord(ref ByteBuffer o, long publishMs, scope const(char)[] r
 }
 
 package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
-        out const(char)[] rkey, out const(ubyte)[] props, out const(ubyte)[] body_) @nogc nothrow
+        out int deaths, out const(char)[] rkey, out const(ubyte)[] props,
+        out const(ubyte)[] body_) @nogc nothrow
 {
-    if (blob.length >= 14 && blob[0] == 0x03 && blob[1] == 'A' && blob[2] == 'M'
+    if (blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A' && blob[2] == 'M'
             && blob[3] == 'Q')
     {
         long pm = 0;
         foreach (k; 0 .. 8)
             pm = (pm << 8) | blob[4 + k];
         publishMs = pm;
-        immutable rl = (cast(size_t) blob[12] << 8) | blob[13];
-        if (14 + rl + 4 <= blob.length)
+        deaths = blob[12];
+        immutable rl = (cast(size_t) blob[13] << 8) | blob[14];
+        if (15 + rl + 4 <= blob.length)
         {
-            rkey = cast(const(char)[]) blob[14 .. 14 + rl];
-            immutable po = 14 + rl;
+            rkey = cast(const(char)[]) blob[15 .. 15 + rl];
+            immutable po = 15 + rl;
             immutable pl = (cast(size_t) blob[po] << 24) | (cast(size_t) blob[po + 1] << 16)
                 | (cast(size_t) blob[po + 2] << 8) | blob[po + 3];
             if (po + 4 + pl <= blob.length)
@@ -1523,7 +1555,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         if (rec is &recStatic)
             recBusy = false;
     rec.clear();
-    buildRecord(*rec, cast(long) nowMs(), ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
+    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(ch.pub.props.data);
     int routed = 0;
@@ -1564,9 +1596,10 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
 private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blob) nothrow
 {
     long pm0;
+    int dths0;
     const(char)[] rkey0;
     const(ubyte)[] props, body_;
-    splitRecord(blob, pm0, rkey0, props, body_);
+    splitRecord(blob, pm0, dths0, rkey0, props, body_);
     // content HEADER frame — the publisher's property block replays VERBATIM
     // (content-type, headers, correlation-id ... survive the queue)
     size_t at;
@@ -1674,10 +1707,16 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
     if (ttlMs <= 0)
         return false;
     long pm;
+    int dths;
     const(char)[] rk;
     const(ubyte)[] props, body_;
-    splitRecord(blob, pm, rk, props, body_);
-    return pm > 0 && cast(long) nowMs() > pm + ttlMs;
+    splitRecord(blob, pm, dths, rk, props, body_);
+    // compare as `published <= now - ttl` (NOT `now > published + ttl`): the
+    // sum form overflows i64 for a client-supplied huge x-message-ttl and
+    // wraps negative, falsely expiring fresh messages. `now - ttl` underflows
+    // to negative for such a ttl -> pm(>0) <= negative is false -> never
+    // expires, the correct reading of a ~290-million-year TTL.
+    return pm > 0 && pm <= cast(long) nowMs() - ttlMs;
 }
 
 /// Route an (already-stored) record to `queue`'s dead-letter exchange, keeping
@@ -1695,11 +1734,22 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob) no
     if (meta.dlx.length == 0)
         return; // no dead-letter exchange: drop
     long pm;
+    int deaths;
     const(char)[] origRk;
     const(ubyte)[] props, body_;
-    splitRecord(blob, pm, origRk, props, body_);
+    splitRecord(blob, pm, deaths, origRk, props, body_);
+    // x-death loop bound: A(ttl)->DLX->A(ttl)->... would livelock (TTL re-fires
+    // automatically, no client action). Persist the hop count in the record and
+    // drop once it saturates.
+    if (deaths >= AMQP_MAX_DEATHS)
+        return;
     auto rk = meta.dlrk.length ? meta.dlrk : (origRk.length ? origRk : queue);
-    auto blobc = cast(const(char)[]) blob;
+    // rebuild the record with deaths+1 (keeps publishMs so TTL still measures
+    // from the ORIGINAL publish, RabbitMQ-style)
+    static ByteBuffer dlrec; // TLS
+    dlrec.clear();
+    buildRecord(dlrec, pm, deaths + 1, origRk, props, body_);
+    auto blobc = dlrec.data.asChars;
     routeTo(meta.dlx, rk, propsHeaders(props), (string q) nothrow {
         static ByteBuffer kb5; // TLS
         queueKey(q, kb5);
@@ -1779,10 +1829,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
                         break;
                     // x-message-ttl: an expired head is dead-lettered (or
-                    // dropped), never delivered — pop the next in its place
+                    // dropped), never delivered. Count it toward the burst so a
+                    // backlog of expired heads can't drain unboundedly in one
+                    // pass (it yields between bursts).
                     if (isExpired(pay.data, queueTtl(qq)))
                     {
                         deadLetter(qq, pay.data);
+                        burst++;
                         continue;
                     }
                     // the pop's cross-shard hop yielded; if the channel/conn was
