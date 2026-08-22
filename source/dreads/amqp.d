@@ -41,6 +41,13 @@ public __gshared void delegate(scope const(char)[] key, scope const(char)[] payl
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
 public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
+/// Flush THIS shard-thread's AOF pending buffer to the OS (installed by
+/// server.d). Skins call it once per network batch so a confirmed publish is
+/// durable before the ack/confirm reaches the client — matching how the RESP
+/// serve loop flushes per batch. Without it, skin writes sat in the in-memory
+/// pending buffer until the everysec tick, so a kill -9 lost up to a second of
+/// ALREADY-ACKED messages.
+public __gshared void delegate() nothrow gAmqpAofFlush;
 public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
@@ -1002,6 +1009,8 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
                 return; // framing error
             if (!handleFrame(c, ftype, chan, payload, outb))
             {
+                if (gAmqpAofFlush !is null)
+                    gAmqpAofFlush();
                 if (!outb.empty)
                     sendTo(c, outb.data);
                 return;
@@ -1010,6 +1019,8 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         }
         if (!outb.empty)
         {
+            if (gAmqpAofFlush !is null)
+                gAmqpAofFlush(); // AOF durable BEFORE the confirm/reply is sent
             sendTo(c, outb.data);
             outb.clear();
         }
