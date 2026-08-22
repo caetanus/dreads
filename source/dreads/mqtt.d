@@ -116,6 +116,8 @@ public final class MqttConn
     string willTopic;
     const(ubyte)[] willPayload;
     bool willRetain;
+    const(char)[] willProps; // v5 forwardable will properties (will-delay-interval
+    // stripped): emitted on the will PUBLISH so content-type/user-props survive.
     // QoS1/2 OUTBOUND delivery: a per-conn packet-id (1..65535, wraps), the set
     // of QoS1 ids delivered but not yet PUBACKed, and the QoS2 ids mid-handshake
     // (outQos2[pid]: 1 = awaiting PUBREC, 2 = PUBREL sent, awaiting PUBCOMP). One
@@ -1205,9 +1207,11 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     if (c.connected && c.willTopic.length != 0)
     {
         immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-        mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
+        mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
+                rseq, 0, null, c.willProps);
         if (gMqttFanout !is null)
-            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq, 0, null);
+            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
+                    rseq, 0, c.willProps);
         c.willTopic = null;
     }
     // wake OTHER subscribers whose outboxes this connection's last batch filled
@@ -1563,6 +1567,72 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
     return true;
 }
 
+// Parse a v5 will property block at p[i], building `fwd` = the FORWARDABLE will
+// properties (everything EXCEPT will-delay-interval 0x18, which is will-specific
+// and never delivered) so the will PUBLISH carries content-type / user-property /
+// response-topic / correlation-data / payload-format / message-expiry to
+// subscribers. Advances i to the block end; every read is bounded by `end`
+// (<= p.length), so a malformed CONNECT can't read OOB.
+private bool mqttParseWillProps(scope const(ubyte)[] p, ref size_t i,
+        ref ByteBuffer fwd) @nogc nothrow
+{
+    fwd.clear();
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    immutable end = i + plen;
+    if (end > p.length)
+        return false;
+    while (i < end)
+    {
+        immutable propStart = i;
+        immutable id = p[i++];
+        bool forward = true;
+        switch (id)
+        {
+        case 0x01: // payload-format-indicator: 1 byte
+            if (i + 1 > end)
+                return false;
+            i += 1;
+            break;
+        case 0x02, 0x18: // message-expiry-interval (fwd) / will-delay-interval (not): u32
+            if (i + 4 > end)
+                return false;
+            i += 4;
+            if (id == 0x18)
+                forward = false; // will-delay is consumed by the broker, not sent
+            break;
+        case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data
+            if (i + 2 > end)
+                return false;
+            immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > end)
+                return false;
+            i += n;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return false;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return false;
+                i += n;
+            }
+            break;
+        default:
+            return false; // unknown will property id: malformed
+        }
+        if (forward)
+            fwd.append(cast(const(char)[]) p[propStart .. i]);
+    }
+    i = end;
+    return true;
+}
+
 // Copy a (broker-built, well-formed) PUBLISH property block into `out_` omitting
 // any message-expiry-interval (0x02), and return the expiry seconds via `expiry`
 // (0 = none). Retained storage keeps the expiry as an absolute deadline instead,
@@ -1829,8 +1899,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // will topic/message, then username/password per flags
             if (flags & 0x04)
             {
-                // v5: will properties precede the will topic in the payload
-                if (c.protoVer == 5 && !mqttSkipProps(p, i))
+                // v5: will properties precede the will topic in the payload.
+                // Round-trip the forwardable ones (will-delay-interval stripped)
+                // so the will PUBLISH carries content-type/user-props/etc.
+                static ByteBuffer wpBuf;
+                if (c.protoVer == 5 && !mqttParseWillProps(p, i, wpBuf))
                     return false;
                 const(char)[] wt, wm;
                 if (!rdStr(p, i, wt) || !rdStr(p, i, wm))
@@ -1846,6 +1919,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 {
                     c.willTopic = wt.idup;
                     c.willPayload = cast(const(ubyte)[]) wm.idup;
+                    c.willProps = (c.protoVer == 5 && wpBuf.length)
+                        ? (cast(const(char)[]) wpBuf.data).idup : null;
                 }
                 catch (Exception)
                 {
