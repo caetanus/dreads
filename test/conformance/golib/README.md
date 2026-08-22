@@ -48,8 +48,19 @@ go test -count=1 -timeout 100s -run TestDreadsProducerConformance -v .
   Supporting headers is a **protocol milestone** (the whole v2 RecordBatch +
   varint format), not a bug. (Exact-timestamp preservation may also differ and is
   worth a separate check.)
-- **Inspector / Consumer / Transaction**: all require **consumer groups**
-  (FindCoordinator/JoinGroup/SyncGroup/OffsetCommit/OffsetFetch) and/or
+- **Consumer produce path** (`publishConformanceValues` → `PublishBatch` of 3
+  records to one partition): fails "delivery retryable failure" because **dreads
+  does not support compressed message sets**. franz-go (like most modern
+  clients) sends a multi-record batch as ONE snappy-compressed wrapper message
+  (magic 1, attrs `0x02`); dreads correctly rejects any compressed set
+  (`(attrs & 0x07) != 0` → CORRUPT) since it only decodes uncompressed v1.
+  Root-caused by hex trace: a SINGLE record (sent uncompressed, attrs `0x00`)
+  produces fine; the 3-record batch is snappy-wrapped and rejected. This is a
+  **missing feature** (snappy/lz4/gzip/zstd decompression), not a defect — dreads
+  fail-closes rather than mis-decoding. HIGH interop impact: a producer with
+  compression *disabled* works; the default (compressed) does not.
+- **Inspector / Consumer / Transaction**: all additionally require **consumer
+  groups** (FindCoordinator/JoinGroup/SyncGroup/OffsetCommit/OffsetFetch) and/or
   **transactions** — deliberately-unbuilt feature milestones. They are reported,
   not implemented, per the project's standing rule.
 
