@@ -948,8 +948,11 @@ private struct TxSettle
 }
 
 /// Cap the buffered work of one open transaction (unbounded would be a RAM DoS:
-/// a client that tx.selects and never commits).
+/// a client that tx.selects and never commits). The BYTE cap is the real bound —
+/// a message body reaches AMQP_MAX_BODY (128MB), so 100k of them would be
+/// terabytes; the count cap only guards the tiny settle structs.
 private enum size_t AMQP_MAX_TX = 100_000;
+private enum size_t AMQP_MAX_TX_BYTES = 256UL << 20; // 256MB of buffered pubs/tx
 
 private struct Channel
 {
@@ -960,6 +963,7 @@ private struct Channel
     bool txMode; // tx.select: buffer pubs/settles until tx.commit
     TxPub[] txPubs;
     TxSettle[] txSettles;
+    size_t txBytes; // running size of buffered tx publish records (byte cap)
 }
 
 private struct Unacked
@@ -1781,6 +1785,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             auto ch = chan in c.chans;
             if (ch !is null)
             {
+                if (ch.txMode)
+                    return txConfirmConflict(c, chan, o);
                 ch.confirmMode = true;
                 ch.confirmSeq = 1;
             }
@@ -1795,6 +1801,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 return true;
             if (mth == 10) // select
             {
+                if (ch.confirmMode)
+                    return txConfirmConflict(c, chan, o);
                 ch.txMode = true;
                 method(o, chan, 90, 11); // select-ok
             }
@@ -1807,6 +1815,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {                    //  -> messages remain unacked / redeliverable)
                 ch.txPubs = null;
                 ch.txSettles = null;
+                ch.txBytes = 0;
                 method(o, chan, 90, 31); // rollback-ok
             }
             return true;
@@ -1814,6 +1823,25 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
     default:
         return true;
     }
+}
+
+/// confirm.select and tx.select are mutually exclusive (a tx buffers publishes
+/// and sends no confirm, so a confirm client would hang). Reject the second with
+/// a channel.close(406) and kill the channel — RabbitMQ's PRECONDITION_FAILED.
+private bool txConfirmConflict(AmqpConn c, ushort chan, ref ByteBuffer o) nothrow @trusted
+{
+    method(o, chan, 20, 40, (ref ByteBuffer b) @nogc nothrow {
+        putU16(b, 406); // PRECONDITION_FAILED
+        putShortStr(b, "confirm and tx are mutually exclusive");
+        putU16(b, 0); // class-id
+        putU16(b, 0); // method-id
+    });
+    try
+        c.chans.remove(chan); // channel is dead; its (tiny, just-selected) state goes
+    catch (Exception)
+    {
+    }
+    return true;
 }
 
 /// Apply a channel's buffered transaction (tx.commit): route the buffered
@@ -1900,6 +1928,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
     }
     ch.txPubs = null;
     ch.txSettles = null;
+    ch.txBytes = 0;
 }
 
 private auto asChars(const(ubyte)[] b) @nogc nothrow
@@ -2057,9 +2086,15 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     {
         // transaction: buffer the framed publish; it routes on tx.commit and is
         // discarded on tx.rollback. exchange/rkey are already idup'd strings.
-        if (ch.txPubs.length < AMQP_MAX_TX)
+        // Bound by BOTH count and bytes (a 128MB body × 100k count = terabytes).
+        // Over budget: drop this publish (the tx will be incomplete, but the
+        // shard survives) rather than OOM.
+        if (ch.txPubs.length < AMQP_MAX_TX && ch.txBytes + rec.data.length <= AMQP_MAX_TX_BYTES)
             try
+            {
                 ch.txPubs ~= TxPub(ch.pub.exchange, ch.pub.rkey, mandatory, rec.data.idup);
+                ch.txBytes += rec.data.length;
+            }
             catch (Exception)
             {
             }
