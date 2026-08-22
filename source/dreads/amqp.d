@@ -463,29 +463,63 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         auto bl = (cast(string) ex) in gBindings;
         if (t is null || bl is null)
             return;
+        // Collect DEDUPED destination queues: a queue with several matching
+        // bindings (overlapping topic patterns like a.# + a.b, or a fanout queue
+        // bound twice with different routing keys) must receive the message ONCE,
+        // not once per binding — RabbitMQ deduplicates the destination set. The
+        // matching phase yields nowhere, so a reused TLS buffer is safe to fill;
+        // a reentrant routeTo (the sink's cross-shard RPUSH YIELDS) takes a
+        // stack-local so the parked outer loop keeps reading its own list.
+        static string[] destStatic; // TLS
+        static bool destBusy;
+        string[] destLocal;
+        string[]* dests = &destLocal;
+        if (!destBusy)
+        {
+            destBusy = true;
+            dests = &destStatic;
+        }
+        scope (exit)
+            if (dests is &destStatic)
+                destBusy = false;
+        (*dests).length = 0;
+        void add(string q) nothrow
+        {
+            foreach (d; *dests)
+                if (d == q)
+                    return; // this queue already matched another binding
+            try
+                *dests ~= q;
+            catch (Exception)
+            {
+            }
+        }
+
         final switch (*t)
         {
         case ExType.fanout:
             foreach (ref bd; *bl)
                 if (bd.alive)
-                    sink(bd.queue);
+                    add(bd.queue);
             break;
         case ExType.direct:
             foreach (ref bd; *bl)
                 if (bd.alive && bd.key == rkey)
-                    sink(bd.queue);
+                    add(bd.queue);
             break;
         case ExType.topic:
             foreach (ref bd; *bl)
                 if (bd.alive && amqpTopicMatches(bd.key, rkey))
-                    sink(bd.queue);
+                    add(bd.queue);
             break;
         case ExType.headers:
             foreach (ref bd; *bl)
                 if (bd.alive && headersMatch(bd.args, msgHeaders))
-                    sink(bd.queue);
+                    add(bd.queue);
             break;
         }
+        foreach (q; *dests)
+            sink(q); // yields per queue; dests is stable (reentrants use destLocal)
     }
     catch (Exception)
     {
