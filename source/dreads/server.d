@@ -574,11 +574,14 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     }
     if (gConfig.kafkaPort != 0)
     {
-        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort;
+        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort,
+            gKafkaFetchRaw, gKafkaLenRaw;
 
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
             amqpDataExec(args, reply); // the generic RESP-over-data-plane exec
         };
+        gKafkaFetchRaw = &kafkaFetchDirect;
+        gKafkaLenRaw = &kafkaLenDirect;
         gKafkaPort = gConfig.kafkaPort;
         cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
             serveKafkaClient(conn);
@@ -2454,6 +2457,92 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
     }
     reply.append(p.reply.data);
     releaseShardPending(p);
+}
+
+// Kafka fetch fast path: when THIS thread owns the key, walk the packed list
+// segment and append [offset i64][stored blob] per record straight into the
+// response buffer — no synthesized RESP, no LRANGE reply, no re-copy. The
+// stored blob is already verbatim wire bytes ([size i32][MessageSet v1
+// message]); the offset is implicit (= list index), stamped here on the fly.
+private int kafkaFetchDirect(scope const(char)[] key, long from, int maxN,
+        size_t budget, long startOff, ref ByteBuffer o) nothrow @trusted
+{
+    import dreads.shard : tShard, shardOfSlot;
+    import dreads.slots : keyToSlot;
+    import dreads.obj : ObjType;
+    import dreads.list : ListSeekHint;
+
+    if (sharded() && cast(uint) shardOfSlot(keyToSlot(key)) != tShard)
+        return -1; // not the owner: caller takes the data-plane hop
+    bool wrong;
+    auto ks = sharded() ? myKeyspace2(0) : &gDbs[0];
+    auto obj = ks.lookupTyped(key, ObjType.list, wrong);
+    if (wrong || obj is null || maxN <= 0 || from < 0)
+        return 0;
+    // Per-thread resume-cursor cache: a sequential consumer fetching offsets
+    // 0, 16384, 32768... would otherwise pay an O(from) head seek per fetch
+    // (quadratic over the partition — a 12M-record drain never finishes).
+    // Keyed by key hash; epoch-validated inside walkRangeHinted, so a stale
+    // or colliding entry degrades to the head walk, never to wrong bytes.
+    static struct FetchCursor
+    {
+        ulong kh;
+        ListSeekHint h;
+    }
+
+    static FetchCursor[64] tFetchCur; // TLS
+    ulong kh = 1469598103934665603UL;
+    foreach (ch; key)
+    {
+        kh ^= ch;
+        kh *= 1099511628211UL;
+    }
+    auto ce = &tFetchCur[cast(size_t)(kh & 63)];
+    if (ce.kh != kh)
+    {
+        ce.kh = kh;
+        ce.h = ListSeekHint.init;
+    }
+    long off = startOff;
+    int cnt = 0;
+    immutable start = o.length;
+    cast(void) obj.list.walkRangeHinted(ce.h, from, cast(size_t) maxN,
+            (const(char)[] v) @nogc nothrow {
+        if (o.length - start > budget)
+            return 1; // budget filled: stop the walk early
+        ubyte[8] ob = void;
+        immutable ulong u = cast(ulong) off;
+        ob[0] = cast(ubyte)(u >> 56);
+        ob[1] = cast(ubyte)(u >> 48);
+        ob[2] = cast(ubyte)(u >> 40);
+        ob[3] = cast(ubyte)(u >> 32);
+        ob[4] = cast(ubyte)(u >> 24);
+        ob[5] = cast(ubyte)(u >> 16);
+        ob[6] = cast(ubyte)(u >> 8);
+        ob[7] = cast(ubyte)(u & 0xFF);
+        o.append(ob[]);
+        o.append(cast(const(ubyte)[]) v);
+        off++;
+        cnt++;
+        return 0;
+    });
+    return cnt;
+}
+
+private long kafkaLenDirect(scope const(char)[] key) nothrow @trusted
+{
+    import dreads.shard : tShard, shardOfSlot;
+    import dreads.slots : keyToSlot;
+    import dreads.obj : ObjType;
+
+    if (sharded() && cast(uint) shardOfSlot(keyToSlot(key)) != tShard)
+        return -1;
+    bool wrong;
+    auto ks = sharded() ? myKeyspace2(0) : &gDbs[0];
+    auto obj = ks.lookupTyped(key, ObjType.list, wrong);
+    if (wrong || obj is null)
+        return 0;
+    return cast(long) obj.list.length;
 }
 
 // myKeyspace under a different name to dodge the local import shadowing above

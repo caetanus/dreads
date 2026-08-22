@@ -183,6 +183,16 @@ private long pushRecords(scope const(char)[] key, scope const(char)[][] blobs) n
     return v;
 }
 
+/// Direct owner-shard fetch fast path (installed by dreads.server): appends
+/// [offset i64][stored blob] per record straight into `o` — no synthesized
+/// RESP, no LRANGE reply parse, no per-record re-copy. Walks the packed list
+/// segment in cache order. Returns records appended, or -1 when this thread
+/// doesn't own the key (caller falls back to the LRANGE data-plane path).
+public __gshared int function(scope const(char)[] key, long from, int maxN,
+        size_t budget, long startOff, ref ByteBuffer o) nothrow gKafkaFetchRaw;
+/// Direct owner-shard list length; -1 = not owner (fall back to LLEN).
+public __gshared long function(scope const(char)[] key) nothrow gKafkaLenRaw;
+
 private long partLen(scope const(char)[] key) nothrow
 {
     static ByteBuffer rb2; // TLS
@@ -546,7 +556,9 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable partMax = r.i32();
             static ByteBuffer kb2; // TLS
             partKey(topic, part, kb2);
-            immutable hw = partLen(kb2.data.asChars);
+            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb2.data.asChars) : -1;
+            if (hw < 0)
+                hw = partLen(kb2.data.asChars);
             putI32(o, part);
             putI16(o, fetchOff > hw ? E_OFFSET_OUT_OF_RANGE : E_NONE);
             putI64(o, hw); // high watermark
@@ -556,18 +568,25 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             if (fetchOff < hw)
             {
                 // budget: partMax bytes, capped count
-                int maxN = 16384; // deep batches: fewer LRANGE walks per fetch
+                int maxN = 16384; // deep batches: fewer walks per fetch
                 long off = fetchOff;
                 size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
-                immutable startLen = o.length;
-                cast(void) rangeRecords(kb2.data.asChars, fetchOff, maxN,
-                        (scope const(ubyte)[] blob) nothrow {
-                    if (o.length - startLen > budget)
-                        return; // budget exhausted: stop appending
-                    putI64(o, off);
-                    o.append(blob); // [size i32][message] stored verbatim
-                    off++;
-                });
+                int direct = -1;
+                if (gKafkaFetchRaw !is null)
+                    direct = gKafkaFetchRaw(kb2.data.asChars, fetchOff, maxN,
+                            budget, fetchOff, o);
+                if (direct < 0)
+                {
+                    immutable startLen = o.length;
+                    cast(void) rangeRecords(kb2.data.asChars, fetchOff, maxN,
+                            (scope const(ubyte)[] blob) nothrow {
+                        if (o.length - startLen > budget)
+                            return; // budget exhausted: stop appending
+                        putI64(o, off);
+                        o.append(blob); // [size i32][message] stored verbatim
+                        off++;
+                    });
+                }
             }
             // patch records size
             auto d3 = cast(ubyte[]) o.data;
@@ -599,7 +618,9 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 cast(void) r.i32(); // max_num_offsets (v0)
             static ByteBuffer kb3; // TLS
             partKey(topic, part, kb3);
-            immutable hw = partLen(kb3.data.asChars);
+            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb3.data.asChars) : -1;
+            if (hw < 0)
+                hw = partLen(kb3.data.asChars);
             immutable off = ts == -2 ? 0 : hw; // earliest : latest
             putI32(o, part);
             putI16(o, E_NONE);
