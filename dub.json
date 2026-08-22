@@ -182,7 +182,7 @@
 	"libs-linux": [
 		"jemalloc"
 	],
-	"license": "MIT",
+	"license": "BUSL-1.1",
 	"name": "dreads",
 	"targetPath": "bin",
 	"targetType": "executable",
