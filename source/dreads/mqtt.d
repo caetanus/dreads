@@ -506,6 +506,51 @@ private bool rdStr(scope const(ubyte)[] p, ref size_t i, out const(char)[] s) @n
 public __gshared void delegate(scope const(char)[] topic,
         scope const(char)[] payload, bool retain, ulong seq) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
+/// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
+private __gshared ulong gMqttStartMs;
+
+/// Publish the $SYS/broker/* broker-monitoring topics to THIS shard's local
+/// subscribers (a de-facto MQTT standard; mosquitto-compatible). Called ~every
+/// 10s from the maintenance tick. Values are the GLOBAL atomic counters, so a
+/// client subscribed to $SYS on any shard sees broker-wide stats. Non-retained
+/// (a fresh subscriber gets the next tick); the $-guard already lets an explicit
+/// `$SYS/#` match while keeping `#`/`+` from matching $-topics.
+public void mqttPublishSys() nothrow @trusted
+{
+    import core.atomic : atomicLoad, MemoryOrder;
+    import dreads.stream : nowMs;
+    import core.stdc.stdio : snprintf;
+
+    if (atomicLoad!(MemoryOrder.raw)(gMqttSubTotal) == 0)
+        return; // nobody subscribed to anything -> skip (idle-skin cost = 0)
+    immutable now = nowMs();
+    if (gMqttStartMs == 0)
+        gMqttStartMs = now;
+    static char[32] nb = void;
+    void pub(scope const(char)[] topic, scope const(char)[] payload) nothrow
+    {
+        mqttDeliverLocal(topic, payload, false, 0);
+    }
+    static void num(ref char[32] b, ulong v, ref const(char)[] outp) nothrow
+    {
+        immutable n = snprintf(b.ptr, b.length, "%llu", v);
+        outp = n > 0 ? cast(const(char)[]) b[0 .. n] : "0";
+    }
+
+    const(char)[] v;
+    pub("$SYS/broker/version", "dreads MQTT 3.1.1");
+    num(nb, (now - gMqttStartMs) / 1000, v);
+    pub("$SYS/broker/uptime", v);
+    num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttMessages), v);
+    pub("$SYS/broker/messages/received", v);
+    immutable st = atomicLoad!(MemoryOrder.raw)(gMqttSubTotal);
+    num(nb, st < 0 ? 0 : cast(ulong) st, v);
+    pub("$SYS/broker/subscriptions/count", v);
+    num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttDropped), v);
+    pub("$SYS/broker/messages/dropped", v);
+    // deliver the $SYS batch (mqttDeliverLocal queued into subscriber outboxes)
+    mqttFlushDirty();
+}
 
 /// Close a local session a NEWER CONNECT (gen) superseded. Same-thread, so the
 /// map access is unlocked. Setting closed + waking the socket makes the victim's

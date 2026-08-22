@@ -7348,6 +7348,18 @@ private void maintEvictionTick() @trusted nothrow
 
         amqpTtlSweep();
     }
+    // $SYS/broker/* stats every ~10 ticks (10s), per shard, to its subscribers
+    if (gConfig.mqttPort != 0)
+    {
+        static uint sysTick;
+        if (++sysTick >= 10)
+        {
+            sysTick = 0;
+            import dreads.mqtt : mqttPublishSys;
+
+            mqttPublishSys();
+        }
+    }
     // AOF-per-shard: each shard fsyncs its OWN file (the "everysec" contract,
     // now per shard — this tick runs on every shard thread and on main).
     myAof().flush();
