@@ -152,6 +152,131 @@ def c_replay_idempotent(bs, topic):
     assert (begin0, end0) == (begin1, end1), "replay mutated log bounds: %s -> %s" % ((begin0, end0), (begin1, end1))
     return "two replays identical; log bounds unchanged (%d,%d) — no group mutation" % (begin1, end1)
 
+# ---- INSPECTION (inspection.md): broker-observable Metadata/ListOffsets ----
+# Uses RAW named Metadata v1 + ListOffsets v1 requests, not kafka-python's
+# cluster cache: kafka-python's partitions_for_topic triggers an ALL-topics
+# metadata refresh (empty topics array), which dreads answers empty BY DESIGN
+# ("we answer only named topics" — kafka.d handleMetadata). Naming the topic is
+# what a real produce/consume client does, and is what this suite must exercise.
+import socket, struct
+
+def _recv_frame(s):
+    (n,) = struct.unpack(">i", s.recv(4)); b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c: break
+        b += c
+    return b
+
+class _P:
+    def __init__(self, b): self.b = b; self.i = 0
+    def i16(self): v = struct.unpack(">h", self.b[self.i:self.i+2])[0]; self.i += 2; return v
+    def i32(self): v = struct.unpack(">i", self.b[self.i:self.i+4])[0]; self.i += 4; return v
+    def i64(self): v = struct.unpack(">q", self.b[self.i:self.i+8])[0]; self.i += 8; return v
+    def i8(self):  v = self.b[self.i]; self.i += 1; return v
+    def st(self):
+        n = self.i16()
+        if n < 0: return None            # nullable string: advance 0 bytes
+        v = self.b[self.i:self.i+n]; self.i += n; return v.decode()
+
+def _client_hdr(api_key, api_ver, corr):
+    cb = b"insp"
+    return struct.pack(">hhi", api_key, api_ver, corr) + struct.pack(">h", len(cb)) + cb
+
+def raw_metadata(bs, topic):
+    host, port = bs.split(":"); port = int(port)
+    body = _client_hdr(3, 1, 1)
+    tb = topic.encode()
+    body += struct.pack(">i", 1) + struct.pack(">h", len(tb)) + tb   # 1 NAMED topic
+    s = socket.socket(); s.settimeout(3); s.connect((host, port))
+    s.sendall(struct.pack(">i", len(body)) + body)
+    p = _P(_recv_frame(s)); s.close()
+    p.i32()                                                          # correlation id
+    brokers = [(p.i32(), p.st(), p.i32(), p.st()) for _ in range(p.i32())]  # id,host,port,rack
+    ctrl = p.i32()
+    topics = []
+    for _ in range(p.i32()):
+        err = p.i16(); name = p.st(); p.i8()                        # err, name, is_internal
+        parts = []
+        for _ in range(p.i32()):
+            pe = p.i16(); pid = p.i32(); leader = p.i32()
+            [p.i32() for _ in range(p.i32())]                       # replicas
+            [p.i32() for _ in range(p.i32())]                       # isr
+            parts.append((pid, leader, pe))
+        topics.append((err, name, parts))
+    return brokers, ctrl, topics
+
+def raw_listoffsets(bs, topic, part, ts):
+    # ts: -2 = earliest, -1 = latest
+    host, port = bs.split(":"); port = int(port)
+    body = _client_hdr(2, 1, 1) + struct.pack(">i", -1)             # replica_id
+    tb = topic.encode()
+    body += struct.pack(">i", 1) + struct.pack(">h", len(tb)) + tb  # 1 topic
+    body += struct.pack(">i", 1) + struct.pack(">i", part) + struct.pack(">q", ts)  # 1 partition
+    s = socket.socket(); s.settimeout(3); s.connect((host, port))
+    s.sendall(struct.pack(">i", len(body)) + body)
+    p = _P(_recv_frame(s)); s.close()
+    p.i32()                                                         # correlation id
+    for _ in range(p.i32()):
+        p.st()                                                      # topic name
+        for _ in range(p.i32()):
+            p.i32(); err = p.i16(); p.i64(); off = p.i64()         # partition, err, ts, offset
+            return err, off
+    return None, None
+
+@check("INSPECTION", "topic existence: NAMED metadata for an uncreated topic exists (stateless)")
+def c_topic_exists(bs, topic):
+    _, _, topics = raw_metadata(bs, topic)  # topic never produced to
+    assert topics, "uncreated topic absent from NAMED metadata (stateless model broken)"
+    err, name, parts = topics[0]
+    assert err == 0 and name == topic, "topic err=%s name=%s" % (err, name)
+    assert len(parts) >= 1, "topic advertises 0 partitions"
+    return "uncreated topic '%s' exists, err=0, %d partitions" % (name, len(parts))
+
+@check("INSPECTION", "partition count stable + ids 0..n-1 across NAMED metadata requests")
+def c_part_count_stable(bs, topic):
+    _, _, t1 = raw_metadata(bs, topic)
+    _, _, t2 = raw_metadata(bs, topic)
+    ids1 = sorted(pid for pid, _, _ in t1[0][2])
+    ids2 = sorted(pid for pid, _, _ in t2[0][2])
+    assert ids1 == ids2, "partition ids unstable: %s != %s" % (ids1, ids2)
+    assert ids1 == list(range(len(ids1))), "partition ids not 0..n-1: %s" % ids1
+    return "%d partitions, ids 0..%d, stable across requests" % (len(ids1), len(ids1) - 1)
+
+@check("INSPECTION", "every partition has a valid leader in the broker set")
+def c_leaders_all(bs, topic):
+    brokers, _, topics = raw_metadata(bs, topic)
+    bids = {bid for bid, _, _, _ in brokers}
+    parts = topics[0][2]
+    missing = [pid for pid, leader, pe in parts if leader in (-1, None) or pe != 0]
+    assert not missing, "partitions with no leader / error: %s (=> incomplete broker state)" % missing
+    foreign = [(pid, leader) for pid, leader, _ in parts if leader not in bids]
+    assert not foreign, "partitions whose leader is not an advertised broker: %s" % foreign
+    return "all %d partitions err=0 with a leader in broker set %s" % (len(parts), sorted(bids))
+
+@check("INSPECTION", "broker list present and self-consistent (host/port, no dup ids)")
+def c_broker_list(bs, topic):
+    brokers, ctrl, _ = raw_metadata(bs, topic)
+    assert brokers, "empty broker list in metadata"
+    ids = [bid for bid, _, _, _ in brokers]
+    assert len(ids) == len(set(ids)), "duplicate broker node ids: %s" % ids
+    bad = [(bid, h, pt) for bid, h, pt, _ in brokers if not h or not (0 < pt < 65536)]
+    assert not bad, "brokers with invalid host/port: %s" % bad
+    assert ctrl in set(ids), "controller_id %s not an advertised broker %s" % (ctrl, ids)
+    return "%d broker(s), unique ids %s, controller=%s, valid host:port" % (len(brokers), sorted(ids), ctrl)
+
+@check("INSPECTION", "offset queryability: every partition answers ListOffsets earliest+latest")
+def c_offset_queryable(bs, topic):
+    _, _, topics = raw_metadata(bs, topic)
+    parts = [pid for pid, _, _ in topics[0][2]]
+    for pid in parts:
+        e_err, earliest = raw_listoffsets(bs, topic, pid, -2)
+        l_err, latest = raw_listoffsets(bs, topic, pid, -1)
+        assert e_err == 0 and l_err == 0, "partition %d ListOffsets err (earliest=%s latest=%s)" % (pid, e_err, l_err)
+        assert earliest is not None and latest is not None and earliest <= latest, \
+            "partition %d bad offsets earliest=%s latest=%s" % (pid, earliest, latest)
+    return "all %d partitions answer ListOffsets earliest<=latest" % len(parts)
+
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19092
     bs = "%s:%d" % (HOST, port)
