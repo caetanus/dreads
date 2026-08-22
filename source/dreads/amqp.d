@@ -151,22 +151,27 @@ private void seedWellKnownExchanges() nothrow
     if (seeded)
         return;
     seeded = true;
-    try
+    // Seed a default only if it has NO control-plane history: a name present in
+    // gExchangeSeq was either declared or DELETED (op 1/5), and those ops are
+    // broadcast+seq-gated across shards. Seeding a name that a broadcast delete
+    // tombstoned (on a shard that seeds AFTER receiving the delete — the ctl apply
+    // runs without any AMQP connection) would resurrect it on that shard only =
+    // cross-shard split-brain. Deferring to gExchangeSeq keeps every shard in sync.
+    void seed(string name, ExType t) nothrow
     {
-        if ("amq.direct" !in gExchanges)
-            gExchanges["amq.direct"] = ExType.direct;
-        if ("amq.fanout" !in gExchanges)
-            gExchanges["amq.fanout"] = ExType.fanout;
-        if ("amq.topic" !in gExchanges)
-            gExchanges["amq.topic"] = ExType.topic;
-        if ("amq.headers" !in gExchanges)
-            gExchanges["amq.headers"] = ExType.headers;
-        if ("amq.match" !in gExchanges) // amq.match is the headers-exchange alias
-            gExchanges["amq.match"] = ExType.headers;
+        try
+            if (name !in gExchanges && name !in gExchangeSeq)
+                gExchanges[name] = t;
+        catch (Exception)
+        {
+        }
     }
-    catch (Exception)
-    {
-    }
+
+    seed("amq.direct", ExType.direct);
+    seed("amq.fanout", ExType.fanout);
+    seed("amq.topic", ExType.topic);
+    seed("amq.headers", ExType.headers);
+    seed("amq.match", ExType.headers); // amq.match is the headers-exchange alias
 }
 
 /// AMQP topic match: dot-separined; `*` = exactly one word, `#` = zero+ words.
@@ -609,16 +614,24 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         // idup'd dest-exchange names), so no idup. Reused TLS: seeded per publish;
         // a reentrant routeTo (during sink's yield) refills it after we're done
         // with it, which is harmless (collect never reads it across a yield).
+        // Best-depth memo (parallel arrays: name -> shallowest depth expanded). A
+        // DFS that first reaches an exchange DEEP would truncate its subtree one
+        // hop short (the depth cap) and drop an in-cap destination; and a plain
+        // boolean visited would then block the later SHALLOWER path. So we re-expand
+        // an exchange whenever it's reached at a STRICTLY shallower depth (more hop
+        // budget). Bounded: depth strictly decreases, so <= cap+1 re-expansions per
+        // exchange; add() dedups the queues. Reused TLS, seeded per publish.
         static const(char)[][] visited;
-        bool seen(scope const(char)[] cx) nothrow
+        static int[] visitedDepth;
+        size_t vindex(scope const(char)[] cx) nothrow
         {
-            foreach (v; visited)
+            foreach (k, v; visited)
                 if (v == cx)
-                    return true;
-            return false;
+                    return k;
+            return size_t.max;
         }
         // Collect matching destinations, recursing through exchange-to-exchange
-        // bindings (bd.toExchange). visited-guarded (above) AND depth-bounded;
+        // bindings (bd.toExchange). Memo-guarded (above) AND depth-bounded;
         // add() dedups queues reached via multiple paths.
         void collect(scope const(char)[] cx, int depth) nothrow
         {
@@ -652,29 +665,39 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
                     continue;
                 if (bd.toExchange)
                 {
-                    // Check the depth cap in the PARENT, BEFORE marking visited: a
-                    // child that would only be reached at a capped depth expands
-                    // NOTHING, so marking it here would wrongly block a later,
-                    // SHALLOWER path from expanding it (an under-delivery bug).
-                    if (depth + 1 > AMQP_MAX_EXCHANGE_HOPS)
-                        continue;
-                    if (seen(bd.queue))
-                        continue; // already expanded this exchange: cycle/diamond
-                    try
-                        visited ~= bd.queue;
-                    catch (Exception)
+                    immutable nd = depth + 1;
+                    if (nd > AMQP_MAX_EXCHANGE_HOPS)
+                        continue; // beyond the hop budget: expands nothing
+                    immutable idx = vindex(bd.queue);
+                    if (idx == size_t.max)
                     {
+                        try
+                        {
+                            visited ~= bd.queue;
+                            visitedDepth ~= nd;
+                        }
+                        catch (Exception)
+                        {
+                            // keep the parallel arrays the same length (a desync
+                            // would OOB visitedDepth[idx] under -release)
+                            if (visited.length > visitedDepth.length)
+                                visited.length = visitedDepth.length;
+                            continue;
+                        }
                     }
-                    collect(bd.queue, depth + 1); // route into the destination exchange
+                    else if (nd < visitedDepth[idx])
+                        visitedDepth[idx] = nd; // reached shallower: re-expand, more budget
+                    else
+                        continue; // already expanded at an equal-or-shallower depth
+                    collect(bd.queue, nd); // route into the destination exchange
                 }
                 else
                     add(bd.queue);
             }
         }
 
-        visited.length = 0; // origin `ex` isn't seeded (it's not recursed-into): it
-        // may be re-expanded at most once via a cycle, every other exchange exactly
-        // once — total expansions <= E+1, so the walk is polynomial, never N^depth.
+        visited.length = 0;
+        visitedDepth.length = 0;
         collect(ex, 0);
         foreach (q; *dests)
             sink(q); // yields per queue; dests is stable (reentrants use destLocal)
