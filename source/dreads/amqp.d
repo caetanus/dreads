@@ -2151,9 +2151,70 @@ private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] 
     patchU32(o, arrAt, cast(uint)(o.length - arrStart));
 }
 
+/// Append every entry of headers-table `t` to `dst` EXCEPT the one keyed
+/// `skipKey`. Used to drop a prior x-death before adding the current one, so a
+/// message dead-lettered N times carries ONE x-death (with the live count), not
+/// N stale duplicates. Bails (copying nothing further) on a malformed entry.
+private void appendHeadersExcept(ref ByteBuffer dst, scope const(ubyte)[] t,
+        scope const(char)[] skipKey) @nogc nothrow
+{
+    size_t i = 0;
+    while (i < t.length)
+    {
+        immutable entryStart = i;
+        immutable kn = t[i];
+        i += 1;
+        if (i + kn + 1 > t.length)
+            return;
+        auto key = cast(const(char)[]) t[i .. i + kn];
+        i += kn;
+        immutable ty = cast(char) t[i];
+        i += 1;
+        switch (ty)
+        {
+        case 'S', 'x', 'A', 'F':
+            if (i + 4 > t.length)
+                return;
+            immutable vlen = (cast(size_t) t[i] << 24) | (cast(size_t) t[i + 1] << 16)
+                | (cast(size_t) t[i + 2] << 8) | t[i + 3];
+            i += 4 + vlen;
+            break;
+        case 's':
+            if (i + 1 > t.length)
+                return;
+            i += 1 + t[i];
+            break;
+        case 't', 'b', 'B':
+            i += 1;
+            break;
+        case 'U', 'u':
+            i += 2;
+            break;
+        case 'I', 'i', 'f':
+            i += 4;
+            break;
+        case 'l', 'd', 'T':
+            i += 8;
+            break;
+        case 'D':
+            i += 5;
+            break;
+        case 'V':
+            break;
+        default:
+            return; // unknown type: can't size the value -> stop
+        }
+        if (i > t.length)
+            return;
+        if (key != skipKey)
+            dst.append(cast(const(char)[]) t[entryStart .. i]);
+    }
+}
+
 /// Rebuild `props` with `xentry` prepended to the headers table (creating the
-/// headers property if absent). Every other property survives verbatim. On any
-/// malformed length the tail is copied as-is (best-effort, never OOB).
+/// headers property if absent) and any PRIOR x-death dropped. Every other
+/// property survives verbatim. On any malformed length the tail is copied as-is
+/// (best-effort, never OOB).
 private void mergeXDeath(ref ByteBuffer dst, scope const(ubyte)[] props,
         scope const(ubyte)[] xentry) @nogc nothrow @trusted
 {
@@ -2213,9 +2274,14 @@ private void mergeXDeath(ref ByteBuffer dst, scope const(ubyte)[] props,
         existing = props[i .. i + hl];
         i += hl;
     }
-    putU32(dst, cast(uint)(xentry.length + existing.length));
+    // drop any prior x-death from the existing headers so the message carries a
+    // single x-death with the live count, not one stale duplicate per hop
+    static ByteBuffer hstrip; // TLS (consumed synchronously, no yield in here)
+    hstrip.clear();
+    appendHeadersExcept(hstrip, existing, "x-death");
+    putU32(dst, cast(uint)(xentry.length + hstrip.length));
     dst.append(cast(const(char)[]) xentry);
-    dst.append(cast(const(char)[]) existing);
+    dst.append(cast(const(char)[]) hstrip.data);
     dst.append(cast(const(char)[]) props[i .. $]); // delivery-mode onward verbatim
 }
 
