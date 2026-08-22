@@ -84,6 +84,11 @@ public final class MqttConn
     bool closed; // serve fiber sets on exit; writer fiber then drains + stops
     ubyte protoVer = 4; // MQTT protocol level: 4 = 3.1.1, 5 = 5.0 (v5 packets
     // carry a property block; v5 CONNACK/SUBACK use reason codes)
+    // v5 inbound topic aliases: a client maps a small int -> topic to save bytes;
+    // first PUBLISH with an alias carries the topic + alias (registers it), later
+    // ones carry an empty topic + the alias (resolved here). Bounded by the
+    // topic-alias-maximum we advertise in CONNACK.
+    string[ushort] inAlias;
     // Read deadline: a BOUNDED default until CONNECT arrives (a client that
     // opens TCP and never sends CONNECT must be reaped — pre-handshake
     // slowloris), then re-armed to 1.5x the CONNECT keepalive (0 kA = max).
@@ -154,6 +159,9 @@ private size_t tRetainedBytes; // TLS: payload bytes currently in gRetained
 /// Per-connection subscription cap: past this SUBSCRIBE gets SUBACK 0x80
 /// (unlimited re-subscribe was a memory + delivery-amplification DoS).
 private enum size_t MQTT_MAX_SUBS = 4096;
+/// v5 topic-alias-maximum we advertise: the largest alias a client may use when
+/// publishing to us (also bounds the per-conn inbound alias table).
+private enum ushort MQTT_TOPIC_ALIAS_MAX = 8192;
 
 // ---------------------------------------------------------------------------
 // Topic trie (THREAD-LOCAL). Segment-split on '/'; `+` matches exactly one
@@ -1129,9 +1137,8 @@ public void serveMqttClient(TCPConnection tcp) nothrow
 }
 
 // Skip an MQTT 5 property block at p[i]: a varint length then that many bytes.
-// v5 FOUNDATION: properties are parsed-and-ignored for now; individual ones are
-// honored incrementally (topic-alias, message-expiry, user-props, ...). Returns
-// false on a malformed/truncated block.
+// Used where we don't (yet) consume any property (CONNECT/will/SUBSCRIBE/
+// UNSUBSCRIBE). Returns false on a malformed/truncated block.
 private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
 {
     uint plen;
@@ -1140,6 +1147,87 @@ private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
     if (i + plen > p.length)
         return false;
     i += plen;
+    return true;
+}
+
+// The v5 PUBLISH properties we consume (the rest are correctly skipped by type).
+private struct PubProps
+{
+    bool hasAlias;
+    ushort topicAlias;
+    bool hasExpiry;
+    uint msgExpiry; // seconds
+}
+
+// Parse an MQTT 5 PUBLISH property block at p[i], extracting topic-alias and
+// message-expiry and correctly skipping every other typed property. Advances i
+// to the end of the block. Every read is bounded by `end` (= i + declared
+// length, itself bounded by p.length) so a malformed block can't read OOB.
+private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProps pp) @nogc nothrow
+{
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    immutable end = i + plen;
+    if (end > p.length)
+        return false;
+    while (i < end)
+    {
+        immutable id = p[i++];
+        switch (id)
+        {
+        case 0x01: // payload-format-indicator: 1 byte
+            if (i + 1 > end)
+                return false;
+            i += 1;
+            break;
+        case 0x02: // message-expiry-interval: u32 seconds
+            if (i + 4 > end)
+                return false;
+            pp.msgExpiry = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                | (cast(uint) p[i + 2] << 8) | p[i + 3];
+            pp.hasExpiry = true;
+            i += 4;
+            break;
+        case 0x23: // topic-alias: u16
+            if (i + 2 > end)
+                return false;
+            pp.topicAlias = cast(ushort)((p[i] << 8) | p[i + 1]);
+            pp.hasAlias = true;
+            i += 2;
+            break;
+        case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data:
+            // a 2-byte length prefix then that many bytes
+            if (i + 2 > end)
+                return false;
+            immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > end)
+                return false;
+            i += n;
+            break;
+        case 0x0B: // subscription-identifier: varint (not valid inbound; tolerate)
+            uint sv;
+            if (!decodeVarint(p, i, sv) || i > end)
+                return false;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return false;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return false;
+                i += n;
+            }
+            break;
+        default:
+            return false; // unknown property id in a PUBLISH: malformed
+        }
+    }
+    i = end;
     return true;
 }
 
@@ -1152,10 +1240,14 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
     o.appendByte(cast(char)(PT_CONNACK << 4));
     if (protoVer == 5)
     {
-        o.appendByte(cast(char) 3); // remaining: ack-flags + reason + prop-len
+        // properties: topic-alias-maximum (0x22, u16) so the client may alias
+        o.appendByte(cast(char) 6); // ack-flags + reason + prop-len(1) + prop(3)
         o.appendByte(cast(char)(sessionPresent ? 1 : 0));
         o.appendByte(cast(char) code);
-        o.appendByte(cast(char) 0); // property length 0
+        o.appendByte(cast(char) 3); // property length
+        o.appendByte(cast(char) 0x22); // topic-alias-maximum
+        o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX >> 8));
+        o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX & 0xFF));
     }
     else
     {
@@ -1317,11 +1409,14 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (qos == 3)
                 return false; // [MQTT-3.3.1-4] both QoS bits set: close
             immutable retain = (h & 1) != 0;
+            immutable v5 = c.protoVer == 5;
             size_t i = 0;
             const(char)[] topic;
             if (!rdStr(p, i, topic))
                 return false;
-            if (!mqttValidTopicName(topic))
+            // v3 validates the topic now; v5 defers — an aliased PUBLISH may
+            // carry an EMPTY topic (resolved from the alias below).
+            if (!v5 && !mqttValidTopicName(topic))
                 return false; // [MQTT-3.3.2-2] wildcard/empty/NUL topic: close
             ushort pid = 0;
             if (qos > 0)
@@ -1333,10 +1428,46 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (pid == 0)
                     return false; // [MQTT-2.3.1-1]
             }
-            // v5: PUBLISH properties (topic-alias, message-expiry, user-props,
-            // ...) sit between the variable header and the payload; skipped now.
-            if (c.protoVer == 5 && !mqttSkipProps(p, i))
-                return false;
+            if (v5)
+            {
+                PubProps pp;
+                if (!mqttParsePubProps(p, i, pp))
+                    return false;
+                if (pp.hasAlias)
+                {
+                    if (pp.topicAlias == 0 || pp.topicAlias > MQTT_TOPIC_ALIAS_MAX)
+                        return false; // [MQTT-3.3.2-4] alias out of range
+                    if (topic.length != 0)
+                    {
+                        // first use: register alias -> topic (validate the topic)
+                        if (!mqttValidTopicName(topic))
+                            return false;
+                        try
+                            c.inAlias[pp.topicAlias] = topic.idup;
+                        catch (Exception)
+                        {
+                        }
+                    }
+                    else
+                    {
+                        // later use: empty topic, resolve from the alias table
+                        bool found = false;
+                        try
+                            if (auto t = pp.topicAlias in c.inAlias)
+                            {
+                                topic = *t;
+                                found = true;
+                            }
+                        catch (Exception)
+                        {
+                        }
+                        if (!found)
+                            return false; // unknown alias with an empty topic
+                    }
+                }
+                if (!mqttValidTopicName(topic))
+                    return false; // the (resolved) topic must be valid
+            }
             auto payload = cast(const(char)[]) p[i .. $];
             // [MQTT reserved] $-topics belong to the broker: a CLIENT publish to
             // one (e.g. spoofing $SYS/broker/messages) is dropped — not delivered,
