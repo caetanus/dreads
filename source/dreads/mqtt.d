@@ -1659,19 +1659,31 @@ private Retained makeRetained(scope const(char)[] payload, ulong seq,
 // 0x80+ = failure) and an (empty, for now) property block; v3 uses the legacy
 // return code. `code` is already in the caller's version's encoding.
 private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
-        ubyte code) @nogc nothrow
+        ubyte code, scope const(char)[] assignedId = null) @nogc nothrow
 {
     o.appendByte(cast(char)(PT_CONNACK << 4));
     if (protoVer == 5)
     {
-        // properties: topic-alias-maximum (0x22, u16) so the client may alias
-        o.appendByte(cast(char) 6); // ack-flags + reason + prop-len(1) + prop(3)
+        // properties: topic-alias-maximum (0x22, u16) always; assigned-client-
+        // identifier (0x12, utf8) when the server assigned an id to an empty
+        // ClientId. assignedId is broker-generated and short (<32), so every
+        // length here stays in one varint byte.
+        immutable size_t idLen = assignedId.length;
+        immutable size_t propLen = 3 + (idLen ? 3 + idLen : 0);
+        o.appendByte(cast(char)(2 + 1 + propLen)); // remaining length (< 127)
         o.appendByte(cast(char)(sessionPresent ? 1 : 0));
         o.appendByte(cast(char) code);
-        o.appendByte(cast(char) 3); // property length
+        o.appendByte(cast(char) propLen); // property length (< 127)
         o.appendByte(cast(char) 0x22); // topic-alias-maximum
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX >> 8));
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX & 0xFF));
+        if (idLen)
+        {
+            o.appendByte(cast(char) 0x12); // assigned-client-identifier
+            o.appendByte(cast(char)(idLen >> 8));
+            o.appendByte(cast(char)(idLen & 0xFF));
+            o.append(assignedId[0 .. idLen]);
+        }
     }
     else
     {
@@ -1852,6 +1864,35 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false;
             }
             c.connected = okPair;
+            // [MQTT-3.1.3-6] empty ClientId on v5: the server assigns a unique one
+            // and MUST return it (Assigned Client Identifier in the CONNACK). The
+            // global gen counter makes it unique across shards; registered locally
+            // for INFO/teardown, but with NO takeover broadcast — a fresh unique id
+            // can never collide with an existing session.
+            const(char)[] assignedId;
+            if (c.protoVer == 5 && okPair && clientId.length == 0)
+            {
+                immutable g = atomicOp!"+="(gMqttConnGen, 1);
+                c.connGen = g;
+                char[21] buf = void;
+                static immutable string hexd = "0123456789abcdef";
+                buf[0 .. 5] = "auto-";
+                foreach (k; 0 .. 16)
+                    buf[5 + k] = hexd[(g >> ((15 - k) * 4)) & 0xF];
+                try
+                    c.clientId = buf[0 .. 21].idup;
+                catch (Exception)
+                    c.clientId = null;
+                if (c.clientId.length)
+                {
+                    assignedId = c.clientId;
+                    try
+                        gLocalClients[c.clientId] = c;
+                    catch (Exception)
+                    {
+                    }
+                }
+            }
             // [MQTT-3.1.4-2] takeover: a non-empty clientId displaces any
             // existing session with the same id — locally now, and on the other
             // shards via a broadcast. connGen (global monotonic) makes the
@@ -1877,8 +1918,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 }
             }
             // CONNACK: session-present=0 (clean sessions only); reason/rc 0 on
-            // success, else unacceptable-protocol-version
-            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1);
+            // success, else unacceptable-protocol-version. assignedId is non-empty
+            // only for an empty-ClientId v5 client (echoed via property 0x12).
+            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1, assignedId);
             return okPair;
         }
     case PT_PUBLISH:
