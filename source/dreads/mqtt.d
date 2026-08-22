@@ -15,11 +15,12 @@ module dreads.mqtt;
 //   - retained messages are broadcast-replicated to every thread's local map
 //     (rare writes, local reads at SUBSCRIBE time).
 //
-// Scope: QoS 0 delivery, QoS 1 publishes (PUBACK on receipt), QoS 2 publishes
-// (full PUBREC/PUBREL/PUBCOMP receive handshake with packet-id dedup;
-// deliveries themselves go out at QoS 0), clean sessions only (CONNACK
-// session-present=0), retained messages, no keepalive enforcement (TCP death
-// is detected by the read loop), overlapping subscriptions may deliver
+// Scope: QoS 0/1 delivery (outbound PUBLISH at min(publishQoS, subGrant), a
+// bounded per-conn in-flight window, PUBACK releases the id), QoS 1 receive
+// (PUBACK on receipt), QoS 2 receive (full PUBREC/PUBREL/PUBCOMP handshake with
+// packet-id dedup), clean sessions only (CONNACK session-present=0), retained
+// messages, keepalive enforced at 1.5x [MQTT-3.1.2-24] (0 = none; TCP death is
+// also detected by the read loop), overlapping subscriptions may deliver
 // duplicates (the 3.1.1 spec permits this).
 //
 // Delivery writes: each connection owns a WRITER FIBER draining a
@@ -1093,6 +1094,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (!(flags & 0x04) && (flags & 0x38))
                 return false; // [MQTT-3.1.2-11/13/15] will qos/retain w/o will
             // keepalive seconds: enforce 1.5x as the read deadline [MQTT-3.1.2-24]
+            if (i + 2 > p.length)
+                return false; // truncated CONNECT: no keepalive field (a body
+            // ending at/after the flags byte would otherwise read 1-2 bytes
+            // past the packet — an unchecked OOB in a -release build, i.e. a
+            // shard crash from one unauthenticated malformed CONNECT)
             immutable ka = cast(ushort)((p[i] << 8) | p[i + 1]);
             i += 2;
             c.readDeadline = ka == 0 ? Duration.max : (ka * 1500).msecs;
@@ -1421,11 +1427,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         c.willPayload = null;
         return false;
     default:
-        // types 0 and 15 are reserved; CONNACK/PUBACK/PUBREC/PUBCOMP/SUBACK/
-        // UNSUBACK/PINGRESP are server->client only (we never send QoS>0 out,
-        // so none is ever legitimate inbound). This default also replaces a
-        // final-switch that turned any of them into a runtime SwitchError —
-        // one PUBREL used to crash the whole server.
+        // types 0 and 15 are reserved; CONNACK/PUBREC/PUBCOMP/SUBACK/UNSUBACK/
+        // PINGRESP are server->client only and never legitimate inbound (PUBACK
+        // IS legitimate now that we deliver QoS1 out — it has its own case
+        // above). This default also replaces a final-switch that turned any of
+        // them into a runtime SwitchError — one PUBREL used to crash the server.
         return false;
     }
 }
