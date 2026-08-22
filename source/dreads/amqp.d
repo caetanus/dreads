@@ -41,6 +41,13 @@ public __gshared void delegate(scope const(char)[] key, scope const(char)[] payl
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
 public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
+/// Non-destructive head read (LINDEX key 0) for the active-TTL reaper; false =
+/// empty queue. Installed by server.d.
+public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outHead) nothrow gAmqpPeekHead;
+/// Does THIS shard thread own `key`? Only the owner reaps a queue (so peek+pop
+/// stay self-shard and yield-free, and no queue is swept N times). Installed by
+/// server.d.
+public __gshared bool delegate(scope const(char)[] key) nothrow gAmqpOwns;
 /// Flush THIS shard-thread's AOF pending buffer to the OS (installed by
 /// server.d). Skins call it once per network batch so a confirmed publish is
 /// durable before the ack/confirm reaches the client — matching how the RESP
@@ -1803,6 +1810,59 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob) no
         if (gAmqpPush !is null)
             gAmqpPush(kb5.data.asChars, blobc);
     });
+}
+
+/// ACTIVE x-message-ttl expiry (called ~1/s per shard from the maintenance
+/// tick). Lazy expiry only fires when a queue is READ; a message that outlives
+/// its TTL while sitting in an unconsumed queue would linger forever and never
+/// dead-letter (a real gap vs RabbitMQ). This proactively expires the heads of
+/// every TTL queue THIS shard owns: peek the head, and while it is expired,
+/// pop + dead-letter it (bounded per queue per tick). Ownership-gated so peek
+/// and pop are self-shard and yield-free between them.
+public void amqpTtlSweep() nothrow @trusted
+{
+    if (gAmqpPeekHead is null || gAmqpOwns is null || gAmqpPop is null)
+        return;
+    try
+    {
+        static ByteBuffer kb; // TLS
+        static ByteBuffer head; // TLS
+        static ByteBuffer popped; // TLS
+        foreach (q, meta; gQueueMeta)
+        {
+            if (meta.ttlMs <= 0)
+                continue;
+            queueKey(q, kb);
+            if (!gAmqpOwns(kb.data.asChars))
+                continue; // only the list's owner reaps it
+            int reaped = 0;
+            while (reaped < 4096) // bound the work per queue per tick
+            {
+                head.clear();
+                if (!gAmqpPeekHead(kb.data.asChars, head))
+                    break; // empty queue
+                if (!isExpired(head.data, meta.ttlMs))
+                    break; // head is fresh -> everything behind it is younger
+                popped.clear();
+                if (!gAmqpPop(kb.data.asChars, popped))
+                    break;
+                // defensive: if a consumer raced between peek and pop and the
+                // popped record is NOT actually expired, put it back and stop
+                // (peek+pop are yield-free self-shard, so this should not fire)
+                if (!isExpired(popped.data, meta.ttlMs))
+                {
+                    if (gAmqpPushFront !is null)
+                        gAmqpPushFront(kb.data.asChars, popped.data.asChars);
+                    break;
+                }
+                deadLetter(q, popped.data); // DLX route or drop (no DLX)
+                reaped++;
+            }
+        }
+    }
+    catch (Exception)
+    {
+    }
 }
 
 // Consumer: a fiber that drains the queue to this connection. v1 POLLS the

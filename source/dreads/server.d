@@ -2591,7 +2591,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -2646,6 +2646,31 @@ private void amqpInstallHooks() nothrow
         amqpDataExec(a[], rbd);
     };
     gAmqpAofFlush = () nothrow { myAof().flush(); };
+    gAmqpPeekHead = (scope const(char)[] key, ref ByteBuffer outHead) nothrow {
+        static ByteBuffer rbk; // TLS
+        const(char)[][3] a = ["lindex", key, "0"];
+        amqpDataExec(a[], rbk);
+        auto d = rbk.data; // $N\r\n<blob>\r\n or $-1 (empty/nil)
+        if (d.length < 4 || d[0] != '$' || d[1] == '-')
+            return false;
+        size_t i = 1, n = 0;
+        while (i < d.length && d[i] != '\r')
+        {
+            n = n * 10 + (d[i] - '0');
+            i++;
+        }
+        i += 2;
+        if (i + n > d.length)
+            return false;
+        outHead.append(d[i .. i + n]);
+        return true;
+    };
+    gAmqpOwns = (scope const(char)[] key) nothrow {
+        import dreads.shard : tShard, shardOfSlot, sharded;
+        import dreads.slots : keyToSlot;
+
+        return !sharded() || cast(uint) shardOfSlot(keyToSlot(key)) == tShard;
+    };
     gAmqpCtlFanout = (scope const(ubyte)[] ctl) nothrow {
         import dreads.shard : gShardCount, tShard, shardEnqueue, shardWake,
             ShardMsg, sharded;
@@ -7276,6 +7301,14 @@ private void maintEvictionTick() @trusted nothrow
     flushPendingNotify(); // deliver any events the eviction cycle queued
     if (gTrackCount)
         flushTrackingInval(0);
+    // active AMQP x-message-ttl expiry (dead-letter/drop expired heads even in
+    // an unconsumed queue — lazy expiry only fires on read)
+    if (gConfig.amqpPort != 0)
+    {
+        import dreads.amqp : amqpTtlSweep;
+
+        amqpTtlSweep();
+    }
     // AOF-per-shard: each shard fsyncs its OWN file (the "everysec" contract,
     // now per shard — this tick runs on every shard thread and on main).
     myAof().flush();
