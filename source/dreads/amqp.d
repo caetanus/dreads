@@ -1135,10 +1135,19 @@ private enum size_t AMQP_MAX_TX = 100_000;
 /// Max exchange-to-exchange hops a message routes through (cycle/depth bound).
 private enum int AMQP_MAX_EXCHANGE_HOPS = 10;
 private enum size_t AMQP_MAX_TX_BYTES = 256UL << 20; // 256MB of buffered pubs/tx
+// The unacked/prefetch window is byte-bounded too (not just count-bounded): a
+// no-ack=false consumer that stops acking large messages would otherwise pin
+// count*bodysize RAM (the count cap alone is not a RAM bound — the byte-cap
+// lesson). Per connection, like the tx buffer.
+private enum size_t AMQP_MAX_UNACKED_BYTES = 256UL << 20; // 256MB
 
 private struct Channel
 {
     bool open;
+    uint openGen; // per-conn generation stamped on channel.open. Consumer fibers
+    // capture it and exit when the channel is gone OR reopened under a NEW gen —
+    // channel NUMBERS are reused (pika reuses the lowest freed one), so a plain
+    // per-number closed-flag would kill a fresh consumer on a reopened number.
     bool confirmMode;
     ulong confirmSeq; // next publish seq (delivery-tag for basic.ack confirms)
     PendingPub pub;
@@ -1164,10 +1173,11 @@ private final class AmqpConn
     bool closing;
     bool[string] cancelledTags; // basic.cancel'ed consumer tags
     Unacked[ulong] unacked; // delivery-tag -> record (no_ack=false consumers)
+    size_t unackedBytes; // running sum of unacked blob bytes (byte-cap the window)
     ulong nextTag = 1;
     ulong nextCtag = 1; // server-assigned consumer tags (unique per connection)
     size_t prefetch;    // basic.qos prefetch-count (0 = AMQP_DEFAULT_PREFETCH)
-    bool[ushort] closedChans; // channel.close'd: consumer fibers on it must exit
+    uint chanGenCtr; // monotonic per-conn source for Channel.openGen (channel-reuse safe)
     size_t consumerCount; // live basic.consume fibers (per-conn cap)
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     bool hbStarted;  // the sender fiber is spawned exactly once
@@ -1463,7 +1473,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             if (chan !in c.chans && c.chans.length >= AMQP_MAX_CHANNELS)
                 return false; // channel-max exceeded: close the connection
             try
+            {
                 c.chans[chan] = Channel(true);
+                c.chans[chan].openGen = ++c.chanGenCtr; // fresh gen: reopens are distinct
+            }
             catch (Exception)
             {
             }
@@ -1477,7 +1490,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             // otherwise those messages were destructively popped and lost
             try
             {
-                c.closedChans[chan] = true;
+                // removing chans[chan] (below) makes this channel's consumer
+                // fibers observe a gen/existence mismatch and exit — no per-number
+                // closed-flag needed (that flag mis-killed fresh consumers on a
+                // reopened, reused channel number).
                 ulong[] mine;
                 foreach (t, ref u; c.unacked)
                     if (u.chan == chan)
@@ -1711,7 +1727,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getLimit = c.prefetch ? c.prefetch : AMQP_DEFAULT_PREFETCH;
                 bool getFull = false;
                 try
-                    getFull = !getNoAck && c.unacked.length >= getLimit;
+                    getFull = !getNoAck && (c.unacked.length >= getLimit
+                            || c.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
                 catch (Exception)
                 {
                 }
@@ -1758,7 +1775,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // workflow could neither ack nor requeue (message lost)
                     if (!getNoAck)
                         try
+                        {
                             c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0);
+                            c.unackedBytes += pay.data.length;
+                        }
                         catch (Exception)
                         {
                         }
@@ -1850,10 +1870,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                             if ((tag == 0 || t <= tag) && u.chan == chan)
                                 drop ~= t;
                         foreach (t; drop)
-                            c.unacked.remove(t);
+                            dropUnacked(c, t);
                     }
                     else
-                        c.unacked.remove(tag);
+                        dropUnacked(c, tag);
                 }
                 catch (Exception)
                 {
@@ -2107,10 +2127,10 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
                         if ((ts.tag == 0 || t <= ts.tag) && u.chan == chan)
                             drop ~= t;
                     foreach (t; drop)
-                        c.unacked.remove(t);
+                        dropUnacked(c, t);
                 }
                 else
-                    c.unacked.remove(ts.tag);
+                    dropUnacked(c, ts.tag);
             }
             catch (Exception)
             {
@@ -2435,6 +2455,7 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
                     gAmqpPushFront(kb6.data.asChars, rq6.data.asChars);
             }
         c.unacked.clear();
+        c.unackedBytes = 0;
     }
     catch (Exception)
     {
@@ -2442,6 +2463,23 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
 }
 
 /// Negative settle: requeue=true puts the record back at the queue FRONT;
+/// Remove one unacked record (positive ack path), discounting its bytes from the
+/// window accumulator. Call AFTER a foreach over unacked has collected the tags,
+/// never during it. Underflow-guarded.
+private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
+{
+    try
+        if (auto p = tag in c.unacked)
+        {
+            immutable n = p.blob.length;
+            c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
+            c.unacked.remove(tag);
+        }
+    catch (Exception)
+    {
+    }
+}
+
 /// requeue=false dead-letters via the queue's x-dead-letter-exchange (declared
 /// metadata) or drops when none is configured.
 private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @trusted
@@ -2454,6 +2492,8 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
         {
             u = *p;
             found = true;
+            immutable n = u.blob.length;
+            c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
             c.unacked.remove(tag);
         }
     }
@@ -2871,10 +2911,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     }
     catch (Exception)
         return;
+    uint myGen; // the channel generation this consumer belongs to (channel exists
+    if (auto pch = chan in c.chans) // now — basic.consume is on an open channel)
+        myGen = pch.openGen;
     atomicOp!"+="(gAmqpConsumers, 1);
     c.consumerCount++;
     try
-        cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na) nothrow {
+        cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg) nothrow {
             scope (exit)
             {
                 atomicOp!"-="(gAmqpConsumers, 1);
@@ -2898,8 +2941,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 {
                     if (tt in cc.cancelledTags)
                         return;
-                    if (chn in cc.closedChans)
-                        return; // channel.close: stop draining this channel
+                    // channel gone (closed) or REOPENED under a new generation
+                    // (reused number): this fiber is the OLD instance -> exit. A
+                    // fresh consumer on the reused number has the new gen and stays.
+                    auto pch = chn in cc.chans;
+                    if (pch is null || pch.openGen != mg)
+                        return;
                 }
                 catch (Exception)
                 {
@@ -2910,7 +2957,8 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 immutable limit = cc.prefetch ? cc.prefetch : AMQP_DEFAULT_PREFETCH;
                 bool windowFull = false;
                 try
-                    windowFull = !na && cc.unacked.length >= limit;
+                    windowFull = !na && (cc.unacked.length >= limit
+                            || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
                 catch (Exception)
                 {
                 }
@@ -2928,8 +2976,9 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 int burst = 0;
                 while (burst < 64)
                 {
-                    if (!na && cc.unacked.length >= limit)
-                        break; // window filled mid-burst
+                    if (!na && (cc.unacked.length >= limit
+                            || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES))
+                        break; // window filled mid-burst (count OR bytes)
                     pay.clear();
                     if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
                         break;
@@ -2948,7 +2997,10 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     // FRONT and stop rather than deliver on a dead channel
                     bool gone = cc.closing;
                     try
-                        gone = gone || (chn in cc.closedChans) !is null;
+                    {
+                        auto pc2 = chn in cc.chans;
+                        gone = gone || pc2 is null || pc2.openGen != mg;
+                    }
                     catch (Exception)
                     {
                     }
@@ -2961,7 +3013,10 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     immutable tg = cc.nextTag++;
                     if (!na)
                         try
+                        {
                             cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0);
+                            cc.unackedBytes += pay.data.length;
+                        }
                         catch (Exception)
                         {
                         }
@@ -2987,7 +3042,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 }
                 sendTo(cc, ob.data);
             }
-        }, c, chan, qs, ts, noAck);
+        }, c, chan, qs, ts, noAck, myGen);
     catch (Exception)
     {
         atomicOp!"-="(gAmqpConsumers, 1);
