@@ -285,3 +285,36 @@ properties recovered in order after a SIGKILL. Feature surface validated
 with pika at shards=4: topic/direct/fanout/HEADERS exchanges, property
 passthrough, publisher confirms, ack/nack/reject with requeue,
 dead-lettering via x-dead-letter-exchange, consumer cancel, heartbeats.
+
+## Kafka skin vs Apache Kafka 3.7 (2026-08-21)
+
+Same box, driven by the SAME load generator (`bench/kafkaload.d` — a
+correlation-pipelined producer with a 64-request inflight window, 32
+messages per Produce request, acks=1, counting broker acks; and a fetch
+loop counting fetched messages; identical binary against both brokers,
+speaking the pre-flexible dialect both accept: Produce v2 / Fetch v3 /
+MessageSet v1). Apache Kafka 3.7 official docker image, KRaft single
+broker, pinned to cores 0-1 (TWO cores); dreads `--kafka-port 9092`,
+single shard, pinned to core 0 (ONE core). 16B payloads.
+
+| metric | dreads Kafka skin (1 core) | Apache Kafka 3.7 (2 cores) | |
+|---|---:|---:|---:|
+| acked produce rate (acks=1)   | **4.44M msg/s** | 645K | **6.9×** |
+| fetch (consume from offset 0) | **1.94M msg/s** | 2.56M | 0.76× |
+
+A produce request's whole message set lands as ONE atomic variadic RPUSH on
+the owner shard — the batch's base offset is `new length - count`, so offset
+assignment is atomic with the append and every skin (RESP, MQTT, AMQP,
+Kafka) shares the exact same write tail, AOF included: a partition IS a
+list (`LRANGE kafka.t.<topic>.<p>` shows the records from the RESP side),
+and produced messages survive kill -9 with zero Kafka-specific persistence
+code. Fetch is the one place the incumbent still wins: Kafka serves
+contiguous log segments (sendfile), while the skin re-walks a list per
+fetch — the planned segment/IR-log-backed partition closes that gap.
+
+Bench-trap note (recorded so nobody repeats it): the Apache container binds
+`127.0.0.1:9092` (specific address) while dreads binds `*:9092` — BOTH
+listens coexist, and the kernel hands every loopback connect to the more
+specific one. A benchmark "against dreads" with the container still up is
+silently a benchmark against Apache Kafka. `docker stop kafka` first;
+verify with `ss -ltnp | grep 9092`.
