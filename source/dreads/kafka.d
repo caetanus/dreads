@@ -51,6 +51,11 @@ private enum int KAFKA_MAX_ARRAY = 65536;
 private enum size_t KAFKA_MAX_TOPIC = 249;
 /// Trim response/input buffers back to this after a spike.
 private enum size_t KAFKA_BUF_KEEP = 4 << 20;
+/// Absolute per-request response ceiling. safeCount bounds each array count,
+/// but nparts×ntopics (65536×65536) repeated emission still builds a multi-GB
+/// reply that aborts the allocator (broker death). Once the body passes this,
+/// remaining partitions emit empty record sets.
+private enum size_t KAFKA_MAX_RESP = 128 << 20;
 
 /// Clamp a wire array count to a safe iteration bound (negative or absurd -> 0).
 private int safeCount(int n) @nogc nothrow pure
@@ -563,7 +568,14 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                     | (cast(uint) records[i + 9] << 16)
                     | (cast(uint) records[i + 10] << 8) | records[i + 11];
                 if (i + 12 + msz > records.length)
+                {
+                    // a truncated trailing message: reject the whole set. A
+                    // silent partial-accept ACKs a baseOffset for records that
+                    // were never stored -> the producer's offset accounting
+                    // desyncs from the log.
+                    err = E_CORRUPT;
                     break;
+                }
                 auto msg = records[i + 12 .. i + 12 + msz];
                 if (msz < 6)
                 {
@@ -612,6 +624,8 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 foreach (k; 0 .. nrec)
                     slices[k] = cast(const(char)[]) base[offs[k * 2] .. offs[k * 2] + offs[k * 2 + 1]];
                 immutable newLen = pushRecords(kb.data.asChars, slices[0 .. nrec]);
+                if (blobArena.capacity > KAFKA_BUF_KEEP)
+                    blobArena.trim(KAFKA_BUF_KEEP); // a 64MB set must not pin
                 if (newLen < 0)
                     err = E_CORRUPT;
                 else
@@ -654,15 +668,23 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable part = r.i32();
             immutable fetchOff = r.i64();
             immutable partMax = r.i32();
-            // STACK-local key: partLen()'s cross-shard hop YIELDS, and a shared
-            // TLS buffer would be overwritten by another fetch fiber's partKey
-            // during the park -> we'd then serve a DIFFERENT partition/topic to
-            // this client (cross-tenant leak). A per-partition local survives.
-            ByteBuffer kb2;
-            partKey(topic, part, kb2);
-            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb2.data.asChars) : -1;
+            // Build the key in a reused TLS buffer, then COPY it to a stack
+            // array: partLen()'s cross-shard hop YIELDS, and using the TLS
+            // buffer after the park would read a key another fetch fiber
+            // rewrote during the park (cross-tenant leak). The stack copy
+            // survives the yield with zero per-partition heap alloc (the
+            // stack-local ByteBuffer that first fixed this churned the
+            // allocator on the fetch hot path).
+            static ByteBuffer kbBuild; // TLS scratch (only used pre-yield)
+            partKey(topic, part, kbBuild);
+            char[8 + KAFKA_MAX_TOPIC + 16] keyStore = void;
+            immutable klen = kbBuild.length <= keyStore.length ? kbBuild.length : keyStore.length;
+            keyStore[0 .. klen] = cast(const(char)[]) kbBuild.data[0 .. klen];
+            auto key = cast(const(char)[]) keyStore[0 .. klen];
+            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
             if (hw < 0)
-                hw = partLen(kb2.data.asChars);
+                hw = partLen(key);
+            immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
             immutable bad = fetchOff < 0 || fetchOff > hw || !validTopic(topic) || part < 0;
             putI32(o, part);
             putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
@@ -670,7 +692,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             // records: rebuild [offset][stored blob] until ~partMax bytes
             immutable recAt = o.length;
             putI32(o, 0); // records byte size, patched below
-            if (!bad && fetchOff < hw)
+            if (!bad && !overCap && fetchOff < hw)
             {
                 // budget: partMax bytes, capped count
                 int maxN = 16384; // deep batches: fewer walks per fetch
@@ -678,13 +700,13 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                 size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
                 int direct = -1;
                 if (gKafkaFetchRaw !is null)
-                    direct = gKafkaFetchRaw(kb2.data.asChars, fetchOff, maxN,
+                    direct = gKafkaFetchRaw(key, fetchOff, maxN,
                             budget, fetchOff, o);
                 if (direct < 0)
                 {
                     immutable startLen = o.length;
                     bool first = true;
-                    cast(void) rangeRecords(kb2.data.asChars, fetchOff, maxN,
+                    cast(void) rangeRecords(key, fetchOff, maxN,
                             (scope const(ubyte)[] blob) nothrow {
                         // check the budget BEFORE appending (was after: a single
                         // large record always blew past a tiny partMax); always
@@ -730,11 +752,15 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             immutable ts = r.i64();
             if (ver == 0)
                 cast(void) r.i32(); // max_num_offsets (v0)
-            ByteBuffer kb3; // stack-local: safe across partLen's hop yield
-            partKey(topic, part, kb3);
-            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(kb3.data.asChars) : -1;
+            static ByteBuffer kb3build; // TLS scratch (pre-yield only)
+            partKey(topic, part, kb3build);
+            char[8 + KAFKA_MAX_TOPIC + 16] k3store = void;
+            immutable k3len = kb3build.length <= k3store.length ? kb3build.length : k3store.length;
+            k3store[0 .. k3len] = cast(const(char)[]) kb3build.data[0 .. k3len];
+            auto k3 = cast(const(char)[]) k3store[0 .. k3len];
+            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(k3) : -1;
             if (hw < 0)
-                hw = partLen(kb3.data.asChars);
+                hw = partLen(k3);
             immutable off = ts == -2 ? 0 : hw; // earliest : latest
             putI32(o, part);
             putI16(o, E_NONE);
