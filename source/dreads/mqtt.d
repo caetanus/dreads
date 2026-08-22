@@ -165,6 +165,8 @@ private struct SubEntry
     MqttConn c;
     uint gen; // conn's gen at subscribe time; != c.gen ⇒ stale (lazily skipped)
     ubyte qos; // granted qos (v1: always 0 on delivery)
+    ubyte opts; // v5 subscription options: bit2 no-local, bit3 retain-as-published,
+    // bits4-5 retain-handling (v3 subs: 0 = deliver-all, clear-retain, send-retained)
 }
 
 private final class TrieNode
@@ -208,16 +210,17 @@ private TrieNode trieRoot() nothrow @trusted
 // conn, same terminal): update qos in place, no second entry, no recount —
 // appending instead was both a spec violation (duplicate deliveries) and an
 // amplification DoS. Returns true when a NEW entry was created.
-private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos) @trusted nothrow
+private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts) @trusted nothrow
 {
     foreach (ref e; a)
         if (e.c is c && e.gen == c.gen)
         {
             e.qos = qos;
+            e.opts = opts;
             return false;
         }
     try
-        a ~= SubEntry(c, c.gen, qos);
+        a ~= SubEntry(c, c.gen, qos, opts);
     catch (Exception)
         return false;
     atomicOp!"+="(gMqttSubTotal, 1);
@@ -226,7 +229,8 @@ private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos) @trusted nothr
 
 // Split-walk `filter` creating nodes, then upsert the entry at the terminal.
 // Returns true when a NEW subscription was created (false = replaced/failed).
-private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos) @trusted nothrow
+private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
+        ubyte opts = 0) @trusted nothrow
 {
     try
     {
@@ -240,7 +244,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos) @t
                 e++;
             auto seg = filter[i .. e];
             if (seg == "#")
-                return upsertEntry(n.hash, c, qos);
+                return upsertEntry(n.hash, c, qos, opts);
             TrieNode next;
             if (seg == "+")
             {
@@ -260,7 +264,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos) @t
                 }
             }
             if (e >= filter.length)
-                return upsertEntry(next.subs, c, qos);
+                return upsertEntry(next.subs, c, qos, opts);
             n = next;
             i = e + 1;
         }
@@ -330,6 +334,8 @@ private struct Match // one matched subscriber + its granted qos (fused so the
 {                    // conn and its qos can never desync — no parallel arrays)
     MqttConn c;
     ubyte qos;
+    bool noLocal; // v5 no-local: don't echo the publisher's own message back
+    bool rap; // v5 retain-as-published: keep the publisher's retain flag
 }
 
 private Match[] tMatchBuf;
@@ -385,7 +391,7 @@ private void addLive(ref SubEntry e) @trusted nothrow
         catch (Exception)
             return;
     }
-    tMatchBuf[tMatchLen++] = Match(e.c, e.qos);
+    tMatchBuf[tMatchLen++] = Match(e.c, e.qos, (e.opts & 0x04) != 0, (e.opts & 0x08) != 0);
 }
 
 /// Does `filter` match `topic`? (retained-message delivery at SUBSCRIBE time.)
@@ -616,7 +622,7 @@ public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trust
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
 public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
-        bool retain, ulong seq, ubyte pubQos = 0) nothrow @trusted
+        bool retain, ulong seq, ubyte pubQos = 0, MqttConn publisher = null) nothrow @trusted
 {
     if (retain)
     {
@@ -683,7 +689,12 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         auto s = m.c;
         if (s.closed)
             continue;
+        if (m.noLocal && s is publisher)
+            continue; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
+        // v5 retain-as-published keeps the publisher's retain flag; otherwise a
+        // forwarded delivery clears retain [MQTT-3.3.1-9].
+        immutable delRetain = m.rap && retain;
         // effective delivery QoS = min(publish QoS, this subscription's grant)
         immutable effQos = pubQos < m.qos ? pubQos : m.qos;
         if (effQos >= 1)
@@ -698,9 +709,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 q1.clear();
                 if (effQos == 2)
-                    buildPublishQos2(q1, topic, payload, false, pid, v5);
+                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5);
                 else
-                    buildPublishQos1(q1, topic, payload, false, pid, v5);
+                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5);
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
@@ -730,19 +741,35 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             }
             // fall through: window saturated -> deliver at QoS0
         }
-        if (v5 && !pktV5built)
+        if (delRetain)
         {
-            pktV5.clear();
-            buildPublish(pktV5, topic, payload, false, true);
-            pktV5built = true;
+            // rare (retain-as-published, QoS0): the shared packet has retain=0,
+            // so build a one-off with the retain bit set
+            q1.clear();
+            buildPublish(q1, topic, payload, true, v5);
+            if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+            {
+                atomicOp!"+="(gMqttDropped, 1);
+                continue;
+            }
+            s.obox.append(q1.data);
         }
-        immutable plen = v5 ? pktV5.length : pkt.length;
-        if (s.obox.length + plen > MQTT_OBOX_CAP)
+        else
         {
-            atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
-            continue;
+            if (v5 && !pktV5built)
+            {
+                pktV5.clear();
+                buildPublish(pktV5, topic, payload, false, true);
+                pktV5built = true;
+            }
+            immutable plen = v5 ? pktV5.length : pkt.length;
+            if (s.obox.length + plen > MQTT_OBOX_CAP)
+            {
+                atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
+                continue;
+            }
+            s.obox.append(v5 ? pktV5.data : pkt.data);
         }
-        s.obox.append(v5 ? pktV5.data : pkt.data);
         if (!s.dirty)
         {
             s.dirty = true;
@@ -1334,7 +1361,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                         atomicOp!"+="(gMqttMessages, 1);
                         immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                        mqttDeliverLocal(topic, payload, retain, rseq, qos);
+                        mqttDeliverLocal(topic, payload, retain, rseq, qos, c);
                         if (gMqttFanout !is null)
                             gMqttFanout(topic, payload, retain, rseq, qos);
                     }
@@ -1353,7 +1380,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             {
                 atomicOp!"+="(gMqttMessages, 1);
                 immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                mqttDeliverLocal(topic, payload, retain, rseq, qos);
+                mqttDeliverLocal(topic, payload, retain, rseq, qos, c);
                 if (gMqttFanout !is null)
                     gMqttFanout(topic, payload, retain, rseq, qos);
             }
@@ -1448,6 +1475,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             static ubyte[64] granted = void;
             size_t ng = 0;
             static const(char)[][64] filters;
+            static bool[64] retainOk; // per-filter: send retained on subscribe?
             while (i < p.length)
             {
                 if (ng >= granted.length)
@@ -1468,6 +1496,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (!mqttValidFilter(filter) || c.filters.length >= MQTT_MAX_SUBS)
                 {
                     granted[ng] = 0x80; // unusable filter / sub-cap: failure
+                    retainOk[ng] = false;
                     filters[ng++] = null;
                     continue;
                 }
@@ -1483,12 +1512,18 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 catch (Exception)
                 {
                     granted[ng] = 0x80;
+                    retainOk[ng] = false;
                     filters[ng++] = null;
                     continue;
                 }
                 immutable grant = cast(ubyte) reqQos; // QoS0/1/2 out (reqQos already <=2)
-                if (!trieSubscribe(filter, c, grant))
+                immutable isNew = trieSubscribe(filter, c, grant, cast(ubyte)(v5 ? optByte : 0));
+                if (!isNew)
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
+                // v5 retain-handling (opts bits 4-5): 0 = always send retained on
+                // subscribe, 1 = only if the subscription is new, 2 = never.
+                immutable rh = v5 ? ((optByte >> 4) & 0x03) : 0;
+                retainOk[ng] = rh == 0 || (rh == 1 && isNew);
                 filters[ng] = filter;
                 granted[ng++] = grant;
             }
@@ -1510,8 +1545,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         continue; // tombstone (deleted retained): never delivered
                     if (o.length > MQTT_OBOX_CAP)
                         break; // bounded replay burst (retained is QoS0/best-effort)
-                    foreach (f; filters[0 .. ng])
-                        if (f !is null && mqttFilterMatches(f, topic))
+                    foreach (fi, f; filters[0 .. ng])
+                        if (f !is null && retainOk[fi] && mqttFilterMatches(f, topic))
                         {
                             buildPublish(o, topic, r.payload, true, v5);
                             break;
