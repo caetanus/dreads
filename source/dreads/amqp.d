@@ -1889,10 +1889,26 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob) no
         return;
     auto rk = meta.dlrk.length ? meta.dlrk : (origRk.length ? origRk : queue);
     // rebuild the record with deaths+1 (keeps publishMs so TTL still measures
-    // from the ORIGINAL publish, RabbitMQ-style)
-    static ByteBuffer dlrec; // TLS
+    // from the ORIGINAL publish, RabbitMQ-style). The DLX fan-out's cross-shard
+    // RPUSH YIELDS and blobc slices this buffer, so a concurrent deadLetter on
+    // this thread (reaper vs consumer-burst/basic.get/nack) would clobber it and
+    // every fan-out target AFTER the first would ship the wrong record. Mirror
+    // finishPublish: the reentrant caller takes a fresh stack-local so the parked
+    // fan-out keeps reading its own bytes.
+    static ByteBuffer dlrecStatic; // TLS
+    static bool dlrecBusy;
+    ByteBuffer dlrecLocal;
+    ByteBuffer* dlrec = &dlrecLocal;
+    if (!dlrecBusy)
+    {
+        dlrecBusy = true;
+        dlrec = &dlrecStatic;
+    }
+    scope (exit)
+        if (dlrec is &dlrecStatic)
+            dlrecBusy = false;
     dlrec.clear();
-    buildRecord(dlrec, pm, deaths + 1, origRk, props, body_);
+    buildRecord(*dlrec, pm, deaths + 1, origRk, props, body_);
     auto blobc = dlrec.data.asChars;
     routeTo(meta.dlx, rk, propsHeaders(props), (string q) nothrow {
         static ByteBuffer kb5; // TLS
