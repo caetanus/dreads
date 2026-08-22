@@ -263,3 +263,25 @@ Redis tables above`): MQTT here is a protocol face, not a separate broker.
 Correctness: wildcard (`+`/`#`) overlap, retained-message delivery to late
 subscribers on other shard threads, and QoS1 acks verified with paho-mqtt
 at shards=4.
+
+## AMQP skin vs RabbitMQ 3 (2026-08-22)
+
+Same box, both brokers pinned to core 0, driven by the SAME load generator
+(`bench/amqpload.d` — publisher-confirm mode with a 256-message inflight
+window counting basic.ack, and a no-ack consumer counting basic.deliver;
+identical binary against both). RabbitMQ 3 official docker image, default
+config; dreads `--amqp-port 5672`, single shard, AOF off.
+
+| metric (1 core, confirms on, 16B payload) | dreads AMQP skin | RabbitMQ 3 | |
+|---|---:|---:|---:|
+| confirmed publish rate            | **1.13M msg/s** | 33.4K | **34×** |
+| end-to-end (pub+consume, no-ack)  | **797K msg/s**  | 39.5K | **20×** |
+
+Every dreads publish traverses the REAL data plane: the queue is a list in
+the shard's keyspace (`LRANGE amq.q.<name>` shows it from the RESP side),
+which is why queues survive kill -9 via the per-shard AOF with zero
+AMQP-specific persistence code — verified: 10 queued messages with
+properties recovered in order after a SIGKILL. Feature surface validated
+with pika at shards=4: topic/direct/fanout/HEADERS exchanges, property
+passthrough, publisher confirms, ack/nack/reject with requeue,
+dead-lettering via x-dead-letter-exchange, consumer cancel, heartbeats.
