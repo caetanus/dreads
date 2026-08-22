@@ -1262,17 +1262,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 foreach (t, ref u; c.unacked)
                     if (u.chan == chan)
                         mine ~= t;
+                // FIFO-preserving requeue + redelivered mark (settleNegative):
+                // descending tag -> pushFront leaves ascending at the head. The
+                // old inline pushFront scrambled order (AA hash order) and never
+                // set the redelivered flag.
+                import std.algorithm.sorting : sort;
+
+                sort!"a > b"(mine);
                 foreach (t; mine)
-                {
-                    if (auto up = t in c.unacked)
-                    {
-                        static ByteBuffer kbc; // TLS
-                        queueKey((*up).queue, kbc);
-                        if (gAmqpPushFront !is null)
-                            gAmqpPushFront(kbc.data.asChars, (*up).blob.asChars);
-                        c.unacked.remove(t);
-                    }
-                }
+                    settleNegative(c, t, true);
                 c.chans.remove(chan);
             }
             catch (Exception)
@@ -1280,6 +1278,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             }
             method(o, chan, 20, 41);
             return true;
+        case 20: // flow: we never throttle -> acknowledge, echoing the state
+            {
+                immutable active = r.u8() & 1;
+                method(o, chan, 20, 21, (ref ByteBuffer b) @nogc nothrow {
+                    b.appendByte(cast(char) active); // flow-ok
+                });
+                return true;
+            }
         default:
             return true;
         }
@@ -1377,6 +1383,27 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.tableRaw(); // arguments (ignored on unbind)
                 ctlBroadcast(4, ex, q, rk); // op 4: drop the matching binding
                 method(o, chan, 50, 51); // unbind-ok
+                return true;
+            }
+        case 30: // purge: empty the queue, reply purge-ok with the count
+            {
+                cast(void) r.u16();
+                auto q = r.shortStr();
+                cast(void) r.u8(); // no-wait
+                static ByteBuffer pk; // TLS
+                queueKey(q, pk);
+                // stack-copy the key across gAmqpLen's yield (same hazard as
+                // delete below): a concurrent queueKey would clobber TLS `pk`
+                char[8 + 256 + 4] purgeKeyStore = void;
+                immutable pklen = pk.length <= purgeKeyStore.length ? pk.length : purgeKeyStore.length;
+                purgeKeyStore[0 .. pklen] = cast(const(char)[]) pk.data[0 .. pklen];
+                auto purgeKey = cast(const(char)[]) purgeKeyStore[0 .. pklen];
+                immutable n = gAmqpLen !is null ? gAmqpLen(purgeKey) : 0;
+                if (gAmqpDelKey !is null)
+                    gAmqpDelKey(purgeKey); // DEL empties the list; queue-meta kept
+                method(o, chan, 50, 31, (ref ByteBuffer b) @nogc nothrow {
+                    putU32(b, cast(uint)(n < 0 ? 0 : n)); // purged message_count
+                });
                 return true;
             }
         case 40: // delete
