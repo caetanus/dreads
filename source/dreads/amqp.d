@@ -1579,6 +1579,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         foreach (t, ref u; c.unacked)
                             if (t <= tag && u.chan == chan)
                                 all ~= t;
+                        // preserve delivery order on redelivery: tags are
+                        // monotonic (delivery order), but the AA yields them in
+                        // hash order. requeue pushes to the FRONT, so settle
+                        // highest-tag-first (lowest ends up frontmost = FIFO);
+                        // dead-letter RPUSHes the DLX tail, so settle lowest-first.
+                        import std.algorithm.sorting : sort;
+
+                        if (requeue)
+                            sort!"a > b"(all);
+                        else
+                            sort!"a < b"(all);
                         foreach (t; all)
                             settleNegative(c, t, requeue);
                     }
@@ -1846,13 +1857,24 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
 {
     try
     {
+        // snapshot the tags, then requeue in DESCENDING order so the pushFront
+        // leaves them in ascending (delivery/FIFO) order at the queue front. The
+        // snapshot also decouples the iteration from gAmqpPushFront's cross-shard
+        // yield (no live-AA iterator held across the hop).
+        import std.algorithm.sorting : sort;
+
+        ulong[] tags;
         foreach (t, ref u; c.unacked)
-        {
-            static ByteBuffer kb6; // TLS
-            queueKey(u.queue, kb6);
-            if (gAmqpPushFront !is null)
-                gAmqpPushFront(kb6.data.asChars, u.blob.asChars);
-        }
+            tags ~= t;
+        sort!"a > b"(tags);
+        foreach (t; tags)
+            if (auto u = t in c.unacked)
+            {
+                static ByteBuffer kb6; // TLS
+                queueKey(u.queue, kb6);
+                if (gAmqpPushFront !is null)
+                    gAmqpPushFront(kb6.data.asChars, u.blob.asChars);
+            }
         c.unacked.clear();
     }
     catch (Exception)
