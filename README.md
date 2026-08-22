@@ -120,8 +120,11 @@ is the source of truth, and we never claim 1:1 parity without citing it.
 
 The architectural exceptions — the things that will *stay* different:
 
-- **All DBs live on one event-loop thread** (Redis's single-writer model, by
-  choice), with a shared-nothing per-shard future rather than locks.
+- **Single-writer per keyspace, no locks** — one event-loop thread by default,
+  or **thread-per-core sharding** (`--shards N`): each shard owns its slot
+  range, its 16 DBs, its allocators and its AOF file; cross-shard work is
+  explicit message passing over per-pair SPSC rings (Redis Cluster slot
+  semantics on ONE process — hashtags, `CROSSSLOT`, same-slot transactions).
 - **Replication is Raft consensus**, not the legacy async wire. `SYNC`/`PSYNC`/
   `REPLICAOF`/`min-replicas-*` are therefore no-ops or unsupported by design;
   durability comes from the committed log instead.
@@ -171,6 +174,36 @@ dreads leads on every command (1.1–1.5×) — the D + zero-GC + per-command ar
 engine simply does less work per request. Unpipelined throughput is round-trip
 bound on both sides (~95–100k rps); the pipelined numbers show the real
 per-command cost.
+
+### Sharded: one process, N cores
+
+`--shards N` runs a full thread-per-core engine: N SO_REUSEPORT routers, one
+keyspace shard per thread, cross-shard commands hop over SPSC rings. Same
+16-core box (Ryzen 3950X), `redis-benchmark -P 64`, dumb clients (no
+cluster-awareness — every client hits a random router and ~(1−1/N) of
+commands pay an internal hop):
+
+| shards | SET | GET | INCR |
+|---:|---:|---:|---:|
+| 1 | 1.78M | 1.75M | 1.78M |
+| 2 | 2.99M | — | — |
+| 4 | 5.23M | — | — |
+| 8 | **6.84M** | **9.81M** | **8.06M** |
+
+Same box, same clients, against **Dragonfly v1.40.1** (as shipped: io_uring,
+`--proactor_threads N`) — the same thread-per-core architecture:
+
+| op@8 threads | dreads | dragonfly | |
+|---|---:|---:|---:|
+| SET | **6.84M** | 4.26M | 1.6× |
+| GET | **9.81M** | 4.71M | 2.1× |
+| INCR | **8.06M** | 4.62M | 1.7× |
+| SET @1 thread | **1.78M** | 0.63M | 2.8× |
+
+Full ladders, methodology and the measurement-gotcha notes live in
+[bench/valkey-comparison.md](bench/valkey-comparison.md). Correctness under
+sharding is held to the same yardstick as everything else: the live Valkey
+suite battery runs green at shards=1, 4 and 8 with identical test counts.
 
 ### Pub/Sub: publish cost is independent of pattern count
 
@@ -241,6 +274,12 @@ for only at the boundaries where another service or shard is involved.
 
 ## Features
 
+- **Thread-per-core sharding** (`--shards N`): Redis Cluster slot semantics in
+  one process — O(1) key routing, `{hashtags}`, CROSSSLOT enforcement,
+  keyless broadcasts (KEYS/DBSIZE/FLUSH*/SCAN with a composite cursor),
+  blocking commands parked on the key owner, cross-shard pub/sub and keyspace
+  notifications, aggregated INFO/stats, same-slot atomic MULTI/EXEC, and
+  **per-shard AOF** with automatic re-sharding replay when `N` changes.
 - **243 of Valkey's 257 base commands** — see [DRIFT.md](DRIFT.md) for the
   honest gap list and every semantic difference (the 14 missing are all cluster /
   legacy-replication / sentinel / debug — architectural exclusions). All data
