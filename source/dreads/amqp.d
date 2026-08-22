@@ -1251,9 +1251,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u8(); // if-unused/if-empty/no-wait bits
                 static ByteBuffer dk; // TLS
                 queueKey(q, dk);
-                immutable n = gAmqpLen !is null ? gAmqpLen(dk.data.asChars) : 0;
+                // stack-copy: gAmqpLen's cross-shard hop YIELDS, and a
+                // concurrent queueKey would clobber the TLS `dk` used by the
+                // gAmqpDelKey below -> DELETING THE WRONG QUEUE's list.
+                char[8 + 256 + 4] delKeyStore = void;
+                immutable dklen = dk.length <= delKeyStore.length ? dk.length : delKeyStore.length;
+                delKeyStore[0 .. dklen] = cast(const(char)[]) dk.data[0 .. dklen];
+                auto delKey = cast(const(char)[]) delKeyStore[0 .. dklen];
+                immutable n = gAmqpLen !is null ? gAmqpLen(delKey) : 0;
                 if (gAmqpDelKey !is null)
-                    gAmqpDelKey(dk.data.asChars); // DEL the backing list
+                    gAmqpDelKey(delKey); // DEL the backing list
                 method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
                     putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
                 });
@@ -1304,6 +1311,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 static ByteBuffer kb2; // TLS
                 queueKey(q, kb2);
+                // stack-copy the key: the expired-head drain below calls
+                // deadLetter, whose cross-shard DLX push YIELDS, and a
+                // concurrent fiber's queueKey would clobber the TLS `kb2` used
+                // by the next pop -> popping the WRONG queue (same hazard the
+                // active-TTL reaper had).
+                char[8 + 256 + 4] getKeyStore = void;
+                immutable gklen = kb2.length <= getKeyStore.length ? kb2.length : getKeyStore.length;
+                getKeyStore[0 .. gklen] = cast(const(char)[]) kb2.data[0 .. gklen];
+                auto getKey = cast(const(char)[]) getKeyStore[0 .. gklen];
                 static ByteBuffer pay; // TLS
                 pay.clear();
                 // drain expired heads (dead-letter or drop) before delivering
@@ -1314,7 +1330,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     int drained = 0;
                     // bound the expired-head drain so a queue full of expired
                     // messages can't stall the serve fiber in one get
-                    while (drained < 4096 && gAmqpPop(kb2.data.asChars, pay))
+                    while (drained < 4096 && gAmqpPop(getKey, pay))
                     {
                         if (isExpired(pay.data, getTtl))
                         {
@@ -1329,7 +1345,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (getHit)
                 {
-                    immutable remaining = gAmqpLen !is null ? gAmqpLen(kb2.data.asChars) : 0;
+                    immutable remaining = gAmqpLen !is null ? gAmqpLen(getKey) : 0;
                     immutable gtag = c.nextTag++;
                     // no-ack=false: record for later ack/requeue; the old code
                     // hardcoded tag 1 and never recorded it, so a get+ack
