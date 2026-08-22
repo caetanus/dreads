@@ -893,3 +893,116 @@ unittest // wire helpers round-trip
     assert(r.str() == "abc");
     assert(r.ok);
 }
+
+// ---------------------------------------------------------------------------
+// RecordBatch v2 (magic 2) primitives: CRC-32C, LEB128 varints, zigzag.
+// These underpin record-headers support (Produce v3+/Fetch v4+). They ONLY add
+// new code — the v1 MessageSet path is untouched. See the produce/fetch v2
+// integration that consumes them.
+
+/// CRC-32C (Castagnoli, reflected poly 0x82F63B78) — the checksum a v2
+/// RecordBatch carries (distinct from the v1 message's CRC-32/IEEE `crc32Of`).
+private immutable uint[256] CRC32C_TABLE = () {
+    uint[256] t;
+    foreach (i; 0 .. 256)
+    {
+        uint c = cast(uint) i;
+        foreach (_; 0 .. 8)
+            c = (c & 1) ? (0x82F63B78U ^ (c >> 1)) : (c >> 1);
+        t[i] = c;
+    }
+    return t;
+}();
+
+private uint crc32c(scope const(ubyte)[] data) @nogc nothrow pure @safe
+{
+    uint crc = 0xFFFFFFFFU;
+    foreach (b; data)
+        crc = CRC32C_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFU;
+}
+
+/// LEB128 unsigned varint append.
+private void putUVarint(ref ByteBuffer o, ulong v) @nogc nothrow
+{
+    while (v >= 0x80)
+    {
+        o.appendByte(cast(ubyte)(v | 0x80));
+        v >>= 7;
+    }
+    o.appendByte(cast(ubyte) v);
+}
+
+/// Zigzag-encoded signed varint append (Kafka v2 uses these for lengths/deltas).
+private void putVarlong(ref ByteBuffer o, long v) @nogc nothrow
+{
+    putUVarint(o, (cast(ulong) v << 1) ^ cast(ulong)(v >> 63));
+}
+
+/// Read a LEB128 unsigned varint; sets ok=false on truncation or overlong (>10
+/// bytes). Advances i past the varint.
+private ulong getUVarint(scope const(ubyte)[] p, ref size_t i, ref bool ok) @nogc nothrow
+{
+    ulong result = 0;
+    int shift = 0;
+    foreach (_; 0 .. 10)
+    {
+        if (i >= p.length)
+        {
+            ok = false;
+            return 0;
+        }
+        immutable ubyte b = p[i++];
+        result |= cast(ulong)(b & 0x7F) << shift;
+        if ((b & 0x80) == 0)
+            return result;
+        shift += 7;
+    }
+    ok = false; // more than 10 bytes: malformed
+    return 0;
+}
+
+/// Read a zigzag-encoded signed varint.
+private long getVarlong(scope const(ubyte)[] p, ref size_t i, ref bool ok) @nogc nothrow
+{
+    immutable ulong u = getUVarint(p, i, ok);
+    return cast(long)(u >> 1) ^ -cast(long)(u & 1);
+}
+
+unittest // CRC-32C against the canonical "123456789" vector
+{
+    assert(crc32c(cast(const(ubyte)[]) "123456789") == 0xE3069283U);
+    assert(crc32c(cast(const(ubyte)[]) "") == 0U);
+}
+
+unittest // varint / zigzag round-trip, including boundaries and negatives
+{
+    foreach (long v; [
+            0L, 1L, -1L, 2L, -2L, 63L, 64L, -64L, 127L, 128L, -128L,
+            300L, -300L, 2147483647L, -2147483648L, long.max, long.min
+        ])
+    {
+        ByteBuffer b;
+        putVarlong(b, v);
+        auto p = cast(const(ubyte)[]) b.data;
+        size_t i = 0;
+        bool ok = true;
+        immutable got = getVarlong(p, i, ok);
+        assert(ok && got == v && i == b.length);
+    }
+    // unsigned round-trip + truncation detection
+    {
+        ByteBuffer b;
+        putUVarint(b, 300);
+        auto p = cast(const(ubyte)[]) b.data;
+        size_t i = 0;
+        bool ok = true;
+        assert(getUVarint(p, i, ok) == 300 && ok);
+        // a lone 0x80 (continuation with no terminator) must fail, not hang
+        const(ubyte)[1] trunc = [0x80];
+        size_t j = 0;
+        ok = true;
+        cast(void) getUVarint(trunc[], j, ok);
+        assert(!ok);
+    }
+}
