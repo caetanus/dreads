@@ -179,6 +179,8 @@ private struct SubEntry
     ubyte qos; // granted qos (v1: always 0 on delivery)
     ubyte opts; // v5 subscription options: bit2 no-local, bit3 retain-as-published,
     // bits4-5 retain-handling (v3 subs: 0 = deliver-all, clear-retain, send-retained)
+    string shareGroup; // v5 shared subscription ($share/<group>/...): one member
+    // of the group gets each message (round-robin). Empty = a normal subscription.
 }
 
 private final class TrieNode
@@ -222,17 +224,20 @@ private TrieNode trieRoot() nothrow @trusted
 // conn, same terminal): update qos in place, no second entry, no recount —
 // appending instead was both a spec violation (duplicate deliveries) and an
 // amplification DoS. Returns true when a NEW entry was created.
-private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts) @trusted nothrow
+private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts,
+        string shareGroup = null) @trusted nothrow
 {
+    // identity is (conn, gen, shareGroup): a normal sub and a shared sub (or two
+    // different groups) to the same filter are DISTINCT subscriptions.
     foreach (ref e; a)
-        if (e.c is c && e.gen == c.gen)
+        if (e.c is c && e.gen == c.gen && e.shareGroup == shareGroup)
         {
             e.qos = qos;
             e.opts = opts;
             return false;
         }
     try
-        a ~= SubEntry(c, c.gen, qos, opts);
+        a ~= SubEntry(c, c.gen, qos, opts, shareGroup);
     catch (Exception)
         return false;
     atomicOp!"+="(gMqttSubTotal, 1);
@@ -242,7 +247,7 @@ private bool upsertEntry(ref SubEntry[] a, MqttConn c, ubyte qos, ubyte opts) @t
 // Split-walk `filter` creating nodes, then upsert the entry at the terminal.
 // Returns true when a NEW subscription was created (false = replaced/failed).
 private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
-        ubyte opts = 0) @trusted nothrow
+        ubyte opts = 0, string shareGroup = null) @trusted nothrow
 {
     try
     {
@@ -256,7 +261,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
                 e++;
             auto seg = filter[i .. e];
             if (seg == "#")
-                return upsertEntry(n.hash, c, qos, opts);
+                return upsertEntry(n.hash, c, qos, opts, shareGroup);
             TrieNode next;
             if (seg == "+")
             {
@@ -276,7 +281,7 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
                 }
             }
             if (e >= filter.length)
-                return upsertEntry(next.subs, c, qos, opts);
+                return upsertEntry(next.subs, c, qos, opts, shareGroup);
             n = next;
             i = e + 1;
         }
@@ -287,8 +292,11 @@ private bool trieSubscribe(scope const(char)[] filter, MqttConn c, ubyte qos,
     return false;
 }
 
-// Remove every entry of `c` under `filter` (exact filter match).
-private void trieUnsubscribe(scope const(char)[] filter, MqttConn c) @trusted nothrow
+// Remove entries of `c` under `filter`. matchGroup=false removes ALL of the
+// conn's entries there (disconnect teardown); matchGroup=true removes only the
+// one whose shareGroup == group (an explicit UNSUBSCRIBE of one subscription).
+private void trieUnsubscribe(scope const(char)[] filter, MqttConn c,
+        bool matchGroup = false, string group = null) @trusted nothrow
 {
     try
     {
@@ -302,7 +310,7 @@ private void trieUnsubscribe(scope const(char)[] filter, MqttConn c) @trusted no
             auto seg = filter[i .. e];
             if (seg == "#")
             {
-                dropConn(n.hash, c);
+                dropConn(n.hash, c, matchGroup, group);
                 return;
             }
             TrieNode next;
@@ -314,7 +322,7 @@ private void trieUnsubscribe(scope const(char)[] filter, MqttConn c) @trusted no
                 return;
             if (e >= filter.length)
             {
-                dropConn(next.subs, c);
+                dropConn(next.subs, c, matchGroup, group);
                 return;
             }
             n = next;
@@ -326,12 +334,13 @@ private void trieUnsubscribe(scope const(char)[] filter, MqttConn c) @trusted no
     }
 }
 
-private void dropConn(ref SubEntry[] a, MqttConn c) @trusted nothrow
+private void dropConn(ref SubEntry[] a, MqttConn c, bool matchGroup = false,
+        string group = null) @trusted nothrow
 {
     size_t w = 0;
     foreach (ref e; a)
-        if (e.c !is c)
-            a[w++] = e;
+        if (e.c !is c || (matchGroup && e.shareGroup != group))
+            a[w++] = e; // keep
     if (w != a.length)
     {
         atomicOp!"-="(gMqttSubTotal, cast(long)(a.length - w));
@@ -348,6 +357,7 @@ private struct Match // one matched subscriber + its granted qos (fused so the
     ubyte qos;
     bool noLocal; // v5 no-local: don't echo the publisher's own message back
     bool rap; // v5 retain-as-published: keep the publisher's retain flag
+    string shareGroup; // v5 shared sub group ("" = normal, deliver to all)
 }
 
 private Match[] tMatchBuf;
@@ -403,7 +413,8 @@ private void addLive(ref SubEntry e) @trusted nothrow
         catch (Exception)
             return;
     }
-    tMatchBuf[tMatchLen++] = Match(e.c, e.qos, (e.opts & 0x04) != 0, (e.opts & 0x08) != 0);
+    tMatchBuf[tMatchLen++] = Match(e.c, e.qos, (e.opts & 0x04) != 0,
+            (e.opts & 0x08) != 0, e.shareGroup);
 }
 
 /// Does `filter` match `topic`? (retained-message delivery at SUBSCRIBE time.)
@@ -696,24 +707,23 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
     bool pktV5built = false; // build the v5 variant lazily (only if a v5 sub matches)
-    foreach (ref m; tMatchBuf[0 .. tMatchLen])
+    // Deliver one message to one matched subscriber (QoS/no-local/RAP-aware).
+    void deliverTo(ref Match m) @trusted nothrow
     {
         auto s = m.c;
         if (s.closed)
-            continue;
+            return;
         if (m.noLocal && s is publisher)
-            continue; // v5 no-local: don't echo the publisher's own message back
+            return; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
         // v5 retain-as-published keeps the publisher's retain flag; otherwise a
         // forwarded delivery clears retain [MQTT-3.3.1-9].
         immutable delRetain = m.rap && retain;
-        // effective delivery QoS = min(publish QoS, this subscription's grant)
         immutable effQos = pubQos < m.qos ? pubQos : m.qos;
         if (effQos >= 1)
         {
-            // QoS1/2: assign a packet-id and track it in flight (the combined
-            // QoS1+QoS2 window bounds RAM; a saturated window degrades this
-            // delivery to QoS0)
+            // QoS1/2: assign a packet-id and track it in flight (a saturated
+            // window degrades this delivery to QoS0)
             ushort pid = 0;
             if (s.inflight.length + s.outQos2.length < MQTT_QOS1_WINDOW)
                 pid = nextDeliveryPid(s);
@@ -727,7 +737,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
-                    continue;
+                    return;
                 }
                 s.obox.append(q1.data);
                 try
@@ -749,9 +759,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     {
                     }
                 }
-                continue;
+                return;
             }
-            // fall through: window saturated -> deliver at QoS0
+            // window saturated -> deliver at QoS0
         }
         if (delRetain)
         {
@@ -762,7 +772,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             if (s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
-                continue;
+                return;
             }
             s.obox.append(q1.data);
         }
@@ -778,7 +788,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             if (s.obox.length + plen > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
-                continue;
+                return;
             }
             s.obox.append(v5 ? pktV5.data : pkt.data);
         }
@@ -792,7 +802,67 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             }
         }
     }
+
+    // Pass 1: deliver to every NORMAL subscriber; tally shared subs per group.
+    static size_t[string] groupCount; // TLS, reused
+    bool anyShared = false;
+    foreach (ref m; tMatchBuf[0 .. tMatchLen])
+    {
+        if (m.shareGroup.length == 0)
+            deliverTo(m);
+        else
+        {
+            anyShared = true;
+            try
+                groupCount[m.shareGroup] = groupCount.get(m.shareGroup, 0) + 1;
+            catch (Exception)
+            {
+            }
+        }
+    }
+    // Pass 2: shared subscriptions — ONE member of each group receives the
+    // message, chosen round-robin across deliveries (load balancing).
+    if (anyShared)
+    {
+        static size_t[string] groupPos; // TLS
+        foreach (ref m; tMatchBuf[0 .. tMatchLen])
+        {
+            if (m.shareGroup.length == 0)
+                continue;
+            size_t cnt, pos, rr;
+            try
+            {
+                cnt = groupCount.get(m.shareGroup, 0);
+                pos = groupPos.get(m.shareGroup, 0);
+                rr = gShareRR.get(m.shareGroup, 0);
+            }
+            catch (Exception)
+            {
+            }
+            if (cnt != 0 && pos == rr % cnt)
+                deliverTo(m);
+            try
+                groupPos[m.shareGroup] = pos + 1;
+            catch (Exception)
+            {
+            }
+        }
+        try
+        {
+            foreach (g, _; groupCount)
+                gShareRR[g] = gShareRR.get(g, 0) + 1; // advance for next message
+            groupCount.clear();
+            groupPos.clear();
+        }
+        catch (Exception)
+        {
+        }
+    }
 }
+
+// Round-robin cursor per shared-subscription group (TLS; persists across
+// deliveries so successive messages rotate through the group's members).
+private size_t[string] gShareRR;
 
 private MqttConn[] tDirty; // TLS: conns with pending deliveries this batch
 
@@ -1261,6 +1331,38 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
     }
 }
 
+// Parse a v5 shared-subscription filter "$share/<group>/<filter>". Returns true
+// if the filter has the $share/ prefix (fills group+actual, or sets malformed on
+// an empty/wildcard group or empty actual filter); false if it's a normal filter.
+private bool mqttParseShare(scope const(char)[] f, out const(char)[] group,
+        out const(char)[] actual, out bool malformed) @nogc nothrow
+{
+    malformed = false;
+    enum string pfx = "$share/";
+    if (f.length < pfx.length || f[0 .. pfx.length] != pfx)
+        return false; // not a shared subscription
+    auto rest = f[pfx.length .. $];
+    size_t s = 0;
+    while (s < rest.length && rest[s] != '/')
+        s++;
+    if (s == 0 || s >= rest.length)
+    {
+        malformed = true; // empty group, or no "/<filter>" after the group
+        return true;
+    }
+    group = rest[0 .. s];
+    actual = rest[s + 1 .. $];
+    foreach (ch; group)
+        if (ch == '+' || ch == '#')
+        {
+            malformed = true; // [MQTT-4.8.2] a share group has no wildcards
+            return true;
+        }
+    if (actual.length == 0)
+        malformed = true;
+    return true;
+}
+
 // Returns false to close the connection. Validation posture: anything the
 // 3.1.1 spec marks "MUST close the Network Connection" closes; malformed
 // SUBSCRIBE filters that are merely unusable get SUBACK failure 0x80.
@@ -1643,20 +1745,41 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 immutable reqQos = cast(ubyte)(v5 ? (optByte & 0x03) : optByte);
                 if (reqQos > 2)
                     return false; // [MQTT-3.8.3-4]
-                if (!mqttValidFilter(filter) || c.filters.length >= MQTT_MAX_SUBS)
+                // v5 shared subscription: $share/<group>/<actual-filter> — the
+                // trie stores the ACTUAL filter, the entry carries the group.
+                const(char)[] actualFilter = filter;
+                const(char)[] shareGroup;
+                if (v5)
+                {
+                    const(char)[] g, a;
+                    bool malformed;
+                    if (mqttParseShare(filter, g, a, malformed))
+                    {
+                        if (malformed)
+                        {
+                            granted[ng] = 0x80;
+                            retainOk[ng] = false;
+                            filters[ng++] = null;
+                            continue;
+                        }
+                        actualFilter = a;
+                        shareGroup = g;
+                    }
+                }
+                if (!mqttValidFilter(actualFilter) || c.filters.length >= MQTT_MAX_SUBS)
                 {
                     granted[ng] = 0x80; // unusable filter / sub-cap: failure
                     retainOk[ng] = false;
                     filters[ng++] = null;
                     continue;
                 }
-                // teardown-list entry FIRST: if this allocation fails we
-                // refuse the filter instead of creating a trie entry with no
-                // teardown record (that combination leaked gMqttSubTotal)
+                // teardown-list entry FIRST (the ACTUAL filter, so disconnect
+                // walks the right trie path): if this alloc fails we refuse the
+                // filter rather than leak gMqttSubTotal on a trie-only entry
                 const(char)[] fcopy;
                 try
                 {
-                    fcopy = filter.idup;
+                    fcopy = actualFilter.idup;
                     c.filters ~= fcopy;
                 }
                 catch (Exception)
@@ -1667,14 +1790,23 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     continue;
                 }
                 immutable grant = cast(ubyte) reqQos; // QoS0/1/2 out (reqQos already <=2)
-                immutable isNew = trieSubscribe(filter, c, grant, cast(ubyte)(v5 ? optByte : 0));
+                string sg;
+                if (shareGroup.length)
+                    try
+                        sg = shareGroup.idup;
+                    catch (Exception)
+                    {
+                    }
+                immutable isNew = trieSubscribe(actualFilter, c, grant,
+                        cast(ubyte)(v5 ? optByte : 0), sg);
                 if (!isNew)
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
-                // v5 retain-handling (opts bits 4-5): 0 = always send retained on
-                // subscribe, 1 = only if the subscription is new, 2 = never.
+                // retain-handling (opts bits 4-5): 0 = always send retained on
+                // subscribe, 1 = only if new, 2 = never. A SHARED subscription
+                // never gets retained-on-subscribe [MQTT-4.8.2].
                 immutable rh = v5 ? ((optByte >> 4) & 0x03) : 0;
-                retainOk[ng] = rh == 0 || (rh == 1 && isNew);
-                filters[ng] = filter;
+                retainOk[ng] = shareGroup.length == 0 && (rh == 0 || (rh == 1 && isNew));
+                filters[ng] = actualFilter;
                 granted[ng++] = grant;
             }
             if (ng == 0)
@@ -1727,14 +1859,35 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (!rdStr(p, i, filter))
                     return false;
                 nf++;
-                if (!mqttValidFilter(filter))
+                // a $share/<group>/<filter> unsubscribe removes only THAT shared
+                // subscription; a normal filter removes only the normal one
+                // (group ""). Both are group-specific (matchGroup=true).
+                const(char)[] actualFilter = filter;
+                string group;
+                if (v5)
+                {
+                    const(char)[] g, a;
+                    bool malformed;
+                    if (mqttParseShare(filter, g, a, malformed))
+                    {
+                        if (malformed)
+                            continue; // ack it, ignore
+                        actualFilter = a;
+                        group = cast(string) g;
+                    }
+                }
+                if (!mqttValidFilter(actualFilter))
                     continue; // ack it, but never trie-walk a malformed filter
-                trieUnsubscribe(filter, c);
-                size_t w = 0;
-                foreach (f; c.filters)
-                    if (f != filter)
-                        c.filters[w++] = f;
-                c.filters.length = w;
+                trieUnsubscribe(actualFilter, c, true, group);
+                // remove ONE matching teardown record (the conn may still hold
+                // other subscriptions — different group — at the same filter)
+                foreach (idx, f; c.filters)
+                    if (f == actualFilter)
+                    {
+                        c.filters[idx] = c.filters[$ - 1];
+                        c.filters.length = c.filters.length - 1;
+                        break;
+                    }
             }
             if (nf == 0)
                 return false; // [MQTT-3.10.3-2]
