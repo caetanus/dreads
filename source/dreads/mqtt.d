@@ -317,8 +317,13 @@ private void dropConn(ref SubEntry[] a, MqttConn c) @trusted nothrow
 // TLS match scratch: grows to the largest fan-out seen on this thread. A
 // fixed [64] here silently starved every subscriber past the 64th — forever,
 // per publish, with no counter.
-private MqttConn[] tMatchBuf;
-private ubyte[] tMatchQos; // parallel: granted qos of the matching subscription
+private struct Match // one matched subscriber + its granted qos (fused so the
+{                    // conn and its qos can never desync — no parallel arrays)
+    MqttConn c;
+    ubyte qos;
+}
+
+private Match[] tMatchBuf;
 private size_t tMatchLen;
 
 /// Collect the live subscribers matching `topic` into tMatchBuf[0..tMatchLen].
@@ -367,16 +372,11 @@ private void addLive(ref SubEntry e) @trusted nothrow
     if (tMatchLen >= tMatchBuf.length)
     {
         try
-        {
-            immutable nl = tMatchBuf.length ? tMatchBuf.length * 2 : 64;
-            tMatchBuf.length = nl;
-            tMatchQos.length = nl;
-        }
+            tMatchBuf.length = tMatchBuf.length ? tMatchBuf.length * 2 : 64;
         catch (Exception)
             return;
     }
-    tMatchQos[tMatchLen] = e.qos;
-    tMatchBuf[tMatchLen++] = e.c;
+    tMatchBuf[tMatchLen++] = Match(e.c, e.qos);
 }
 
 /// Does `filter` match `topic`? (retained-message delivery at SUBSCRIBE time.)
@@ -667,12 +667,13 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     static ByteBuffer q1; // TLS: a per-subscriber QoS1 publish
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
-    foreach (idx, s; tMatchBuf[0 .. tMatchLen])
+    foreach (ref m; tMatchBuf[0 .. tMatchLen])
     {
+        auto s = m.c;
         if (s.closed)
             continue;
         // effective delivery QoS = min(publish QoS, this subscription's grant)
-        immutable effQos = pubQos < tMatchQos[idx] ? pubQos : tMatchQos[idx];
+        immutable effQos = pubQos < m.qos ? pubQos : m.qos;
         if (effQos >= 1)
         {
             // QoS1: assign a packet-id and track it in flight (window-bounded;
