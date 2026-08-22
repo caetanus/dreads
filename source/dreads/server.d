@@ -2437,10 +2437,12 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
             flushPendingNotify();
         return;
     }
-    // cross-shard: synchronous hop (AMQP fibers may block; the drain delivers)
+    // cross-shard: synchronous hop (AMQP fibers may block; the drain delivers).
+    // hb is a STACK-local, not a TLS static: shardEnqueue yields under ring
+    // backpressure, and a shared static would be clobbered by another AMQP
+    // fiber's hop during that yield (its hop bytes would then replay ours).
     auto p = acquireShardPending();
-    static ByteBuffer hb; // TLS
-    hb.clear();
+    ByteBuffer hb;
     appendHopCmd(hb, cmd, raw.data, opcode, 0, cast(void*) p);
     shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.cmd);
     shardWake(cast(uint) owner);
@@ -2455,6 +2457,12 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
         {
         }
     }
+    // Re-clear AFTER the park: `reply` is a caller-shared TLS static (gAmqpPop's
+    // rb2 etc). Another AMQP fiber that ran its own amqpDataExec while we were
+    // parked left its bytes in this same buffer; without this re-clear we would
+    // parse the leading reply = the other consumer's message (misdelivery).
+    // Everything from here to the caller's parse is yield-free.
+    reply.clear();
     reply.append(p.reply.data);
     releaseShardPending(p);
 }

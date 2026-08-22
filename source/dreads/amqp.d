@@ -42,6 +42,19 @@ public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
 public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
+public shared ulong gAmqpReturned; // mandatory publishes returned (no route)
+public shared ulong gAmqpBindingDrops; // duplicate/over-cap bindings refused
+
+/// Advertised frame-max (connection.tune). A frame larger than this is a
+/// framing error: refuse instead of buffering an attacker-chosen u32 of bytes.
+enum uint AMQP_FRAME_MAX = 131072;
+/// Hard cap on a single message body (content-header bodySize is a u64).
+enum ulong AMQP_MAX_BODY = 128UL << 20;
+/// Default per-connection unacked window when the client never sets basic.qos:
+/// bounds the RAM a consumer that never acks can pin (prefetch DoS).
+enum size_t AMQP_DEFAULT_PREFETCH = 20000;
+/// Bindings per exchange, per shard (each is replicated to every thread).
+enum size_t AMQP_MAX_BINDINGS = 4096;
 
 /// Queue key namespace: visible from RESP on purpose (cross-protocol is a
 /// feature — `LRANGE amq.q.tasks 0 -1` shows the queue).
@@ -84,6 +97,18 @@ private Binding[][string] gBindings; // TLS: exchange -> bindings
 /// AMQP topic match: dot-separined; `*` = exactly one word, `#` = zero+ words.
 package bool amqpTopicMatches(scope const(char)[] pattern, scope const(char)[] key) @nogc nothrow
 {
+    // Bound the '#'-backtracking: routing keys are attacker-controlled and a
+    // key with thousands of dot-words against a multi-'#' pattern is
+    // exponential recursion + fiber-stack growth. Real routing keys have a
+    // handful of segments; refuse to match absurd ones on the hot path.
+    {
+        size_t words = 1;
+        foreach (ch; key)
+            if (ch == '.')
+                words++;
+        if (words > 128)
+            return false;
+    }
     size_t pi = 0, ki = 0;
     for (;;)
     {
@@ -166,12 +191,51 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
         {
             auto b = rd().idup;
             auto extra = rd(); // raw binding args table (may be empty)
-            gBindings[ex] ~= Binding(a, b, extra is null ? null : cast(immutable(ubyte)[]) extra.idup);
+            auto exb = extra is null ? null : cast(immutable(ubyte)[]) extra.idup;
+            auto lst = ex in gBindings;
+            // dedup: identical (queue,key,args) must not stack — otherwise a
+            // repeated queue.bind fans N duplicate deliveries and grows every
+            // shard's binding list without bound (amplification DoS)
+            if (lst !is null)
+            {
+                foreach (ref bd; *lst)
+                    if (bd.queue == a && bd.key == b && bd.args == exb)
+                        return;
+                if ((*lst).length >= AMQP_MAX_BINDINGS)
+                {
+                    atomicOp!"+="(gAmqpBindingDrops, 1);
+                    return;
+                }
+            }
+            gBindings[ex] ~= Binding(a, b, exb);
         }
         else if (op == 3) // queue metadata: ex=queue, a=dlx, b=dlrk
         {
             auto b = rd().idup;
             gQueueMeta[ex] = QueueMeta(a, b);
+        }
+        else if (op == 4) // queue.unbind: ex=exchange, a=queue, b=routing-key
+        {
+            auto b = rd().idup;
+            if (auto lst = ex in gBindings)
+            {
+                size_t w = 0;
+                foreach (ref bd; *lst)
+                    if (!(bd.queue == a && bd.key == b))
+                        (*lst)[w++] = bd;
+                (*lst).length = w;
+            }
+        }
+        else if (op == 5) // exchange.delete: ex=exchange
+        {
+            try
+            {
+                gExchanges.remove(cast(string) ex);
+                gBindings.remove(cast(string) ex);
+            }
+            catch (Exception)
+            {
+            }
         }
     }
     catch (Exception)
@@ -182,27 +246,67 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
 private void ctlBroadcast(ubyte op, scope const(char)[] ex, scope const(char)[] a,
         scope const(char)[] b, scope const(ubyte)[] extra = null) nothrow @trusted
 {
-    static ByteBuffer cb; // TLS
-    cb.clear();
-    cb.appendByte(cast(char) op);
+    // gAmqpCtlFanout -> shardEnqueue YIELDS under ring backpressure; a shared
+    // static staging buffer would be rewritten by a concurrent declare/bind on
+    // this thread during that yield, replicating a corrupted op to peers. Fast
+    // path keeps the reused TLS buffer; reentrant callers get a fresh local.
+    static ByteBuffer cbStatic; // TLS
+    static bool cbBusy;
+    ByteBuffer cbLocal;
+    ByteBuffer* cbp = &cbLocal;
+    if (!cbBusy)
+    {
+        cbBusy = true;
+        cbp = &cbStatic;
+    }
+    scope (exit)
+        if (cbp is &cbStatic)
+            cbBusy = false;
+    cbp.clear();
+    cbp.appendByte(cast(char) op);
     void put(scope const(char)[] s)
     {
-        cb.appendByte(cast(char)(s.length >> 8));
-        cb.appendByte(cast(char)(s.length & 0xFF));
-        cb.append(s);
+        cbp.appendByte(cast(char)(s.length >> 8));
+        cbp.appendByte(cast(char)(s.length & 0xFF));
+        cbp.append(s);
     }
 
     put(ex);
     put(a);
     put(b);
     put(cast(const(char)[]) extra);
-    amqpApplyCtl(cb.data); // local first
+    amqpApplyCtl(cbp.data); // local first
     if (gAmqpCtlFanout !is null)
-        gAmqpCtlFanout(cb.data);
+        gAmqpCtlFanout(cbp.data);
+}
+
+/// Compare a header WANT (type/value from the binding args) against message
+/// headers by key. Void ('V') or empty want = presence-only (any value);
+/// every other type must match by value bytes AND compatible type. This is
+/// what a headers binding of {count: 5} means — a message with count=7 must
+/// NOT route (the old code matched on key presence alone).
+private bool headerWantMatches(scope const(ubyte)[] msgHeaders,
+        scope const(char)[] key, char wty, scope const(ubyte)[] wval) @nogc nothrow
+{
+    immutable presenceOnly = wty == 'V' || wval.length == 0;
+    bool hit = false;
+    cast(void) tableWalk(msgHeaders, (scope const(char)[] mk, char mt,
+            scope const(ubyte)[] mv) @nogc nothrow {
+        if (mk != key)
+            return true;
+        if (presenceOnly)
+            hit = true;
+        else if ((wty == 'S' || wty == 's') && (mt == 'S' || mt == 's'))
+            hit = wval == mv; // string equality regardless of short/long tag
+        else
+            hit = wty == mt && wval == mv; // same type, same bytes
+        return false; // first occurrence of the key decides
+    });
+    return hit;
 }
 
 /// Headers-exchange match: binding args carry x-match (all|any, default all)
-/// plus wanted key/values; string values compared, other types by presence.
+/// plus wanted key/values compared by value (void/empty = presence-only).
 private bool headersMatch(scope const(ubyte)[] bindArgs,
         scope const(ubyte)[] msgHeaders) @nogc nothrow
 {
@@ -220,28 +324,7 @@ private bool headersMatch(scope const(ubyte)[] bindArgs,
         if (k.length >= 2 && k[0] == 'x' && k[1] == '-')
             return true; // x-match etc are directives, not header wants
         sawWant = true;
-        bool hit = false;
-        if (msgHeaders !is null)
-        {
-            if (ty == 'S' || ty == 's')
-            {
-                auto mv = tableGetStr(msgHeaders, k);
-                hit = mv !is null && mv == cast(const(char)[]) v;
-            }
-            else
-            {
-                // non-string want: match on key presence
-                cast(void) tableWalk(msgHeaders, (scope const(char)[] mk, char mt,
-                        scope const(ubyte)[] mv2) @nogc nothrow {
-                    if (mk == k)
-                    {
-                        hit = true;
-                        return false;
-                    }
-                    return true;
-                });
-            }
-        }
+        immutable hit = msgHeaders !is null && headerWantMatches(msgHeaders, k, ty, v);
         if (hit)
             anyOk = true;
         else
@@ -583,6 +666,7 @@ package const(ubyte)[] propsHeaders(return scope const(ubyte)[] props) @nogc not
 private struct PendingPub
 {
     bool active;
+    bool mandatory; // basic.publish mandatory bit: unroutable -> basic.return
     string exchange;
     string rkey;
     ulong bodySize;
@@ -602,6 +686,7 @@ private struct Unacked
 {
     string queue;
     const(ubyte)[] blob; // stored record (props+body), for requeue/dead-letter
+    ushort chan; // owning channel: channel.close requeues just this channel's
 }
 
 private final class AmqpConn
@@ -613,6 +698,11 @@ private final class AmqpConn
     bool[string] cancelledTags; // basic.cancel'ed consumer tags
     Unacked[ulong] unacked; // delivery-tag -> record (no_ack=false consumers)
     ulong nextTag = 1;
+    ulong nextCtag = 1; // server-assigned consumer tags (unique per connection)
+    size_t prefetch;    // basic.qos prefetch-count (0 = AMQP_DEFAULT_PREFETCH)
+    bool[ushort] closedChans; // channel.close'd: consumer fibers on it must exit
+    uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
+    bool hbStarted;  // the sender fiber is spawned exactly once
 
     this(TCPConnection c) nothrow
     {
@@ -675,6 +765,7 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
     {
         c.closing = true;
         requeueAllUnacked(c);
+        releaseChannels(c); // free malloc-plane bufs on THIS (owning) thread
         closeQuiet(c);
     }
 
@@ -778,7 +869,9 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             immutable chan = cast(ushort)((d[pos + 1] << 8) | d[pos + 2]);
             immutable fsize = (cast(uint) d[pos + 3] << 24) | (cast(uint) d[pos + 4] << 16)
                 | (cast(uint) d[pos + 5] << 8) | d[pos + 6];
-            if (d.length - pos < 7 + fsize + 1)
+            if (fsize > AMQP_FRAME_MAX)
+                return; // exceeds advertised frame-max: framing error, close
+            if (d.length - pos < 7 + cast(size_t) fsize + 1) // size_t: no u32 wrap
                 break;
             auto payload = d[pos + 7 .. pos + 7 + fsize];
             if (d[pos + 7 + fsize] != FRAME_END)
@@ -814,6 +907,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         cast(void) r.u16(); // class
         cast(void) r.u16(); // weight
         ch.pub.bodySize = r.u64();
+        if (ch.pub.bodySize > AMQP_MAX_BODY)
+            return false; // oversized message body: close
         ch.pub.props.clear();
         if (r.i < p.length)
             ch.pub.props.append(p[r.i .. $]); // property flags + list, verbatim
@@ -850,12 +945,23 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             method(o, 0, 10, 30, (ref ByteBuffer b) @nogc nothrow {
                 putU16(b, 2047); // channel-max
                 putU32(b, 131072); // frame-max
-                putU16(b, 30); // heartbeat: we SEND every ~15s (see the sender
-            });                //  fiber); client heartbeats are accepted
-            startHeartbeat(c);
+                putU16(b, 30); // heartbeat we PROPOSE; the client's tune-ok
+            });                //  (below) is what we actually honor
             return true;
-        case 31: // tune-ok
-            return true;
+        case 31: // tune-ok: channel-max u16, frame-max u32, heartbeat u16
+            {
+                cast(void) r.u16(); // channel-max (we accept the client's)
+                cast(void) r.u16();
+                cast(void) r.u16(); // frame-max hi/lo halves of the u32
+                immutable hb = r.u16(); // NEGOTIATED heartbeat interval, seconds
+                // Send at half the negotiated interval so the client always
+                // sees a frame within its dead-peer window (2× interval).
+                // 0 = heartbeats disabled: don't start the sender at all.
+                c.hbSendSecs = hb == 0 ? 0 : (hb + 1) / 2;
+                if (c.hbSendSecs != 0)
+                    startHeartbeat(c);
+                return true;
+            }
         case 40: // open
             method(o, 0, 10, 41, (ref ByteBuffer b) @nogc nothrow {
                 putShortStr(b, "");
@@ -883,8 +989,29 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             });
             return true;
         case 40: // close
+            // requeue this channel's in-flight (unacked) records to the queue
+            // front and stop its consumer fibers before dropping the channel —
+            // otherwise those messages were destructively popped and lost
             try
+            {
+                c.closedChans[chan] = true;
+                ulong[] mine;
+                foreach (t, ref u; c.unacked)
+                    if (u.chan == chan)
+                        mine ~= t;
+                foreach (t; mine)
+                {
+                    if (auto up = t in c.unacked)
+                    {
+                        static ByteBuffer kbc; // TLS
+                        queueKey((*up).queue, kbc);
+                        if (gAmqpPushFront !is null)
+                            gAmqpPushFront(kbc.data.asChars, (*up).blob.asChars);
+                        c.unacked.remove(t);
+                    }
+                }
                 c.chans.remove(chan);
+            }
             catch (Exception)
             {
             }
@@ -961,9 +1088,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u16();
                 auto ex = r.shortStr();
                 auto rk = r.shortStr();
+                immutable pubBits = r.u8(); // mandatory bit 0, immediate bit 1
                 try
                 {
                     ch.pub.active = true;
+                    ch.pub.mandatory = (pubBits & 1) != 0;
                     ch.pub.exchange = ex.idup;
                     ch.pub.rkey = rk.idup;
                     ch.pub.payload.clear();
@@ -978,6 +1107,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 cast(void) r.u16();
                 auto q = r.shortStr();
+                immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
                 static ByteBuffer kb2; // TLS
                 queueKey(q, kb2);
                 static ByteBuffer pay; // TLS
@@ -985,8 +1115,18 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 if (gAmqpPop !is null && gAmqpPop(kb2.data.asChars, pay))
                 {
                     immutable remaining = gAmqpLen !is null ? gAmqpLen(kb2.data.asChars) : 0;
+                    immutable gtag = c.nextTag++;
+                    // no-ack=false: record for later ack/requeue; the old code
+                    // hardcoded tag 1 and never recorded it, so a get+ack
+                    // workflow could neither ack nor requeue (message lost)
+                    if (!getNoAck)
+                        try
+                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan);
+                        catch (Exception)
+                        {
+                        }
                     method(o, chan, 60, 71, (ref ByteBuffer b) @nogc nothrow {
-                        putU64(b, 1); // delivery-tag (auto-ack semantics)
+                        putU64(b, gtag);
                         b.appendByte(0); // redelivered
                         putShortStr(b, "");
                         putShortStr(b, "");
@@ -1003,6 +1143,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         case 20: // consume
             {
                 auto ch = chan in c.chans;
+                if (ch is null)
+                    return true; // consume on an unopened channel: ignore
                 cast(void) r.u16();
                 auto q = r.shortStr();
                 auto tag = r.shortStr();
@@ -1011,7 +1153,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 static char[128] tagbuf = void;
                 const(char)[] tg;
                 if (tag.length == 0)
-                    tg = "ctag-1";
+                {
+                    // server-assigned tag MUST be unique per connection — the
+                    // old shared literal "ctag-1" made basic.cancel stop every
+                    // default-tagged consumer at once
+                    import core.stdc.stdio : snprintf;
+
+                    immutable n = snprintf(tagbuf.ptr, tagbuf.length,
+                            "ctag-%llu", cast(ulong) c.nextCtag++);
+                    tg = cast(const(char)[]) tagbuf[0 .. n];
+                }
                 else
                 {
                     auto tn = tag.length <= tagbuf.length ? tag.length : tagbuf.length;
@@ -1079,9 +1230,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 return true;
             }
-        case 10: // qos — no windowing v1 (consumers poll); acknowledge it
-            method(o, chan, 60, 11);
-            return true;
+        case 10: // qos: prefetch-size u32, prefetch-count u16, global bit
+            {
+                cast(void) r.u32(); // prefetch-size (byte window: unsupported)
+                immutable pc = r.u16();
+                c.prefetch = pc; // 0 = "no specific limit" -> default cap applies
+                method(o, chan, 60, 11);
+                return true;
+            }
         case 30: // cancel — stop the consumer fiber, reply CancelOk
             {
                 auto tag = r.shortStr();
@@ -1163,20 +1319,55 @@ package void splitRecord(scope const(ubyte)[] blob, out const(ubyte)[] props,
 private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
 {
     ch.pub.active = false;
-    // route to queues and RPUSH the framed record through the data plane
-    static ByteBuffer rec; // TLS
+    immutable mandatory = ch.pub.mandatory;
+    // route to queues and RPUSH the framed record through the data plane. rec
+    // is normally a reused TLS static, but the sink's cross-shard RPUSH YIELDS
+    // and `payload` slices rec — a concurrent publish on this thread would
+    // clobber it. Reentrant callers take a fresh local so the parked fan-out
+    // keeps writing its own bytes.
+    static ByteBuffer recStatic; // TLS
+    static bool recBusy;
+    ByteBuffer recLocal;
+    ByteBuffer* rec = &recLocal;
+    if (!recBusy)
+    {
+        recBusy = true;
+        rec = &recStatic;
+    }
+    scope (exit)
+        if (rec is &recStatic)
+            recBusy = false;
     rec.clear();
-    buildRecord(rec, ch.pub.props.data, ch.pub.payload.data);
+    buildRecord(*rec, ch.pub.props.data, ch.pub.payload.data);
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(ch.pub.props.data);
+    int routed = 0;
     routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, (string q) nothrow {
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
         if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
+        routed++;
     });
+    // [basic.return] a mandatory publish that matched no queue must come BACK
+    // to the publisher (312 NO_ROUTE) instead of vanishing while confirmed
+    if (mandatory && routed == 0)
+    {
+        auto exn = ch.pub.exchange;
+        auto rkn = ch.pub.rkey;
+        method(o, chan, 60, 50, (ref ByteBuffer b) @nogc nothrow {
+            putU16(b, 312); // NO_ROUTE
+            putShortStr(b, "NO_ROUTE");
+            putShortStr(b, exn);
+            putShortStr(b, rkn);
+        });
+        emitContent(o, chan, cast(const(ubyte)[]) payload);
+        atomicOp!"+="(gAmqpReturned, 1);
+    }
     if (ch.confirmMode)
     {
+        // RabbitMQ confirms a returned mandatory message too: the return is the
+        // routing signal, the ack is the broker-took-responsibility signal
         immutable tag = ch.confirmSeq++;
         method(o, chan, 60, 80, (ref ByteBuffer b) @nogc nothrow {
             putU64(b, tag);
@@ -1209,6 +1400,24 @@ private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blo
 
 /// A dying connection returns everything unacked to the FRONT of its queue —
 /// the at-least-once contract for no_ack=false consumers.
+// Release each channel's malloc-plane ByteBuffers on the OWNING shard thread.
+// Left to the GC, ByteBuffer.~this would run on whatever thread triggered the
+// collection and free these blocks into another shard's per-thread freelist =
+// heap corruption (the shard-registry bug class). (scope(exit) can't hold a
+// try/catch, so this lives in a named nothrow helper.)
+private void releaseChannels(AmqpConn c) nothrow @trusted
+{
+    try
+        foreach (ref ch; c.chans)
+        {
+            ch.pub.payload.release();
+            ch.pub.props.release();
+        }
+    catch (Exception)
+    {
+    }
+}
+
 private void requeueAllUnacked(AmqpConn c) nothrow @trusted
 {
     try
@@ -1307,9 +1516,29 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 {
                     if (tt in cc.cancelledTags)
                         return;
+                    if (chn in cc.closedChans)
+                        return; // channel.close: stop draining this channel
                 }
                 catch (Exception)
                 {
+                }
+                // prefetch window: a no-ack=false consumer that stops acking
+                // must not drain the whole queue into `unacked` (RAM DoS). Once
+                // the window is full, back off until acks drain it.
+                immutable limit = cc.prefetch ? cc.prefetch : AMQP_DEFAULT_PREFETCH;
+                bool windowFull = false;
+                try
+                    windowFull = !na && cc.unacked.length >= limit;
+                catch (Exception)
+                {
+                }
+                if (windowFull)
+                {
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                    continue;
                 }
                 // BURST drain: up to 64 messages per socket write — a delivery
                 // per write capped the consumer at ~137k msg/s (measured)
@@ -1317,13 +1546,15 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 int burst = 0;
                 while (burst < 64)
                 {
+                    if (!na && cc.unacked.length >= limit)
+                        break; // window filled mid-burst
                     pay.clear();
                     if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
                         break;
                     immutable tg = cc.nextTag++;
                     if (!na)
                         try
-                            cc.unacked[tg] = Unacked(qq, pay.data.idup);
+                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn);
                         catch (Exception)
                         {
                         }
@@ -1357,13 +1588,17 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
 // stays TCP-level in v1 (the serve loop notices the close).
 private void startHeartbeat(AmqpConn c) nothrow
 {
+    if (c.hbStarted || c.hbSendSecs == 0)
+        return;
+    c.hbStarted = true;
     try
         cast(void) runTask((AmqpConn cc) nothrow {
             static immutable ubyte[8] hb = [8, 0, 0, 0, 0, 0, 0, 0xCE];
+            immutable dur = cc.hbSendSecs * 1000;
             while (!cc.closing)
             {
                 try
-                    sleep(15_000.msecs);
+                    sleep(dur.msecs);
                 catch (Exception)
                     return;
                 if (cc.closing)
