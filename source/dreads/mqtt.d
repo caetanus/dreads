@@ -97,6 +97,12 @@ public final class MqttConn
     // order the cross-shard takeover broadcasts arrive (the retained-seq lesson).
     string clientId;
     ulong connGen;
+    // Last Will and Testament ([MQTT-3.1.2-8]): published if the connection
+    // drops abnormally (TCP death, takeover, protocol error) but NOT on a clean
+    // DISCONNECT, which clears it. willTopic empty = no will.
+    string willTopic;
+    const(ubyte)[] willPayload;
+    bool willRetain;
 
     this(TCPConnection c) nothrow
     {
@@ -779,6 +785,18 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
         {
         }
     c.gen++; // invalidate any remaining trie entries (lazily skipped)
+    // Last Will: an abnormal disconnect (TCP death / takeover / protocol error)
+    // left willTopic set (a clean DISCONNECT cleared it) -> publish it now, the
+    // same path a live PUBLISH takes (local delivery + cross-shard fan-out +
+    // retained if the will-retain flag was set).
+    if (c.willTopic.length != 0)
+    {
+        immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+        mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
+        if (gMqttFanout !is null)
+            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
+        c.willTopic = null;
+    }
     // wake OTHER subscribers whose outboxes this connection's last batch filled
     // (PUBLISH+DISCONNECT coalesced in one read batch is the standard
     // fire-and-forget pattern; their writers are alive and deliver). This
@@ -969,7 +987,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 o.appendByte(cast(char) 2);
                 return false;
             }
-            // skip will topic/message, username, password per flags
+            // will topic/message, then username/password per flags
             if (flags & 0x04)
             {
                 const(char)[] wt, wm;
@@ -977,6 +995,19 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     return false;
                 if (!mqttValidTopicName(wt))
                     return false;
+                // stored for publish on abnormal disconnect; will-QoS (bits
+                // 3-4) is delivered at QoS 0 like every other delivery, will
+                // -retain (bit 5) is honored
+                try
+                {
+                    c.willTopic = wt.idup;
+                    c.willPayload = cast(const(ubyte)[]) wm.idup;
+                }
+                catch (Exception)
+                {
+                    c.willTopic = null;
+                }
+                c.willRetain = (flags & 0x20) != 0;
             }
             if (flags & 0x80)
             {
@@ -1227,6 +1258,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         o.appendByte(cast(char) 0);
         return true;
     case PT_DISCONNECT:
+        c.willTopic = null; // [MQTT-3.1.2-8/3.14.4-3] a clean DISCONNECT drops the will
+        c.willPayload = null;
         return false;
     default:
         // types 0 and 15 are reserved; CONNACK/PUBACK/PUBREC/PUBCOMP/SUBACK/
