@@ -480,6 +480,8 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
 }
 
 // Advertised identity (set by server.d at listener setup)
+public shared ulong gKafkaProduced; // records stored via Produce (dashboard)
+public shared ulong gKafkaFetched;  // records served via Fetch (dashboard)
 public __gshared const(char)[] gKafkaHost = "127.0.0.1";
 public __gshared ushort gKafkaPort = 9092;
 
@@ -652,7 +654,11 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 if (newLen < 0)
                     err = E_CORRUPT;
                 else
+                {
                     baseOffset = newLen - cast(long) nrec;
+                    import core.atomic : atomicOp;
+                    atomicOp!"+="(gKafkaProduced, nrec);
+                }
             }
             if (o.length - respStart > KAFKA_MAX_RESP)
                 continue; // response ceiling: stop emitting per-partition results
@@ -728,6 +734,11 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                 if (gKafkaFetchRaw !is null)
                     direct = gKafkaFetchRaw(key, fetchOff, maxN,
                             budget, fetchOff, o);
+                if (direct > 0)
+                {
+                    import core.atomic : atomicOp;
+                    atomicOp!"+="(gKafkaFetched, cast(ulong) direct);
+                }
                 if (direct < 0)
                 {
                     immutable startLen = o.length;
