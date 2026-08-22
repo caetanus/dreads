@@ -557,8 +557,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             serveMqttClient(conn);
         }, listenOpts);
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
-                bool retain, ulong seq) nothrow {
-            shardMqttFanout(topic, payload, retain, seq);
+                bool retain, ulong seq, ubyte pubQos) nothrow {
+            shardMqttFanout(topic, payload, retain, seq, pubQos);
         };
         gMqttConnBcast = (scope const(char)[] clientId, ulong gen) nothrow {
             shardMqttConnBcast(clientId, gen);
@@ -2197,15 +2197,16 @@ private void shardDrainLoop() nothrow
             // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
             import dreads.mqtt : mqttDeliverLocal;
 
-            if (p.length >= 11)
+            if (p.length >= 12)
             {
+                immutable ubyte pubQos = p[1];
                 ulong seq = 0;
                 foreach (k; 0 .. 8)
-                    seq = (seq << 8) | p[1 + k];
-                immutable size_t tl = (cast(size_t) p[9] << 8) | p[10];
-                if (11 + tl <= p.length)
-                    mqttDeliverLocal(cast(const(char)[]) p[11 .. 11 + tl],
-                            cast(const(char)[]) p[11 + tl .. $], p[0] != 0, seq);
+                    seq = (seq << 8) | p[2 + k];
+                immutable size_t tl = (cast(size_t) p[10] << 8) | p[11];
+                if (12 + tl <= p.length)
+                    mqttDeliverLocal(cast(const(char)[]) p[12 .. 12 + tl],
+                            cast(const(char)[]) p[12 + tl .. $], p[0] != 0, seq, pubQos);
             }
         }
         else if (cast(ShardMsg) kind == ShardMsg.pub)
@@ -2730,7 +2731,7 @@ private void shardMqttConnBcast(scope const(char)[] clientId, ulong gen) nothrow
 }
 
 private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
-        bool retain, ulong seq) nothrow
+        bool retain, ulong seq, ubyte pubQos) nothrow
 {
     import core.atomic : atomicLoad, MemoryOrder;
 
@@ -2759,16 +2760,17 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
         if (buf is &mb)
             mbBusy = false;
     buf.clear();
-    // wire: [retain u8][seq u64 BE][topicLen u16][topic][payload]
-    immutable size_t len = 11 + topic.length + msg.length;
+    // wire: [retain u8][pubQos u8][seq u64 BE][topicLen u16][topic][payload]
+    immutable size_t len = 12 + topic.length + msg.length;
     auto space = buf.freeSpace(len)[0 .. len];
     space[0] = retain ? 1 : 0;
+    space[1] = pubQos;
     foreach (k; 0 .. 8)
-        space[1 + k] = cast(ubyte)(seq >> ((7 - k) * 8));
-    space[9] = cast(ubyte)(topic.length >> 8);
-    space[10] = cast(ubyte)(topic.length & 0xFF);
-    space[11 .. 11 + topic.length] = cast(const(ubyte)[]) topic[];
-    space[11 + topic.length .. $] = cast(const(ubyte)[]) msg[];
+        space[2 + k] = cast(ubyte)(seq >> ((7 - k) * 8));
+    space[10] = cast(ubyte)(topic.length >> 8);
+    space[11] = cast(ubyte)(topic.length & 0xFF);
+    space[12 .. 12 + topic.length] = cast(const(ubyte)[]) topic[];
+    space[12 + topic.length .. $] = cast(const(ubyte)[]) msg[];
     buf.grow(len);
     foreach (uint s2; 0 .. gShardCount)
         if (s2 != tShard)

@@ -103,6 +103,11 @@ public final class MqttConn
     string willTopic;
     const(ubyte)[] willPayload;
     bool willRetain;
+    // QoS1 OUTBOUND delivery: a per-conn packet-id (1..65535, wraps) and the set
+    // of ids delivered but not yet PUBACKed. Bounded window -> a slow consumer
+    // degrades a QoS1 delivery to QoS0 rather than growing memory.
+    ushort nextPid = 1;
+    bool[ushort] inflight;
 
     this(TCPConnection c) nothrow
     {
@@ -126,6 +131,9 @@ private enum size_t MQTT_OBOX_CAP = 64 << 20;
 /// Largest accepted remaining-length. The varint allows 256MB; accepting that
 /// from an unauthenticated socket is an invitation. Oversized frame = close.
 private enum uint MQTT_MAX_PACKET = 16 << 20;
+/// Per-connection QoS1 in-flight window: past this, a QoS1 delivery is sent as
+/// QoS0 (graceful degradation, no unbounded in-flight growth for a slow acker).
+private enum size_t MQTT_QOS1_WINDOW = 1024;
 public shared ulong gMqttDropped; // deliveries dropped at full outboxes
 public shared ulong gMqttRetainedDropped; // retained stores refused at the caps
 /// Retained-store caps, PER THREAD (the store is broadcast-replicated): an
@@ -310,6 +318,7 @@ private void dropConn(ref SubEntry[] a, MqttConn c) @trusted nothrow
 // fixed [64] here silently starved every subscriber past the 64th — forever,
 // per publish, with no counter.
 private MqttConn[] tMatchBuf;
+private ubyte[] tMatchQos; // parallel: granted qos of the matching subscription
 private size_t tMatchLen;
 
 /// Collect the live subscribers matching `topic` into tMatchBuf[0..tMatchLen].
@@ -358,10 +367,15 @@ private void addLive(ref SubEntry e) @trusted nothrow
     if (tMatchLen >= tMatchBuf.length)
     {
         try
-            tMatchBuf.length = tMatchBuf.length ? tMatchBuf.length * 2 : 64;
+        {
+            immutable nl = tMatchBuf.length ? tMatchBuf.length * 2 : 64;
+            tMatchBuf.length = nl;
+            tMatchQos.length = nl;
+        }
         catch (Exception)
             return;
     }
+    tMatchQos[tMatchLen] = e.qos;
     tMatchBuf[tMatchLen++] = e.c;
 }
 
@@ -504,7 +518,7 @@ private bool rdStr(scope const(ubyte)[] p, ref size_t i, out const(char)[] s) @n
 // Hooks installed by server.d (avoids a server import cycle): fan a publish
 // out to the other shards / count stats.
 public __gshared void delegate(scope const(char)[] topic,
-        scope const(char)[] payload, bool retain, ulong seq) nothrow gMqttFanout;
+        scope const(char)[] payload, bool retain, ulong seq, ubyte pubQos) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
 private shared ulong gMqttStartMs;
@@ -593,7 +607,7 @@ public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trust
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
 public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
-        bool retain, ulong seq) nothrow @trusted
+        bool retain, ulong seq, ubyte pubQos = 0) nothrow @trusted
 {
     if (retain)
     {
@@ -646,13 +660,54 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     trieMatch(gTrieRoot, topic, 0);
     if (tMatchLen == 0)
         return;
-    static ByteBuffer pkt; // TLS: built once per publish, appended to each sub
+    // QoS0 packet built ONCE and shared (the hot path); QoS1 subscribers get a
+    // per-conn packet with their own packet-id (a separate, slower branch that
+    // does NOT touch the QoS0 fast path).
+    static ByteBuffer pkt; // TLS: the shared QoS0 publish
+    static ByteBuffer q1; // TLS: a per-subscriber QoS1 publish
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
-    foreach (s; tMatchBuf[0 .. tMatchLen])
+    foreach (idx, s; tMatchBuf[0 .. tMatchLen])
     {
         if (s.closed)
             continue;
+        // effective delivery QoS = min(publish QoS, this subscription's grant)
+        immutable effQos = pubQos < tMatchQos[idx] ? pubQos : tMatchQos[idx];
+        if (effQos >= 1)
+        {
+            // QoS1: assign a packet-id and track it in flight (window-bounded;
+            // a saturated window degrades this delivery to QoS0)
+            ushort pid = 0;
+            if (s.inflight.length < MQTT_QOS1_WINDOW)
+                pid = nextDeliveryPid(s);
+            if (pid != 0)
+            {
+                q1.clear();
+                buildPublishQos1(q1, topic, payload, false, pid);
+                if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+                {
+                    atomicOp!"+="(gMqttDropped, 1);
+                    continue;
+                }
+                s.obox.append(q1.data);
+                try
+                    s.inflight[pid] = true;
+                catch (Exception)
+                {
+                }
+                if (!s.dirty)
+                {
+                    s.dirty = true;
+                    try
+                        tDirty ~= s;
+                    catch (Exception)
+                    {
+                    }
+                }
+                continue;
+            }
+            // fall through: window saturated -> deliver at QoS0
+        }
         if (s.obox.length + pkt.length > MQTT_OBOX_CAP)
         {
             atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
@@ -789,6 +844,39 @@ private void buildPublish(ref ByteBuffer o, scope const(char)[] topic,
     o.append(payload);
 }
 
+/// QoS1 PUBLISH (DUP=0): fixed header 0x32|retain, then topic, packet-id, payload.
+private void buildPublishQos1(ref ByteBuffer o, scope const(char)[] topic,
+        scope const(char)[] payload, bool retain, ushort pid) @nogc nothrow
+{
+    o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x02 | (retain ? 1 : 0)));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2 + payload.length));
+    o.appendByte(cast(char)(topic.length >> 8));
+    o.appendByte(cast(char)(topic.length & 0xFF));
+    o.append(topic);
+    o.appendByte(cast(char)(pid >> 8));
+    o.appendByte(cast(char)(pid & 0xFF));
+    o.append(payload);
+}
+
+/// Next outbound packet-id for `c` that isn't already in flight (skips 0).
+private ushort nextDeliveryPid(MqttConn c) @trusted nothrow
+{
+    foreach (_; 0 .. 65535)
+    {
+        immutable pid = c.nextPid;
+        c.nextPid = c.nextPid == 0xFFFF ? 1 : cast(ushort)(c.nextPid + 1);
+        bool used = false;
+        try
+            used = (pid in c.inflight) !is null;
+        catch (Exception)
+        {
+        }
+        if (pid != 0 && !used)
+            return pid;
+    }
+    return 0; // window saturated (all ids in flight)
+}
+
 private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 {
     try
@@ -839,7 +927,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
         immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
         mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
         if (gMqttFanout !is null)
-            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq);
+            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain, rseq, 0);
         c.willTopic = null;
     }
     // wake OTHER subscribers whose outboxes this connection's last batch filled
@@ -1146,9 +1234,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                         atomicOp!"+="(gMqttMessages, 1);
                         immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                        mqttDeliverLocal(topic, payload, retain, rseq);
+                        mqttDeliverLocal(topic, payload, retain, rseq, qos);
                         if (gMqttFanout !is null)
-                            gMqttFanout(topic, payload, retain, rseq);
+                            gMqttFanout(topic, payload, retain, rseq, qos);
                     }
                     try
                         c.q2pids ~= pid;
@@ -1165,9 +1253,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             {
                 atomicOp!"+="(gMqttMessages, 1);
                 immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                mqttDeliverLocal(topic, payload, retain, rseq);
+                mqttDeliverLocal(topic, payload, retain, rseq, qos);
                 if (gMqttFanout !is null)
-                    gMqttFanout(topic, payload, retain, rseq);
+                    gMqttFanout(topic, payload, retain, rseq, qos);
             }
             if (qos == 1)
             {
@@ -1178,6 +1266,18 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             }
             return true;
         }
+    case PT_PUBACK:
+        // the subscriber acking one of OUR QoS1 deliveries -> release the id
+        if (p.length >= 2)
+        {
+            immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            try
+                c.inflight.remove(pid);
+            catch (Exception)
+            {
+            }
+        }
+        return true;
     case PT_PUBREL:
         {
             // completes the qos2 receive handshake
@@ -1241,10 +1341,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     filters[ng++] = null;
                     continue;
                 }
-                if (!trieSubscribe(filter, c, 0))
+                immutable grant = reqQos < 1 ? cast(ubyte) 0 : cast(ubyte) 1; // QoS0/1 out
+                if (!trieSubscribe(filter, c, grant))
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
                 filters[ng] = filter;
-                granted[ng++] = 0; // v1: everything granted at QoS 0
+                granted[ng++] = grant;
             }
             if (ng == 0)
                 return false; // [MQTT-3.8.3-3] at least one filter required
