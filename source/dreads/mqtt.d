@@ -90,6 +90,17 @@ public final class MqttConn
     // topic-alias-maximum we advertise in CONNACK.
     string[ushort] inAlias;
     size_t inAliasBytes; // running size of the aliased topics (byte cap)
+    // v5 OUTBOUND topic aliases (broker -> client): if the client advertised a
+    // topic-alias-maximum, we map a topic to a short alias so repeat deliveries
+    // ship an empty topic + the alias. outAliasMax = how many we may use (capped);
+    // outAliasNext = the next alias to hand out (1-based); outAlias = topic->alias
+    // registered ON THE CLIENT; outAliasBytes = byte cap on the table. An alias is
+    // recorded ONLY after the registering PUBLISH is actually queued, so a dropped
+    // registration never leaves the client unable to resolve a later reuse.
+    ushort outAliasMax;
+    ushort outAliasNext = 1;
+    ushort[string] outAlias;
+    size_t outAliasBytes;
     uint maxPktSize; // v5 maximum-packet-size the CLIENT advertised: we MUST NOT
     // send a PUBLISH larger than this to it [MQTT-3.1.2-24 area]. 0 = no limit.
     ushort sendMax = 0xFFFF; // v5 receive-maximum the CLIENT advertised: the max
@@ -782,16 +793,69 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         if (m.noLocal && s is publisher)
             return; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
-        // v5 subscription-identifier: prefix a 0x0B property onto THIS subscriber's
-        // property block (per-sub, so it can't reuse the pooled v5 packet below).
-        // The common no-subId case leaves `props` untouched — zero extra work.
+        // v5 outbound topic alias: map this topic to a short alias for a client
+        // that advertised topic-alias-maximum. First delivery of a topic REGISTERS
+        // it (full topic + alias); later ones REUSE (empty topic + alias). The
+        // mapping is recorded only after a successful queue (recordAlias), so a
+        // dropped registration never strands the client on an unknown alias.
+        const(char)[] outTopic = topic;
+        ushort aliasVal = 0;
+        bool aliasRegister = false;
+        if (v5 && s.outAliasMax != 0)
+        {
+            try
+            {
+                if (auto pa = topic in s.outAlias)
+                {
+                    aliasVal = *pa;
+                    outTopic = null; // reuse: the alias resolves the empty topic
+                }
+                else if (s.outAliasNext <= s.outAliasMax
+                        && s.outAliasBytes + topic.length <= MQTT_MAX_ALIAS_BYTES)
+                {
+                    aliasVal = s.outAliasNext; // register a new alias for this topic
+                    aliasRegister = true;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+        void recordAlias()
+        {
+            if (!aliasRegister)
+                return;
+            try
+            {
+                s.outAlias[topic.idup] = aliasVal;
+                s.outAliasBytes += topic.length;
+            }
+            catch (Exception)
+            {
+            }
+            if (s.outAliasNext < ushort.max)
+                s.outAliasNext++;
+        }
+        // v5 property prefix for THIS subscriber: topic-alias (0x23) then
+        // subscription-identifier (0x0B), ahead of the forwarded props. Any prefix
+        // forces a per-conn one-off packet (can't reuse the pooled v5 packet). The
+        // common no-alias/no-subId case leaves `props` untouched — zero extra work.
         static ByteBuffer sidBuf;
         const(char)[] dprops = props;
-        if (v5 && m.subId != 0)
+        if (v5 && (aliasVal != 0 || m.subId != 0))
         {
             sidBuf.clear();
-            sidBuf.appendByte(0x0B);
-            encodeVarint(sidBuf, m.subId);
+            if (aliasVal != 0)
+            {
+                sidBuf.appendByte(cast(char) 0x23);
+                sidBuf.appendByte(cast(char)(aliasVal >> 8));
+                sidBuf.appendByte(cast(char)(aliasVal & 0xFF));
+            }
+            if (m.subId != 0)
+            {
+                sidBuf.appendByte(cast(char) 0x0B);
+                encodeVarint(sidBuf, m.subId);
+            }
             sidBuf.append(props);
             dprops = cast(const(char)[]) sidBuf.data;
         }
@@ -813,9 +877,9 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             {
                 q1.clear();
                 if (effQos == 2)
-                    buildPublishQos2(q1, topic, payload, delRetain, pid, v5, dprops);
+                    buildPublishQos2(q1, outTopic, payload, delRetain, pid, v5, dprops);
                 else
-                    buildPublishQos1(q1, topic, payload, delRetain, pid, v5, dprops);
+                    buildPublishQos1(q1, outTopic, payload, delRetain, pid, v5, dprops);
                 if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
@@ -823,6 +887,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     return;
                 }
                 s.obox.append(q1.data);
+                recordAlias(); // registration is now queued: safe to remember it
                 try
                 {
                     if (effQos == 2)
@@ -851,7 +916,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // rare (retain-as-published, QoS0): the shared packet has retain=0,
             // so build a one-off with the retain bit set
             q1.clear();
-            buildPublish(q1, topic, payload, true, v5, dprops);
+            buildPublish(q1, outTopic, payload, true, v5, dprops);
             if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
@@ -859,13 +924,14 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 return;
             }
             s.obox.append(q1.data);
+            recordAlias();
         }
-        else if (v5 && m.subId != 0)
+        else if (v5 && (m.subId != 0 || aliasVal != 0))
         {
-            // per-sub subscription-identifier: distinct property block, so build a
-            // one-off instead of the pooled v5 packet
+            // per-sub property prefix (subscription-identifier and/or topic-alias):
+            // distinct packet, so build a one-off instead of the pooled v5 packet
             q1.clear();
-            buildPublish(q1, topic, payload, false, true, dprops);
+            buildPublish(q1, outTopic, payload, false, true, dprops);
             if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
                     || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
@@ -873,6 +939,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 return;
             }
             s.obox.append(q1.data);
+            recordAlias();
         }
         else
         {
@@ -1375,7 +1442,7 @@ private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
 // end; every read is bounded by `end` (<= p.length) so a malformed block can't
 // read OOB. recvMax stays 0 if absent (caller treats 0 as "no client limit").
 private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i,
-        out ushort recvMax, out uint maxPkt) @nogc nothrow
+        out ushort recvMax, out uint maxPkt, out ushort aliasMax) @nogc nothrow
 {
     uint plen;
     if (!decodeVarint(p, i, plen))
@@ -1401,6 +1468,8 @@ private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i,
                 return false;
             if (id == 0x21)
                 recvMax = cast(ushort)((p[i] << 8) | p[i + 1]);
+            else // 0x22: how many outbound aliases this client will accept
+                aliasMax = cast(ushort)((p[i] << 8) | p[i + 1]);
             i += 2;
             break;
         case 0x17, 0x19: // request-problem-info, request-response-info: 1 byte
@@ -1880,13 +1949,17 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // per [MQTT-3.3.4-9]; we treat it leniently as "no client limit".
             if (c.protoVer == 5)
             {
-                ushort recvMax;
+                ushort recvMax, aliasMax;
                 uint maxPkt;
-                if (!mqttParseConnectProps(p, i, recvMax, maxPkt))
+                if (!mqttParseConnectProps(p, i, recvMax, maxPkt, aliasMax))
                     return false;
                 if (recvMax != 0)
                     c.sendMax = recvMax;
                 c.maxPktSize = maxPkt; // 0 = no limit
+                // cap our outbound-alias usage at what the client accepts AND our
+                // own table bound (the client may advertise up to 65535)
+                c.outAliasMax = aliasMax < MQTT_TOPIC_ALIAS_MAX
+                    ? aliasMax : MQTT_TOPIC_ALIAS_MAX;
             }
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
