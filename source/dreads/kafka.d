@@ -153,15 +153,23 @@ private void partKey(scope const(char)[] topic, int part, ref ByteBuffer o) @nog
 
 // data-plane wrappers -------------------------------------------------------
 
-/// RPUSH one stored record; returns the new length (= assigned offset + 1),
-/// or -1 on failure.
-private long pushRecord(scope const(char)[] key, scope const(char)[] blob) nothrow
+/// RPUSH a BATCH of stored records in one data-plane call (RPUSH is variadic
+/// and atomic on the owner): returns the new length — base offset of the
+/// batch = length - count. One exec per produce request instead of one per
+/// message (the per-message path measured ~1.8µs each = the whole bottleneck).
+private long pushRecords(scope const(char)[] key, scope const(char)[][] blobs) nothrow
 {
     static ByteBuffer rb; // TLS
-    if (gKafkaExec is null)
+    if (gKafkaExec is null || blobs.length == 0)
         return -1;
-    const(char)[][3] a = ["rpush", key, blob];
-    gKafkaExec(a[], rb);
+    static const(char)[][] argv; // TLS scratch
+    if (argv.length < blobs.length + 2)
+        argv.length = blobs.length + 2;
+    argv[0] = "rpush";
+    argv[1] = key;
+    foreach (i, b; blobs)
+        argv[2 + i] = b;
+    gKafkaExec(argv[0 .. blobs.length + 2], rb);
     auto d = rb.data;
     if (d.length < 2 || d[0] != ':')
         return -1;
@@ -461,11 +469,15 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             short err = E_NONE;
             static ByteBuffer kb; // TLS
             partKey(topic, part, kb);
-            // walk the producer's message set
+            // collect the whole message set, ONE atomic variadic RPUSH
+            static ByteBuffer blobArena; // TLS: all records back-to-back
+            static const(char)[][] slices; // TLS: their slices (offsets fixed later)
+            static size_t[] offs; // (start,len) pairs into blobArena
+            blobArena.clear();
+            size_t nrec = 0;
             size_t i = 0;
             while (i + 12 <= records.length)
             {
-                // producer-side offset ignored
                 immutable msz = (cast(uint) records[i + 8] << 24)
                     | (cast(uint) records[i + 9] << 16)
                     | (cast(uint) records[i + 10] << 8) | records[i + 11];
@@ -477,20 +489,27 @@ private void handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                     err = E_CORRUPT; // compressed sets unsupported in v1
                     break;
                 }
-                // stored record: [size i32][message]
-                static ByteBuffer blob; // TLS
-                blob.clear();
-                putI32(blob, cast(int) msz);
-                blob.append(msg);
-                immutable newLen = pushRecord(kb.data.asChars, blob.data.asChars);
-                if (newLen < 0)
-                {
-                    err = E_CORRUPT;
-                    break;
-                }
-                if (baseOffset < 0)
-                    baseOffset = newLen - 1;
+                if (offs.length < (nrec + 1) * 2)
+                    offs.length = (nrec + 1) * 2;
+                offs[nrec * 2] = blobArena.length;
+                putI32(blobArena, cast(int) msz);
+                blobArena.append(msg);
+                offs[nrec * 2 + 1] = blobArena.length - offs[nrec * 2];
+                nrec++;
                 i += 12 + msz;
+            }
+            if (err == E_NONE && nrec > 0)
+            {
+                if (slices.length < nrec)
+                    slices.length = nrec;
+                auto base = blobArena.data;
+                foreach (k; 0 .. nrec)
+                    slices[k] = cast(const(char)[]) base[offs[k * 2] .. offs[k * 2] + offs[k * 2 + 1]];
+                immutable newLen = pushRecords(kb.data.asChars, slices[0 .. nrec]);
+                if (newLen < 0)
+                    err = E_CORRUPT;
+                else
+                    baseOffset = newLen - cast(long) nrec;
             }
             putI32(o, part);
             putI16(o, err);
@@ -537,7 +556,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             if (fetchOff < hw)
             {
                 // budget: partMax bytes, capped count
-                int maxN = 1000;
+                int maxN = 16384; // deep batches: fewer LRANGE walks per fetch
                 long off = fetchOff;
                 size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
                 immutable startLen = o.length;
