@@ -31,7 +31,9 @@ module dreads.mqtt;
 
 import core.atomic : atomicLoad, atomicOp, MemoryOrder;
 
-import vibe.core.core : runTask;
+import core.time : Duration, msecs, seconds;
+
+import vibe.core.core : runTask, Task;
 import vibe.core.net : TCPConnection;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
@@ -64,6 +66,7 @@ public final class MqttConn
     LocalManualEvent flushEvt;
     bool dirty;
     bool closed; // serve fiber sets on exit; writer fiber then drains + stops
+    Duration readDeadline = Duration.max; // 1.5x CONNECT keepalive (0 kA = max)
     // QoS2 receive state: packet ids between PUBLISH(qos2) and PUBREL. Dedup:
     // a retransmitted qos2 PUBLISH with an id already here is PUBRECed but
     // NOT redelivered (exactly-once toward the subscriber side).
@@ -577,21 +580,28 @@ private void swapBufs(ref ByteBuffer a, ref ByteBuffer b) @nogc nothrow @trusted
     memcpy(&b, t.ptr, ByteBuffer.sizeof);
 }
 
+/// Idle outboxes shrink back to this; a one-time fan-out burst must not pin
+/// ~64MB per connection for the life of an otherwise-idle subscriber. Sized
+/// ABOVE the steady-state working set (a windowed consumer accumulates a few
+/// hundred KB between writes) so the hot path never churns the allocator —
+/// only a genuine multi-MB spike gets released.
+private enum size_t MQTT_OBOX_KEEP = 4 << 20;
+
 /// The per-connection writer fiber: drains the outbox for as long as the conn
 /// lives. Only THIS fiber writes deliveries, so a blocked write blocks only
-/// this subscriber; deliverers append to `obox` while a write is in flight
-/// on `wbox`. The writer also OWNS the teardown: it closes the socket (never
-/// yanking the fd from under its own in-flight write) and releases both
-/// buffers deterministically on the owning thread — GC finalization would
-/// free these malloc-plane blocks from whatever thread ran the collection,
-/// poisoning another shard's per-thread freelist.
+/// this subscriber; deliverers append to `obox` while a write is in flight on
+/// `wbox`. It releases both buffers deterministically on the owning thread at
+/// exit — GC finalization would free these malloc-plane blocks from whatever
+/// thread ran the collection, poisoning another shard's freelist. The SERVE
+/// fiber owns the socket close (and joins this fiber), so a writer parked in a
+/// stalled tcp.write is unblocked when the serve side closes the fd — the
+/// stuck-writer-can-never-be-reaped hole the previous design left.
 private void mqttWriter(MqttConn c) nothrow
 {
     scope (exit)
     {
         c.obox.release();
         c.wbox.release();
-        closeTcp(c);
     }
     for (;;)
     {
@@ -623,7 +633,7 @@ private void mqttWriter(MqttConn c) nothrow
             c.closed = true; // dead socket: stop delivering
             return;
         }
-        c.wbox.clear();
+        c.wbox.trim(MQTT_OBOX_KEEP); // release a burst-grown block back down
     }
 }
 
@@ -664,6 +674,40 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 // ---------------------------------------------------------------------------
 // The per-connection serve loop (a fiber per accepted MQTT connection).
 
+// Connection teardown (a named nothrow helper: scope(exit) may not hold a
+// try/catch). Order matters: real subscription teardown, wake+close so a
+// stalled writer unblocks, then join so buffer release runs on THIS thread.
+private void mqttTeardown(MqttConn c, Task writer) nothrow
+{
+    // tear down subscriptions for real (not just lazily): under connect/
+    // subscribe churn the lazy-gen scheme leaked trie entries and pinned
+    // gMqttSubTotal above zero forever, keeping the idle-skin gate open.
+    foreach (f; c.filters)
+        trieUnsubscribe(f, c);
+    c.filters = null;
+    c.gen++; // invalidate any remaining trie entries (lazily skipped)
+    // deliveries queued before a protocol-error/DISCONNECT return would
+    // otherwise strand in their outboxes (PUBLISH+DISCONNECT in one read batch
+    // is the standard fire-and-forget client pattern)
+    mqttFlushDirty();
+    c.closed = true;
+    try
+        c.flushEvt.emit(); // wake the writer to drain and exit
+    catch (Exception)
+    {
+    }
+    // The SERVE fiber closes the socket — this unblocks a writer parked in a
+    // stalled tcp.write (its write throws, sendTo returns false). Then join so
+    // buffer release runs (this thread) before the MqttConn is dropped — no
+    // reliance on the GC finalizer.
+    closeTcp(c);
+    try
+        writer.join();
+    catch (Exception)
+    {
+    }
+}
+
 public void serveMqttClient(TCPConnection tcp) nothrow
 {
     try
@@ -672,8 +716,9 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     {
     }
     auto c = new MqttConn(tcp);
+    Task writer;
     try
-        cast(void) runTask(&mqttWriter, c);
+        writer = runTask(&mqttWriter, c);
     catch (Exception)
     {
         closeTcp(c); // no writer fiber exists: close here or the fd leaks
@@ -681,43 +726,19 @@ public void serveMqttClient(TCPConnection tcp) nothrow
         c.wbox.release();
         return;
     }
-    // Signal-only: the WRITER closes the socket after draining, so a close
-    // never lands under an in-flight write and the delivery tail isn't lost.
-    static void closeQuiet(MqttConn cc) nothrow
-    {
-        cc.closed = true;
-        try
-            cc.flushEvt.emit();
-        catch (Exception)
-        {
-        }
-    }
 
     scope (exit)
-    {
-        // tear down subscriptions for real (not just lazily): under
-        // connect/subscribe churn the lazy-gen scheme leaked trie entries and
-        // pinned gMqttSubTotal above zero forever, keeping the idle-skin
-        // fan-out gate open.
-        foreach (f; c.filters)
-            trieUnsubscribe(f, c);
-        c.filters = null;
-        c.gen++; // invalidate any remaining trie entries (lazily skipped)
-        // deliveries this batch queued before a protocol-error/DISCONNECT
-        // return would otherwise strand in their outboxes until an unrelated
-        // publish woke the writers (PUBLISH+DISCONNECT in one read batch is
-        // the standard fire-and-forget client pattern)
-        mqttFlushDirty();
-        closeQuiet(c); // sets closed + wakes the writer fiber to drain and exit
-    }
+        mqttTeardown(c, writer);
     ByteBuffer inb;
     ByteBuffer outb;
     for (;;)
     {
-        // read at least one byte (blocks in the fiber)
+        // read at least one byte; a keepalive-exceeded silence closes the conn
+        // (waitForData returns false on BOTH the deadline and a real close —
+        // both mean "drop it", exactly the MQTT keepalive contract)
         bool alive;
         try
-            alive = tcp.waitForData();
+            alive = tcp.waitForData(c.readDeadline);
         catch (Exception)
             alive = false;
         if (!alive)
@@ -775,9 +796,11 @@ public void serveMqttClient(TCPConnection tcp) nothrow
         if (!outb.empty)
         {
             sendTo(c, outb.data);
-            outb.clear();
+            outb.trim(MQTT_OBOX_KEEP); // a retained-# replay can spike outb
         }
         inb.consume(pos);
+        if (inb.empty && inb.capacity > MQTT_OBOX_KEEP)
+            inb.trim(MQTT_OBOX_KEEP); // drop a max-packet reservation once drained
     }
 }
 
@@ -821,7 +844,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 return false; // [MQTT-3.1.2-14]
             if (!(flags & 0x04) && (flags & 0x38))
                 return false; // [MQTT-3.1.2-11/13/15] will qos/retain w/o will
-            i += 2; // keepalive (unenforced v1)
+            // keepalive seconds: enforce 1.5x as the read deadline [MQTT-3.1.2-24]
+            immutable ka = cast(ushort)((p[i] << 8) | p[i + 1]);
+            i += 2;
+            c.readDeadline = ka == 0 ? Duration.max : (ka * 1500).msecs;
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
                 return false;
