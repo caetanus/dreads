@@ -15,9 +15,10 @@ module dreads.mqtt;
 //   - retained messages are broadcast-replicated to every thread's local map
 //     (rare writes, local reads at SUBSCRIBE time).
 //
-// Scope: QoS 0/1 delivery (outbound PUBLISH at min(publishQoS, subGrant), a
-// bounded per-conn in-flight window, PUBACK releases the id), QoS 1 receive
-// (PUBACK on receipt), QoS 2 receive (full PUBREC/PUBREL/PUBCOMP handshake with
+// Scope: QoS 0/1/2 delivery (outbound PUBLISH at min(publishQoS, subGrant): QoS1
+// tracks an unacked id, QoS2 runs the PUBLISH/PUBREC/PUBREL/PUBCOMP handshake, a
+// bounded per-conn in-flight window degrades to QoS0), QoS 1 receive (PUBACK on
+// receipt), QoS 2 receive (full PUBREC/PUBREL/PUBCOMP handshake with
 // packet-id dedup), clean sessions only (CONNACK session-present=0), retained
 // messages, keepalive enforced at 1.5x [MQTT-3.1.2-24] (0 = none; TCP death is
 // also detected by the read loop), overlapping subscriptions may deliver
@@ -104,11 +105,15 @@ public final class MqttConn
     string willTopic;
     const(ubyte)[] willPayload;
     bool willRetain;
-    // QoS1 OUTBOUND delivery: a per-conn packet-id (1..65535, wraps) and the set
-    // of ids delivered but not yet PUBACKed. Bounded window -> a slow consumer
-    // degrades a QoS1 delivery to QoS0 rather than growing memory.
+    // QoS1/2 OUTBOUND delivery: a per-conn packet-id (1..65535, wraps), the set
+    // of QoS1 ids delivered but not yet PUBACKed, and the QoS2 ids mid-handshake
+    // (outQos2[pid]: 1 = awaiting PUBREC, 2 = PUBREL sent, awaiting PUBCOMP). One
+    // shared pid space; the combined window bounds RAM -> a slow consumer degrades
+    // the delivery to QoS0 rather than growing memory. In-session only: no
+    // cross-reconnect retransmit (needs persistent sessions).
     ushort nextPid = 1;
     bool[ushort] inflight;
+    ubyte[ushort] outQos2;
 
     this(TCPConnection c) nothrow
     {
@@ -132,8 +137,9 @@ private enum size_t MQTT_OBOX_CAP = 64 << 20;
 /// Largest accepted remaining-length. The varint allows 256MB; accepting that
 /// from an unauthenticated socket is an invitation. Oversized frame = close.
 private enum uint MQTT_MAX_PACKET = 16 << 20;
-/// Per-connection QoS1 in-flight window: past this, a QoS1 delivery is sent as
-/// QoS0 (graceful degradation, no unbounded in-flight growth for a slow acker).
+/// Per-connection outbound in-flight window (QoS1 inflight + QoS2 handshakes,
+/// combined): past this, a QoS1/2 delivery is sent as QoS0 (graceful
+/// degradation, no unbounded in-flight growth for a slow acker).
 private enum size_t MQTT_QOS1_WINDOW = 1024;
 public shared ulong gMqttDropped; // deliveries dropped at full outboxes
 public shared ulong gMqttRetainedDropped; // retained stores refused at the caps
@@ -677,15 +683,19 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         immutable effQos = pubQos < m.qos ? pubQos : m.qos;
         if (effQos >= 1)
         {
-            // QoS1: assign a packet-id and track it in flight (window-bounded;
-            // a saturated window degrades this delivery to QoS0)
+            // QoS1/2: assign a packet-id and track it in flight (the combined
+            // QoS1+QoS2 window bounds RAM; a saturated window degrades this
+            // delivery to QoS0)
             ushort pid = 0;
-            if (s.inflight.length < MQTT_QOS1_WINDOW)
+            if (s.inflight.length + s.outQos2.length < MQTT_QOS1_WINDOW)
                 pid = nextDeliveryPid(s);
             if (pid != 0)
             {
                 q1.clear();
-                buildPublishQos1(q1, topic, payload, false, pid);
+                if (effQos == 2)
+                    buildPublishQos2(q1, topic, payload, false, pid);
+                else
+                    buildPublishQos1(q1, topic, payload, false, pid);
                 if (s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
@@ -693,7 +703,12 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 }
                 s.obox.append(q1.data);
                 try
-                    s.inflight[pid] = true;
+                {
+                    if (effQos == 2)
+                        s.outQos2[pid] = 1; // awaiting PUBREC
+                    else
+                        s.inflight[pid] = true;
+                }
                 catch (Exception)
                 {
                 }
@@ -860,7 +875,22 @@ private void buildPublishQos1(ref ByteBuffer o, scope const(char)[] topic,
     o.append(payload);
 }
 
-/// Next outbound packet-id for `c` that isn't already in flight (skips 0).
+/// QoS2 PUBLISH (DUP=0): fixed header 0x34|retain, then topic, packet-id, payload.
+private void buildPublishQos2(ref ByteBuffer o, scope const(char)[] topic,
+        scope const(char)[] payload, bool retain, ushort pid) @nogc nothrow
+{
+    o.appendByte(cast(char)((PT_PUBLISH << 4) | 0x04 | (retain ? 1 : 0)));
+    encodeVarint(o, cast(uint)(2 + topic.length + 2 + payload.length));
+    o.appendByte(cast(char)(topic.length >> 8));
+    o.appendByte(cast(char)(topic.length & 0xFF));
+    o.append(topic);
+    o.appendByte(cast(char)(pid >> 8));
+    o.appendByte(cast(char)(pid & 0xFF));
+    o.append(payload);
+}
+
+/// Next outbound packet-id for `c` not already in flight on EITHER the QoS1 or
+/// the QoS2 handshake (one shared id space; skips 0).
 private ushort nextDeliveryPid(MqttConn c) @trusted nothrow
 {
     foreach (_; 0 .. 65535)
@@ -869,7 +899,7 @@ private ushort nextDeliveryPid(MqttConn c) @trusted nothrow
         c.nextPid = c.nextPid == 0xFFFF ? 1 : cast(ushort)(c.nextPid + 1);
         bool used = false;
         try
-            used = (pid in c.inflight) !is null;
+            used = (pid in c.inflight) !is null || (pid in c.outQos2) !is null;
         catch (Exception)
         {
         }
@@ -1285,6 +1315,39 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             }
         }
         return true;
+    case PT_PUBREC:
+        // phase 1 ack of one of OUR QoS2 deliveries -> advance the handshake and
+        // send PUBREL [MQTT-4.3.3]. Lenient on an unknown pid (still PUBREL, so a
+        // lost outQos2 entry can't strand the peer) but never close.
+        if (p.length >= 2)
+        {
+            immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            try
+            {
+                if ((pid in c.outQos2) !is null)
+                    c.outQos2[pid] = 2; // PUBREL sent, awaiting PUBCOMP
+            }
+            catch (Exception)
+            {
+            }
+            o.appendByte(cast(char)((PT_PUBREL << 4) | 0x02));
+            o.appendByte(cast(char) 2);
+            o.appendByte(cast(char)(pid >> 8));
+            o.appendByte(cast(char)(pid & 0xFF));
+        }
+        return true;
+    case PT_PUBCOMP:
+        // the subscriber completing one of OUR QoS2 deliveries -> release the id
+        if (p.length >= 2)
+        {
+            immutable pid = cast(ushort)((p[0] << 8) | p[1]);
+            try
+                c.outQos2.remove(pid);
+            catch (Exception)
+            {
+            }
+        }
+        return true;
     case PT_PUBREL:
         {
             // completes the qos2 receive handshake
@@ -1348,7 +1411,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     filters[ng++] = null;
                     continue;
                 }
-                immutable grant = reqQos < 1 ? cast(ubyte) 0 : cast(ubyte) 1; // QoS0/1 out
+                immutable grant = cast(ubyte) reqQos; // QoS0/1/2 out (reqQos already <=2)
                 if (!trieSubscribe(filter, c, grant))
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
                 filters[ng] = filter;
@@ -1427,9 +1490,9 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         c.willPayload = null;
         return false;
     default:
-        // types 0 and 15 are reserved; CONNACK/PUBREC/PUBCOMP/SUBACK/UNSUBACK/
-        // PINGRESP are server->client only and never legitimate inbound (PUBACK
-        // IS legitimate now that we deliver QoS1 out — it has its own case
+        // types 0 and 15 are reserved; CONNACK/SUBACK/UNSUBACK/PINGRESP are
+        // server->client only and never legitimate inbound. PUBACK/PUBREC/
+        // PUBCOMP ARE legitimate now that we deliver QoS1/2 out (own cases
         // above). This default also replaces a final-switch that turned any of
         // them into a runtime SwitchError — one PUBREL used to crash the server.
         return false;
