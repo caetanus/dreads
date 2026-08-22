@@ -120,7 +120,24 @@ public struct Aof
     {
         if (f is null || pending.empty)
             return;
-        fwrite(pending.data.ptr, 1, pending.length, f);
+        // A short fwrite (ENOSPC / IO error) must NOT clear pending: dropping
+        // the un-written bytes silently loses data AND leaves a partial record
+        // in the file that breaks replay mid-stream. Keep pending and retry on
+        // the next flush; the bytes already written are a whole-record prefix
+        // (append() only ever adds complete commands), so no torn record ships.
+        immutable wrote = fwrite(pending.data.ptr, 1, pending.length, f);
+        if (wrote != pending.length)
+        {
+            // partial write: `wrote` bytes reached the file, so DROP that prefix
+            // and keep the tail for the next flush (retaining the whole buffer
+            // would re-write the prefix = duplicate/corrupt; clearing it would
+            // lose the tail). append() only adds whole commands, so the file
+            // still ends on a record boundary or mid-record that the tail
+            // completes on retry.
+            pending.consume(wrote);
+            dirty = true;
+            return;
+        }
         fflush(f);
         pending.clear();
         dirty = true;

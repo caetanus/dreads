@@ -2268,6 +2268,15 @@ private void shardDrainLoop() nothrow
 
                 mqttFlushDirty();
             }
+            // Durability before the reply: a hopped write (a cross-shard skin
+            // publish — the COMMON case at shards>1, since a skin client's queue
+            // owner is any shard by key hash) was applied to THIS owner's AOF
+            // pending during shardDrainOnce. Flush it to the OS now, before the
+            // reply (which carries the basic.ack / acks=1 confirm) ships back —
+            // otherwise the confirm reaches the client while the write lives
+            // only in the owner's un-flushed buffer, lost on the owner's kill-9.
+            // No-op when nothing was written (pending.empty).
+            myAof().flush();
             // ship each requester's coalesced reply batch, then its ONE wake
             while (replyTouch)
             {
