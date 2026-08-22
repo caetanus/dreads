@@ -32,35 +32,23 @@ go test -count=1 -timeout 100s -run TestDreadsProducerConformance -v .
 | Seam | Result | Detail |
 |------|--------|--------|
 | **Replay** | ✅ PASS | Planned ranges resume + report exact independent progress. dreads' direct-partition fetch/offset semantics conform fully. |
-| **Producer** | ⚠️ 3/4 | batch-order-across-partitions, async-admission-owns-input, close-fences-later-delivery all PASS. Only `synchronous binary-safe owned delivery` FAILS. |
+| **Producer** | ✅ 4/4 | All pass since RecordBatch v2 / record-headers support (Produce v3/Fetch v4) landed. The `synchronous binary-safe owned delivery` case round-trips a header + explicit timestamp, which now works. |
 | **Inspector** | ❌ FAIL | `RunOnce()` drives a consumer-group poll (`consumer poll permanent failure`). |
 | **Consumer** | ❌ FAIL | at-least-once settlement is defined over consumer-group commits. |
 | **Transaction** | ❌ FAIL | requires transactions (transactional producer + consume-transform-produce). |
 
-### What the failures mean (none is a memory-safety / correctness bug in existing code)
+### What the remaining failures mean (none is a memory-safety / correctness bug)
 
-- **Producer sync-delivery**: the test publishes a record carrying **one header**
-  and an explicit **timestamp**, then requires them back verbatim. dreads speaks
-  the pre-flexible **MessageSet v1 (magic 1)** wire format
-  (`[offset][size][crc][magic][attrs][timestamp][key][value]`), which has **no
-  record-headers field** — headers arrived with MessageSet v2 / RecordBatch
-  (magic 2). So the read record has zero headers and the assertion trips.
-  Supporting headers is a **protocol milestone** (the whole v2 RecordBatch +
-  varint format), not a bug. (Exact-timestamp preservation may also differ and is
-  worth a separate check.)
-- **Consumer produce path** (`publishConformanceValues` → `PublishBatch` of 3
-  records to one partition): fails "delivery retryable failure" because **dreads
-  does not support compressed message sets**. franz-go (like most modern
-  clients) sends a multi-record batch as ONE snappy-compressed wrapper message
-  (magic 1, attrs `0x02`); dreads correctly rejects any compressed set
-  (`(attrs & 0x07) != 0` → CORRUPT) since it only decodes uncompressed v1.
-  Root-caused by hex trace: a SINGLE record (sent uncompressed, attrs `0x00`)
-  produces fine; the 3-record batch is snappy-wrapped and rejected. This is a
-  **missing feature** (snappy/lz4/gzip/zstd decompression), not a defect — dreads
-  fail-closes rather than mis-decoding. HIGH interop impact: a producer with
-  compression *disabled* works; the default (compressed) does not.
-- **Inspector / Consumer / Transaction**: all additionally require **consumer
-  groups** (FindCoordinator/JoinGroup/SyncGroup/OffsetCommit/OffsetFetch) and/or
+- **Producer sync-delivery** (now PASSES): the test round-trips a record header +
+  explicit timestamp. This was the driver for adding **RecordBatch v2 / magic-2**
+  support (Produce v3 / Fetch v4): dreads now decodes v2 batches (carrying
+  headers), stores headers in an internal blob, and re-encodes a v2 batch on
+  Fetch v4+ (down-converting to v1 for old clients). Adding v2 also resolved the
+  earlier "compressed batch" symptom — franz-go on Produce v3 sends **uncompressed
+  v2** by default (the snappy wrapper only appeared when franz-go was forced down
+  to magic-1). Compression of v2 batches remains a separate unbuilt gap.
+- **Inspector / Consumer / Transaction**: all require **consumer groups**
+  (FindCoordinator/JoinGroup/SyncGroup/OffsetCommit/OffsetFetch) and/or
   **transactions** — deliberately-unbuilt feature milestones. They are reported,
   not implemented, per the project's standing rule.
 
