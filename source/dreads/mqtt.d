@@ -90,6 +90,8 @@ public final class MqttConn
     // topic-alias-maximum we advertise in CONNACK.
     string[ushort] inAlias;
     size_t inAliasBytes; // running size of the aliased topics (byte cap)
+    uint maxPktSize; // v5 maximum-packet-size the CLIENT advertised: we MUST NOT
+    // send a PUBLISH larger than this to it [MQTT-3.1.2-24 area]. 0 = no limit.
     ushort sendMax = 0xFFFF; // v5 receive-maximum the CLIENT advertised: the max
     // QoS1/2 messages we may have in flight toward it (flow control). Default =
     // no limit beyond our own window.
@@ -814,7 +816,8 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                     buildPublishQos2(q1, topic, payload, delRetain, pid, v5, dprops);
                 else
                     buildPublishQos1(q1, topic, payload, delRetain, pid, v5, dprops);
-                if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+                if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
+                    || s.obox.length + q1.length > MQTT_OBOX_CAP)
                 {
                     atomicOp!"+="(gMqttDropped, 1);
                     return;
@@ -849,7 +852,8 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // so build a one-off with the retain bit set
             q1.clear();
             buildPublish(q1, topic, payload, true, v5, dprops);
-            if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+            if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
+                    || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
                 return;
@@ -862,7 +866,8 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // one-off instead of the pooled v5 packet
             q1.clear();
             buildPublish(q1, topic, payload, false, true, dprops);
-            if (s.obox.length + q1.length > MQTT_OBOX_CAP)
+            if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
+                    || s.obox.length + q1.length > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1);
                 return;
@@ -878,7 +883,8 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 pktV5built = true;
             }
             immutable plen = v5 ? pktV5.length : pkt.length;
-            if (s.obox.length + plen > MQTT_OBOX_CAP)
+            if ((s.maxPktSize != 0 && plen > s.maxPktSize)
+                    || s.obox.length + plen > MQTT_OBOX_CAP)
             {
                 atomicOp!"+="(gMqttDropped, 1); // QoS0 drop at a full outbox is spec-legal
                 return;
@@ -1368,7 +1374,8 @@ private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
 // and correctly skipping every other CONNECT property by type. Advances i to the
 // end; every read is bounded by `end` (<= p.length) so a malformed block can't
 // read OOB. recvMax stays 0 if absent (caller treats 0 as "no client limit").
-private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i, out ushort recvMax) @nogc nothrow
+private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i,
+        out ushort recvMax, out uint maxPkt) @nogc nothrow
 {
     uint plen;
     if (!decodeVarint(p, i, plen))
@@ -1384,6 +1391,9 @@ private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i, out ush
         case 0x11, 0x27: // session-expiry-interval u32, maximum-packet-size u32
             if (i + 4 > end)
                 return false;
+            if (id == 0x27) // maximum-packet-size: cap our outbound to this client
+                maxPkt = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                    | (cast(uint) p[i + 2] << 8) | p[i + 3];
             i += 4;
             break;
         case 0x21, 0x22: // receive-maximum u16, topic-alias-maximum u16
@@ -1871,10 +1881,12 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (c.protoVer == 5)
             {
                 ushort recvMax;
-                if (!mqttParseConnectProps(p, i, recvMax))
+                uint maxPkt;
+                if (!mqttParseConnectProps(p, i, recvMax, maxPkt))
                     return false;
                 if (recvMax != 0)
                     c.sendMax = recvMax;
+                c.maxPktSize = maxPkt; // 0 = no limit
             }
             const(char)[] clientId;
             if (!rdStr(p, i, clientId))
