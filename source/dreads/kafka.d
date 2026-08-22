@@ -1006,3 +1006,365 @@ unittest // varint / zigzag round-trip, including boundaries and negatives
         assert(!ok);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal stored-record blob: a v2-origin record kept as ONE list element so
+// the existing list storage engine is reused unchanged. The leading 0xFF tag
+// distinguishes it from a legacy v1 blob `[i32 size][crc..]`, whose size high
+// byte is 0x00 for any real (<16MB) message.
+//   [u8 0xFF][i64 ts][i32 keyLen(-1=null)][key][i32 valLen(-1=null)][val]
+//   [i32 hdrLen][hdrSection] — hdrSection is the record's raw v2 header bytes
+//   ([svarint count]([svarint kLen][k][svarint vLen][v])*), verbatim-copyable
+//   into a re-encoded batch because header key/value lengths are absolute.
+private enum ubyte KREC_TAG = 0xFF;
+
+private struct KRec2
+{
+    long ts;
+    const(ubyte)[] key;
+    bool keyNull;
+    const(ubyte)[] val;
+    bool valNull;
+    const(ubyte)[] hdrSection; // empty for a v1-origin record
+    bool ok = true;
+}
+
+private void putBytesI32(ref ByteBuffer o, scope const(ubyte)[] b, bool isNull) @nogc nothrow
+{
+    if (isNull)
+    {
+        putI32(o, -1);
+        return;
+    }
+    putI32(o, cast(int) b.length);
+    o.append(b);
+}
+
+private void putInternalRec(ref ByteBuffer o, long ts, scope const(ubyte)[] key, bool keyNull,
+        scope const(ubyte)[] val, bool valNull, scope const(ubyte)[] hdrSection) @nogc nothrow
+{
+    o.appendByte(cast(char) KREC_TAG);
+    putI64(o, ts);
+    putBytesI32(o, key, keyNull);
+    putBytesI32(o, val, valNull);
+    putI32(o, cast(int) hdrSection.length);
+    o.append(hdrSection);
+}
+
+/// Parse a stored list element into common fields, handling BOTH the internal
+/// v2 blob (0xFF tag) and a legacy v1 message blob `[i32 size][crc magic attrs
+/// ts key val]`. A partition may hold a mix (v1 produce + v2 produce).
+private KRec2 parseStoredRec(scope const(ubyte)[] b) @nogc nothrow
+{
+    KRec2 r;
+    if (b.length >= 1 && b[0] == KREC_TAG)
+    {
+        Rd rd = Rd(b);
+        rd.i = 1;
+        r.ts = rd.i64();
+        immutable kl = rd.i32();
+        if (!rd.ok)
+        {
+            r.ok = false;
+            return r;
+        }
+        if (kl < 0)
+            r.keyNull = true;
+        else if (rd.i + kl <= b.length)
+        {
+            r.key = b[rd.i .. rd.i + kl];
+            rd.i += kl;
+        }
+        else
+        {
+            r.ok = false;
+            return r;
+        }
+        immutable vl = rd.i32();
+        if (!rd.ok)
+        {
+            r.ok = false;
+            return r;
+        }
+        if (vl < 0)
+            r.valNull = true;
+        else if (rd.i + vl <= b.length)
+        {
+            r.val = b[rd.i .. rd.i + vl];
+            rd.i += vl;
+        }
+        else
+        {
+            r.ok = false;
+            return r;
+        }
+        immutable hl = rd.i32();
+        if (!rd.ok || hl < 0 || rd.i + hl > b.length)
+        {
+            r.ok = false;
+            return r;
+        }
+        r.hdrSection = b[rd.i .. rd.i + hl];
+        return r;
+    }
+    // legacy v1 message blob: [i32 size][crc i32][magic i8][attrs i8][ts i64][key][val]
+    Rd rd = Rd(b);
+    cast(void) rd.i32(); // size
+    cast(void) rd.i32(); // crc
+    if (rd.i + 2 > b.length)
+    {
+        r.ok = false;
+        return r;
+    }
+    rd.i += 2; // magic + attrs
+    r.ts = rd.i64();
+    auto k = rd.bytesI32();
+    r.keyNull = (k is null);
+    r.key = cast(const(ubyte)[]) k;
+    auto v = rd.bytesI32();
+    r.valNull = (v is null);
+    r.val = cast(const(ubyte)[]) v;
+    r.ok = rd.ok;
+    return r;
+}
+
+/// Validate a raw v2 header section so a later verbatim re-emit is safe.
+private bool validHeaderSection(scope const(ubyte)[] h) @nogc nothrow
+{
+    size_t i = 0;
+    bool ok = true;
+    immutable long n = getVarlong(h, i, ok);
+    if (!ok || n < 0)
+        return false;
+    foreach (_; 0 .. n)
+    {
+        immutable long kl = getVarlong(h, i, ok);
+        if (!ok || kl < 0 || i + cast(size_t) kl > h.length)
+            return false;
+        i += cast(size_t) kl;
+        immutable long vl = getVarlong(h, i, ok);
+        if (!ok)
+            return false;
+        if (vl >= 0)
+        {
+            if (i + cast(size_t) vl > h.length)
+                return false;
+            i += cast(size_t) vl;
+        }
+    }
+    return i == h.length;
+}
+
+/// Decode an uncompressed RecordBatch v2. Calls rec() per record with ABSOLUTE
+/// timestamp and the record's raw (verbatim-copyable) header section. Returns
+/// the record count, or -1 on any malformation / unsupported (compressed) set.
+private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
+        scope const(ubyte)[] key, bool keyNull, scope const(ubyte)[] val, bool valNull,
+        scope const(ubyte)[] hdrSection) nothrow rec) nothrow
+{
+    if (b.length < 61)
+        return -1; // fixed v2 batch header is 61 bytes
+    Rd h = Rd(b);
+    cast(void) h.i64(); // baseOffset
+    cast(void) h.i32(); // batchLength
+    cast(void) h.i32(); // partitionLeaderEpoch
+    immutable ubyte magic = b[h.i];
+    h.i += 1;
+    if (magic != 2)
+        return -1;
+    immutable uint crcStored = cast(uint) h.i32();
+    immutable size_t crcCoverStart = h.i; // attributes onward
+    immutable short attrs = h.i16();
+    if ((attrs & 0x07) != 0)
+        return -1; // compressed: unsupported here (separate milestone)
+    cast(void) h.i32(); // lastOffsetDelta
+    immutable long firstTs = h.i64();
+    cast(void) h.i64(); // maxTimestamp
+    cast(void) h.i64(); // producerId
+    cast(void) h.i16(); // producerEpoch
+    cast(void) h.i32(); // baseSequence
+    immutable int nrec = h.i32();
+    if (!h.ok || nrec < 0 || nrec > KAFKA_MAX_RECORDS)
+        return -1;
+    if (crcCoverStart > b.length || crc32c(b[crcCoverStart .. $]) != crcStored)
+        return -1;
+    size_t i = h.i;
+    foreach (_; 0 .. nrec)
+    {
+        bool ok = true;
+        immutable long rlen = getVarlong(b, i, ok);
+        if (!ok || rlen < 0 || i + cast(size_t) rlen > b.length)
+            return -1;
+        immutable size_t recEnd = i + cast(size_t) rlen;
+        if (i >= recEnd)
+            return -1;
+        i += 1; // per-record attributes (unused)
+        immutable long tsDelta = getVarlong(b, i, ok);
+        cast(void) getVarlong(b, i, ok); // offsetDelta (contiguous — recomputed)
+        immutable long kl = getVarlong(b, i, ok);
+        if (!ok)
+            return -1;
+        const(ubyte)[] key;
+        bool keyNull;
+        if (kl < 0)
+            keyNull = true;
+        else
+        {
+            if (i + cast(size_t) kl > recEnd)
+                return -1;
+            key = b[i .. i + cast(size_t) kl];
+            i += cast(size_t) kl;
+        }
+        immutable long vl = getVarlong(b, i, ok);
+        if (!ok)
+            return -1;
+        const(ubyte)[] val;
+        bool valNull;
+        if (vl < 0)
+            valNull = true;
+        else
+        {
+            if (i + cast(size_t) vl > recEnd)
+                return -1;
+            val = b[i .. i + cast(size_t) vl];
+            i += cast(size_t) vl;
+        }
+        if (i > recEnd)
+            return -1;
+        scope const(ubyte)[] hdrSection = b[i .. recEnd];
+        if (!validHeaderSection(hdrSection))
+            return -1;
+        rec(firstTs + tsDelta, key, keyNull, val, valNull, hdrSection);
+        i = recEnd;
+    }
+    return nrec;
+}
+
+/// Encode stored records (internal or v1 blobs) as ONE RecordBatch v2 at
+/// baseOffset — the Fetch v4+ emit path.
+private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
+        scope const(ubyte)[][] blobs) nothrow
+{
+    static ByteBuffer bodyB; // TLS: attributes..end (the CRC-covered region)
+    static ByteBuffer rbuf; // TLS: one record body
+    bodyB.clear();
+    long firstTs = 0, maxTs = 0;
+    bool haveTs = false;
+    foreach (bl; blobs)
+    {
+        auto rr = parseStoredRec(bl);
+        if (!rr.ok)
+            continue;
+        if (!haveTs)
+        {
+            firstTs = rr.ts;
+            maxTs = rr.ts;
+            haveTs = true;
+        }
+        else
+        {
+            if (rr.ts < firstTs)
+                firstTs = rr.ts;
+            if (rr.ts > maxTs)
+                maxTs = rr.ts;
+        }
+    }
+    immutable int count = cast(int) blobs.length;
+    putI16(bodyB, 0); // attributes
+    putI32(bodyB, count > 0 ? count - 1 : 0); // lastOffsetDelta
+    putI64(bodyB, firstTs);
+    putI64(bodyB, maxTs);
+    putI64(bodyB, -1); // producerId
+    putI16(bodyB, -1); // producerEpoch
+    putI32(bodyB, -1); // baseSequence
+    putI32(bodyB, count); // record count
+    foreach (idx, bl; blobs)
+    {
+        auto rr = parseStoredRec(bl);
+        rbuf.clear();
+        rbuf.appendByte(0); // record attributes
+        putVarlong(rbuf, rr.ok ? rr.ts - firstTs : 0);
+        putVarlong(rbuf, cast(long) idx); // offsetDelta
+        if (!rr.ok || rr.keyNull)
+            putVarlong(rbuf, -1);
+        else
+        {
+            putVarlong(rbuf, cast(long) rr.key.length);
+            rbuf.append(rr.key);
+        }
+        if (!rr.ok || rr.valNull)
+            putVarlong(rbuf, -1);
+        else
+        {
+            putVarlong(rbuf, cast(long) rr.val.length);
+            rbuf.append(rr.val);
+        }
+        if (rr.ok && rr.hdrSection.length)
+            rbuf.append(rr.hdrSection);
+        else
+            putVarlong(rbuf, 0); // zero headers
+        putVarlong(bodyB, cast(long) rbuf.length);
+        bodyB.append(rbuf.data);
+    }
+    immutable uint crc = crc32c(cast(const(ubyte)[]) bodyB.data);
+    putI64(o, baseOffset);
+    immutable size_t blenOff = o.length;
+    putI32(o, 0); // batchLength placeholder
+    putI32(o, -1); // partitionLeaderEpoch
+    o.appendByte(2); // magic = 2
+    putI32(o, cast(int) crc);
+    o.append(bodyB.data);
+    patchI32(o, blenOff, cast(int)(4 + 1 + 4 + bodyB.length));
+}
+
+unittest // v2 batch codec round-trip: internal blobs -> encode -> decode -> back
+{
+    // build a v2 header section with two headers (h1=><bytes>, h2=null)
+    ByteBuffer hs;
+    putVarlong(hs, 2); // header count
+    putVarlong(hs, 2);
+    hs.append("hk"); // header 0 key
+    putVarlong(hs, 3);
+    hs.append(cast(const(ubyte)[])[1, 2, 3]); // header 0 value
+    putVarlong(hs, 3);
+    hs.append("hk2"); // header 1 key
+    putVarlong(hs, -1); // header 1 value = null
+    assert(validHeaderSection(cast(const(ubyte)[]) hs.data));
+
+    ByteBuffer zeroHdr; // a valid v2 header section with zero headers
+    putVarlong(zeroHdr, 0);
+
+    ByteBuffer r0, r1, r2;
+    putInternalRec(r0, 1000, cast(const(ubyte)[]) "key0", false,
+            cast(const(ubyte)[]) "val0", false, cast(const(ubyte)[]) hs.data);
+    putInternalRec(r1, 1005, null, true, cast(const(ubyte)[]) "val1", false,
+            cast(const(ubyte)[]) zeroHdr.data); // null key, zero headers
+    putInternalRec(r2, 1002, cast(const(ubyte)[]) "k2", false, null, true,
+            cast(const(ubyte)[]) zeroHdr.data); // null value, zero headers
+
+    const(ubyte)[][3] blobs = [
+        cast(const(ubyte)[]) r0.data, cast(const(ubyte)[]) r1.data, cast(const(ubyte)[]) r2.data
+    ];
+    ByteBuffer batch;
+    encodeV2BatchFromInternal(batch, 42, blobs[]);
+
+    // decode and rebuild internal blobs; must equal the originals
+    ByteBuffer[3] out_;
+    size_t seen = 0;
+    immutable n = decodeV2Batch(cast(const(ubyte)[]) batch.data, (long ts, scope const(ubyte)[] key,
+            bool keyNull, scope const(ubyte)[] val, bool valNull, scope const(ubyte)[] hdr) nothrow{
+        if (seen < 3)
+            putInternalRec(out_[seen], ts, key, keyNull, val, valNull, hdr);
+        seen++;
+    });
+    assert(n == 3 && seen == 3);
+    assert(out_[0].data == r0.data);
+    assert(out_[1].data == r1.data);
+    assert(out_[2].data == r2.data);
+
+    // a corrupted CRC must be rejected
+    auto bad = cast(ubyte[]) batch.data.dup;
+    bad[17] ^= 0xFF; // flip a byte inside the crc field region
+    assert(decodeV2Batch(cast(const(ubyte)[]) bad, (long, scope const(ubyte)[], bool,
+            scope const(ubyte)[], bool, scope const(ubyte)[]) nothrow{}) == -1);
+}
