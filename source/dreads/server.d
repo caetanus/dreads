@@ -2204,12 +2204,13 @@ private void shardDrainLoop() nothrow
                 foreach (k; 0 .. 8)
                     seq = (seq << 8) | p[2 + k];
                 immutable size_t tl = (cast(size_t) p[10] << 8) | p[11];
-                // [topic][propsLen u16][props][payload]
-                if (12 + tl + 2 <= p.length)
+                // [topic][propsLen u32][props][payload]
+                if (12 + tl + 4 <= p.length)
                 {
                     size_t po = 12 + tl;
-                    immutable size_t pl = (cast(size_t) p[po] << 8) | p[po + 1];
-                    po += 2;
+                    immutable size_t pl = (cast(size_t) p[po] << 24) | (cast(size_t) p[po + 1] << 16)
+                        | (cast(size_t) p[po + 2] << 8) | p[po + 3];
+                    po += 4;
                     if (po + pl <= p.length)
                         mqttDeliverLocal(cast(const(char)[]) p[12 .. 12 + tl],
                                 cast(const(char)[]) p[po + pl .. $], p[0] != 0, seq,
@@ -2769,9 +2770,14 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
             mbBusy = false;
     buf.clear();
     // wire: [retain u8][pubQos u8][seq u64 BE][topicLen u16][topic]
-    //       [propsLen u16][props (v5 forwarded properties)][payload]
-    immutable size_t plen = props.length > 0xFFFF ? 0xFFFF : props.length;
-    immutable size_t len = 12 + topic.length + 2 + plen + msg.length;
+    //       [propsLen u32][props (v5 forwarded properties)][payload]
+    // propsLen is u32 (not u16): v5 PUBLISH properties (many/large user-props) can
+    // exceed 64KB — bounded only by MQTT_MAX_PACKET. A u16 here silently TRUNCATED
+    // >64KB props mid-property, so cross-shard subscribers got a corrupt PUBLISH
+    // (dropped) while same-shard subscribers got the full block — inconsistent,
+    // silent loss. u32 carries the whole block, matching local delivery.
+    immutable size_t plen = props.length;
+    immutable size_t len = 12 + topic.length + 4 + plen + msg.length;
     auto space = buf.freeSpace(len)[0 .. len];
     space[0] = retain ? 1 : 0;
     space[1] = pubQos;
@@ -2781,9 +2787,11 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
     space[11] = cast(ubyte)(topic.length & 0xFF);
     space[12 .. 12 + topic.length] = cast(const(ubyte)[]) topic[];
     size_t w = 12 + topic.length;
-    space[w] = cast(ubyte)(plen >> 8);
-    space[w + 1] = cast(ubyte)(plen & 0xFF);
-    w += 2;
+    space[w] = cast(ubyte)(plen >> 24);
+    space[w + 1] = cast(ubyte)(plen >> 16);
+    space[w + 2] = cast(ubyte)(plen >> 8);
+    space[w + 3] = cast(ubyte)(plen & 0xFF);
+    w += 4;
     space[w .. w + plen] = (cast(const(ubyte)[]) props)[0 .. plen];
     w += plen;
     space[w .. $] = cast(const(ubyte)[]) msg[];
