@@ -2023,7 +2023,14 @@ private void shardDrainLoop() nothrow
                     repError(reply, "ERR shard: malformed bytecode hop");
                     pos = p.length; // poisoned batch: stop walking
                 }
-                if (meta < 64)
+                if (pend is null)
+                {
+                    // framing-level decode failure recovered no pending pointer
+                    // (only reachable on a corrupt SPSC ring). There is nobody
+                    // to route the reply to; drop the section rather than stage
+                    // a null the requester's drain would dereference (crash).
+                }
+                else if (meta < 64)
                 {
                     // stage: [bytes][pending][reply] into the requester's batch
                     auto rb = &replyBatch[cast(size_t) meta];
@@ -2197,6 +2204,8 @@ private void shardDrainLoop() nothrow
             if (tag !is null) // unbatched single (wide shard id): tag is the pending
             {
                 auto pend = cast(ShardPending*) tag;
+                if (pend is null)
+                    return; // defensive: corrupt frame, nothing to fill
                 pend.reply.clear();
                 pend.reply.append(p);
                 pend.ready = true;
@@ -2210,6 +2219,11 @@ private void shardDrainLoop() nothrow
                 if (sect < 8 || p.length - pos - 4 < sect)
                     break; // malformed tail: drop (a pending never filled is a bug loud in tests)
                 auto pend = cast(ShardPending*)*cast(const(ulong)*)(p.ptr + pos + 4);
+                if (pend is null)
+                {
+                    pos += 4 + sect; // corrupt frame staged no route: skip it
+                    continue;
+                }
                 pend.reply.clear();
                 pend.reply.append(p[pos + 12 .. pos + 4 + sect]);
                 pend.ready = true;
