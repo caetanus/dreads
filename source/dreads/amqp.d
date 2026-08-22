@@ -1500,9 +1500,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 {
                     if (multiple)
                     {
+                        // [basic.ack] delivery tags are channel-specific: a
+                        // multiple-ack on THIS channel must ack only THIS
+                        // channel's deliveries <= tag. Our tags are per-conn
+                        // (monotonic across channels), so without the u.chn filter
+                        // a multiple-ack would over-ack sibling channels' lower
+                        // tags -> their messages silently dropped from unacked.
                         ulong[] drop;
                         foreach (t, ref u; c.unacked)
-                            if (t <= tag)
+                            if (t <= tag && u.chan == chan)
                                 drop ~= t;
                         foreach (t; drop)
                             c.unacked.remove(t);
@@ -1532,9 +1538,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 {
                     if (multiple)
                     {
+                        // channel-scoped like basic.ack: nack-multiple settles
+                        // only THIS channel's deliveries <= tag (tags are per-conn
+                        // so the u.chn filter stops cross-channel over-nack)
                         ulong[] all;
                         foreach (t, ref u; c.unacked)
-                            if (t <= tag)
+                            if (t <= tag && u.chan == chan)
                                 all ~= t;
                         foreach (t; all)
                             settleNegative(c, t, requeue);
