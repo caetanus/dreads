@@ -557,8 +557,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             serveMqttClient(conn);
         }, listenOpts);
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
-                bool retain) nothrow {
-            shardMqttFanout(topic, payload, retain);
+                bool retain, ulong seq) nothrow {
+            shardMqttFanout(topic, payload, retain, seq);
         };
         printf("dreads MQTT skin on port %u\n", cast(uint) gConfig.mqttPort);
     }
@@ -2179,12 +2179,15 @@ private void shardDrainLoop() nothrow
             // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
             import dreads.mqtt : mqttDeliverLocal;
 
-            if (p.length >= 3)
+            if (p.length >= 11)
             {
-                immutable size_t tl = (cast(size_t) p[1] << 8) | p[2];
-                if (3 + tl <= p.length)
-                    mqttDeliverLocal(cast(const(char)[]) p[3 .. 3 + tl],
-                            cast(const(char)[]) p[3 + tl .. $], p[0] != 0);
+                ulong seq = 0;
+                foreach (k; 0 .. 8)
+                    seq = (seq << 8) | p[1 + k];
+                immutable size_t tl = (cast(size_t) p[9] << 8) | p[10];
+                if (11 + tl <= p.length)
+                    mqttDeliverLocal(cast(const(char)[]) p[11 .. 11 + tl],
+                            cast(const(char)[]) p[11 + tl .. $], p[0] != 0, seq);
             }
         }
         else if (cast(ShardMsg) kind == ShardMsg.pub)
@@ -2651,7 +2654,7 @@ private void amqpInstallHooks() nothrow
 // [u8 retain][u16 topicLen][topic][payload]. Retained messages fan out even
 // with zero subscribers (every thread's retained map must converge).
 private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
-        bool retain) nothrow
+        bool retain, ulong seq) nothrow
 {
     import core.atomic : atomicLoad, MemoryOrder;
 
@@ -2680,13 +2683,16 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
         if (buf is &mb)
             mbBusy = false;
     buf.clear();
-    immutable size_t len = 3 + topic.length + msg.length;
+    // wire: [retain u8][seq u64 BE][topicLen u16][topic][payload]
+    immutable size_t len = 11 + topic.length + msg.length;
     auto space = buf.freeSpace(len)[0 .. len];
     space[0] = retain ? 1 : 0;
-    space[1] = cast(ubyte)(topic.length >> 8);
-    space[2] = cast(ubyte)(topic.length & 0xFF);
-    space[3 .. 3 + topic.length] = cast(const(ubyte)[]) topic[];
-    space[3 + topic.length .. $] = cast(const(ubyte)[]) msg[];
+    foreach (k; 0 .. 8)
+        space[1 + k] = cast(ubyte)(seq >> ((7 - k) * 8));
+    space[9] = cast(ubyte)(topic.length >> 8);
+    space[10] = cast(ubyte)(topic.length & 0xFF);
+    space[11 .. 11 + topic.length] = cast(const(ubyte)[]) topic[];
+    space[11 + topic.length .. $] = cast(const(ubyte)[]) msg[];
     buf.grow(len);
     foreach (uint s2; 0 .. gShardCount)
         if (s2 != tShard)

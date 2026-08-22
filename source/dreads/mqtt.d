@@ -138,7 +138,21 @@ private final class TrieNode
 }
 
 private TrieNode gTrieRoot; // TLS: this thread's subscription trie
-private const(char)[][string] gRetained; // TLS: topic -> retained payload (replicated)
+/// A retained entry carries a global monotonic SEQUENCE so cross-shard
+/// replication converges: shards apply an incoming retained op only when its
+/// seq beats the stored one. An empty payload is a TOMBSTONE (a retained
+/// DELETE) that still holds a seq, so a late lower-seq SET can't resurrect it.
+private struct Retained
+{
+    const(char)[] payload;
+    ulong seq;
+}
+
+private Retained[string] gRetained; // TLS: topic -> retained value (replicated)
+
+/// Global monotonic sequence stamped on every retained publish (origin-agnostic
+/// total order). Only retained publishes touch it — off the delivery hot path.
+public shared ulong gMqttRetainSeq;
 
 private TrieNode trieRoot() nothrow @trusted
 {
@@ -469,43 +483,50 @@ private bool rdStr(scope const(ubyte)[] p, ref size_t i, out const(char)[] s) @n
 // Hooks installed by server.d (avoids a server import cycle): fan a publish
 // out to the other shards / count stats.
 public __gshared void delegate(scope const(char)[] topic,
-        scope const(char)[] payload, bool retain) nothrow gMqttFanout;
+        scope const(char)[] payload, bool retain, ulong seq) nothrow gMqttFanout;
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 
 /// Deliver `topic`/`payload` to THIS thread's matching subscribers, and update
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
 public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
-        bool retain) nothrow @trusted
+        bool retain, ulong seq) nothrow @trusted
 {
     if (retain)
     {
         try
         {
-            if (auto old = topic in gRetained)
+            auto old = topic in gRetained;
+            // seq-gated: apply only a strictly newer op (converges every shard
+            // regardless of the order the SPSC lanes deliver same-topic writes
+            // from different origins). A tombstone (empty payload) keeps its seq
+            // so a late lower-seq SET is rejected, not resurrected.
+            if (old !is null && seq <= old.seq)
             {
-                immutable oldLen = (*old).length;
+                // stale replica write: ignore
+            }
+            else if (old !is null)
+            {
+                immutable oldLen = old.payload.length;
                 if (payload.length == 0)
                 {
-                    gRetained.remove(cast(string) topic);
+                    gRetained[cast(string) topic] = Retained(null, seq); // tombstone
                     tRetainedBytes -= oldLen;
                 }
                 else if (tRetainedBytes - oldLen + payload.length <= MQTT_MAX_RETAINED_BYTES)
                 {
-                    gRetained[cast(string) topic] = payload.idup;
+                    gRetained[cast(string) topic] = Retained(payload.idup, seq);
                     tRetainedBytes += payload.length - oldLen;
                 }
                 else
                     atomicOp!"+="(gMqttRetainedDropped, 1);
             }
-            else if (payload.length != 0)
+            else // new topic
             {
-                // new retained topic: both caps gate the store (per thread —
-                // the store is replicated, so this bounds every shard's heap)
                 if (gRetained.length < MQTT_MAX_RETAINED_TOPICS
                         && tRetainedBytes + payload.length <= MQTT_MAX_RETAINED_BYTES)
                 {
-                    gRetained[topic.idup] = payload.idup;
+                    gRetained[topic.idup] = Retained(payload.length ? payload.idup : null, seq);
                     tRetainedBytes += payload.length;
                 }
                 else
@@ -940,9 +961,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     if (c.q2pids.length >= 1024)
                         return false; // receive-window abuse
                     atomicOp!"+="(gMqttMessages, 1);
-                    mqttDeliverLocal(topic, payload, retain);
+                    immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+                    mqttDeliverLocal(topic, payload, retain, rseq);
                     if (gMqttFanout !is null)
-                        gMqttFanout(topic, payload, retain);
+                        gMqttFanout(topic, payload, retain, rseq);
                     try
                         c.q2pids ~= pid;
                     catch (Exception)
@@ -955,9 +977,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 return true;
             }
             atomicOp!"+="(gMqttMessages, 1);
-            mqttDeliverLocal(topic, payload, retain);
+            immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+            mqttDeliverLocal(topic, payload, retain, rseq);
             if (gMqttFanout !is null)
-                gMqttFanout(topic, payload, retain);
+                gMqttFanout(topic, payload, retain, rseq);
             if (qos == 1)
             {
                 o.appendByte(cast(char)(PT_PUBACK << 4));
@@ -1045,14 +1068,16 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 o.appendByte(cast(char) g);
             // retained messages matching the new filters, delivered after SUBACK
             try
-                foreach (topic, payload; gRetained)
+                foreach (topic, r; gRetained)
                 {
+                    if (r.payload.length == 0)
+                        continue; // tombstone (deleted retained): never delivered
                     if (o.length > MQTT_OBOX_CAP)
                         break; // bounded replay burst (retained is QoS0/best-effort)
                     foreach (f; filters[0 .. ng])
                         if (f !is null && mqttFilterMatches(f, topic))
                         {
-                            buildPublish(o, topic, payload, true);
+                            buildPublish(o, topic, r.payload, true);
                             break;
                         }
                 }
