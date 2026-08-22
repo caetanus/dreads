@@ -1123,6 +1123,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 return false; // [MQTT-3.1.2-14]
             if (!(flags & 0x04) && (flags & 0x38))
                 return false; // [MQTT-3.1.2-11/13/15] will qos/retain w/o will
+            if ((flags & 0x40) && !(flags & 0x80))
+                return false; // [MQTT-3.1.2-22] password flag requires username flag
             // keepalive seconds: enforce 1.5x as the read deadline [MQTT-3.1.2-24]
             if (i + 2 > p.length)
                 return false; // truncated CONNECT: no keepalive field (a body
