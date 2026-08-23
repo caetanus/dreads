@@ -88,7 +88,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_PRODUCE: return 3;
     case API_FETCH: return 4;
     case API_LIST_OFFSETS: return 1;
-    case API_METADATA: return 2; // v2 adds cluster_id; v3+ adds throttle (unhandled)
+    case API_METADATA: return 9; // v9+ flexible (handleMetadataFlex)
     case API_API_VERSIONS: return 0;
     case API_OFFSET_COMMIT: return 7; // v8+ flexible
     case API_OFFSET_FETCH: return 5; // v6+ flexible (compact encoding — unsupported)
@@ -107,6 +107,41 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_TXN_OFFSET_COMMIT: return 2; // v3+ flexible
     default: return 0;
     }
+}
+
+/// The apiVersion at which each API switches to the flexible (KIP-482) encoding
+/// (compact lengths + tagged fields). A request/response at >= this uses it.
+private short flexibleSince(short apiKey) @nogc nothrow pure
+{
+    switch (apiKey)
+    {
+    case API_PRODUCE: return 9;
+    case API_FETCH: return 12;
+    case API_LIST_OFFSETS: return 6;
+    case API_METADATA: return 9;
+    case API_OFFSET_COMMIT: return 8;
+    case API_OFFSET_FETCH: return 6;
+    case API_FIND_COORDINATOR: return 3;
+    case API_JOIN_GROUP: return 6;
+    case API_HEARTBEAT: return 4;
+    case API_LEAVE_GROUP: return 4;
+    case API_SYNC_GROUP: return 4;
+    case API_DESCRIBE_GROUPS: return 5;
+    case API_API_VERSIONS: return 3;
+    case API_CREATE_TOPICS: return 5;
+    case API_INIT_PRODUCER_ID: return 2;
+    case API_ADD_PARTITIONS_TO_TXN: return 3;
+    case API_ADD_OFFSETS_TO_TXN: return 3;
+    case API_END_TXN: return 3;
+    case API_TXN_OFFSET_COMMIT: return 3;
+    case API_DESCRIBE_CONFIGS: return 4;
+    default: return short.max;
+    }
+}
+
+private bool isFlexible(short apiKey, short apiVer) @nogc nothrow pure
+{
+    return apiVer >= flexibleSince(apiKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +187,94 @@ private void putStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
 {
     putI16(o, cast(short) s.length);
     o.append(s);
+}
+
+// ---------------------------------------------------------------------------
+// Flexible-dialect (KIP-482) wire helpers. Flexible request/response versions
+// encode lengths as unsigned varints (compact), strings/arrays/bytes as
+// length+1 (0 = null), and append a tagged-fields section (a uvarint count,
+// 0 = none) after every struct and after the request/response header. dreads
+// emits only EMPTY tagged fields. Non-flexible versions keep the classic i16/
+// i32 length prefixes above — the handlers branch on the request version.
+
+/// Unsigned LEB128 varint.
+private void putUvarint(ref ByteBuffer o, ulong v) @nogc nothrow
+{
+    while (v >= 0x80)
+    {
+        o.appendByte(cast(char)((v & 0x7F) | 0x80));
+        v >>= 7;
+    }
+    o.appendByte(cast(char)(v & 0x7F));
+}
+
+/// Compact string: uvarint(length+1) then bytes; length 0 encodes as uvarint 1.
+private void putCStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
+{
+    putUvarint(o, cast(ulong) s.length + 1);
+    o.append(s);
+}
+
+/// Compact nullable string: null -> uvarint 0.
+private void putCStrNull(ref ByteBuffer o, scope const(char)[] s, bool isNull) @nogc nothrow
+{
+    if (isNull)
+    {
+        putUvarint(o, 0);
+        return;
+    }
+    putCStr(o, s);
+}
+
+/// Compact bytes: uvarint(length+1) then bytes.
+private void putCBytes(ref ByteBuffer o, scope const(ubyte)[] b, bool isNull) @nogc nothrow
+{
+    if (isNull)
+    {
+        putUvarint(o, 0);
+        return;
+    }
+    putUvarint(o, cast(ulong) b.length + 1);
+    o.append(b);
+}
+
+/// Compact array length prefix: uvarint(count+1). A null array is count -1 -> 0.
+private void putCArrLen(ref ByteBuffer o, int count) @nogc nothrow
+{
+    putUvarint(o, count < 0 ? 0 : cast(ulong) count + 1);
+}
+
+/// Empty tagged-fields section (dreads never emits tagged fields).
+private void putTaggedFields(ref ByteBuffer o) @nogc nothrow
+{
+    putUvarint(o, 0);
+}
+
+/// Backpatch a compact array count that was reserved as a FIXED-width 5-byte
+/// uvarint placeholder (see reserveCArrLen). Encodes count+1 into the 5 bytes at
+/// off using continuation bits, so the width never changes regardless of value.
+private void patchCArrLen(ref ByteBuffer o, size_t off, int count) @nogc nothrow
+{
+    auto d = o.data;
+    if (off + 5 > d.length)
+        return;
+    ulong v = count < 0 ? 0 : cast(ulong) count + 1;
+    foreach (k; 0 .. 4)
+    {
+        d[off + k] = cast(ubyte)((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    d[off + 4] = cast(ubyte)(v & 0x7F); // final byte, no continuation
+}
+
+/// Reserve a 5-byte fixed-width uvarint slot for a compact array count to be
+/// backpatched later (when the count isn't known up front). Returns its offset.
+private size_t reserveCArrLen(ref ByteBuffer o) @nogc nothrow
+{
+    immutable off = o.length;
+    foreach (_; 0 .. 5)
+        o.appendByte(0x80); // placeholder continuation bytes; patched later
+    return off;
 }
 
 private struct Rd
@@ -229,6 +352,95 @@ private struct Rd
         auto b = p[i .. i + n];
         i += n;
         return b;
+    }
+
+    // --- flexible-dialect readers ---
+
+    /// Unsigned LEB128 varint, capped at 5 bytes (32-bit values on the wire).
+    uint uvarint() @nogc nothrow
+    {
+        uint v = 0;
+        int shift = 0;
+        foreach (_; 0 .. 5)
+        {
+            if (i >= p.length)
+            {
+                ok = false;
+                return 0;
+            }
+            immutable b = p[i++];
+            v |= (cast(uint)(b & 0x7F)) << shift;
+            if ((b & 0x80) == 0)
+                return v;
+            shift += 7;
+        }
+        ok = false; // overlong
+        return 0;
+    }
+
+    /// Compact string: uvarint(length+1); 0 = null.
+    const(char)[] cstr() @nogc nothrow
+    {
+        immutable n = uvarint();
+        if (!ok || n == 0)
+            return null;
+        immutable len = n - 1;
+        if (i + len > p.length)
+        {
+            ok = false;
+            return null;
+        }
+        auto s = cast(const(char)[]) p[i .. i + len];
+        i += len;
+        return s;
+    }
+
+    /// Compact bytes: uvarint(length+1); 0 = null.
+    const(ubyte)[] cbytes() @nogc nothrow
+    {
+        immutable n = uvarint();
+        if (!ok || n == 0)
+            return null;
+        immutable len = n - 1;
+        if (i + len > p.length)
+        {
+            ok = false;
+            return null;
+        }
+        auto b = p[i .. i + len];
+        i += len;
+        return b;
+    }
+
+    /// Compact array length: uvarint(count+1) -> count, or -1 for a null array.
+    int carrlen() @nogc nothrow
+    {
+        immutable n = uvarint();
+        if (!ok)
+            return 0;
+        return n == 0 ? -1 : cast(int)(n - 1);
+    }
+
+    /// Skip a tagged-fields section: uvarint count, then each {tag uvarint, size
+    /// uvarint, size bytes}. dreads understands no tags, so it skips them all.
+    void skipTaggedFields() @nogc nothrow
+    {
+        immutable cnt = uvarint();
+        if (!ok)
+            return;
+        foreach (_; 0 .. cnt)
+        {
+            if (!ok)
+                return;
+            cast(void) uvarint(); // tag
+            immutable sz = uvarint();
+            if (!ok || i + sz > p.length)
+            {
+                ok = false;
+                return;
+            }
+            i += sz;
+        }
     }
 }
 
@@ -458,7 +670,11 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
     immutable apiKey = r.i16();
     immutable apiVer = r.i16();
     immutable corr = r.i32();
-    cast(void) r.str(); // client_id (nullable)
+    cast(void) r.str(); // client_id (nullable) — a normal i16 string even in the
+    // flexible request header v2, which then adds tagged fields:
+    immutable flex = isFlexible(apiKey, apiVer);
+    if (flex)
+        r.skipTaggedFields(); // flexible request-header tagged fields
     if (!r.ok)
         return;
 
@@ -466,6 +682,11 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
     immutable sizeAt = o.length;
     putI32(o, 0);
     putI32(o, corr);
+    // Flexible response header v1 adds tagged fields after correlation_id — EXCEPT
+    // ApiVersions, which always uses response header v0 (no tagged fields) so a
+    // client can parse it before it knows the negotiated version.
+    if (flex && apiKey != API_API_VERSIONS)
+        putTaggedFields(o);
     immutable bodyAt = o.length;
 
     // A version beyond what we parse has a shifted layout; parsing it at the
@@ -503,7 +724,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_PRODUCE, 0, 3);
         row(o, API_FETCH, 0, 4);
         row(o, API_LIST_OFFSETS, 0, 1);
-        row(o, API_METADATA, 0, 2);
+        row(o, API_METADATA, 0, 9);
         row(o, API_API_VERSIONS, 0, 0);
         row(o, API_OFFSET_COMMIT, 0, 7);
         row(o, API_OFFSET_FETCH, 0, 5);
@@ -1548,8 +1769,108 @@ private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
     return count; // 0 for an empty topic (caller decides exists-vs-unknown)
 }
 
+/// Resolve a topic's advertised partition count and error code (shared by the
+/// classic and flexible Metadata responses). reg>=0 = created; else glob-probe;
+/// else auto-exist (compat) or UNKNOWN_TOPIC (registry mode).
+private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) nothrow @trusted
+{
+    immutable reg = registeredTopicPartitions(t);
+    terr = E_NONE;
+    if (reg >= 0)
+        np = reg;
+    else
+    {
+        np = topicPartitionCount(t);
+        if (np == 0)
+        {
+            if (gKafkaAutoCreate)
+                np = cast(int) KAFKA_PARTITIONS;
+            else
+                terr = E_UNKNOWN_TOPIC;
+        }
+    }
+    if (np > KAFKA_MAX_PARTITIONS)
+        np = KAFKA_MAX_PARTITIONS;
+}
+
+/// Metadata v9+ (flexible dialect: compact strings/arrays + tagged fields).
+private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    // request: topics COMPACT array of { name compact-string, TAGGED_FIELDS };
+    // then allow_auto_topic_creation + include_*_authorized_operations bools.
+    immutable rawn = r.carrlen(); // -1 = null array (all topics)
+    immutable ntopics = rawn < 0 ? 0 : safeCount(rawn);
+    const(char)[][64] topics;
+    size_t nt = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto t = r.cstr();
+        r.skipTaggedFields(); // per-topic tagged fields
+        if (nt < topics.length && t !is null && validTopic(t))
+        {
+            bool dup = false;
+            foreach (k; 0 .. nt)
+                if (topics[k] == t)
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup)
+                topics[nt++] = t;
+        }
+    }
+    tMetaProbes = 0;
+
+    putI32(o, 0); // throttle_time_ms
+    // brokers: just us
+    putCArrLen(o, 1);
+    putI32(o, 0); // node_id
+    putCStr(o, gKafkaHost);
+    putI32(o, gKafkaPort);
+    putCStrNull(o, null, true); // rack: null
+    putTaggedFields(o); // broker tagged fields
+    putCStrNull(o, null, true); // cluster_id: null
+    putI32(o, 0); // controller_id
+    // topics
+    putCArrLen(o, cast(int) nt);
+    foreach (t; topics[0 .. nt])
+    {
+        int np;
+        short terr;
+        metaTopicParts(t, np, terr);
+        putI16(o, terr);
+        putCStr(o, t);
+        o.appendByte(0); // is_internal = false
+        putCArrLen(o, np);
+        foreach (int p2; 0 .. np)
+        {
+            putI16(o, E_NONE);
+            putI32(o, p2); // partition_index
+            putI32(o, 0); // leader_id
+            putI32(o, 0); // leader_epoch (v7+)
+            putCArrLen(o, 1); // replica_nodes
+            putI32(o, 0);
+            putCArrLen(o, 1); // isr_nodes
+            putI32(o, 0);
+            putCArrLen(o, 0); // offline_replicas (v5+): none
+            putTaggedFields(o); // partition tagged fields
+        }
+        putI32(o, -2147483648); // topic_authorized_operations (v8+): not computed
+        putTaggedFields(o); // topic tagged fields
+    }
+    putI32(o, -2147483648); // cluster_authorized_operations (v8..v10)
+    putTaggedFields(o); // response-level tagged fields
+}
+
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
+    if (isFlexible(API_METADATA, ver))
+    {
+        handleMetadataFlex(r, ver, o);
+        return;
+    }
     // request: [topics: array of string] (null/empty = all — we answer only
     // named topics; a fresh producer always names what it wants)
     immutable ntopics = safeCount(r.i32());
