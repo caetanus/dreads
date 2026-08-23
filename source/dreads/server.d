@@ -2505,6 +2505,15 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
     auto p = acquireShardPending();
     ByteBuffer hb;
     appendHopCmd(hb, cmd, raw.data, opcode, 0, cast(void*) p);
+    if (hb.length == 0)
+    {
+        // OOM: appendHopCmd staged nothing. Don't enqueue an empty hop and then
+        // block forever on a reply that never comes — release the pending and
+        // return an empty reply (surfaced to the client as a failed command).
+        releaseShardPending(p);
+        reply.clear();
+        return;
+    }
     shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.cmd);
     shardWake(cast(uint) owner);
     while (!p.ready)
