@@ -551,8 +551,11 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // one listener per shard thread (shard 0 = here; the rest in
         // shardThreadEntry), fibers per connection on the accepting thread
         import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal;
-        import dreads.mqtt : gMqttSubTotal, gMqttConnBcast;
+        import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec;
 
+        gMqttExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
+            amqpDataExec(args, reply); // persistent-session state in the keyspace
+        };
         cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
             serveMqttClient(conn);
         }, listenOpts);

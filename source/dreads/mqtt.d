@@ -123,6 +123,8 @@ public final class MqttConn
     // order the cross-shard takeover broadcasts arrive (the retained-seq lesson).
     string clientId;
     ulong connGen;
+    bool cleanStart; // CONNECT clean-start/clean-session flag (flags & 0x02)
+    uint sessionExpiry; // v5 session-expiry-interval (seconds; uint.max = never)
     // Last Will and Testament ([MQTT-3.1.2-8]): published if the connection
     // drops abnormally (TCP death, takeover, protocol error) but NOT on a clean
     // DISCONNECT, which clears it. willTopic empty = no will.
@@ -593,6 +595,74 @@ private bool rdStr(scope const(ubyte)[] p, ref size_t i, out const(char)[] s) @n
 // out to the other shards / count stats.
 public __gshared void delegate(scope const(char)[] topic, scope const(char)[] payload,
         bool retain, ulong seq, ubyte pubQos, scope const(char)[] props) nothrow gMqttFanout;
+
+/// Generic RESP-over-data-plane exec (installed by server.d = amqpDataExec):
+/// hops to the owning shard, so persistent-session state survives in the Redis
+/// keyspace and is reachable from whichever thread a client reconnects on
+/// (SO_REUSEPORT spreads reconnects across shards). Cross-shard hops YIELD.
+public __gshared void delegate(scope const(char)[][] args, ref ByteBuffer reply) nothrow gMqttExec;
+
+// A persistent MQTT session lives in the key `mqtt.sess.<clientId>` with a Redis
+// TTL = session-expiry-interval, so expiry is handled by the keyspace itself. A
+// clean_start=1 connect discards it; a clean_start=0 connect that finds it live
+// resumes (CONNACK session-present=1). [MQTT-3.1.2-4..6 / 3.1.2-23]
+private enum string MQTT_SESS_PREFIX = "mqtt.sess.";
+
+private void sessKey(scope const(char)[] clientId, ref ByteBuffer kb) nothrow @trusted
+{
+    kb.clear();
+    kb.append(MQTT_SESS_PREFIX);
+    kb.append(clientId);
+}
+
+/// Does a live persistent session exist for this client id? (EXISTS -> :1/:0)
+private bool mqttSessionExists(scope const(char)[] clientId) nothrow @trusted
+{
+    if (gMqttExec is null || clientId.length == 0)
+        return false;
+    static ByteBuffer kb, rb;
+    sessKey(clientId, kb);
+    const(char)[][2] a = ["exists", cast(const(char)[]) kb.data];
+    gMqttExec(a[], rb);
+    auto d = rb.data;
+    return d.length >= 2 && d[0] == ':' && d[1] == '1';
+}
+
+/// Persist the session with a TTL (seconds); expiry==uint.max means "never
+/// expire" -> no TTL. expiry==0 means discard (handled by the caller via del).
+private void mqttSessionPut(scope const(char)[] clientId, uint expiry) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gMqttExec is null || clientId.length == 0)
+        return;
+    static ByteBuffer kb, rb;
+    sessKey(clientId, kb);
+    if (expiry == uint.max)
+    {
+        const(char)[][3] a = ["set", cast(const(char)[]) kb.data, "1"];
+        gMqttExec(a[], rb);
+    }
+    else
+    {
+        char[16] eb = void;
+        immutable n = snprintf(eb.ptr, eb.length, "%u", expiry);
+        const(char)[][5] a = ["set", cast(const(char)[]) kb.data, "1", "EX",
+            cast(const(char)[]) eb[0 .. (n > 0 ? n : 0)]];
+        gMqttExec(a[], rb);
+    }
+}
+
+/// Discard the persistent session (clean_start, or session-expiry-interval 0).
+private void mqttSessionDel(scope const(char)[] clientId) nothrow @trusted
+{
+    if (gMqttExec is null || clientId.length == 0)
+        return;
+    static ByteBuffer kb, rb;
+    sessKey(clientId, kb);
+    const(char)[][2] a = ["del", cast(const(char)[]) kb.data];
+    gMqttExec(a[], rb);
+}
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
 private shared ulong gMqttStartMs;
@@ -1273,16 +1343,31 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     c.filters = null;
     // drop our clientId registration, but only if a NEWER session hasn't
     // already replaced us in the map (identity check)
+    bool stillMine = false;
     if (c.clientId.length != 0)
         try
         {
             if (auto pc = c.clientId in gLocalClients)
                 if (*pc is c)
+                {
+                    stillMine = true;
                     gLocalClients.remove(c.clientId);
+                }
         }
         catch (Exception)
         {
         }
+    // Persistent session: on our own close (not a takeover), keep the session
+    // record for session-expiry-interval seconds (Redis TTL) so a later
+    // clean_start=0 reconnect resumes it; expiry 0 discards it. A takeover skips
+    // this — the newer connection already owns the client id's session.
+    if (stillMine)
+    {
+        if (c.sessionExpiry == 0)
+            mqttSessionDel(c.clientId);
+        else
+            mqttSessionPut(c.clientId, c.sessionExpiry);
+    }
     c.gen++; // invalidate any remaining trie entries (lazily skipped)
     // Last Will: an abnormal disconnect (TCP death / takeover / protocol error)
     // left willTopic set (a clean DISCONNECT cleared it) -> publish it now, the
@@ -1450,12 +1535,69 @@ private bool mqttSkipProps(scope const(ubyte)[] p, ref size_t i) @nogc nothrow
     return true;
 }
 
+// Extract the session-expiry-interval (0x11, u32) from a v5 DISCONNECT payload,
+// which may OVERRIDE the CONNECT value [MQTT-3.1.2-23]. p = [reason?][proplen]
+// [props]. Returns false on malformation; hasSei=true when 0x11 was present.
+private bool mqttDisconnectSEI(scope const(ubyte)[] p, out uint sei, out bool hasSei) @nogc nothrow
+{
+    hasSei = false;
+    if (p.length <= 1)
+        return true; // no reason+props (or reason only): SEI unchanged
+    size_t i = 1; // skip reason code
+    uint plen;
+    if (!decodeVarint(p, i, plen))
+        return false;
+    immutable end = i + plen;
+    if (end > p.length)
+        return false;
+    while (i < end)
+    {
+        immutable id = p[i++];
+        switch (id)
+        {
+        case 0x11: // session-expiry-interval u32
+            if (i + 4 > end)
+                return false;
+            sei = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                | (cast(uint) p[i + 2] << 8) | p[i + 3];
+            hasSei = true;
+            i += 4;
+            break;
+        case 0x1F, 0x1C: // reason-string / server-reference: utf8 string
+            if (i + 2 > end)
+                return false;
+            immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > end)
+                return false;
+            i += n;
+            break;
+        case 0x26: // user-property: two utf8 strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > end)
+                    return false;
+                immutable n = (cast(size_t) p[i] << 8) | p[i + 1];
+                i += 2;
+                if (i + n > end)
+                    return false;
+                i += n;
+            }
+            break;
+        default:
+            return false; // unknown DISCONNECT property
+        }
+    }
+    return true;
+}
+
 // Parse a v5 CONNECT property block at p[i], extracting receive-maximum (0x21)
 // and correctly skipping every other CONNECT property by type. Advances i to the
 // end; every read is bounded by `end` (<= p.length) so a malformed block can't
 // read OOB. recvMax stays 0 if absent (caller treats 0 as "no client limit").
 private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i,
-        out ushort recvMax, out uint maxPkt, out ushort aliasMax) @nogc nothrow
+        out ushort recvMax, out uint maxPkt, out ushort aliasMax,
+        out uint sessionExpiry) @nogc nothrow
 {
     uint plen;
     if (!decodeVarint(p, i, plen))
@@ -1471,9 +1613,12 @@ private bool mqttParseConnectProps(scope const(ubyte)[] p, ref size_t i,
         case 0x11, 0x27: // session-expiry-interval u32, maximum-packet-size u32
             if (i + 4 > end)
                 return false;
+            immutable u32 = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                | (cast(uint) p[i + 2] << 8) | p[i + 3];
             if (id == 0x27) // maximum-packet-size: cap our outbound to this client
-                maxPkt = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
-                    | (cast(uint) p[i + 2] << 8) | p[i + 3];
+                maxPkt = u32;
+            else // 0x11 session-expiry-interval (0xFFFFFFFF = never expire)
+                sessionExpiry = u32;
             i += 4;
             break;
         case 0x21, 0x22: // receive-maximum u16, topic-alias-maximum u16
@@ -1972,6 +2117,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 serverKa = MQTT_SERVER_KEEPALIVE;
             }
             c.readDeadline = effKa == 0 ? Duration.max : (effKa * 1500).msecs;
+            // clean-start/clean-session (flags bit 1) + session-expiry govern the
+            // persistent session. v3 has no expiry property: clean_session=1 means
+            // discard-on-disconnect (SEI 0), clean_session=0 means never-expire.
+            c.cleanStart = (flags & 0x02) != 0;
+            c.sessionExpiry = c.cleanStart ? 0 : uint.max; // v3 default; v5 overrides
             // v5 CONNECT properties (session-expiry, receive-max, ...) follow the
             // keepalive. We extract receive-maximum (flow control on how many
             // QoS1/2 we may hold in flight toward this client) and correctly skip
@@ -1980,9 +2130,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             if (c.protoVer == 5)
             {
                 ushort recvMax, aliasMax;
-                uint maxPkt;
-                if (!mqttParseConnectProps(p, i, recvMax, maxPkt, aliasMax))
+                uint maxPkt, sessExp;
+                if (!mqttParseConnectProps(p, i, recvMax, maxPkt, aliasMax, sessExp))
                     return false;
+                c.sessionExpiry = sessExp; // v5: 0 = discard on disconnect
                 if (recvMax != 0)
                     c.sendMax = recvMax;
                 c.maxPktSize = maxPkt; // 0 = no limit
@@ -2109,10 +2260,22 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         gMqttConnBcast(c.clientId, g);
                 }
             }
-            // CONNACK: session-present=0 (clean sessions only); reason/rc 0 on
-            // success, else unacceptable-protocol-version. assignedId is non-empty
-            // only for an empty-ClientId v5 client (echoed via property 0x12).
-            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1, assignedId, serverKa);
+            // Persistent session: clean_start discards any prior session; a
+            // clean_start=0 connect resumes a live one (CONNACK session-present=1).
+            // The keyspace record (mqtt.sess.<id>, Redis TTL = expiry) survives
+            // across reconnects to any shard. These ops hop cross-shard and YIELD;
+            // o/clientId are fiber-local, so no cross-connection clobber.
+            bool sessPresent = false;
+            if (okPair && c.clientId.length != 0)
+            {
+                if (c.cleanStart)
+                    mqttSessionDel(c.clientId);
+                else
+                    sessPresent = mqttSessionExists(c.clientId);
+            }
+            // CONNACK: reason/rc 0 on success, else unacceptable-protocol-version.
+            // assignedId is non-empty only for an empty-ClientId v5 client.
+            mqttConnack(o, c.protoVer, sessPresent, okPair ? 0 : 1, assignedId, serverKa);
             return okPair;
         }
     case PT_PUBLISH:
@@ -2633,6 +2796,16 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         {
             c.willTopic = null;
             c.willPayload = null;
+        }
+        // A v5 DISCONNECT may override the session-expiry-interval, changing how
+        // long the persistent session is kept [MQTT-3.1.2-23]. The cleanup path
+        // reads c.sessionExpiry to persist/discard the session record.
+        if (c.protoVer == 5)
+        {
+            uint sei;
+            bool hasSei;
+            if (mqttDisconnectSEI(p, sei, hasSei) && hasSei)
+                c.sessionExpiry = sei;
         }
         return false;
     default:
