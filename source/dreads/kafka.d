@@ -1329,6 +1329,12 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// Owner-shard probes (gKafkaLenRaw, no hop) are free and don't count.
 private enum size_t KAFKA_META_PROBE_BUDGET = 1024;
 private size_t tMetaProbes; // TLS, reset at the top of handleMetadata
+/// Per-request budget on cross-shard partLen hops in Fetch/ListOffsets, reset at
+/// each handler's top. Owner-shard reads (gKafkaLenRaw, no hop) are free and
+/// never counted, so single-shard mode never trips it — only sharded mode, where
+/// a 64 MB request naming millions of tiny partition entries would otherwise
+/// drive a partLen hop storm across sibling shards (same guard as Metadata).
+private size_t tHopProbes;
 
 private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
 {
@@ -1630,6 +1636,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         cast(void) r.i32(); // max_bytes (whole request)
     if (ver >= 4)
         cast(void) r.i8(); // isolation_level (read_uncommitted assumed)
+    tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
@@ -1640,6 +1647,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     {
         if (!r.ok)
             break;
+        if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+            break; // capped: stop before misreading the next topic (desync-safe)
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         if (!r.ok)
@@ -1653,6 +1662,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         {
             if (!r.ok)
                 break;
+            if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+                break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
             immutable fetchOff = r.i64();
             immutable partMax = r.i32();
@@ -1673,7 +1684,10 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             auto key = cast(const(char)[]) keyStore[0 .. klen];
             long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
             if (hw < 0)
+            {
+                tHopProbes++; // count the cross-shard hop against the budget
                 hw = partLen(key);
+            }
             immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
             immutable bad = fetchOff < 0 || fetchOff > hw || !validTopic(topic) || part < 0;
             putI32(o, part);
@@ -1787,6 +1801,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     cast(void) r.i32(); // replica_id
+    tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
     immutable ntopics = safeCount(r.i32());
     immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
@@ -1795,6 +1810,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
     {
         if (!r.ok)
             break;
+        if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+            break; // capped: stop before misreading the next topic (desync-safe)
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         if (!r.ok)
@@ -1808,6 +1825,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
         {
             if (!r.ok)
                 break;
+            if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+                break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
             immutable ts = r.i64();
             if (ver == 0)
@@ -1822,7 +1841,10 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             auto k3 = cast(const(char)[]) k3store[0 .. k3len];
             long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(k3) : -1;
             if (hw < 0)
+            {
+                tHopProbes++; // count the cross-shard hop against the budget
                 hw = partLen(k3);
+            }
             immutable off = ts == -2 ? 0 : hw; // earliest : latest
             putI32(o, part);
             putI16(o, E_NONE);
