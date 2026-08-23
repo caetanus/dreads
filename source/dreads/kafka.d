@@ -818,7 +818,15 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             if (!bad && !overCap && fetchOff < hw)
             {
                 immutable int maxN = 16384; // deep batches: fewer walks per fetch
-                immutable size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
+                // Clamp the client's partition_max_bytes to the response ceiling.
+                // An unclamped ~int.max budget both defeats KAFKA_MAX_RESP within a
+                // single partition (a large-allocation broker-death vector) and can
+                // push a v4 batch body past 2^31 bytes, wrapping the i32 batchLength
+                // NEGATIVE and desyncing the client's RecordBatch decoder. Honest
+                // clients send tens of MB, so this is a no-op for them.
+                size_t budget = partMax > 0 ? cast(size_t) partMax : 65536;
+                if (budget > KAFKA_MAX_RESP)
+                    budget = KAFKA_MAX_RESP;
                 immutable startLen = o.length;
                 import core.atomic : atomicOp;
 
