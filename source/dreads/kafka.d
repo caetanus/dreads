@@ -85,7 +85,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
 {
     switch (apiKey)
     {
-    case API_PRODUCE: return 3;
+    case API_PRODUCE: return 8; // v9+ flexible (v8 non-flexible; KIP-467)
     case API_FETCH: return 11; // v12+ flexible (v11 non-flexible)
     case API_LIST_OFFSETS: return 5; // v6+ flexible (v5 non-flexible)
     case API_METADATA: return 9; // v9+ flexible (handleMetadataFlex)
@@ -95,16 +95,16 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_FIND_COORDINATOR: return 3; // v3 flexible (single key)
     case API_JOIN_GROUP: return 7; // v6+ flexible (v7 adds response protocol_type)
     case API_HEARTBEAT: return 4; // v4 flexible
-    case API_LEAVE_GROUP: return 3; // v4+ flexible
+    case API_LEAVE_GROUP: return 4; // v4 flexible
     case API_SYNC_GROUP: return 5; // v4+ flexible (v5 adds protocol_type)
     case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
     case API_CREATE_TOPICS: return 4; // v5+ flexible
     case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
-    case API_INIT_PRODUCER_ID: return 1; // v2+ flexible
+    case API_INIT_PRODUCER_ID: return 3; // v2+ flexible
     case API_ADD_PARTITIONS_TO_TXN: return 2; // v3+ flexible
     case API_ADD_OFFSETS_TO_TXN: return 2; // v3+ flexible
     case API_END_TXN: return 2; // v3+ flexible
-    case API_TXN_OFFSET_COMMIT: return 2; // v3+ flexible
+    case API_TXN_OFFSET_COMMIT: return 3; // v3 flexible
     default: return 0;
     }
 }
@@ -721,7 +721,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
             putI16(o2, hi);
         }
 
-        row(o, API_PRODUCE, 0, 3);
+        row(o, API_PRODUCE, 0, 8);
         row(o, API_FETCH, 0, 11);
         row(o, API_LIST_OFFSETS, 0, 5);
         row(o, API_METADATA, 0, 9);
@@ -731,16 +731,16 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_FIND_COORDINATOR, 0, 3);
         row(o, API_JOIN_GROUP, 0, 7);
         row(o, API_HEARTBEAT, 0, 4);
-        row(o, API_LEAVE_GROUP, 0, 3);
+        row(o, API_LEAVE_GROUP, 0, 4);
         row(o, API_SYNC_GROUP, 0, 5);
         row(o, API_DESCRIBE_CONFIGS, 0, 3);
         row(o, API_CREATE_TOPICS, 0, 4);
         row(o, API_DESCRIBE_GROUPS, 0, 4);
-        row(o, API_INIT_PRODUCER_ID, 0, 1);
+        row(o, API_INIT_PRODUCER_ID, 0, 3);
         row(o, API_ADD_PARTITIONS_TO_TXN, 0, 2);
         row(o, API_ADD_OFFSETS_TO_TXN, 0, 2);
         row(o, API_END_TXN, 0, 2);
-        row(o, API_TXN_OFFSET_COMMIT, 0, 2);
+        row(o, API_TXN_OFFSET_COMMIT, 0, 3);
         break;
 
     case API_METADATA:
@@ -1136,6 +1136,23 @@ private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     import core.atomic : atomicOp;
 
+    if (isFlexible(API_INIT_PRODUCER_ID, ver)) // v2/v3 flexible
+    {
+        cast(void) r.cstr(); // transactional_id (nullable compact)
+        cast(void) r.i32(); // transaction_timeout_ms
+        if (ver >= 3)
+        {
+            cast(void) r.i64(); // producer_id (v3+, for resume/fence)
+            cast(void) r.i16(); // producer_epoch (v3+)
+        }
+        immutable pidf = atomicOp!"+="(gNextProducerId, 1);
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE); // error_code
+        putI64(o, pidf); // producer_id
+        putI16(o, 0); // producer_epoch
+        putTaggedFields(o);
+        return;
+    }
     cast(void) r.str(); // transactional_id (nullable)
     cast(void) r.i32(); // transaction_timeout_ms
     immutable pid = atomicOp!"+="(gNextProducerId, 1);
@@ -1216,8 +1233,68 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
 /// group/topic slices point into the fiber's own request buffer, o is the
 /// per-connection reply buffer, storeGroupOffset's TLS args are consumed before
 /// the park).
+/// TxnOffsetCommit v3+ (flexible): v3 adds generation_id/member_id/
+/// group_instance_id (KIP-447). Persists offsets to kafka.cg.<group> like the
+/// classic path (hop-safe interleave; see handleOffsetCommit).
+private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.cstr(); // transactional_id
+    auto group = r.cstr();
+    cast(void) r.i64(); // producer_id
+    cast(void) r.i16(); // producer_epoch
+    cast(void) r.i32(); // generation_id (v3+)
+    cast(void) r.cstr(); // member_id (v3+)
+    cast(void) r.cstr(); // group_instance_id (nullable, v3+)
+    immutable rawn = r.carrlen();
+    immutable ntopics = rawn < 0 ? 0 : safeCount(rawn);
+    immutable respStart = o.length;
+    putI32(o, 0); // throttle_time_ms
+    immutable tOff = reserveCArrLen(o);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+            break;
+        auto topic = r.cstr();
+        immutable rawp = r.carrlen();
+        immutable nparts = rawp < 0 ? 0 : safeCount(rawp);
+        if (!r.ok)
+            break;
+        putCStr(o, topic);
+        immutable pOff = reserveCArrLen(o);
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+                break;
+            immutable part = r.i32();
+            immutable off = r.i64();
+            cast(void) r.i32(); // committed_leader_epoch (v2+)
+            cast(void) r.cstr(); // metadata (nullable compact)
+            r.skipTaggedFields(); // partition tagged fields
+            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+                storeGroupOffset(group, topic, part, off);
+            putI32(o, part);
+            putI16(o, E_NONE); // error_code
+            putTaggedFields(o); // partition tagged fields
+            ep++;
+        }
+        r.skipTaggedFields(); // topic tagged fields
+        patchCArrLen(o, pOff, ep);
+        putTaggedFields(o); // topic tagged fields
+        et++;
+    }
+    patchCArrLen(o, tOff, et);
+    putTaggedFields(o); // response tagged fields
+}
+
 private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_TXN_OFFSET_COMMIT, ver)) // v3 flexible
+    {
+        handleTxnOffsetCommitFlex(r, ver, o);
+        return;
+    }
     cast(void) r.str(); // transactional_id
     auto group = r.str();
     cast(void) r.i64(); // producer_id
@@ -1632,6 +1709,43 @@ private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
 /// LeaveGroup (v0-v3): acknowledge. v3+ is a batched leave (members array).
 private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_LEAVE_GROUP, ver)) // v4 flexible (batched members)
+    {
+        cast(void) r.cstr(); // group_id
+        const(char)[][32] fmids; // stack-local (no hop in this handler)
+        const(char)[][32] fgiis;
+        bool[32] fgiiNull;
+        size_t nm;
+        immutable rawc = r.carrlen();
+        immutable cnt = rawc < 0 ? 0 : safeCount(rawc);
+        foreach (i; 0 .. cnt)
+        {
+            if (!r.ok)
+                break;
+            auto mid = r.cstr();
+            auto gii = r.cstr(); // group_instance_id (nullable compact)
+            r.skipTaggedFields(); // member tagged fields
+            if (nm < fmids.length && r.ok)
+            {
+                fmids[nm] = mid;
+                fgiis[nm] = gii;
+                fgiiNull[nm] = (gii is null);
+                nm++;
+            }
+        }
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE); // error_code
+        putCArrLen(o, cast(int) nm); // members
+        foreach (i; 0 .. nm)
+        {
+            putCStr(o, fmids[i]); // member_id
+            putCStrNull(o, fgiis[i], fgiiNull[i]); // group_instance_id
+            putI16(o, E_NONE); // member error_code
+            putTaggedFields(o); // member tagged fields
+        }
+        putTaggedFields(o); // response tagged fields
+        return;
+    }
     cast(void) r.str(); // group_id
     static const(char)[][32] mids;
     static bool[32] giiNull;
@@ -2350,6 +2464,13 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             putI64(o, baseOffset < 0 ? 0 : baseOffset);
             if (ver >= 2)
                 putI64(o, -1); // log_append_time (CreateTime in use)
+            if (ver >= 5)
+                putI64(o, 0); // log_start_offset (v5+)
+            if (ver >= 8)
+            {
+                putI32(o, 0); // record_errors: empty array (v8+, KIP-467)
+                putI16(o, -1); // error_message: null (v8+)
+            }
             emittedParts++;
         }
         patchI32(o, partsCountOff, emittedParts); // count == entries actually emitted
