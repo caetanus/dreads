@@ -1081,7 +1081,50 @@ private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothro
         putI16(o, -1); // error_message = null
         o.appendByte(cast(char) rtype[i]); // resource_type
         putStr(o, rname[i]); // resource_name
-        putI32(o, 0); // configs: empty
+        // resource_type 2 == TOPIC: emit the fixed defaults an inspector needs
+        // (a stateless broker has no per-topic overrides); others: empty.
+        if (rtype[i] == 2)
+        {
+            putI32(o, cast(int) KAFKA_TOPIC_CONFIGS.length);
+            foreach (cfg; KAFKA_TOPIC_CONFIGS)
+                putConfigEntry(o, ver, cfg[0], cfg[1]);
+        }
+        else
+            putI32(o, 0);
+    }
+}
+
+/// Fixed topic-config defaults (a stateless broker has no per-topic state). The
+/// keys/values satisfy the golib inspector's required set + its parsers.
+private static immutable string[2][11] KAFKA_TOPIC_CONFIGS = [
+    ["min.insync.replicas", "1"],
+    ["cleanup.policy", "delete"],
+    ["retention.ms", "-1"],
+    ["retention.bytes", "-1"],
+    ["delete.retention.ms", "86400000"],
+    ["min.compaction.lag.ms", "0"],
+    ["max.compaction.lag.ms", "9223372036854775807"],
+    ["min.cleanable.dirty.ratio", "0.5"],
+    ["segment.bytes", "1073741824"],
+    ["segment.ms", "604800000"],
+    ["unclean.leader.election.enable", "false"],
+];
+
+/// Emit one DescribeConfigs config entry, version-correct.
+private void putConfigEntry(ref ByteBuffer o, short ver, scope const(char)[] name,
+        scope const(char)[] value) @nogc nothrow
+{
+    putStr(o, name);
+    putStr(o, value); // value (non-null)
+    o.appendByte(0); // read_only = false
+    o.appendByte(0); // v0 is_default / v1+ config_source (both a single byte)
+    o.appendByte(0); // is_sensitive = false
+    if (ver >= 1)
+        putI32(o, 0); // synonyms: empty array
+    if (ver >= 3)
+    {
+        o.appendByte(0); // config_type (0 = unknown)
+        putI16(o, -1); // documentation = null
     }
 }
 
@@ -1102,12 +1145,41 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
     putI32(o, gKafkaPort);
 }
 
+/// Partition count reported in Metadata for a topic: the contiguous run of
+/// POPULATED partitions from 0 (probing the keyspace kafka.t.<topic>.<p>), so a
+/// topic produced into with N contiguous partitions reports N. Falls back to
+/// KAFKA_PARTITIONS for an empty/fresh topic so a producer always has partitions
+/// to write to. Derived from the keyspace — no per-topic partition-count state.
+private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
+{
+    if (!validTopic(topic))
+        return cast(int) KAFKA_PARTITIONS;
+    static ByteBuffer kb; // TLS scratch (consumed synchronously per probe)
+    int count = 0;
+    foreach (p; 0 .. 256) // hard cap on the probe
+    {
+        partKey(topic, p, kb);
+        auto key = kb.data.asChars;
+        long len = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
+        if (len < 0)
+            len = partLen(key); // not the owner shard: data-plane LLEN (hops)
+        if (len <= 0)
+            break; // first empty partition ends the contiguous run
+        count++;
+    }
+    return count > 0 ? count : cast(int) KAFKA_PARTITIONS;
+}
+
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     // request: [topics: array of string] (null/empty = all — we answer only
     // named topics; a fresh producer always names what it wants)
     immutable ntopics = safeCount(r.i32());
-    static const(char)[][64] topics;
+    // STACK-local (not TLS static): topicPartitionCount below hops cross-shard
+    // and YIELDS, and a shared static would be clobbered by another connection's
+    // handleMetadata during the park (its topic slices would replace ours). The
+    // slices point into the request buffer, which this fiber owns across the yield.
+    const(char)[][64] topics;
     size_t nt = 0;
     foreach (_; 0 .. ntopics)
     {
@@ -1137,8 +1209,9 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
         putStr(o, t);
         if (ver >= 1)
             o.appendByte(0); // is_internal = false
-        putI32(o, KAFKA_PARTITIONS);
-        foreach (int p2; 0 .. KAFKA_PARTITIONS)
+        immutable np = topicPartitionCount(t);
+        putI32(o, np);
+        foreach (int p2; 0 .. np)
         {
             putI16(o, E_NONE);
             putI32(o, p2);
