@@ -43,7 +43,7 @@ private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
 private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_FIND_COORDINATOR = 10, API_JOIN_GROUP = 11, API_HEARTBEAT = 12,
         API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14, API_DESCRIBE_CONFIGS = 32,
-        API_CREATE_TOPICS = 19;
+        API_CREATE_TOPICS = 19, API_DESCRIBE_GROUPS = 15;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
@@ -95,6 +95,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_SYNC_GROUP: return 3; // v4+ flexible
     case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
     case API_CREATE_TOPICS: return 4; // v5+ flexible
+    case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
     default: return 0;
     }
 }
@@ -479,7 +480,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 14); // array count
+        putI32(o, 15); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -501,6 +502,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_SYNC_GROUP, 0, 3);
         row(o, API_DESCRIBE_CONFIGS, 0, 3);
         row(o, API_CREATE_TOPICS, 0, 4);
+        row(o, API_DESCRIBE_GROUPS, 0, 4);
         break;
 
     case API_METADATA:
@@ -557,6 +559,10 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
 
     case API_CREATE_TOPICS:
         handleCreateTopics(r, apiVer, o);
+        break;
+
+    case API_DESCRIBE_GROUPS:
+        handleDescribeGroups(r, apiVer, o);
         break;
 
     default:
@@ -1137,6 +1143,54 @@ private void putConfigEntry(ref ByteBuffer o, short ver, scope const(char)[] nam
     {
         o.appendByte(0); // config_type (0 = unknown)
         putI16(o, -1); // documentation = null
+    }
+}
+
+/// True if the group has any committed offsets (HLEN kafka.cg.<group> > 0).
+private bool groupExists(scope const(char)[] group) nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return false;
+    static ByteBuffer keyb, rb;
+    groupOffKey(group, keyb);
+    const(char)[][2] a = ["hlen", cast(const(char)[]) keyb.data];
+    gKafkaExec(a[], rb);
+    auto d = rb.data;
+    return d.length >= 3 && d[0] == ':' && d[1] != '0'; // :N\r\n with N>0
+}
+
+/// DescribeGroups (v0-v4): a group with committed offsets is "Empty" (our group
+/// model doesn't persist live membership), an unknown group is "Dead". Members
+/// are reported empty; the inspector derives partitions from OffsetFetch.
+private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable ngroups = safeCount(r.i32());
+    // STACK-local: groupExists hops cross-shard and yields; a shared static would
+    // be clobbered by another connection's handleDescribeGroups during the park.
+    const(char)[][64] groups;
+    size_t ng;
+    foreach (_; 0 .. ngroups)
+    {
+        if (!r.ok)
+            break;
+        auto g = r.str();
+        if (ng < groups.length && r.ok)
+            groups[ng++] = g;
+    }
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) ng); // groups count
+    foreach (i; 0 .. ng)
+    {
+        immutable exists = groupExists(groups[i]);
+        putI16(o, E_NONE); // error_code
+        putStr(o, groups[i]); // group_id
+        putStr(o, exists ? "Empty" : "Dead"); // group_state
+        putStr(o, exists ? "consumer" : ""); // protocol_type
+        putStr(o, ""); // protocol_data / assignment protocol
+        putI32(o, 0); // members: empty
+        if (ver >= 3)
+            putI32(o, 0); // authorized_operations
     }
 }
 
