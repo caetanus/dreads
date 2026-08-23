@@ -38,6 +38,11 @@ public enum uint KAFKA_PARTITIONS = 4; // partitions advertised per topic
 
 private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
         API_METADATA = 3, API_API_VERSIONS = 18;
+// consumer-group coordinator APIs (feature build — driving golib Consumer/
+// Inspector/Transaction conformance to pass)
+private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
+        API_FIND_COORDINATOR = 10, API_JOIN_GROUP = 11, API_HEARTBEAT = 12,
+        API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
@@ -78,8 +83,15 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_PRODUCE: return 3;
     case API_FETCH: return 4;
     case API_LIST_OFFSETS: return 1;
-    case API_METADATA: return 1;
+    case API_METADATA: return 2; // v2 adds cluster_id; v3+ adds throttle (unhandled)
     case API_API_VERSIONS: return 0;
+    case API_OFFSET_COMMIT: return 7; // v8+ flexible
+    case API_OFFSET_FETCH: return 5; // v6+ flexible (compact encoding — unsupported)
+    case API_FIND_COORDINATOR: return 2; // v3+ flexible
+    case API_JOIN_GROUP: return 4; // v5 adds JoinGroup protocol type; v6+ flexible
+    case API_HEARTBEAT: return 3; // v4+ flexible
+    case API_LEAVE_GROUP: return 3; // v4+ flexible
+    case API_SYNC_GROUP: return 3; // v4+ flexible
     default: return 0;
     }
 }
@@ -459,7 +471,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 5); // array count
+        putI32(o, 12); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -470,8 +482,15 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_PRODUCE, 0, 3);
         row(o, API_FETCH, 0, 4);
         row(o, API_LIST_OFFSETS, 0, 1);
-        row(o, API_METADATA, 0, 1);
+        row(o, API_METADATA, 0, 2);
         row(o, API_API_VERSIONS, 0, 0);
+        row(o, API_OFFSET_COMMIT, 0, 7);
+        row(o, API_OFFSET_FETCH, 0, 5);
+        row(o, API_FIND_COORDINATOR, 0, 2);
+        row(o, API_JOIN_GROUP, 0, 4);
+        row(o, API_HEARTBEAT, 0, 3);
+        row(o, API_LEAVE_GROUP, 0, 3);
+        row(o, API_SYNC_GROUP, 0, 3);
         break;
 
     case API_METADATA:
@@ -492,6 +511,34 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
 
     case API_LIST_OFFSETS:
         handleListOffsets(r, apiVer, o);
+        break;
+
+    case API_FIND_COORDINATOR:
+        handleFindCoordinator(r, apiVer, o);
+        break;
+
+    case API_JOIN_GROUP:
+        handleJoinGroup(r, apiVer, o);
+        break;
+
+    case API_SYNC_GROUP:
+        handleSyncGroup(r, apiVer, o);
+        break;
+
+    case API_LEAVE_GROUP:
+        handleLeaveGroup(r, apiVer, o);
+        break;
+
+    case API_OFFSET_FETCH:
+        handleOffsetFetch(r, apiVer, o);
+        break;
+
+    case API_HEARTBEAT:
+        handleHeartbeat(r, apiVer, o);
+        break;
+
+    case API_OFFSET_COMMIT:
+        handleOffsetCommit(r, apiVer, o);
         break;
 
     default:
@@ -517,6 +564,489 @@ public shared ulong gKafkaFetched;  // records served via Fetch (dashboard)
 public __gshared const(char)[] gKafkaHost = "127.0.0.1";
 public __gshared ushort gKafkaPort = 9092;
 
+private shared int gKafkaMemberCtr;
+
+/// Generate a broker-assigned member id into `buf`, returns the slice.
+private const(char)[] genMemberId(ref char[64] buf) nothrow @trusted
+{
+    import core.atomic : atomicOp;
+    import core.stdc.stdio : snprintf;
+
+    immutable n = atomicOp!"+="(gKafkaMemberCtr, 1);
+    immutable k = snprintf(buf.ptr, buf.length, "dreads-%d", n);
+    return cast(const(char)[]) buf[0 .. (k > 0 ? k : 0)];
+}
+
+/// JoinGroup (v0-v4): single-node coordinator. The joining member is always made
+/// the leader of a one-member group at generation 1; franz-go (as leader) then
+/// computes the assignment and ships it back in SyncGroup. We echo the member's
+/// own subscription metadata so the leader has the member list it needs.
+private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // group_id
+    cast(void) r.i32(); // session_timeout_ms
+    if (ver >= 1)
+        cast(void) r.i32(); // rebalance_timeout_ms
+    auto memberId = r.str();
+    cast(void) r.str(); // protocol_type
+    immutable nproto = safeCount(r.i32());
+    const(char)[] protoName;
+    const(ubyte)[] protoMeta;
+    bool haveProto;
+    foreach (i; 0 .. nproto)
+    {
+        if (!r.ok)
+            break;
+        auto name = r.str();
+        auto meta = r.bytesI32();
+        if (!haveProto && r.ok)
+        {
+            protoName = name;
+            protoMeta = meta;
+            haveProto = true;
+        }
+    }
+    static char[64] midBuf;
+    immutable(char)[] emptyName = "";
+    const(char)[] mid = memberId.length ? memberId : genMemberId(midBuf);
+    if (ver >= 2)
+        putI32(o, 0); // throttle_time_ms
+    if (!r.ok || !haveProto)
+    {
+        putI16(o, 0x0010); // COORDINATOR_LOAD_IN_PROGRESS-ish: safe retryable
+        putI32(o, -1); // generation
+        putStr(o, emptyName);
+        putStr(o, emptyName);
+        putStr(o, mid);
+        putI32(o, 0); // members
+        return;
+    }
+    putI16(o, E_NONE); // error_code
+    putI32(o, 1); // generation_id
+    putStr(o, protoName); // protocol_name
+    putStr(o, mid); // leader = this member
+    putStr(o, mid); // member_id
+    putI32(o, 1); // members: 1
+    putStr(o, mid); // member_id
+    putBytesI32(o, protoMeta, protoMeta is null); // subscription metadata (echoed)
+}
+
+// Consumer-group committed offsets live in a per-group hash `kafka.cg.<group>`,
+// field `<topic>/<partition>` -> decimal offset, via the RESP executor (routed
+// to the owning shard exactly like partition data).
+private void groupOffKey(scope const(char)[] group, ref ByteBuffer keyb) nothrow @trusted
+{
+    keyb.clear();
+    keyb.append("kafka.cg.");
+    keyb.append(group);
+}
+
+private const(char)[] partField(scope const(char)[] topic, int part, ref char[KAFKA_MAX_TOPIC + 16] buf) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    size_t n = topic.length <= KAFKA_MAX_TOPIC ? topic.length : KAFKA_MAX_TOPIC;
+    buf[0 .. n] = topic[0 .. n];
+    immutable k = snprintf(buf.ptr + n, buf.length - n, "/%d", part);
+    return cast(const(char)[]) buf[0 .. n + (k > 0 ? k : 0)];
+}
+
+/// HGET the committed offset for one partition, or -1 if none/unset.
+private long fetchGroupOffset(scope const(char)[] group, scope const(char)[] topic, int part) nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return -1;
+    static ByteBuffer keyb, rb;
+    groupOffKey(group, keyb);
+    char[KAFKA_MAX_TOPIC + 16] fb = void;
+    auto field = partField(topic, part, fb);
+    const(char)[][3] a = ["hget", cast(const(char)[]) keyb.data, field];
+    gKafkaExec(a[], rb);
+    auto d = rb.data;
+    // RESP bulk: `$-1\r\n` (nil) or `$<len>\r\n<digits>\r\n`
+    if (d.length < 4 || d[0] != '$')
+        return -1;
+    size_t i = 1;
+    bool neg = d[i] == '-';
+    if (neg)
+        return -1; // nil
+    long blen = 0;
+    while (i < d.length && d[i] >= '0' && d[i] <= '9')
+        blen = blen * 10 + (d[i++] - '0');
+    if (i + 2 > d.length)
+        return -1;
+    i += 2; // skip \r\n
+    long off = 0;
+    size_t got = 0;
+    while (i < d.length && d[i] >= '0' && d[i] <= '9' && got < blen)
+    {
+        off = off * 10 + (d[i++] - '0');
+        got++;
+    }
+    return got ? off : -1;
+}
+
+/// HSET the committed offset for one partition.
+private void storeGroupOffset(scope const(char)[] group, scope const(char)[] topic, int part, long off) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer keyb, rb;
+    groupOffKey(group, keyb);
+    char[KAFKA_MAX_TOPIC + 16] fb = void;
+    auto field = partField(topic, part, fb);
+    char[24] ob = void;
+    immutable k = snprintf(ob.ptr, ob.length, "%lld", off);
+    const(char)[][4] a = ["hset", cast(const(char)[]) keyb.data, field,
+        cast(const(char)[]) ob[0 .. (k > 0 ? k : 0)]];
+    gKafkaExec(a[], rb);
+}
+
+/// OffsetCommit (v0-v7): persist the committed offset per partition.
+private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    auto group = r.str();
+    if (ver >= 1)
+    {
+        cast(void) r.i32(); // generation_id
+        cast(void) r.str(); // member_id
+    }
+    if (ver >= 7)
+        cast(void) r.str(); // group_instance_id (nullable)
+    if (ver >= 2 && ver <= 4)
+        cast(void) r.i64(); // retention_time_ms (v2-v4 only)
+    immutable ntopics = safeCount(r.i32());
+    if (ver >= 3)
+        putI32(o, 0); // throttle_time_ms
+    immutable tOff = o.length;
+    putI32(o, ntopics);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto topic = r.str();
+        immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break;
+        putStr(o, topic);
+        immutable pOff = o.length;
+        putI32(o, nparts);
+        et++;
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok)
+                break;
+            immutable part = r.i32();
+            immutable off = r.i64();
+            if (ver == 1)
+                cast(void) r.i64(); // commit_timestamp (v1 only)
+            if (ver >= 6)
+                cast(void) r.i32(); // committed_leader_epoch
+            cast(void) r.str(); // committed_metadata (nullable)
+            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+                storeGroupOffset(group, topic, part, off);
+            putI32(o, part);
+            putI16(o, E_NONE); // error_code
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+    }
+    patchI32(o, tOff, et);
+}
+
+/// Read one RESP bulk string `$<len>\r\n<bytes>\r\n` from d at i; advances i.
+/// Returns null on nil (`$-1`) or malformation (and parks i at end).
+private const(ubyte)[] respBulk(scope const(ubyte)[] d, ref size_t i) nothrow @trusted
+{
+    if (i >= d.length || d[i] != '$')
+    {
+        i = d.length;
+        return null;
+    }
+    i++;
+    if (i < d.length && d[i] == '-')
+    { // nil: `$-1\r\n`
+        while (i < d.length && d[i] != '\n')
+            i++;
+        if (i < d.length)
+            i++;
+        return null;
+    }
+    long len = 0;
+    while (i < d.length && d[i] >= '0' && d[i] <= '9')
+        len = len * 10 + (d[i++] - '0');
+    i += 2; // \r\n
+    if (len < 0 || i + cast(size_t) len > d.length)
+    {
+        i = d.length;
+        return null;
+    }
+    auto s = d[i .. i + cast(size_t) len];
+    i += cast(size_t) len + 2; // value + trailing \r\n
+    return s;
+}
+
+/// OffsetFetch fetch-all (topics == null): HGETALL the group hash and emit every
+/// committed offset, grouped by topic. Used by kadm.FetchOffsets(group).
+private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    static ByteBuffer keyb, rb;
+    if (gKafkaExec is null)
+    {
+        putI32(o, 0);
+        return;
+    }
+    groupOffKey(group, keyb);
+    const(char)[][2] a = ["hgetall", cast(const(char)[]) keyb.data];
+    gKafkaExec(a[], rb);
+    auto d = cast(const(ubyte)[]) rb.data;
+    static const(char)[][4096] tf; // topic slice (into rb, stable until next exec)
+    static int[4096] tp;
+    static long[4096] to;
+    static bool[4096] done;
+    size_t nf = 0;
+    size_t i = 0;
+    if (d.length >= 1 && d[0] == '*')
+    {
+        i = 1;
+        long n = 0;
+        while (i < d.length && d[i] >= '0' && d[i] <= '9')
+            n = n * 10 + (d[i++] - '0');
+        i += 2; // \r\n
+        for (long e = 0; e + 1 < n && nf < tf.length; e += 2)
+        {
+            auto field = respBulk(d, i);
+            auto val = respBulk(d, i);
+            if (field is null || val is null)
+                break;
+            // split "topic/partition" on the LAST '/'
+            size_t sl = field.length;
+            foreach_reverse (k; 0 .. field.length)
+                if (field[k] == '/')
+                {
+                    sl = k;
+                    break;
+                }
+            if (sl >= field.length)
+                continue;
+            int part = 0;
+            foreach (c; field[sl + 1 .. $])
+                if (c >= '0' && c <= '9')
+                    part = part * 10 + (c - '0');
+            long off = 0;
+            bool neg = val.length && val[0] == '-';
+            foreach (c; val[(neg ? 1 : 0) .. $])
+                if (c >= '0' && c <= '9')
+                    off = off * 10 + (c - '0');
+            tf[nf] = cast(const(char)[]) field[0 .. sl];
+            tp[nf] = part;
+            to[nf] = neg ? -off : off;
+            done[nf] = false;
+            nf++;
+        }
+    }
+    immutable tOff = o.length;
+    putI32(o, 0);
+    int et = 0;
+    foreach (idx; 0 .. nf)
+    {
+        if (done[idx])
+            continue;
+        putStr(o, tf[idx]);
+        immutable pOff = o.length;
+        putI32(o, 0);
+        int ep = 0;
+        foreach (j; idx .. nf)
+        {
+            if (done[j] || tf[j] != tf[idx])
+                continue;
+            done[j] = true;
+            putI32(o, tp[j]);
+            putI64(o, to[j]);
+            if (ver >= 5)
+                putI32(o, -1); // committed_leader_epoch
+            putI16(o, -1); // metadata = null
+            putI16(o, E_NONE);
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+        et++;
+    }
+    patchI32(o, tOff, et);
+}
+
+/// OffsetFetch (v0-v5): committed offsets for the requested partitions, or all
+/// (topics == null) via HGETALL.
+private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    auto group = r.str();
+    immutable rawN = r.i32();
+    if (ver >= 3)
+        putI32(o, 0); // throttle_time_ms
+    if (rawN < 0)
+    {
+        emitAllGroupOffsets(group, ver, o); // null topics = fetch all
+    }
+    else
+    {
+        immutable ntopics = safeCount(rawN);
+        immutable topicsCountOff = o.length;
+        putI32(o, ntopics);
+        int emittedTopics = 0;
+        foreach (_; 0 .. ntopics)
+        {
+            if (!r.ok)
+                break;
+            auto topic = r.str();
+            immutable nparts = safeCount(r.i32());
+            if (!r.ok)
+                break;
+            putStr(o, topic);
+            immutable partsOff = o.length;
+            putI32(o, nparts);
+            emittedTopics++;
+            int emittedParts = 0;
+            foreach (_2; 0 .. nparts)
+            {
+                if (!r.ok)
+                    break;
+                immutable part = r.i32();
+                immutable off = (r.ok && validTopic(topic) && part >= 0)
+                    ? fetchGroupOffset(group, topic, part) : -1;
+                putI32(o, part);
+                putI64(o, off); // committed_offset (-1 = none)
+                if (ver >= 5)
+                    putI32(o, -1); // committed_leader_epoch
+                putI16(o, -1); // metadata = null
+                putI16(o, E_NONE); // error_code
+                emittedParts++;
+            }
+            patchI32(o, partsOff, emittedParts);
+        }
+        patchI32(o, topicsCountOff, emittedTopics);
+    }
+    if (ver >= 2)
+        putI16(o, E_NONE); // top-level error_code
+}
+
+/// Heartbeat (v0-v3): always OK (single-member group never rebalances).
+private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // group_id
+    cast(void) r.i32(); // generation_id
+    cast(void) r.str(); // member_id
+    if (ver >= 3)
+        cast(void) r.str(); // group_instance_id
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+}
+
+/// SyncGroup (v0-v3): the leader shipped the computed assignment; echo this
+/// member's assignment back. Single-member group, so we return the (only)
+/// assignment the leader provided.
+private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // group_id
+    cast(void) r.i32(); // generation_id
+    auto memberId = r.str(); // this member
+    if (ver >= 3)
+        cast(void) r.str(); // group_instance_id (nullable)
+    immutable nassign = safeCount(r.i32());
+    const(ubyte)[] myAssignment;
+    bool found;
+    foreach (i; 0 .. nassign)
+    {
+        if (!r.ok)
+            break;
+        auto mid = r.str();
+        auto assign = r.bytesI32();
+        if (r.ok && (!found || mid == memberId))
+        {
+            myAssignment = assign;
+            found = true;
+        }
+    }
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+    putBytesI32(o, myAssignment, myAssignment is null); // member assignment
+}
+
+/// LeaveGroup (v0-v3): acknowledge. v3+ is a batched leave (members array).
+private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // group_id
+    static const(char)[][32] mids;
+    static bool[32] giiNull;
+    static const(char)[][32] giis;
+    size_t nm;
+    if (ver >= 3)
+    {
+        immutable cnt = safeCount(r.i32());
+        foreach (i; 0 .. cnt)
+        {
+            if (!r.ok)
+                break;
+            auto mid = r.str();
+            auto gii = r.str(); // group_instance_id (nullable)
+            if (nm < mids.length && r.ok)
+            {
+                mids[nm] = mid;
+                giis[nm] = gii;
+                giiNull[nm] = (gii is null);
+                nm++;
+            }
+        }
+    }
+    else
+    {
+        auto mid = r.str();
+        if (r.ok)
+        {
+            mids[0] = mid;
+            nm = 1;
+        }
+    }
+    if (ver >= 2)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+    if (ver >= 3)
+    {
+        putI32(o, cast(int) nm); // members
+        foreach (i; 0 .. nm)
+        {
+            putStr(o, mids[i]); // member_id
+            if (giiNull[i])
+                putI16(o, -1); // group_instance_id = null
+            else
+                putStr(o, giis[i]);
+            putI16(o, E_NONE); // member error_code
+        }
+    }
+}
+
+private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    // request: [key string] (v0); v1+ adds [key_type i8]. Ignored — the
+    // single-node broker is always its own group/txn coordinator.
+    cast(void) r.str();
+    if (ver >= 1)
+        cast(void) r.i8();
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+    if (ver >= 1)
+        putI16(o, -1); // error_message = null
+    putI32(o, 0); // node_id = us
+    putStr(o, gKafkaHost);
+    putI32(o, gKafkaPort);
+}
+
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     // request: [topics: array of string] (null/empty = all — we answer only
@@ -540,6 +1070,8 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     putI32(o, gKafkaPort);
     if (ver >= 1)
         putI16(o, -1); // rack: null
+    if (ver >= 2)
+        putI16(o, -1); // cluster_id: null (nullable string)
     if (ver >= 1)
         putI32(o, 0); // controller_id
     // topics — STATELESS: every named topic exists with KAFKA_PARTITIONS
