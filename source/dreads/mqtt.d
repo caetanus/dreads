@@ -230,6 +230,8 @@ private struct Retained
     // out (re-emitted decremented on replay per [MQTT-3.3.2-5]); null for v3/no-props
     MonoTime deadline; // when this retained message expires; valid iff hasExpiry
     bool hasExpiry; // v5 message-expiry-interval was present: evict + decrement
+    ubyte qos; // original publish QoS: retained-on-subscribe delivers at
+    // min(this, the subscription's granted QoS) [MQTT-3.3.1-9 / 3.8.4]
 }
 
 private Retained[string] gRetained; // TLS: topic -> retained value (replicated)
@@ -737,7 +739,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 }
                 else
                 {
-                    Retained r = makeRetained(payload, seq, props);
+                    Retained r = makeRetained(payload, seq, props, pubQos);
                     immutable newLen = r.payload.length + r.props.length;
                     if (tRetainedBytes - oldLen + newLen <= MQTT_MAX_RETAINED_BYTES)
                     {
@@ -763,7 +765,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 }
                 else
                 {
-                    Retained r = makeRetained(payload, seq, props);
+                    Retained r = makeRetained(payload, seq, props, pubQos);
                     immutable newLen = r.payload.length + r.props.length;
                     if (gRetained.length < MQTT_MAX_RETAINED_TOPICS
                             && tRetainedBytes + newLen <= MQTT_MAX_RETAINED_BYTES)
@@ -1794,11 +1796,12 @@ private void stripExpiryProp(scope const(char)[] props, ref ByteBuffer out_,
 // props (message-expiry becomes an absolute deadline). Called only on the cold
 // retained-publish path, inside the caller's try/catch.
 private Retained makeRetained(scope const(char)[] payload, ulong seq,
-        scope const(char)[] props) @trusted
+        scope const(char)[] props, ubyte qos = 0) @trusted
 {
     Retained r;
     r.payload = payload.length ? payload.idup : null;
     r.seq = seq;
+    r.qos = qos;
     if (props.length)
     {
         static ByteBuffer sb;
@@ -2470,7 +2473,39 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                                 pb.append(r.props);
                                 outProps = cast(const(char)[]) pb.data;
                             }
-                            buildPublish(o, topic, r.payload, true, v5, outProps);
+                            // retained delivered at min(msg QoS, granted QoS)
+                            // [MQTT-3.8.4]. QoS1/2 needs a packet-id tracked in
+                            // flight (PUBACK/PUBREC clears it); a saturated
+                            // receive-maximum window degrades to QoS0.
+                            immutable ubyte effQos = r.qos < granted[fi] ? r.qos : granted[fi];
+                            ushort rpid = 0;
+                            if (effQos >= 1)
+                            {
+                                immutable size_t win = c.sendMax < MQTT_QOS1_WINDOW
+                                    ? c.sendMax : MQTT_QOS1_WINDOW;
+                                if (c.inflight.length + c.outQos2.length < win)
+                                    rpid = nextDeliveryPid(c);
+                            }
+                            if (rpid == 0)
+                                buildPublish(o, topic, r.payload, true, v5, outProps);
+                            else if (effQos == 2)
+                            {
+                                buildPublishQos2(o, topic, r.payload, true, rpid, v5, outProps);
+                                try
+                                    c.outQos2[rpid] = 1; // awaiting PUBREC
+                                catch (Exception)
+                                {
+                                }
+                            }
+                            else
+                            {
+                                buildPublishQos1(o, topic, r.payload, true, rpid, v5, outProps);
+                                try
+                                    c.inflight[rpid] = true;
+                                catch (Exception)
+                                {
+                                }
+                            }
                             break;
                         }
                 }
