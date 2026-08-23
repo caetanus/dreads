@@ -106,18 +106,15 @@ public final class MqttConn
     // reconnect is the deliberately-unhandled ostrich case.)
     bool offline; // wrapper state: socket dead/disconnected, session held ALIVE
     MonoTime offlineDeadline; // (legacy; park computes its own deadlines)
-    // Transparent-strategy (model A): on socket death the serve fiber does NOT
-    // return — it parks here, holding the whole session ALIVE (subs in the trie,
+    // Transparent-strategy: on socket death the serve fiber does NOT return — it
+    // parks (mqttParkOrEnd), holding the whole session ALIVE (subs in the trie,
     // obox as the offline queue), and vibe never learns the socket died. A
-    // reconnect on the SAME shard hands a new socket via pendingTcp + emits
-    // reconnectEvt (same-thread cooperative => no lock needed); the parked fiber
-    // rebinds c.tcp and resumes. Expiry is a timed wait (no separate Timer);
-    // will-delay is orchestrated in the same wait loop and cancelled by reconnect.
+    // same-shard reconnect MIGRATES this session onto the new connection and wakes
+    // reconnectEvt to end the parked fiber (the socket is never moved between
+    // conns — vibe forbids that under a pending read). Expiry is a timed wait (no
+    // separate Timer); will-delay is orchestrated in the same wait loop.
     LocalManualEvent reconnectEvt;
-    TCPConnection pendingTcp; // socket handed off by a reconnecting fiber
-    const(char)[] pendingConnack; // CONNACK bytes the reconnect fiber stashed (sent on resume)
-    bool handedOff; // a throwaway reconnect conn that gave its socket to a parked session
-    bool discard; // set to make a parked session END now (clean_start=1 took it over)
+    bool discard; // set to make a parked session END now (migrated away / clean_start)
     ubyte discReason = 0x82; // v5 server-DISCONNECT reason on a protocol-error close
     // (default 0x82 Protocol Error; a handler may set e.g. 0x93 Receive Maximum)
     uint willDelay; // v5 will-delay-interval (seconds): 0 = fire will immediately on drop
@@ -1829,102 +1826,85 @@ private void mqttExpireOfflineQueue(MqttConn c) nothrow @trusted
     c.oExprQ = null;
 }
 
-/// A reconnecting fiber (same shard) handed this parked session a fresh socket
-/// via pendingTcp + pendingConnack. Rebind to it, send the CONNACK, redeliver the
-/// unacked QoS1/2 in-flight (DUP=1 [MQTT-4.4.0-1]; a QoS2 past PUBREC re-driven
-/// with PUBREL), then wake the writer to flush the offline queue. Same-thread
-/// cooperative scheduling => the reconnect fiber set every field before emit and
-/// is suspended now, so these reads need no lock.
-private void mqttRebind(MqttConn c) nothrow @trusted
+/// A clean_start=0 CONNECT: MIGRATE the parked session `parked` (same shard) onto
+/// the reconnecting connection `newc`, which keeps serving on its OWN socket. We
+/// do NOT move the TCPConnection between conns — vibe forbids reassigning a
+/// socket while a read is in-flight (`assert(sock == m_socket)`, net.d) and doing
+/// so crashes under multiple shards. Instead newc adopts the parked session's
+/// subscriptions (re-pointed in the trie), offline queue, in-flight QoS1/2,
+/// publication-expiry tracking and flow-control hold-queue; then the parked fiber
+/// is signalled to end. Same-thread cooperative scheduling: every mutation here
+/// completes before this fiber yields, and the parked fiber is suspended.
+/// Returns true (a session was resumed).
+private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
 {
-    c.tcp = c.pendingTcp;
-    c.pendingTcp = TCPConnection.init;
-    if (c.pendingConnack.length)
-        sendTo(c, cast(const(ubyte)[]) c.pendingConnack); // CONNACK first, writer parked
-    c.pendingConnack = null;
-    // publication-expiry: drop expired queued PUBLISHes + decrement the survivors
-    // BEFORE the in-flight redeliveries are appended (those aren't expiry-tracked)
-    mqttExpireOfflineQueue(c);
-    // redeliver unacked QoS1/2 (appended AFTER any offline-queued obox already
-    // present, BEFORE the writer is woken)
+    // re-point the parked subscriptions to newc (its trie entries stay under the
+    // parked identity and are unsubscribed by the parked fiber's teardown)
+    foreach (i, f; parked.filters)
+    {
+        if (i >= parked.subInfo.length)
+            break;
+        auto si = parked.subInfo[i];
+        cast(void) trieSubscribe(f, newc, si.qos, si.opts, si.shareGroup, si.subId);
+        try
+        {
+            newc.filters ~= f;
+            newc.subInfo ~= si;
+        }
+        catch (Exception)
+        {
+        }
+    }
+    // adopt the offline queue + in-flight + expiry + flow-control-hold state
     try
-        foreach (pid, msg; c.inflightMsg)
+        if (!parked.obox.empty)
+            newc.obox.append(parked.obox.data);
+    catch (Exception)
+    {
+    }
+    newc.inflight = parked.inflight;
+    newc.outQos2 = parked.outQos2;
+    newc.inflightMsg = parked.inflightMsg;
+    newc.oExprQ = parked.oExprQ;
+    newc.heldQ = parked.heldQ;
+    newc.heldBytes = parked.heldBytes;
+    // publication-expiry on the adopted queue: drop expired, decrement survivors
+    mqttExpireOfflineQueue(newc);
+    // redeliver unacked QoS1/2 (DUP=1 [MQTT-4.4.0-1]) + PUBREL for a QoS2 past PUBREC
+    try
+        foreach (pid, msg; newc.inflightMsg)
         {
             auto dup = msg.dup;
             if (dup.length)
                 dup[0] = cast(char)(dup[0] | 0x08); // set the DUP bit
-            c.obox.append(dup);
+            newc.obox.append(dup);
         }
     catch (Exception)
     {
     }
     try
-        foreach (pid, st; c.outQos2)
+        foreach (pid, st; newc.outQos2)
             if (st == 2)
             {
-                c.obox.appendByte(cast(char)((PT_PUBREL << 4) | 0x02));
-                c.obox.appendByte(cast(char) 2);
-                c.obox.appendByte(cast(char)(pid >> 8));
-                c.obox.appendByte(cast(char)(pid & 0xFF));
+                newc.obox.appendByte(cast(char)((PT_PUBREL << 4) | 0x02));
+                newc.obox.appendByte(cast(char) 2);
+                newc.obox.appendByte(cast(char)(pid >> 8));
+                newc.obox.appendByte(cast(char)(pid & 0xFF));
             }
     catch (Exception)
     {
     }
-    c.offline = false;
-    mqttReleaseHeld(c); // resume: flow any messages held behind the window pre-drop
+    mqttReleaseHeld(newc); // flow any messages held behind the window pre-drop
+    // end the parked session: newc now owns the client id, and the parked will
+    // must NOT fire (the session lives on). Signal its fiber to discard + tear down.
+    parked.willTopic = null;
+    parked.discard = true;
     try
-        c.flushEvt.emit(); // wake the writer to drain obox onto the new socket
+        parked.reconnectEvt.emit();
     catch (Exception)
     {
     }
-}
-
-/// A clean_start=0 CONNECT (model A reconnect): the reconnecting fiber `newc`
-/// hands its socket to the parked session `old` on THIS shard instead of taking
-/// over. `old` keeps its subscriptions / in-flight / queued obox; only the live
-/// connection params are refreshed from the new CONNECT. The CONNACK (session-
-/// present=1) is built here and stashed for `old` to send on resume. Same-thread
-/// cooperative scheduling: every field is set before emit, and `old`'s fiber is
-/// suspended, so no lock is needed.
-private void mqttHandoffToParked(MqttConn old, MqttConn newc, ushort serverKa,
-        scope const(char)[] assignedId) nothrow @trusted
-{
-    old.protoVer = newc.protoVer;
-    old.readDeadline = newc.readDeadline;
-    old.sessionExpiry = newc.sessionExpiry;
-    old.cleanStart = false;
-    old.maxPktSize = newc.maxPktSize;
-    old.sendMax = newc.sendMax;
-    old.outAliasMax = newc.outAliasMax;
-    old.connGen = newc.connGen;
-    // a fresh socket => fresh topic-alias space in BOTH directions
-    old.inAlias = null;
-    old.inAliasBytes = 0;
-    old.outAlias = null;
-    old.outAliasNext = 1;
-    old.outAliasBytes = 0;
-    // a reconnect's CONNECT carries a (possibly new / possibly absent) will
-    old.willTopic = newc.willTopic;
-    old.willPayload = newc.willPayload;
-    old.willRetain = newc.willRetain;
-    old.willProps = newc.willProps;
-    old.willDelay = newc.willDelay;
-    // build the CONNACK (session-present = 1) for `old` to send on rebind
-    static ByteBuffer cbuf; // TLS: consumed into idup synchronously below
-    cbuf.clear();
-    mqttConnack(cbuf, old.protoVer, true, 0, assignedId, serverKa);
-    try
-        old.pendingConnack = (cast(const(char)[]) cbuf.data).idup;
-    catch (Exception)
-        old.pendingConnack = null;
-    old.pendingTcp = newc.tcp;
-    newc.tcp = TCPConnection.init; // the throwaway must never touch the real socket
-    newc.handedOff = true;
-    try
-        old.reconnectEvt.emit(); // wake old's parked serve fiber -> mqttRebind
-    catch (Exception)
-    {
-    }
+    return true;
 }
 
 /// clean_start=1 CONNECT for a client id whose session is parked offline on this
@@ -2004,16 +1984,11 @@ private bool mqttParkOrEnd(MqttConn c, bool cleanDisc) nothrow @trusted
             catch (Exception)
                 return ec;
         }();
-        if (newEc != ec) // woken: reconnect (rebind) or discard (clean_start took over)
-        {
-            if (c.discard)
-            {
-                c.discard = false;
-                c.sessionExpiry = 0; // teardown discards the session record
-                return false;
-            }
-            mqttRebind(c);
-            return true;
+        if (newEc != ec) // woken: a same-shard reconnect MIGRATED this session onto
+        {                //   a new connection (or clean_start discarded it) -> end
+            c.discard = false;
+            c.sessionExpiry = 0; // teardown discards the record; the new conn owns it
+            return false;
         }
         // timed out: fire a due will, end at expiry
         immutable t2 = MonoTime.currTime;
@@ -2031,25 +2006,6 @@ private bool mqttParkOrEnd(MqttConn c, bool cleanDisc) nothrow @trusted
             return false;
         }
     }
-}
-
-/// A throwaway reconnect conn that handed its socket to a parked session: stop
-/// its writer and release its own buffers WITHOUT closing the socket (the parked
-/// session owns it now) and WITHOUT touching the session (it owns the client id).
-private void mqttReleaseHandedOff(MqttConn c, Task writer) nothrow @trusted
-{
-    c.closed = true;
-    try
-        c.flushEvt.emit();
-    catch (Exception)
-    {
-    }
-    try
-        writer.join();
-    catch (Exception)
-    {
-    }
-    c.obox.release();
 }
 
 /// Maintenance sweep hook (retained for server.d wiring). Model A holds offline
@@ -2151,12 +2107,7 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     }
 
     scope (exit)
-    {
-        if (c.handedOff)
-            mqttReleaseHandedOff(c, writer); // its socket lives on in a parked session
-        else
-            mqttTeardown(c, writer);
-    }
+        mqttTeardown(c, writer);
     ByteBuffer inb;
     ByteBuffer outb;
     readloop: for (;;)
@@ -2249,8 +2200,6 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             auto body_ = d[hp .. hp + rem];
             if (!handlePacket(c, h, body_, outb))
             {
-                if (c.handedOff)
-                    return; // socket given to a parked session; -> mqttReleaseHandedOff
                 // v5: on a protocol-error close of an ESTABLISHED session, send a
                 // server DISCONNECT with a reason so the client isn't left to
                 // infer a bare TCP reset. A clean client DISCONNECT (which also
@@ -3045,6 +2994,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // existing session with the same id — locally now, and on the other
             // shards via a broadcast. connGen (global monotonic) makes the
             // newest win regardless of broadcast arrival order.
+            bool resumedOffline = false;
             if (okPair && clientId.length != 0)
             {
                 immutable g = atomicOp!"+="(gMqttConnGen, 1);
@@ -3055,10 +3005,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     c.clientId = null;
                 if (c.clientId.length != 0)
                 {
-                    // Model A reconnect: a parked OFFLINE session for this id on
-                    // THIS shard + clean_start=0 => HAND our socket to it (rebind)
-                    // rather than take it over. It resumes with its queued obox +
-                    // in-flight redelivery; this fiber becomes a throwaway.
+                    // Reconnect: a parked OFFLINE session for this id on THIS shard.
+                    // clean_start=0 MIGRATES it onto this connection (no socket move
+                    // — see mqttMigrateParked); clean_start=1 discards it. A parked
+                    // session on ANOTHER shard isn't in this shard's gLocalClients,
+                    // so it isn't found here (cross-shard reconnect = fresh session).
                     MqttConn parked;
                     try
                         if (auto pc = c.clientId in gLocalClients)
@@ -3068,11 +3019,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                     }
                     if (parked !is null && !c.cleanStart)
-                    {
-                        mqttHandoffToParked(parked, c, serverKa, assignedId);
-                        return false; // exit the serve loop -> mqttReleaseHandedOff
-                    }
-                    if (parked !is null && c.cleanStart)
+                        resumedOffline = mqttMigrateParked(parked, c);
+                    else if (parked !is null && c.cleanStart)
                         mqttDiscardParked(parked); // fresh session takes over
                     takeoverLocal(c.clientId, g);
                     try
@@ -3084,13 +3032,12 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         gMqttConnBcast(c.clientId, g);
                 }
             }
-            // Persistent session: a same-shard offline session is resumed by the
-            // socket-rebind handoff above (which returns early). Here only the
-            // cross-shard case remains: the keyspace record (mqtt.sess.<id>, Redis
-            // TTL) gives session-present. These ops hop cross-shard and YIELD;
-            // o/clientId are fiber-local.
-            bool sessPresent = false;
-            if (okPair && c.clientId.length != 0)
+            // Persistent session: a same-shard offline session was MIGRATED above
+            // (resumedOffline). Otherwise the keyspace record (mqtt.sess.<id>, Redis
+            // TTL) gives cross-shard session-present. These ops hop cross-shard and
+            // YIELD; o/clientId are fiber-local.
+            bool sessPresent = resumedOffline;
+            if (okPair && c.clientId.length != 0 && !resumedOffline)
             {
                 if (c.cleanStart)
                     mqttSessionDel(c.clientId);
@@ -3100,6 +3047,13 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // CONNACK: reason/rc 0 on success, else unacceptable-protocol-version.
             // assignedId is non-empty only for an empty-ClientId v5 client.
             mqttConnack(o, c.protoVer, sessPresent, okPair ? 0 : 1, assignedId, serverKa);
+            // a migrated session's queued messages go out right after the CONNACK,
+            // in the same response buffer (ordering guaranteed, no writer race)
+            if (resumedOffline && !c.obox.empty)
+            {
+                o.append(c.obox.data);
+                c.obox.clear();
+            }
             return okPair;
         }
     case PT_PUBLISH:
