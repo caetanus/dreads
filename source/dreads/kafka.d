@@ -888,7 +888,7 @@ private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow 
     const(char)[] protoName;
     const(ubyte)[] protoMeta;
     bool haveProto;
-    foreach (i; 0 .. (nproto < 0 ? 0 : nproto))
+    foreach (i; 0 .. (nproto < 0 ? 0 : safeCount(nproto))) // clamp like siblings
     {
         if (!r.ok)
             break;
@@ -1652,7 +1652,7 @@ private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow 
     immutable nassign = r.carrlen();
     const(ubyte)[] myAssignment;
     bool found;
-    foreach (i; 0 .. (nassign < 0 ? 0 : nassign))
+    foreach (i; 0 .. (nassign < 0 ? 0 : safeCount(nassign))) // clamp like siblings
     {
         if (!r.ok)
             break;
