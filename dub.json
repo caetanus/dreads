@@ -159,6 +159,7 @@
 		"bash vendor/lua/build.sh",
 		"bash vendor/lz4/build.sh",
 		"bash vendor/snappy/build.sh",
+		"bash vendor/zstd/build.sh",
 		"bash vendor/dashboard/build.sh"
 	],
 	"preBuildCommands-windows": [
@@ -168,7 +169,8 @@
 	"lflags-posix": [
 		"vendor/lua/build/liblua.a",
 		"vendor/lz4/build/liblz4.a",
-		"vendor/snappy/build/libsnappy.a"
+		"vendor/snappy/build/libsnappy.a",
+		"vendor/zstd/build/libzstd.a"
 	],
 	"lflags-windows": [
 		"vendor/lua/build/liblua.lib",

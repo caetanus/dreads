@@ -1381,6 +1381,37 @@ private bool snappyInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t cap
     return true;
 }
 
+// libzstd C API (vendored static libzstd.a). Kafka's v2 zstd payload is a raw
+// zstd frame; franz-go writes the content size into the frame header, so
+// ZSTD_getFrameContentSize gives a bomb-bound before we allocate.
+private extern (C) @nogc nothrow @system
+{
+    ulong ZSTD_getFrameContentSize(const(void)* src, size_t srcSize);
+    size_t ZSTD_decompress(void* dst, size_t dstCap, const(void)* src, size_t srcSize);
+    uint ZSTD_isError(size_t code);
+}
+
+/// Bounded zstd decompress into `dst`. Rejects frames with unknown/erroneous
+/// content size (can't bomb-bound) or plaintext > capMax.
+private bool zstdInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMax) @nogc nothrow @trusted
+{
+    if (src.length == 0)
+        return false;
+    immutable ulong content = ZSTD_getFrameContentSize(src.ptr, src.length);
+    // ZSTD_CONTENTSIZE_UNKNOWN = ulong.max, ZSTD_CONTENTSIZE_ERROR = ulong.max-1
+    if (content == ulong.max || content == ulong.max - 1)
+        return false;
+    if (content == 0 || content > capMax)
+        return false; // empty or decompression bomb
+    dst.clear();
+    auto space = dst.freeSpace(cast(size_t) content);
+    immutable size_t n = ZSTD_decompress(space.ptr, cast(size_t) content, src.ptr, src.length);
+    if (ZSTD_isError(n) != 0 || n != content)
+        return false;
+    dst.grow(n);
+    return true;
+}
+
 /// Request-level ceiling on TOTAL decompressed bytes, reset per Produce request
 /// (tKafkaDecompUsed). The per-partition KAFKA_DECOMP_MAX bounds ONE batch, but a
 /// request enumerating many partitions each carrying a ~1000:1 frame could
@@ -1389,9 +1420,9 @@ private enum size_t KAFKA_DECOMP_REQ_MAX = 512 << 20;
 private size_t tKafkaDecompUsed; // TLS, reset at the top of handleProduce
 
 /// Decompress a v2 batch's compressed records region (codec = attrs & 0x07)
-/// into `dst`. 1=gzip, 2=snappy, 3=lz4 implemented; zstd(4) not yet wired
-/// (return false → the batch is rejected, exactly as before). Bounded by both
-/// the per-batch cap and the running per-request budget.
+/// into `dst`. 1=gzip, 2=snappy, 3=lz4, 4=zstd — all Kafka codecs supported;
+/// undefined 5/6/7 reject. Bounded by both the per-batch cap and the running
+/// per-request budget.
 private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst) nothrow @trusted
 {
     if (tKafkaDecompUsed >= KAFKA_DECOMP_REQ_MAX)
@@ -1410,8 +1441,11 @@ private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBu
     case 3:
         ok = lz4FrameInto(src, dst, cap);
         break;
+    case 4:
+        ok = zstdInto(src, dst, cap);
+        break;
     default:
-        return false; // zstd: not yet supported
+        return false; // codecs 5/6/7 are undefined in Kafka
     }
     if (ok)
         tKafkaDecompUsed += dst.length;
