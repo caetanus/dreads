@@ -86,17 +86,17 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     switch (apiKey)
     {
     case API_PRODUCE: return 3;
-    case API_FETCH: return 4;
-    case API_LIST_OFFSETS: return 1;
+    case API_FETCH: return 11; // v12+ flexible (v11 non-flexible)
+    case API_LIST_OFFSETS: return 5; // v6+ flexible (v5 non-flexible)
     case API_METADATA: return 9; // v9+ flexible (handleMetadataFlex)
     case API_API_VERSIONS: return 0;
     case API_OFFSET_COMMIT: return 7; // v8+ flexible
-    case API_OFFSET_FETCH: return 5; // v6+ flexible (compact encoding — unsupported)
-    case API_FIND_COORDINATOR: return 2; // v3+ flexible
-    case API_JOIN_GROUP: return 4; // v5 adds JoinGroup protocol type; v6+ flexible
-    case API_HEARTBEAT: return 3; // v4+ flexible
+    case API_OFFSET_FETCH: return 7; // v6+ flexible (v7 adds require_stable)
+    case API_FIND_COORDINATOR: return 3; // v3 flexible (single key)
+    case API_JOIN_GROUP: return 7; // v6+ flexible (v7 adds response protocol_type)
+    case API_HEARTBEAT: return 4; // v4 flexible
     case API_LEAVE_GROUP: return 3; // v4+ flexible
-    case API_SYNC_GROUP: return 3; // v4+ flexible
+    case API_SYNC_GROUP: return 5; // v4+ flexible (v5 adds protocol_type)
     case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
     case API_CREATE_TOPICS: return 4; // v5+ flexible
     case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
@@ -722,17 +722,17 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         }
 
         row(o, API_PRODUCE, 0, 3);
-        row(o, API_FETCH, 0, 4);
-        row(o, API_LIST_OFFSETS, 0, 1);
+        row(o, API_FETCH, 0, 11);
+        row(o, API_LIST_OFFSETS, 0, 5);
         row(o, API_METADATA, 0, 9);
         row(o, API_API_VERSIONS, 0, 0);
         row(o, API_OFFSET_COMMIT, 0, 7);
-        row(o, API_OFFSET_FETCH, 0, 5);
-        row(o, API_FIND_COORDINATOR, 0, 2);
-        row(o, API_JOIN_GROUP, 0, 4);
-        row(o, API_HEARTBEAT, 0, 3);
+        row(o, API_OFFSET_FETCH, 0, 7);
+        row(o, API_FIND_COORDINATOR, 0, 3);
+        row(o, API_JOIN_GROUP, 0, 7);
+        row(o, API_HEARTBEAT, 0, 4);
         row(o, API_LEAVE_GROUP, 0, 3);
-        row(o, API_SYNC_GROUP, 0, 3);
+        row(o, API_SYNC_GROUP, 0, 5);
         row(o, API_DESCRIBE_CONFIGS, 0, 3);
         row(o, API_CREATE_TOPICS, 0, 4);
         row(o, API_DESCRIBE_GROUPS, 0, 4);
@@ -876,8 +876,72 @@ private const(char)[] genMemberId(ref char[64] buf) nothrow @trusted
 /// the leader of a one-member group at generation 1; franz-go (as leader) then
 /// computes the assignment and ships it back in SyncGroup. We echo the member's
 /// own subscription metadata so the leader has the member list it needs.
+private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.cstr(); // group_id
+    cast(void) r.i32(); // session_timeout_ms
+    cast(void) r.i32(); // rebalance_timeout_ms (present from v1; v6+ is flexible)
+    auto memberId = r.cstr();
+    cast(void) r.cstr(); // group_instance_id (nullable, v5+)
+    auto protocolType = r.cstr();
+    immutable nproto = r.carrlen();
+    const(char)[] protoName;
+    const(ubyte)[] protoMeta;
+    bool haveProto;
+    foreach (i; 0 .. (nproto < 0 ? 0 : nproto))
+    {
+        if (!r.ok)
+            break;
+        auto name = r.cstr();
+        auto meta = r.cbytes();
+        r.skipTaggedFields(); // per-protocol tagged fields
+        if (!haveProto && r.ok)
+        {
+            protoName = name;
+            protoMeta = meta;
+            haveProto = true;
+        }
+    }
+    static char[64] midBuf;
+    const(char)[] mid = memberId.length ? memberId : genMemberId(midBuf);
+    putI32(o, 0); // throttle_time_ms
+    if (!r.ok || !haveProto)
+    {
+        putI16(o, 0x0010); // COORDINATOR_LOAD_IN_PROGRESS-ish: safe retryable
+        putI32(o, -1); // generation
+        putCStrNull(o, null, true); // protocol_type (v7+) = null
+        putCStrNull(o, null, true); // protocol_name = null
+        putCStr(o, ""); // leader
+        putCStr(o, mid); // member_id
+        putCArrLen(o, 0); // members
+        putTaggedFields(o);
+        return;
+    }
+    putI16(o, E_NONE); // error_code
+    putI32(o, 1); // generation_id
+    putCStrNull(o, protocolType, protocolType is null); // protocol_type (v7+)
+    putCStrNull(o, protoName, protoName is null); // protocol_name
+    putCStr(o, mid); // leader = this member
+    putCStr(o, mid); // member_id
+    putCArrLen(o, 1); // members: 1
+    putCStr(o, mid); // member_id
+    putCStrNull(o, null, true); // group_instance_id (v5+) = null
+    putCBytes(o, protoMeta, protoMeta is null); // subscription metadata (echoed)
+    putTaggedFields(o); // member tagged fields
+    putTaggedFields(o); // response tagged fields
+}
+
+/// JoinGroup (v0-v4): single-node coordinator. The joining member is always made
+/// the leader of a one-member group at generation 1; franz-go (as leader) then
+/// computes the assignment and ships it back in SyncGroup. We echo the member's
+/// own subscription metadata so the leader has the member list it needs.
 private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_JOIN_GROUP, ver)) // v6/v7 flexible
+    {
+        handleJoinGroupFlex(r, ver, o);
+        return;
+    }
     cast(void) r.str(); // group_id
     cast(void) r.i32(); // session_timeout_ms
     if (ver >= 1)
@@ -1231,22 +1295,24 @@ private const(ubyte)[] respBulk(scope const(ubyte)[] d, ref size_t i) nothrow @t
 
 /// OffsetFetch fetch-all (topics == null): HGETALL the group hash and emit every
 /// committed offset, grouped by topic. Used by kadm.FetchOffsets(group).
-private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteBuffer o) nothrow @trusted
+// Fetch-all group offsets: HGETALL kafka.cg.<group>, parsed once into these
+// per-shard TLS arrays (slices point into tGoRb, valid until the next exec),
+// then emitted by either the classic or the flexible OffsetFetch responder.
+private const(char)[][4096] tGoTf; // topic slice
+private int[4096] tGoTp; // partition
+private long[4096] tGoTo; // committed offset
+private bool[4096] tGoDone; // grouping marker
+private ByteBuffer tGoRb; // HGETALL reply (backing for tGoTf slices)
+
+private size_t parseGroupOffsets(scope const(char)[] group) nothrow @trusted
 {
-    static ByteBuffer keyb, rb;
+    static ByteBuffer keyb;
     if (gKafkaExec is null)
-    {
-        putI32(o, 0);
-        return;
-    }
+        return 0;
     groupOffKey(group, keyb);
     const(char)[][2] a = ["hgetall", cast(const(char)[]) keyb.data];
-    gKafkaExec(a[], rb);
-    auto d = cast(const(ubyte)[]) rb.data;
-    static const(char)[][4096] tf; // topic slice (into rb, stable until next exec)
-    static int[4096] tp;
-    static long[4096] to;
-    static bool[4096] done;
+    gKafkaExec(a[], tGoRb);
+    auto d = cast(const(ubyte)[]) tGoRb.data;
     size_t nf = 0;
     size_t i = 0;
     if (d.length >= 1 && d[0] == '*')
@@ -1256,14 +1322,13 @@ private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteB
         while (i < d.length && d[i] >= '0' && d[i] <= '9')
             n = n * 10 + (d[i++] - '0');
         i += 2; // \r\n
-        for (long e = 0; e + 1 < n && nf < tf.length; e += 2)
+        for (long e = 0; e + 1 < n && nf < tGoTf.length; e += 2)
         {
             auto field = respBulk(d, i);
             auto val = respBulk(d, i);
             if (field is null || val is null)
                 break;
-            // split "topic/partition" on the LAST '/'
-            size_t sl = field.length;
+            size_t sl = field.length; // split "topic/partition" on the LAST '/'
             foreach_reverse (k; 0 .. field.length)
                 if (field[k] == '/')
                 {
@@ -1281,31 +1346,37 @@ private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteB
             foreach (c; val[(neg ? 1 : 0) .. $])
                 if (c >= '0' && c <= '9')
                     off = off * 10 + (c - '0');
-            tf[nf] = cast(const(char)[]) field[0 .. sl];
-            tp[nf] = part;
-            to[nf] = neg ? -off : off;
-            done[nf] = false;
+            tGoTf[nf] = cast(const(char)[]) field[0 .. sl];
+            tGoTp[nf] = part;
+            tGoTo[nf] = neg ? -off : off;
+            tGoDone[nf] = false;
             nf++;
         }
     }
+    return nf;
+}
+
+private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable nf = parseGroupOffsets(group);
     immutable tOff = o.length;
     putI32(o, 0);
     int et = 0;
     foreach (idx; 0 .. nf)
     {
-        if (done[idx])
+        if (tGoDone[idx])
             continue;
-        putStr(o, tf[idx]);
+        putStr(o, tGoTf[idx]);
         immutable pOff = o.length;
         putI32(o, 0);
         int ep = 0;
         foreach (j; idx .. nf)
         {
-            if (done[j] || tf[j] != tf[idx])
+            if (tGoDone[j] || tGoTf[j] != tGoTf[idx])
                 continue;
-            done[j] = true;
-            putI32(o, tp[j]);
-            putI64(o, to[j]);
+            tGoDone[j] = true;
+            putI32(o, tGoTp[j]);
+            putI64(o, tGoTo[j]);
             if (ver >= 5)
                 putI32(o, -1); // committed_leader_epoch
             putI16(o, -1); // metadata = null
@@ -1318,10 +1389,103 @@ private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteB
     patchI32(o, tOff, et);
 }
 
+/// Flexible (v6+) fetch-all: compact topics/partitions arrays + tagged fields.
+private void emitAllGroupOffsetsFlex(scope const(char)[] group, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable nf = parseGroupOffsets(group);
+    immutable tOff = reserveCArrLen(o);
+    int et = 0;
+    foreach (idx; 0 .. nf)
+    {
+        if (tGoDone[idx])
+            continue;
+        putCStr(o, tGoTf[idx]);
+        immutable pOff = reserveCArrLen(o);
+        int ep = 0;
+        foreach (j; idx .. nf)
+        {
+            if (tGoDone[j] || tGoTf[j] != tGoTf[idx])
+                continue;
+            tGoDone[j] = true;
+            putI32(o, tGoTp[j]);
+            putI64(o, tGoTo[j]);
+            putI32(o, -1); // committed_leader_epoch (v5+)
+            putCStrNull(o, null, true); // metadata = null
+            putI16(o, E_NONE);
+            putTaggedFields(o); // partition tagged fields
+            ep++;
+        }
+        patchCArrLen(o, pOff, ep);
+        putTaggedFields(o); // topic tagged fields
+        et++;
+    }
+    patchCArrLen(o, tOff, et);
+}
+
 /// OffsetFetch (v0-v5): committed offsets for the requested partitions, or all
 /// (topics == null) via HGETALL.
+/// OffsetFetch v6+ (flexible): compact strings/arrays + tagged fields; v7 adds
+/// require_stable to the request.
+private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    auto group = r.cstr();
+    immutable rawN = r.carrlen(); // -1 = null topics (fetch all)
+    immutable respStart = o.length;
+    putI32(o, 0); // throttle_time_ms
+    if (rawN < 0)
+    {
+        emitAllGroupOffsetsFlex(group, ver, o);
+    }
+    else
+    {
+        immutable ntopics = safeCount(rawN);
+        immutable topicsOff = reserveCArrLen(o);
+        int emittedTopics = 0;
+        foreach (_; 0 .. ntopics)
+        {
+            if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+                break;
+            auto topic = r.cstr();
+            immutable rawP = r.carrlen();
+            immutable nparts = rawP < 0 ? 0 : safeCount(rawP);
+            if (!r.ok)
+                break;
+            putCStr(o, topic);
+            immutable partsOff = reserveCArrLen(o);
+            int emittedParts = 0;
+            foreach (_2; 0 .. nparts)
+            {
+                if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+                    break;
+                immutable part = r.i32();
+                immutable off = (r.ok && validTopic(topic) && part >= 0)
+                    ? fetchGroupOffset(group, topic, part) : -1;
+                putI32(o, part);
+                putI64(o, off); // committed_offset (-1 = none)
+                putI32(o, -1); // committed_leader_epoch (v5+)
+                putCStrNull(o, null, true); // metadata = null
+                putI16(o, E_NONE); // error_code
+                putTaggedFields(o); // partition tagged fields
+                emittedParts++;
+            }
+            r.skipTaggedFields(); // per-topic request tagged fields
+            patchCArrLen(o, partsOff, emittedParts);
+            putTaggedFields(o); // topic tagged fields
+            emittedTopics++;
+        }
+        patchCArrLen(o, topicsOff, emittedTopics);
+    }
+    putI16(o, E_NONE); // top-level error_code (v2+)
+    putTaggedFields(o); // response tagged fields
+}
+
 private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_OFFSET_FETCH, ver)) // v6/v7 flexible
+    {
+        handleOffsetFetchFlex(r, ver, o);
+        return;
+    }
     auto group = r.str();
     immutable rawN = r.i32();
     immutable respStart = o.length;
@@ -1376,6 +1540,17 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
 /// Heartbeat (v0-v3): always OK (single-member group never rebalances).
 private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_HEARTBEAT, ver)) // v4 flexible
+    {
+        cast(void) r.cstr(); // group_id
+        cast(void) r.i32(); // generation_id
+        cast(void) r.cstr(); // member_id
+        cast(void) r.cstr(); // group_instance_id (nullable, v3+)
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE); // error_code
+        putTaggedFields(o);
+        return;
+    }
     cast(void) r.str(); // group_id
     cast(void) r.i32(); // generation_id
     cast(void) r.str(); // member_id
@@ -1389,8 +1564,45 @@ private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
 /// SyncGroup (v0-v3): the leader shipped the computed assignment; echo this
 /// member's assignment back. Single-member group, so we return the (only)
 /// assignment the leader provided.
+private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.cstr(); // group_id
+    cast(void) r.i32(); // generation_id
+    auto memberId = r.cstr(); // this member
+    cast(void) r.cstr(); // group_instance_id (nullable, v3+)
+    auto protocolType = r.cstr(); // v5+ nullable
+    auto protocolName = r.cstr(); // v5+ nullable
+    immutable nassign = r.carrlen();
+    const(ubyte)[] myAssignment;
+    bool found;
+    foreach (i; 0 .. (nassign < 0 ? 0 : nassign))
+    {
+        if (!r.ok)
+            break;
+        auto mid = r.cstr();
+        auto assign = r.cbytes();
+        r.skipTaggedFields();
+        if (r.ok && (!found || mid == memberId))
+        {
+            myAssignment = assign;
+            found = true;
+        }
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+    putCStrNull(o, protocolType, protocolType is null); // v5+
+    putCStrNull(o, protocolName, protocolName is null); // v5+
+    putCBytes(o, myAssignment, myAssignment is null); // member assignment
+    putTaggedFields(o);
+}
+
 private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (isFlexible(API_SYNC_GROUP, ver)) // v4/v5 flexible
+    {
+        handleSyncGroupFlex(r, ver, o);
+        return;
+    }
     cast(void) r.str(); // group_id
     cast(void) r.i32(); // generation_id
     auto memberId = r.str(); // this member
@@ -1607,6 +1819,19 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
 {
     // request: [key string] (v0); v1+ adds [key_type i8]. Ignored — the
     // single-node broker is always its own group/txn coordinator.
+    if (isFlexible(API_FIND_COORDINATOR, ver)) // v3 (single key; v4+ batches keys)
+    {
+        cast(void) r.cstr(); // key (compact string)
+        cast(void) r.i8(); // key_type
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE); // error_code
+        putCStrNull(o, null, true); // error_message = null
+        putI32(o, 0); // node_id = us
+        putCStr(o, gKafkaHost);
+        putI32(o, gKafkaPort);
+        putTaggedFields(o);
+        return;
+    }
     cast(void) r.str();
     if (ver >= 1)
         cast(void) r.i8();
@@ -2144,10 +2369,20 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         cast(void) r.i32(); // max_bytes (whole request)
     if (ver >= 4)
         cast(void) r.i8(); // isolation_level (read_uncommitted assumed)
+    if (ver >= 7)
+    {
+        cast(void) r.i32(); // session_id
+        cast(void) r.i32(); // session_epoch
+    }
     tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
+    if (ver >= 7)
+    {
+        putI16(o, E_NONE); // error_code (v7+)
+        putI32(o, 0); // session_id (v7+)
+    }
     immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
     int emittedTopics = 0;
@@ -2173,7 +2408,11 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
                 break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
+            if (ver >= 9)
+                cast(void) r.i32(); // current_leader_epoch (v9+)
             immutable fetchOff = r.i64();
+            if (ver >= 5)
+                cast(void) r.i64(); // log_start_offset (v5+)
             immutable partMax = r.i32();
             if (!r.ok)
                 break; // truncated mid-partition: don't emit a phantom entry
@@ -2204,7 +2443,11 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             if (ver >= 4)
             {
                 putI64(o, hw); // last_stable_offset (no transactions => == hw)
+                if (ver >= 5)
+                    putI64(o, 0); // log_start_offset (v5+)
                 putI32(o, 0); // aborted_transactions: empty array
+                if (ver >= 11)
+                    putI32(o, -1); // preferred_read_replica (v11+): none
             }
             // records: re-encode stored blobs per fetch version — v0-v3 as a v1
             // MessageSet (down-converting v2-origin blobs, dropping headers),
@@ -2309,8 +2552,12 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     cast(void) r.i32(); // replica_id
+    if (ver >= 2)
+        cast(void) r.i8(); // isolation_level (v2+)
     tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
     immutable ntopics = safeCount(r.i32());
+    if (ver >= 2)
+        putI32(o, 0); // throttle_time_ms (v2+)
     immutable topicsCountOff = o.length; // backpatched to emittedTopics below
     putI32(o, ntopics);
     int emittedTopics = 0;
@@ -2336,6 +2583,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
                 break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
+            if (ver >= 4)
+                cast(void) r.i32(); // current_leader_epoch (v4+)
             immutable ts = r.i64();
             if (ver == 0)
                 cast(void) r.i32(); // max_num_offsets (v0)
@@ -2360,6 +2609,8 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             {
                 putI64(o, -1); // timestamp
                 putI64(o, off);
+                if (ver >= 4)
+                    putI32(o, -1); // leader_epoch (v4+)
             }
             else
             {
