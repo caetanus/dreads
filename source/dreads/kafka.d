@@ -1296,8 +1296,59 @@ private bool gunzipInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t cap
     }
 }
 
+// liblz4 FRAME API (Kafka's v2 lz4 payload is an LZ4 frame: magic 04 22 4d 18),
+// distinct from the block API (LZ4_decompress_safe) dreads.lz4 uses for raft.
+// Symbols are in the same vendored liblz4.a.
+private extern (C) @nogc nothrow @system
+{
+    struct LZ4F_dctx;
+    size_t LZ4F_createDecompressionContext(LZ4F_dctx** ctxPtr, uint ver);
+    size_t LZ4F_freeDecompressionContext(LZ4F_dctx* ctx);
+    size_t LZ4F_decompress(LZ4F_dctx* ctx, void* dst, size_t* dstSize,
+            const(void)* src, size_t* srcSize, const(void)* opt);
+    uint LZ4F_isError(size_t code);
+}
+
+private enum uint LZ4F_VERSION = 100;
+
+/// Bounded LZ4-frame decompress into `dst`. Returns false on malformed input,
+/// codec error, truncation, or if the plaintext would exceed capMax (bomb).
+private bool lz4FrameInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMax) @nogc nothrow @trusted
+{
+    if (src.length == 0)
+        return false;
+    LZ4F_dctx* ctx;
+    if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION)))
+        return false;
+    scope (exit)
+        LZ4F_freeDecompressionContext(ctx);
+    dst.clear();
+    ubyte[65536] chunk = void;
+    size_t srcPos = 0;
+    for (;;)
+    {
+        size_t dstSize = chunk.length;
+        size_t srcSize = src.length - srcPos;
+        immutable hint = LZ4F_decompress(ctx, chunk.ptr, &dstSize,
+                src.ptr + srcPos, &srcSize, null);
+        if (LZ4F_isError(hint))
+            return false;
+        srcPos += srcSize;
+        if (dstSize)
+        {
+            if (dst.length + dstSize > capMax)
+                return false; // decompression bomb
+            dst.append(chunk[0 .. dstSize]);
+        }
+        if (hint == 0)
+            return true; // frame fully decoded
+        if (srcSize == 0 && dstSize == 0)
+            return false; // no progress: truncated frame
+    }
+}
+
 /// Decompress a v2 batch's compressed records region (codec = attrs & 0x07)
-/// into `dst`. 1=gzip implemented; snappy(2)/lz4(3)/zstd(4) are not yet wired
+/// into `dst`. 1=gzip, 3=lz4 implemented; snappy(2)/zstd(4) not yet wired
 /// (return false → the batch is rejected, exactly as before).
 private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst) nothrow @trusted
 {
@@ -1305,8 +1356,10 @@ private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBu
     {
     case 1:
         return gunzipInto(src, dst, KAFKA_DECOMP_MAX);
+    case 3:
+        return lz4FrameInto(src, dst, KAFKA_DECOMP_MAX);
     default:
-        return false; // snappy/lz4/zstd: not yet supported
+        return false; // snappy/zstd: not yet supported
     }
 }
 
