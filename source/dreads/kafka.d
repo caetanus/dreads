@@ -45,6 +45,9 @@ private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_FIND_COORDINATOR = 10, API_JOIN_GROUP = 11, API_HEARTBEAT = 12,
         API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14, API_DESCRIBE_CONFIGS = 32,
         API_CREATE_TOPICS = 19, API_DESCRIBE_GROUPS = 15;
+// Transaction coordinator APIs (single-node = own coordinator).
+private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
+        API_ADD_OFFSETS_TO_TXN = 25, API_END_TXN = 26, API_TXN_OFFSET_COMMIT = 28;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
@@ -97,6 +100,11 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
     case API_CREATE_TOPICS: return 4; // v5+ flexible
     case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
+    case API_INIT_PRODUCER_ID: return 1; // v2+ flexible
+    case API_ADD_PARTITIONS_TO_TXN: return 2; // v3+ flexible
+    case API_ADD_OFFSETS_TO_TXN: return 2; // v3+ flexible
+    case API_END_TXN: return 2; // v3+ flexible
+    case API_TXN_OFFSET_COMMIT: return 2; // v3+ flexible
     default: return 0;
     }
 }
@@ -481,7 +489,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 15); // array count
+        putI32(o, 20); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -504,6 +512,11 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_DESCRIBE_CONFIGS, 0, 3);
         row(o, API_CREATE_TOPICS, 0, 4);
         row(o, API_DESCRIBE_GROUPS, 0, 4);
+        row(o, API_INIT_PRODUCER_ID, 0, 1);
+        row(o, API_ADD_PARTITIONS_TO_TXN, 0, 2);
+        row(o, API_ADD_OFFSETS_TO_TXN, 0, 2);
+        row(o, API_END_TXN, 0, 2);
+        row(o, API_TXN_OFFSET_COMMIT, 0, 2);
         break;
 
     case API_METADATA:
@@ -564,6 +577,26 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
 
     case API_DESCRIBE_GROUPS:
         handleDescribeGroups(r, apiVer, o);
+        break;
+
+    case API_INIT_PRODUCER_ID:
+        handleInitProducerId(r, apiVer, o);
+        break;
+
+    case API_ADD_PARTITIONS_TO_TXN:
+        handleAddPartitionsToTxn(r, apiVer, o);
+        break;
+
+    case API_ADD_OFFSETS_TO_TXN:
+        handleAddOffsetsToTxn(r, apiVer, o);
+        break;
+
+    case API_END_TXN:
+        handleEndTxn(r, apiVer, o);
+        break;
+
+    case API_TXN_OFFSET_COMMIT:
+        handleTxnOffsetCommit(r, apiVer, o);
         break;
 
     default:
@@ -778,6 +811,149 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             if (ver >= 6)
                 cast(void) r.i32(); // committed_leader_epoch
             cast(void) r.str(); // committed_metadata (nullable)
+            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+                storeGroupOffset(group, topic, part, off);
+            putI32(o, part);
+            putI16(o, E_NONE); // error_code
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+    }
+    patchI32(o, tOff, et);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction coordinator (single-node = own coordinator). dreads stores every
+// record read-uncommitted, so a transaction needs no control markers and no
+// client-record buffering: the producer is handed an id, its partitions/offsets
+// are accepted, and EndTxn simply acks. Commit AND abort both leave the produced
+// records in the log — a read-uncommitted consumer sees them, and read-committed
+// clients page by offset (the golib harness reads uncommitted and distinguishes
+// the two purely by record count). This delivers the exactly-once PRODUCE path
+// the golib Transaction seam exercises; it does NOT implement broker-side
+// producer fencing (the seam's "callback fencing" is enforced client-side).
+private shared long gNextProducerId = 1000; // monotonic id source (atomic)
+
+/// InitProducerID (v0-v1): hand a transactional/idempotent producer a fresh
+/// producer_id and epoch 0.
+private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    import core.atomic : atomicOp;
+
+    cast(void) r.str(); // transactional_id (nullable)
+    cast(void) r.i32(); // transaction_timeout_ms
+    immutable pid = atomicOp!"+="(gNextProducerId, 1);
+    putI32(o, 0); // throttle_time_ms (v0+)
+    putI16(o, E_NONE); // error_code
+    putI64(o, pid); // producer_id
+    putI16(o, 0); // producer_epoch
+}
+
+/// AddPartitionsToTxn (v0-v2): accept every partition into the txn (echo E_NONE).
+/// Pure echo, no cross-shard hop.
+private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // transactional_id
+    cast(void) r.i64(); // producer_id
+    cast(void) r.i16(); // producer_epoch
+    immutable ntopics = safeCount(r.i32());
+    putI32(o, 0); // throttle_time_ms
+    immutable tOff = o.length;
+    putI32(o, ntopics);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok || o.length > KAFKA_MAX_RESP)
+            break;
+        auto topic = r.str();
+        immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break;
+        putStr(o, topic);
+        immutable pOff = o.length;
+        putI32(o, nparts);
+        et++;
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok)
+                break;
+            immutable part = r.i32();
+            if (!r.ok)
+                break;
+            putI32(o, part);
+            putI16(o, E_NONE); // error_code
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+    }
+    patchI32(o, tOff, et);
+}
+
+/// AddOffsetsToTxn (v0-v2): register the consumer group with the txn — ack only
+/// (the offsets themselves arrive via TxnOffsetCommit).
+private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // transactional_id
+    cast(void) r.i64(); // producer_id
+    cast(void) r.i16(); // producer_epoch
+    cast(void) r.str(); // group
+    putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+}
+
+/// EndTxn (v0-v2): commit or abort. Both just ack — records are already stored
+/// (read-uncommitted), so there is nothing to flush or roll back.
+private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // transactional_id
+    cast(void) r.i64(); // producer_id
+    cast(void) r.i16(); // producer_epoch
+    cast(void) r.i8(); // committed (commit vs abort)
+    putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+}
+
+/// TxnOffsetCommit (v0-v2): persist consumer offsets as part of the txn. Same
+/// keyspace as OffsetCommit (kafka.cg.<group>), so OffsetFetch reads them back;
+/// mirrors handleOffsetCommit's interleaved parse+HSET-hop+emit (hop-safe: the
+/// group/topic slices point into the fiber's own request buffer, o is the
+/// per-connection reply buffer, storeGroupOffset's TLS args are consumed before
+/// the park).
+private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    cast(void) r.str(); // transactional_id
+    auto group = r.str();
+    cast(void) r.i64(); // producer_id
+    cast(void) r.i16(); // producer_epoch
+    immutable ntopics = safeCount(r.i32());
+    immutable respStart = o.length;
+    putI32(o, 0); // throttle_time_ms
+    immutable tOff = o.length;
+    putI32(o, ntopics);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+            break; // response ceiling: also bounds the HSET hop count
+        auto topic = r.str();
+        immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break;
+        putStr(o, topic);
+        immutable pOff = o.length;
+        putI32(o, nparts);
+        et++;
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+                break;
+            immutable part = r.i32();
+            immutable off = r.i64();
+            if (ver >= 2)
+                cast(void) r.i32(); // committed_leader_epoch (v2+)
+            cast(void) r.str(); // metadata (nullable)
             if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
                 storeGroupOffset(group, topic, part, off);
             putI32(o, part);
