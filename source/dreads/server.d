@@ -586,6 +586,16 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gKafkaFetchRaw = &kafkaFetchDirect;
         gKafkaLenRaw = &kafkaLenDirect;
         gKafkaPort = gConfig.kafkaPort;
+        {
+            import core.stdc.stdlib : getenv;
+            import core.stdc.string : strcmp;
+            import dreads.kafka : gKafkaAutoCreate;
+
+            auto ac = getenv("DREADS_KAFKA_AUTOCREATE");
+            if (ac !is null && (strcmp(ac, "0") == 0 || strcmp(ac, "false") == 0
+                    || strcmp(ac, "off") == 0))
+                gKafkaAutoCreate = false; // registry mode (Inspector: sees missing topics)
+        }
         cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
             serveKafkaClient(conn);
         }, listenOpts);

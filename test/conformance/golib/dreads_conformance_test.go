@@ -25,7 +25,14 @@ func makeHarness(t *testing.T) kafkatest.BrokerHarness {
 		// dreads topics auto-exist with KAFKA_PARTITIONS; no create needed.
 		NewTopic: func(tb *testing.T, partitions int) string {
 			tb.Helper()
-			return fmt.Sprintf("golib-conf-%d-%d", time.Now().UnixNano(), topicSeq.Add(1))
+			name := fmt.Sprintf("golib-conf-%d-%d", time.Now().UnixNano(), topicSeq.Add(1))
+			// registry mode (DREADS_KAFKA_AUTOCREATE=false) needs the topic created
+			cl, err := kgo.NewClient(kgo.SeedBrokers(bs...))
+			if err == nil {
+				kadm.NewClient(cl).CreateTopics(tb.Context(), int32(partitions), 1, nil, name)
+				cl.Close()
+			}
+			return name
 		},
 		ReadRecords: func(ctx context.Context, req kafkatest.ReadRequest) ([]kafka.ConsumedRecord, error) {
 			client, err := kgo.NewClient(

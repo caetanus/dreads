@@ -42,7 +42,8 @@ private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
 // Inspector/Transaction conformance to pass)
 private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_FIND_COORDINATOR = 10, API_JOIN_GROUP = 11, API_HEARTBEAT = 12,
-        API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14, API_DESCRIBE_CONFIGS = 32;
+        API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14, API_DESCRIBE_CONFIGS = 32,
+        API_CREATE_TOPICS = 19;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
@@ -93,6 +94,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_LEAVE_GROUP: return 3; // v4+ flexible
     case API_SYNC_GROUP: return 3; // v4+ flexible
     case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
+    case API_CREATE_TOPICS: return 4; // v5+ flexible
     default: return 0;
     }
 }
@@ -477,7 +479,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 13); // array count
+        putI32(o, 14); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -498,6 +500,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_LEAVE_GROUP, 0, 3);
         row(o, API_SYNC_GROUP, 0, 3);
         row(o, API_DESCRIBE_CONFIGS, 0, 3);
+        row(o, API_CREATE_TOPICS, 0, 4);
         break;
 
     case API_METADATA:
@@ -552,6 +555,10 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         handleDescribeConfigs(r, apiVer, o);
         break;
 
+    case API_CREATE_TOPICS:
+        handleCreateTopics(r, apiVer, o);
+        break;
+
     default:
         // unknown api: minimal error shell (correlation already written).
         // Clients that see our ApiVersions table never send these.
@@ -574,6 +581,11 @@ public shared ulong gKafkaProduced; // records stored via Produce (dashboard)
 public shared ulong gKafkaFetched;  // records served via Fetch (dashboard)
 public __gshared const(char)[] gKafkaHost = "127.0.0.1";
 public __gshared ushort gKafkaPort = 9092;
+/// When true (default), any named topic auto-exists with KAFKA_PARTITIONS (the
+/// stateless model — clients need no CreateTopics). When false, a topic exists
+/// only once created (CreateTopics) or produced-into, and Metadata returns
+/// UNKNOWN_TOPIC for the rest — which lets an inspector see a missing topic.
+public __gshared bool gKafkaAutoCreate = true;
 
 private shared int gKafkaMemberCtr;
 
@@ -1145,6 +1157,109 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
     putI32(o, gKafkaPort);
 }
 
+// Topic registry: created topics live in the hash `kafka.topics`, field=name,
+// value=partition count. This gives topic EXISTENCE (an unregistered topic with
+// no data is UNKNOWN — so an inspector sees it missing) plus the exact created
+// partition count. Auto-create is OFF: clients CreateTopics before producing.
+private enum string KAFKA_TOPIC_REGISTRY = "kafka.topics";
+
+private void registerTopic(scope const(char)[] topic, int nparts) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer rb;
+    char[16] nb = void;
+    immutable k = snprintf(nb.ptr, nb.length, "%d", nparts);
+    const(char)[][4] a = ["hset", KAFKA_TOPIC_REGISTRY, topic,
+        cast(const(char)[]) nb[0 .. (k > 0 ? k : 0)]];
+    gKafkaExec(a[], rb);
+}
+
+/// Registered partition count for a topic, or -1 if not in the registry.
+private int registeredTopicPartitions(scope const(char)[] topic) nothrow @trusted
+{
+    if (gKafkaExec is null || !validTopic(topic))
+        return -1;
+    static ByteBuffer rb;
+    const(char)[][3] a = ["hget", KAFKA_TOPIC_REGISTRY, topic];
+    gKafkaExec(a[], rb);
+    auto d = rb.data;
+    if (d.length < 4 || d[0] != '$' || d[1] == '-')
+        return -1; // nil = not registered
+    size_t i = 1;
+    long blen = 0;
+    while (i < d.length && d[i] >= '0' && d[i] <= '9')
+        blen = blen * 10 + (d[i++] - '0');
+    if (i + 2 > d.length)
+        return -1;
+    i += 2; // \r\n
+    long v = 0;
+    size_t got = 0;
+    while (i < d.length && d[i] >= '0' && d[i] <= '9' && got < blen)
+    {
+        v = v * 10 + (d[i++] - '0');
+        got++;
+    }
+    return got ? cast(int) v : -1;
+}
+
+/// CreateTopics (v0-v4): register each topic's partition count. Auto-create is
+/// off, so this is how a topic comes into existence.
+private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable ntopics = safeCount(r.i32());
+    static const(char)[][256] names;
+    static int[256] nparts;
+    size_t nt;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto name = r.str();
+        immutable np = r.i32(); // num_partitions
+        cast(void) r.i16(); // replication_factor
+        immutable nassign = safeCount(r.i32());
+        foreach (_2; 0 .. nassign)
+        {
+            if (!r.ok)
+                break;
+            cast(void) r.i32(); // partition_index
+            immutable nb = safeCount(r.i32());
+            foreach (_3; 0 .. nb)
+                cast(void) r.i32(); // broker id
+        }
+        immutable ncfg = safeCount(r.i32());
+        foreach (_2; 0 .. ncfg)
+        {
+            if (!r.ok)
+                break;
+            cast(void) r.str(); // config name
+            cast(void) r.str(); // config value (nullable)
+        }
+        if (nt < names.length && r.ok)
+        {
+            names[nt] = name;
+            nparts[nt] = np > 0 ? np : cast(int) KAFKA_PARTITIONS;
+            nt++;
+        }
+    }
+    foreach (i; 0 .. nt)
+        if (validTopic(names[i]))
+            registerTopic(names[i], nparts[i]);
+    if (ver >= 2)
+        putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nt); // topics count
+    foreach (i; 0 .. nt)
+    {
+        putStr(o, names[i]);
+        putI16(o, E_NONE); // error_code
+        if (ver >= 1)
+            putI16(o, -1); // error_message = null
+    }
+}
+
 /// Partition count reported in Metadata for a topic: the contiguous run of
 /// POPULATED partitions from 0 (probing the keyspace kafka.t.<topic>.<p>), so a
 /// topic produced into with N contiguous partitions reports N. Falls back to
@@ -1178,7 +1293,7 @@ private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
             break; // first empty partition ends the contiguous run
         count++;
     }
-    return count > 0 ? count : cast(int) KAFKA_PARTITIONS;
+    return count; // 0 for an empty topic (caller decides exists-vs-unknown)
 }
 
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
@@ -1227,11 +1342,26 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     putI32(o, cast(int) nt);
     foreach (t; topics[0 .. nt])
     {
-        putI16(o, E_NONE);
+        immutable reg = registeredTopicPartitions(t); // -1 if not created
+        int np;
+        short terr = E_NONE;
+        if (reg >= 0)
+            np = reg; // created topic: exact registered partition count
+        else
+        {
+            np = topicPartitionCount(t); // glob: 0 if empty
+            if (np == 0)
+            {
+                if (gKafkaAutoCreate)
+                    np = cast(int) KAFKA_PARTITIONS; // auto-exist (compat default)
+                else
+                    terr = E_UNKNOWN_TOPIC; // registry mode: topic is missing
+            }
+        }
+        putI16(o, terr);
         putStr(o, t);
         if (ver >= 1)
             o.appendByte(0); // is_internal = false
-        immutable np = topicPartitionCount(t);
         putI32(o, np);
         foreach (int p2; 0 .. np)
         {
