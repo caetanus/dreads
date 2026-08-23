@@ -952,6 +952,16 @@ private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @tru
             auto victim = *pc;
             if (victim !is null && victim.connGen < gen)
             {
+                // v5: tell the displaced client WHY (Session taken over, 0x8E)
+                // before we close its socket, instead of a bare TCP reset. Only for
+                // an ONLINE v5 session (an offline/parked one has no live socket).
+                if (victim.connected && victim.protoVer == 5 && !victim.offline)
+                {
+                    static ByteBuffer db; // TLS: consumed synchronously by sendTo
+                    db.clear();
+                    mqttServerDisconnect(db, 0x8E); // Session taken over
+                    sendTo(victim, db.data);
+                }
                 victim.closed = true;
                 try
                     victim.flushEvt.emit();
