@@ -9,6 +9,12 @@ import std.experimental.allocator.mallocator : Mallocator;
 import std.experimental.allocator : reallocate;
 import dreads.alloc : ConnAllocator;
 
+/// Set by ByteBuffer.reserve on a GENUINE allocation failure (OOM), per shard
+/// thread (TLS). The connection handler checks it after building a response and
+/// drops THAT client rather than sending a truncated reply — a per-client
+/// failure, never a broker crash or heap corruption. Callers reset it.
+public bool tByteBufferOom;
+
 /// Growable malloc-backed byte buffer (network in/out buffers, reply building).
 public struct ByteBuffer
 {
@@ -69,7 +75,16 @@ public struct ByteBuffer
             ncap *= 2;
         void[] blk = ptr is null ? null : (cast(void*) ptr)[0 .. cap];
         immutable ok = reallocate(ConnAllocator.instance, blk, ncap);
-        assert(ok, "out of memory");
+        if (!ok)
+        {
+            // Genuine OOM: `reallocate` left the block unchanged. Do NOT set cap
+            // to the larger ncap over the un-grown block — a later append/
+            // freeSpace would then overrun the real allocation (heap corruption).
+            // Flag it (the handler drops this client) and no-op every writer
+            // below until it's cleared; the buffer stays valid at its old size.
+            tByteBufferOom = true;
+            return;
+        }
         ptr = cast(ubyte*) blk.ptr;
         cap = ncap;
     }
@@ -79,6 +94,8 @@ public struct ByteBuffer
         if (bytes.length == 0)
             return;
         reserve(bytes.length);
+        if (len + bytes.length > cap)
+            return; // OOM (tByteBufferOom set): drop rather than overrun the block
         memcpy(ptr + len, bytes.ptr, bytes.length);
         len += bytes.length;
     }
@@ -86,6 +103,8 @@ public struct ByteBuffer
     void appendByte(ubyte b) @nogc nothrow
     {
         reserve(1);
+        if (len + 1 > cap)
+            return; // OOM
         ptr[len++] = b;
     }
 
@@ -93,6 +112,8 @@ public struct ByteBuffer
     ubyte[] freeSpace(size_t atLeast) @nogc nothrow
     {
         reserve(atLeast);
+        if (cap - len < atLeast)
+            return null; // OOM: caller must check the returned length before writing
         return ptr[len .. cap];
     }
 

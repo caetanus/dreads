@@ -27,7 +27,7 @@ module dreads.kafka;
 import vibe.core.net : TCPConnection;
 import vibe.core.sync : TaskMutex;
 
-import dreads.mem : ByteBuffer;
+import dreads.mem : ByteBuffer, tByteBufferOom;
 import std.digest.crc : crc32Of;
 
 /// Data-plane hook installed by server.d: execute a synthesized RESP command
@@ -42,7 +42,7 @@ private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
 // Inspector/Transaction conformance to pass)
 private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_FIND_COORDINATOR = 10, API_JOIN_GROUP = 11, API_HEARTBEAT = 12,
-        API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14;
+        API_LEAVE_GROUP = 13, API_SYNC_GROUP = 14, API_DESCRIBE_CONFIGS = 32;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
@@ -92,6 +92,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_HEARTBEAT: return 3; // v4+ flexible
     case API_LEAVE_GROUP: return 3; // v4+ flexible
     case API_SYNC_GROUP: return 3; // v4+ flexible
+    case API_DESCRIBE_CONFIGS: return 3; // v4+ flexible
     default: return 0;
     }
 }
@@ -409,6 +410,11 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
             if (d.length - pos < 4 + sz)
                 break;
             handleRequest(d[pos + 4 .. pos + 4 + sz], outb);
+            if (tByteBufferOom)
+            {
+                tByteBufferOom = false; // per-thread flag: clear before dropping
+                return; // OOM building this reply: drop THIS client, not the broker
+            }
             pos += 4 + sz;
         }
         if (!outb.empty)
@@ -471,7 +477,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 12); // array count
+        putI32(o, 13); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -491,6 +497,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_HEARTBEAT, 0, 3);
         row(o, API_LEAVE_GROUP, 0, 3);
         row(o, API_SYNC_GROUP, 0, 3);
+        row(o, API_DESCRIBE_CONFIGS, 0, 3);
         break;
 
     case API_METADATA:
@@ -539,6 +546,10 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
 
     case API_OFFSET_COMMIT:
         handleOffsetCommit(r, apiVer, o);
+        break;
+
+    case API_DESCRIBE_CONFIGS:
+        handleDescribeConfigs(r, apiVer, o);
         break;
 
     default:
@@ -718,6 +729,7 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     if (ver >= 2 && ver <= 4)
         cast(void) r.i64(); // retention_time_ms (v2-v4 only)
     immutable ntopics = safeCount(r.i32());
+    immutable respStart = o.length;
     if (ver >= 3)
         putI32(o, 0); // throttle_time_ms
     immutable tOff = o.length;
@@ -725,8 +737,8 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     int et = 0;
     foreach (_; 0 .. ntopics)
     {
-        if (!r.ok)
-            break;
+        if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+            break; // response ceiling: also bounds the HSET hop count
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         if (!r.ok)
@@ -738,7 +750,7 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         int ep = 0;
         foreach (_2; 0 .. nparts)
         {
-            if (!r.ok)
+            if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
                 break;
             immutable part = r.i32();
             immutable off = r.i64();
@@ -885,6 +897,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
 {
     auto group = r.str();
     immutable rawN = r.i32();
+    immutable respStart = o.length;
     if (ver >= 3)
         putI32(o, 0); // throttle_time_ms
     if (rawN < 0)
@@ -899,8 +912,8 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
         int emittedTopics = 0;
         foreach (_; 0 .. ntopics)
         {
-            if (!r.ok)
-                break;
+            if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
+                break; // response ceiling: also bounds the HGET hop count
             auto topic = r.str();
             immutable nparts = safeCount(r.i32());
             if (!r.ok)
@@ -912,7 +925,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
             int emittedParts = 0;
             foreach (_2; 0 .. nparts)
             {
-                if (!r.ok)
+                if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
                     break;
                 immutable part = r.i32();
                 immutable off = (r.ok && validTopic(topic) && part >= 0)
@@ -1012,8 +1025,8 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
             nm = 1;
         }
     }
-    if (ver >= 2)
-        putI32(o, 0); // throttle_time_ms
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms (LeaveGroup: v1+)
     putI16(o, E_NONE); // error_code
     if (ver >= 3)
     {
@@ -1027,6 +1040,48 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
                 putStr(o, giis[i]);
             putI16(o, E_NONE); // member error_code
         }
+    }
+}
+
+/// DescribeConfigs (v0-v3): a stateless broker exposes no per-resource config,
+/// so echo each requested resource with an empty config list (error 0). This is
+/// enough for kadm/franz-go Topics() (Inspector conformance) to enumerate topics.
+private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable nres = safeCount(r.i32());
+    static byte[256] rtype;
+    static const(char)[][256] rname;
+    size_t nr;
+    foreach (_; 0 .. nres)
+    {
+        if (!r.ok)
+            break;
+        immutable t = r.i8();
+        auto name = r.str();
+        immutable nkeys = r.i32(); // configuration_keys (-1 = null/all)
+        if (nkeys >= 0)
+            foreach (_2; 0 .. safeCount(nkeys))
+            {
+                if (!r.ok)
+                    break;
+                cast(void) r.str();
+            }
+        if (nr < rtype.length && r.ok)
+        {
+            rtype[nr] = cast(byte) t;
+            rname[nr] = name;
+            nr++;
+        }
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nr); // results
+    foreach (i; 0 .. nr)
+    {
+        putI16(o, E_NONE); // error_code
+        putI16(o, -1); // error_message = null
+        o.appendByte(cast(char) rtype[i]); // resource_type
+        putStr(o, rname[i]); // resource_name
+        putI32(o, 0); // configs: empty
     }
 }
 
@@ -1903,6 +1958,8 @@ private bool snappyInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t cap
         return false; // empty or decompression bomb
     dst.clear();
     auto space = dst.freeSpace(ulen); // writable region >= ulen bytes
+    if (space.length < ulen)
+        return false; // allocation failed (OOM)
     size_t outLen = ulen;
     if (snappy_uncompress(cast(const(char)*) src.ptr, src.length,
             cast(char*) space.ptr, &outLen) != 0)
@@ -1937,6 +1994,8 @@ private bool zstdInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMa
         return false; // empty or decompression bomb
     dst.clear();
     auto space = dst.freeSpace(cast(size_t) content);
+    if (space.length < cast(size_t) content)
+        return false; // allocation failed (OOM)
     immutable size_t n = ZSTD_decompress(space.ptr, cast(size_t) content, src.ptr, src.length);
     if (ZSTD_isError(n) != 0 || n != content)
         return false;
