@@ -164,6 +164,10 @@ public final class MqttConn
     ushort nextPid = 1;
     bool[ushort] inflight;
     ubyte[ushort] outQos2;
+    // Persistent sessions (session-expiry > 0) keep the full unacked QoS1/2
+    // PUBLISH bytes per packet-id, so a reconnect redelivers them with DUP=1
+    // [MQTT-4.4.0-1]. Cleared on PUBACK/PUBCOMP; empty for clean sessions.
+    const(char)[][ushort] inflightMsg;
 
     this(TCPConnection c) nothrow
     {
@@ -1010,6 +1014,11 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                         s.outQos2[pid] = 1; // awaiting PUBREC
                     else
                         s.inflight[pid] = true;
+                    // Keep for redelivery only when actually SENT to a live client
+                    // (persistent session). An offline conn just QUEUES it in obox,
+                    // so recording it as inflight would double-deliver on resume.
+                    if (s.sessionExpiry > 0 && !s.offline)
+                        s.inflightMsg[pid] = (cast(const(char)[]) q1.data).idup;
                 }
                 catch (Exception)
                 {
@@ -1433,6 +1442,32 @@ private bool mqttResumeOffline(MqttConn c) nothrow @trusted
     }
     c.inflight = old.inflight; // adopt in-flight QoS1/2 so acks match
     c.outQos2 = old.outQos2;
+    c.inflightMsg = old.inflightMsg;
+    // redeliver unacked QoS1/2 with DUP=1 [MQTT-4.4.0-1]; a QoS2 past PUBREC
+    // (state 2) is re-driven with PUBREL. Appended to obox -> flushed post-CONNACK.
+    try
+        foreach (pid, msg; c.inflightMsg)
+        {
+            auto dup = msg.dup;
+            if (dup.length)
+                dup[0] = cast(char)(dup[0] | 0x08); // set the DUP bit
+            c.obox.append(dup);
+        }
+    catch (Exception)
+    {
+    }
+    try
+        foreach (pid, st; c.outQos2)
+            if (st == 2)
+            {
+                c.obox.appendByte(cast(char)((PT_PUBREL << 4) | 0x02));
+                c.obox.appendByte(cast(char) 2);
+                c.obox.appendByte(cast(char)(pid >> 8));
+                c.obox.appendByte(cast(char)(pid & 0xFF));
+            }
+    catch (Exception)
+    {
+    }
     // drop the placeholder (trie subs already re-pointed to c above)
     foreach (f; old.filters)
         trieUnsubscribe(f, old);
@@ -2634,7 +2669,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
         {
             immutable pid = cast(ushort)((p[0] << 8) | p[1]);
             try
+            {
                 c.inflight.remove(pid);
+                c.inflightMsg.remove(pid);
+            }
             catch (Exception)
             {
             }
@@ -2651,6 +2689,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             {
                 if ((pid in c.outQos2) !is null)
                     c.outQos2[pid] = 2; // PUBREL sent, awaiting PUBCOMP
+                c.inflightMsg.remove(pid); // PUBLISH done; redeliver PUBREL instead
             }
             catch (Exception)
             {
