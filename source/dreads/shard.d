@@ -209,6 +209,13 @@ public enum ShardMsg : uint
     // and fires the wakes/notifications once at the end. One reply, holding
     // the concatenated per-command replies, answers the batch's single pending.
     execBatch = 4,
+    /// MQTT cross-shard reconnect handshake (dreads.mqtt): a reconnect that
+    /// SO_REUSEPORT hashed onto a DIFFERENT shard than the client's parked
+    /// session asks the OWNER shard to FREEZE that session (drop its subs so its
+    /// offline queue stops growing) + become a short-lived redirect, so the
+    /// reconnecting shard can safely adopt the now-frozen state. Payload:
+    /// [clientId]; the owner's drain calls dreads.mqtt mqttResumeSignal.
+    mqttResume = 8,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which

@@ -551,7 +551,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // one listener per shard thread (shard 0 = here; the rest in
         // shardThreadEntry), fibers per connection on the accepting thread
         import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal;
-        import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec;
+        import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec, gMqttResume;
 
         gMqttExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
             amqpDataExec(args, reply); // persistent-session state in the keyspace
@@ -565,6 +565,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         };
         gMqttConnBcast = (scope const(char)[] clientId, ulong gen) nothrow {
             shardMqttConnBcast(clientId, gen);
+        };
+        gMqttResume = (uint dstShard, scope const(char)[] clientId) nothrow {
+            shardMqttResume(dstShard, clientId);
         };
         printf("dreads MQTT skin on port %u\n", cast(uint) gConfig.mqttPort);
     }
@@ -2209,6 +2212,13 @@ private void shardDrainLoop() nothrow
                 mqttTakeover(cast(const(char)[]) p[8 .. $], gen);
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.mqttResume)
+        {
+            // cross-shard reconnect handshake: freeze our parked session for this id
+            import dreads.mqtt : mqttResumeSignal;
+
+            mqttResumeSignal(cast(const(char)[]) p[0 .. $]);
+        }
         else if (cast(ShardMsg) kind == ShardMsg.mqttPub)
         {
             // MQTT skin fan-in: deliver to THIS thread's topic trie / retained map
@@ -2754,6 +2764,26 @@ private void shardMqttConnBcast(scope const(char)[] clientId, ulong gen) nothrow
             shardEnqueue(s2, mb.data, null, tShard, ShardMsg.mqttConnect);
             shardWake(s2);
         }
+}
+
+/// Cross-shard reconnect handshake (dreads.mqtt): ask `dstShard` to freeze the
+/// parked session for `clientId`. Payload is just the client id; the receiving
+/// drain calls mqttResumeSignal. Fire-and-forget (the reconnecting shard then
+/// waits on the session's `frozen` flag).
+private void shardMqttResume(uint dstShard, scope const(char)[] clientId) nothrow
+{
+    import dreads.shard : tShard, shardEnqueue, shardWake, ShardMsg, sharded;
+
+    if (!sharded())
+        return;
+    ByteBuffer mb;
+    auto raw = mb.freeSpace(clientId.length);
+    if (raw.length < clientId.length)
+        return;
+    raw[0 .. clientId.length] = cast(const(ubyte)[]) clientId[];
+    mb.grow(clientId.length);
+    shardEnqueue(dstShard, mb.data, null, tShard, ShardMsg.mqttResume);
+    shardWake(dstShard);
 }
 
 private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,

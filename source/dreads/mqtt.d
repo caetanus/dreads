@@ -31,7 +31,7 @@ module dreads.mqtt;
 // holding a slice of a buffer another fiber can grow (the classic
 // append-during-write use-after-free).
 
-import core.atomic : atomicLoad, atomicOp, MemoryOrder;
+import core.atomic : atomicLoad, atomicStore, atomicOp, MemoryOrder;
 
 import core.time : Duration, msecs, seconds, MonoTime, dur;
 
@@ -41,6 +41,7 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
 import dreads.mem : ByteBuffer;
 import dreads.acl : AclUser, aclUser, aclCheckPassword, aclCanAccessChannel;
+import dreads.shard : tShard, ShardMsg;
 
 // ---------------------------------------------------------------------------
 // Global gate: total MQTT subscriptions across every thread's trie. A publish
@@ -53,9 +54,107 @@ public shared long gMqttSubTotal;
 public shared ulong gMqttConnGen;
 /// THIS shard's live clientId -> conn map (share-nothing).
 private MqttConn[string] gLocalClients; // TLS
+/// Cross-shard parked-session pool. A persistent session parked offline on its
+/// shard is ALSO registered here (keyed by clientId) so a reconnect that
+/// SO_REUSEPORT hashed onto a DIFFERENT shard can still find and resume it. The
+/// per-shard gLocalClients stays the fast same-shard path; this global is the
+/// only shared-mutable MQTT state, guarded by a SPINLOCK (not a mutex, which would
+/// sleep a thread and break the thread-per-core no-blocking model). The critical
+/// section is a single AA op — a reconnect grabs the lock only to CLAIM the parked
+/// session (microseconds), never during the state copy, so contention is nil.
+private __gshared MqttConn[string] gParkedPool;
+private shared bool gParkedLock;
+
+private void cpuPause() @trusted nothrow @nogc
+{
+    version (D_InlineAsm_X86_64)
+        asm nothrow @nogc { rep; nop; } // PAUSE — spin-wait hint
+    else version (D_InlineAsm_X86)
+        asm nothrow @nogc { rep; nop; }
+}
+
+private void parkedLock() @trusted nothrow @nogc
+{
+    import core.atomic : cas;
+
+    while (!cas(&gParkedLock, false, true))
+        cpuPause();
+}
+
+private void parkedUnlock() @trusted nothrow @nogc
+{
+    import core.atomic : atomicStore;
+
+    atomicStore!(MemoryOrder.rel)(gParkedLock, false);
+}
+
+/// Register a parked session in the cross-shard pool (so a reconnect on another
+/// shard can find it). Locks gParkedMutex briefly; the key is the idup'd clientId.
+private void parkedPoolPut(MqttConn c) nothrow @trusted
+{
+    if (c.clientId.length == 0)
+        return;
+    parkedLock();
+    scope (exit)
+        parkedUnlock();
+    try
+        gParkedPool[c.clientId] = c;
+    catch (Exception)
+    {
+    }
+}
+
+/// Remove a parked session from the cross-shard pool — but only if this exact conn
+/// is still the registered one (a newer session for the same id may have replaced
+/// it). Called when the parked session ends or is resumed.
+private void parkedPoolDel(MqttConn c) nothrow @trusted
+{
+    if (c.clientId.length == 0)
+        return;
+    parkedLock();
+    scope (exit)
+        parkedUnlock();
+    try
+        if (auto pc = c.clientId in gParkedPool)
+            if (*pc is c)
+                gParkedPool.remove(c.clientId);
+    catch (Exception)
+    {
+    }
+}
 /// Broadcast a (clientId, connGen) takeover to every OTHER shard (installed by
 /// server.d). Null when unsharded.
 public __gshared void delegate(scope const(char)[] clientId, ulong gen) nothrow gMqttConnBcast;
+/// Ask shard `dstShard` to FREEZE the parked session for `clientId` (cross-shard
+/// reconnect handshake). Installed by server.d as a ShardMsg.mqttResume enqueue;
+/// null when unsharded. See mqttResumeSignal (the receiving side).
+public __gshared void delegate(uint dstShard, scope const(char)[] clientId) nothrow gMqttResume;
+
+/// Owner-shard side of the cross-shard reconnect handshake: the drain calls this
+/// when a ShardMsg.mqttResume arrives. If we hold the parked session for this id,
+/// flag it to freeze and wake its parked fiber (same thread => LocalManualEvent
+/// works). The fiber then sets `redirect`+`frozen` so the reconnecting shard can
+/// adopt the now-stable state.
+public void mqttResumeSignal(scope const(char)[] clientId) nothrow @trusted
+{
+    try
+        if (auto pc = clientId in gLocalClients)
+        {
+            auto s = *pc;
+            if (s !is null && s.offline)
+            {
+                s.freezeReq = true;
+                try
+                    s.reconnectEvt.emit();
+                catch (Exception)
+                {
+                }
+            }
+        }
+    catch (Exception)
+    {
+    }
+}
 
 /// Deadline for a freshly-accepted socket to complete CONNECT. Without it a
 /// client that opens TCP and never speaks pins a serve fiber + writer fiber +
@@ -115,6 +214,15 @@ public final class MqttConn
     // separate Timer); will-delay is orchestrated in the same wait loop.
     LocalManualEvent reconnectEvt;
     bool discard; // set to make a parked session END now (migrated away / clean_start)
+    // Cross-shard reconnect handshake: a reconnect on ANOTHER shard asks this
+    // session's owner shard (shardId) to FREEZE it (drop subs so obox stops
+    // growing) + become a redirect, then adopts the frozen state. `redirect` is
+    // the atomic hot-path flag (a delivery to a redirect conn is re-published so
+    // it reaches the session's new shard, instead of piling in a dead obox).
+    uint shardId; // the shard that owns this conn (set at accept)
+    bool freezeReq; // owner-shard fiber: a cross-shard reconnect asked us to freeze
+    shared bool frozen; // set by the owner once frozen — the reconnecting shard waits on it
+    shared bool redirect; // hot-path flag: this parked conn is now a short-lived redirect
     ubyte discReason = 0x82; // v5 server-DISCONNECT reason on a protocol-error close
     // (default 0x82 Protocol Error; a handler may set e.g. 0x93 Receive Maximum)
     uint willDelay; // v5 will-delay-interval (seconds): 0 = fire will immediately on drop
@@ -973,9 +1081,17 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     // over maxPktSize), so a message is never lost for the whole group.
     bool deliverTo(ref Match m) @trusted nothrow
     {
+        import core.builtins : expect;
+
         auto s = m.c;
         if (s.closed)
             return false;
+        // Cross-shard resume: a session FROZEN for a reconnect on another shard
+        // is a short-lived redirect — its obox is being adopted there, so don't
+        // pile into it. `expect(..., false)`: never true on the delivery hot path
+        // except during the ~1s redirect window of a rare cross-shard reconnect.
+        if (expect(atomicLoad!(MemoryOrder.acq)(s.redirect), false))
+            return true; // dropped here; it reaches the session via its new shard
         if (m.noLocal && s is publisher)
             return false; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
@@ -1836,10 +1952,13 @@ private void mqttExpireOfflineQueue(MqttConn c) nothrow @trusted
 /// is signalled to end. Same-thread cooperative scheduling: every mutation here
 /// completes before this fiber yields, and the parked fiber is suspended.
 /// Returns true (a session was resumed).
-private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
+/// Adopt a parked session's state onto the reconnecting connection `newc`:
+/// re-point its subscriptions to newc's trie, take its offline queue + in-flight
+/// QoS1/2 + publication-expiry + flow-control-hold state, run the expiry sweep,
+/// and redeliver the unacked (DUP) + PUBRELs. Reads only from `parked` (a frozen
+/// or same-thread session — no concurrent writer). Does NOT end `parked`.
+private void mqttAdoptState(MqttConn parked, MqttConn newc) nothrow @trusted
 {
-    // re-point the parked subscriptions to newc (its trie entries stay under the
-    // parked identity and are unsubscribed by the parked fiber's teardown)
     foreach (i, f; parked.filters)
     {
         if (i >= parked.subInfo.length)
@@ -1855,7 +1974,6 @@ private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
         {
         }
     }
-    // adopt the offline queue + in-flight + expiry + flow-control-hold state
     try
         if (!parked.obox.empty)
             newc.obox.append(parked.obox.data);
@@ -1868,15 +1986,13 @@ private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
     newc.oExprQ = parked.oExprQ;
     newc.heldQ = parked.heldQ;
     newc.heldBytes = parked.heldBytes;
-    // publication-expiry on the adopted queue: drop expired, decrement survivors
-    mqttExpireOfflineQueue(newc);
-    // redeliver unacked QoS1/2 (DUP=1 [MQTT-4.4.0-1]) + PUBREL for a QoS2 past PUBREC
+    mqttExpireOfflineQueue(newc); // drop expired, decrement survivors
     try
         foreach (pid, msg; newc.inflightMsg)
         {
             auto dup = msg.dup;
             if (dup.length)
-                dup[0] = cast(char)(dup[0] | 0x08); // set the DUP bit
+                dup[0] = cast(char)(dup[0] | 0x08); // set the DUP bit [MQTT-4.4.0-1]
             newc.obox.append(dup);
         }
     catch (Exception)
@@ -1895,8 +2011,14 @@ private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
     {
     }
     mqttReleaseHeld(newc); // flow any messages held behind the window pre-drop
-    // end the parked session: newc now owns the client id, and the parked will
-    // must NOT fire (the session lives on). Signal its fiber to discard + tear down.
+}
+
+/// SAME-shard reconnect: adopt the parked session onto newc, then signal the
+/// parked fiber to discard + tear down (it no longer owns the id, and its will
+/// must not fire). Synchronous — same thread, no freeze handshake needed.
+private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
+{
+    mqttAdoptState(parked, newc);
     parked.willTopic = null;
     parked.discard = true;
     try
@@ -1904,6 +2026,56 @@ private bool mqttMigrateParked(MqttConn parked, MqttConn newc) nothrow @trusted
     catch (Exception)
     {
     }
+    return true;
+}
+
+/// CROSS-shard reconnect: the parked session lives on ANOTHER shard. Claim it from
+/// the shared pool, ask its owner to FREEZE it (ShardMsg.mqttResume), wait for the
+/// freeze (bounded), then adopt its now-stable state. The owner's freeze fiber
+/// ends `parked` itself after its redirect window, so we never write to it. Falls
+/// back to a fresh session (returns false) if there is no cross-shard path or the
+/// owner does not freeze in time.
+private bool mqttResumeXShard(MqttConn newc) nothrow @trusted
+{
+    import vibe.core.core : sleep;
+
+    if (gMqttResume is null || newc.clientId.length == 0)
+        return false;
+    // claim the parked session from the cross-shard pool (spinlock — yield-free)
+    MqttConn parked;
+    parkedLock();
+    try
+        if (auto pc = newc.clientId in gParkedPool)
+        {
+            parked = *pc;
+            gParkedPool.remove(newc.clientId);
+        }
+    catch (Exception)
+    {
+    }
+    parkedUnlock();
+    if (parked is null || parked.shardId == tShard)
+        return false; // nothing parked cross-shard for this id
+    // ask the owner shard to freeze it, then wait (bounded) for the frozen flag
+    gMqttResume(parked.shardId, newc.clientId);
+    bool ok = false;
+    immutable deadline = MonoTime.currTime + dur!"msecs"(500);
+    while (MonoTime.currTime < deadline)
+    {
+        if (atomicLoad!(MemoryOrder.acq)(parked.frozen))
+        {
+            ok = true;
+            break;
+        }
+        try
+            sleep(2.msecs); // yield-loop: the owner freezes within a drain tick
+        catch (Exception)
+        {
+        }
+    }
+    if (!ok)
+        return false; // owner didn't freeze in time -> start a fresh session
+    mqttAdoptState(parked, newc); // parked is frozen (redirect=drop) -> safe to read
     return true;
 }
 
@@ -1954,7 +2126,10 @@ private bool mqttParkOrEnd(MqttConn c, bool cleanDisc) nothrow @trusted
     c.offline = true;
     mqttFlushDirty();
     if (queueHold)
+    {
         mqttSessionPut(c.clientId, c.sessionExpiry); // advertise session-present
+        parkedPoolPut(c); // and make it resumable from ANY shard (cross-shard reconnect)
+    }
 
     immutable now = MonoTime.currTime;
     immutable expirySecs = expirySecs0;
@@ -1984,8 +2159,48 @@ private bool mqttParkOrEnd(MqttConn c, bool cleanDisc) nothrow @trusted
             catch (Exception)
                 return ec;
         }();
-        if (newEc != ec) // woken: a same-shard reconnect MIGRATED this session onto
-        {                //   a new connection (or clean_start discarded it) -> end
+        if (newEc != ec) // woken: freeze-for-cross-shard-resume, migration, or discard
+        {
+            if (c.freezeReq)
+            {
+                // A reconnect on ANOTHER shard is adopting this session. FREEZE:
+                // set `redirect` (deliverTo now drops into us — obox stops growing)
+                // then publish `frozen` (release) so the reconnecting shard reads a
+                // stable obox+state. Same-thread cooperative scheduling => no other
+                // fiber runs between these stores, so no delivery races the freeze.
+                c.freezeReq = false;
+                c.willTopic = null; // session lives on the new shard: our will must NOT fire
+                atomicStore!(MemoryOrder.rel)(c.redirect, true);
+                atomicStore!(MemoryOrder.rel)(c.frozen, true);
+                parkedPoolDel(c); // claimed by the reconnecting shard; leave the pool
+                // hold as a redirect for a bounded window (covers the reconnecting
+                // shard's adopt + routing convergence), then end (teardown drops our
+                // subs). ~1s time-to-die, per the design.
+                immutable rdl = MonoTime.currTime + dur!"msecs"(1000);
+                for (;;)
+                {
+                    immutable left = rdl - MonoTime.currTime;
+                    if (left <= Duration.zero)
+                        break;
+                    immutable e2 = () @trusted {
+                        try
+                            return c.reconnectEvt.emitCount;
+                        catch (Exception)
+                            return 0;
+                    }();
+                    cast(void) () @trusted {
+                        try
+                            return c.reconnectEvt.waitUninterruptible(left, e2);
+                        catch (Exception)
+                            return e2;
+                    }();
+                    if (MonoTime.currTime >= rdl)
+                        break;
+                }
+                c.sessionExpiry = 0; // teardown discards the record
+                return false;
+            }
+            // migration (same-shard) or clean_start discard -> end
             c.discard = false;
             c.sessionExpiry = 0; // teardown discards the record; the new conn owns it
             return false;
@@ -2021,6 +2236,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     // parked serve fiber (mqttParkOrEnd), NOT here. Teardown is the REAL end —
     // reached only when the session ended (expiry, park set sessionExpiry=0) or
     // was never persistent (protocol error / clean session / bad CONNECT).
+    parkedPoolDel(c); // drop the cross-shard pool entry if this conn owned it
     // tear down subscriptions for real (not just lazily): under connect/
     // subscribe churn the lazy-gen scheme leaked trie entries and pinned
     // gMqttSubTotal above zero forever, keeping the idle-skin gate open.
@@ -2095,6 +2311,7 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     {
     }
     auto c = new MqttConn(tcp);
+    c.shardId = tShard; // the shard that accepted this socket (for cross-shard resume)
     Task writer;
     try
         writer = runTask(&mqttWriter, c);
@@ -3005,11 +3222,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     c.clientId = null;
                 if (c.clientId.length != 0)
                 {
-                    // Reconnect: a parked OFFLINE session for this id on THIS shard.
-                    // clean_start=0 MIGRATES it onto this connection (no socket move
-                    // — see mqttMigrateParked); clean_start=1 discards it. A parked
-                    // session on ANOTHER shard isn't in this shard's gLocalClients,
-                    // so it isn't found here (cross-shard reconnect = fresh session).
+                    // Reconnect: a parked OFFLINE session for this id. Same shard =
+                    // MIGRATE synchronously (no socket move — see mqttMigrateParked).
+                    // clean_start=1 discards it. A parked session on ANOTHER shard is
+                    // resumed via the freeze handshake (mqttResumeXShard).
                     MqttConn parked;
                     try
                         if (auto pc = c.clientId in gLocalClients)
@@ -3022,6 +3238,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         resumedOffline = mqttMigrateParked(parked, c);
                     else if (parked !is null && c.cleanStart)
                         mqttDiscardParked(parked); // fresh session takes over
+                    else if (parked is null && !c.cleanStart)
+                        resumedOffline = mqttResumeXShard(c); // cross-shard resume
                     takeoverLocal(c.clientId, g);
                     try
                         gLocalClients[c.clientId] = c;
