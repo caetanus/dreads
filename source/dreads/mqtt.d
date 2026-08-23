@@ -187,6 +187,8 @@ private enum size_t MQTT_MAX_SUBS = 4096;
 /// v5 topic-alias-maximum we advertise: the largest alias a client may use when
 /// publishing to us (also bounds the per-conn inbound alias table by COUNT).
 private enum ushort MQTT_TOPIC_ALIAS_MAX = 1024;
+private enum ushort MQTT_SERVER_KEEPALIVE = 60; // cap the client's keep-alive at
+// 60s and tell it via CONNACK ServerKeepAlive (0x13) so idle clients keep pinging
 /// ...and by BYTES: an aliased topic is idup'd (up to ~64KB), so the count cap
 /// alone would let one conn pin MAX*64KB; this bounds the whole table.
 private enum size_t MQTT_MAX_ALIAS_BYTES = 1 << 20; // 1MB of aliased topics/conn
@@ -1822,17 +1824,18 @@ private Retained makeRetained(scope const(char)[] payload, ulong seq,
 // 0x80+ = failure) and an (empty, for now) property block; v3 uses the legacy
 // return code. `code` is already in the caller's version's encoding.
 private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
-        ubyte code, scope const(char)[] assignedId = null) @nogc nothrow
+        ubyte code, scope const(char)[] assignedId = null, ushort serverKeepAlive = 0) @nogc nothrow
 {
     o.appendByte(cast(char)(PT_CONNACK << 4));
     if (protoVer == 5)
     {
         // properties: topic-alias-maximum (0x22, u16) always; assigned-client-
         // identifier (0x12, utf8) when the server assigned an id to an empty
-        // ClientId. assignedId is broker-generated and short (<32), so every
-        // length here stays in one varint byte.
+        // ClientId; server-keep-alive (0x13, u16) when the server capped it.
+        // assignedId is broker-generated and short (<32), so every length here
+        // stays in one varint byte.
         immutable size_t idLen = assignedId.length;
-        immutable size_t propLen = 3 + (idLen ? 3 + idLen : 0);
+        immutable size_t propLen = 3 + (idLen ? 3 + idLen : 0) + (serverKeepAlive ? 3 : 0);
         o.appendByte(cast(char)(2 + 1 + propLen)); // remaining length (< 127)
         o.appendByte(cast(char)(sessionPresent ? 1 : 0));
         o.appendByte(cast(char) code);
@@ -1840,6 +1843,12 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
         o.appendByte(cast(char) 0x22); // topic-alias-maximum
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX >> 8));
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX & 0xFF));
+        if (serverKeepAlive)
+        {
+            o.appendByte(cast(char) 0x13); // server-keep-alive
+            o.appendByte(cast(char)(serverKeepAlive >> 8));
+            o.appendByte(cast(char)(serverKeepAlive & 0xFF));
+        }
         if (idLen)
         {
             o.appendByte(cast(char) 0x12); // assigned-client-identifier
@@ -1953,7 +1962,16 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // shard crash from one unauthenticated malformed CONNECT)
             immutable ka = cast(ushort)((p[i] << 8) | p[i + 1]);
             i += 2;
-            c.readDeadline = ka == 0 ? Duration.max : (ka * 1500).msecs;
+            // Cap the keep-alive at 60s; a client asking for more is told the
+            // server's value via CONNACK ServerKeepAlive (0x13) [MQTT-3.1.2-21].
+            ushort serverKa = 0;
+            ushort effKa = ka;
+            if (ka > MQTT_SERVER_KEEPALIVE)
+            {
+                effKa = MQTT_SERVER_KEEPALIVE;
+                serverKa = MQTT_SERVER_KEEPALIVE;
+            }
+            c.readDeadline = effKa == 0 ? Duration.max : (effKa * 1500).msecs;
             // v5 CONNECT properties (session-expiry, receive-max, ...) follow the
             // keepalive. We extract receive-maximum (flow control on how many
             // QoS1/2 we may hold in flight toward this client) and correctly skip
@@ -2094,7 +2112,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // CONNACK: session-present=0 (clean sessions only); reason/rc 0 on
             // success, else unacceptable-protocol-version. assignedId is non-empty
             // only for an empty-ClientId v5 client (echoed via property 0x12).
-            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1, assignedId);
+            mqttConnack(o, c.protoVer, false, okPair ? 0 : 1, assignedId, serverKa);
             return okPair;
         }
     case PT_PUBLISH:
