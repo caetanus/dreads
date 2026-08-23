@@ -35,6 +35,7 @@ import std.digest.crc : crc32Of;
 public __gshared void delegate(scope const(char)[][] args, ref ByteBuffer reply) nothrow gKafkaExec;
 
 public enum uint KAFKA_PARTITIONS = 4; // partitions advertised per topic
+private enum int KAFKA_MAX_PARTITIONS = 1024; // cap a topic's partition count (DoS)
 
 private enum short API_PRODUCE = 0, API_FETCH = 1, API_LIST_OFFSETS = 2,
         API_METADATA = 3, API_API_VERSIONS = 18;
@@ -1264,8 +1265,11 @@ private int registeredTopicPartitions(scope const(char)[] topic) nothrow @truste
 private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     immutable ntopics = safeCount(r.i32());
-    static const(char)[][256] names;
-    static int[256] nparts;
+    // STACK-local (not TLS static): registerTopic below hops cross-shard and
+    // yields; a shared static would be clobbered by another connection's
+    // handleCreateTopics during the park, registering the wrong topic.
+    const(char)[][64] names;
+    int[64] nparts;
     size_t nt;
     foreach (_; 0 .. ntopics)
     {
@@ -1295,7 +1299,8 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         if (nt < names.length && r.ok)
         {
             names[nt] = name;
-            nparts[nt] = np > 0 ? np : cast(int) KAFKA_PARTITIONS;
+            immutable c = np > 0 ? np : cast(int) KAFKA_PARTITIONS;
+            nparts[nt] = c > KAFKA_MAX_PARTITIONS ? KAFKA_MAX_PARTITIONS : c; // cap
             nt++;
         }
     }
@@ -1412,6 +1417,8 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
                     terr = E_UNKNOWN_TOPIC; // registry mode: topic is missing
             }
         }
+        if (np > KAFKA_MAX_PARTITIONS)
+            np = KAFKA_MAX_PARTITIONS; // defense-in-depth vs a huge registered count
         putI16(o, terr);
         putStr(o, t);
         if (ver >= 1)
