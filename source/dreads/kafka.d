@@ -1253,9 +1253,67 @@ private bool validHeaderSection(scope const(ubyte)[] h) @nogc nothrow
     return i == h.length;
 }
 
-/// Decode an uncompressed RecordBatch v2. Calls rec() per record with ABSOLUTE
-/// timestamp and the record's raw (verbatim-copyable) header section. Returns
-/// the record count, or -1 on any malformation / unsupported (compressed) set.
+/// Decompression-bomb ceiling: a compressed batch's plaintext must not exceed
+/// this, else we reject rather than let a tiny frame expand to gigabytes.
+private enum size_t KAFKA_DECOMP_MAX = 128 << 20;
+
+/// Bounded gzip inflate into `dst`. Kafka's v2 gzip payload is a standard gzip
+/// stream (magic 1f 8b). Returns false on malformed input OR if the output would
+/// exceed capMax (bomb guard). @nogc — streams through a stack chunk.
+private bool gunzipInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMax) @nogc nothrow @trusted
+{
+    import etc.c.zlib : z_stream, inflateInit2_, inflate, inflateEnd, zlibVersion,
+        Z_OK, Z_STREAM_END, Z_NO_FLUSH;
+
+    if (src.length == 0 || src.length > uint.max)
+        return false;
+    z_stream zs;
+    // windowBits 15 + 16 selects gzip framing (not raw/zlib).
+    if (inflateInit2_(&zs, 15 + 16, zlibVersion(), cast(int) z_stream.sizeof) != Z_OK)
+        return false;
+    scope (exit)
+        inflateEnd(&zs);
+    dst.clear();
+    zs.next_in = cast(ubyte*) src.ptr;
+    zs.avail_in = cast(uint) src.length;
+    ubyte[65536] chunk = void;
+    for (;;)
+    {
+        zs.next_out = chunk.ptr;
+        zs.avail_out = chunk.length;
+        immutable r = inflate(&zs, Z_NO_FLUSH);
+        immutable produced = chunk.length - zs.avail_out;
+        if (produced)
+        {
+            if (dst.length + produced > capMax)
+                return false; // decompression bomb
+            dst.append(chunk[0 .. produced]);
+        }
+        if (r == Z_STREAM_END)
+            return true;
+        if (r != Z_OK)
+            return false; // Z_BUF_ERROR (truncated), data error, etc.
+    }
+}
+
+/// Decompress a v2 batch's compressed records region (codec = attrs & 0x07)
+/// into `dst`. 1=gzip implemented; snappy(2)/lz4(3)/zstd(4) are not yet wired
+/// (return false → the batch is rejected, exactly as before).
+private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst) nothrow @trusted
+{
+    switch (codec)
+    {
+    case 1:
+        return gunzipInto(src, dst, KAFKA_DECOMP_MAX);
+    default:
+        return false; // snappy/lz4/zstd: not yet supported
+    }
+}
+
+/// Decode a RecordBatch v2. Calls rec() per record with ABSOLUTE timestamp and
+/// the record's raw (verbatim-copyable) header section. Compressed batches
+/// (attrs & 0x07 != 0) are decompressed via the supported codecs. Returns the
+/// record count, or -1 on any malformation / unsupported-codec / bomb.
 private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
         scope const(ubyte)[] key, bool keyNull, scope const(ubyte)[] val, bool valNull,
         scope const(ubyte)[] hdrSection) nothrow rec) nothrow
@@ -1273,8 +1331,7 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
     immutable uint crcStored = cast(uint) h.i32();
     immutable size_t crcCoverStart = h.i; // attributes onward
     immutable short attrs = h.i16();
-    if ((attrs & 0x07) != 0)
-        return -1; // compressed: unsupported here (separate milestone)
+    immutable ubyte codec = cast(ubyte)(attrs & 0x07);
     cast(void) h.i32(); // lastOffsetDelta
     immutable long firstTs = h.i64();
     cast(void) h.i64(); // maxTimestamp
@@ -1286,20 +1343,31 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
         return -1;
     if (crcCoverStart > b.length || crc32c(b[crcCoverStart .. $]) != crcStored)
         return -1;
+    // Records region: b[h.i .. $]. If compressed, decompress into `plain` and
+    // parse that; the CRC above already validated the compressed bytes.
+    scope const(ubyte)[] rp = b;
     size_t i = h.i;
+    static ByteBuffer plain; // TLS: decompressed records (codec != 0)
+    if (codec != 0)
+    {
+        if (!decompressRecords(codec, b[h.i .. $], plain))
+            return -1; // unsupported codec / malformed / decompression bomb
+        rp = cast(const(ubyte)[]) plain.data;
+        i = 0;
+    }
     foreach (_; 0 .. nrec)
     {
         bool ok = true;
-        immutable long rlen = getVarlong(b, i, ok);
-        if (!ok || rlen < 0 || i + cast(size_t) rlen > b.length)
+        immutable long rlen = getVarlong(rp, i, ok);
+        if (!ok || rlen < 0 || i + cast(size_t) rlen > rp.length)
             return -1;
         immutable size_t recEnd = i + cast(size_t) rlen;
         if (i >= recEnd)
             return -1;
         i += 1; // per-record attributes (unused)
-        immutable long tsDelta = getVarlong(b, i, ok);
-        cast(void) getVarlong(b, i, ok); // offsetDelta (contiguous — recomputed)
-        immutable long kl = getVarlong(b, i, ok);
+        immutable long tsDelta = getVarlong(rp, i, ok);
+        cast(void) getVarlong(rp, i, ok); // offsetDelta (contiguous — recomputed)
+        immutable long kl = getVarlong(rp, i, ok);
         if (!ok)
             return -1;
         const(ubyte)[] key;
@@ -1310,10 +1378,10 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
         {
             if (i + cast(size_t) kl > recEnd)
                 return -1;
-            key = b[i .. i + cast(size_t) kl];
+            key = rp[i .. i + cast(size_t) kl];
             i += cast(size_t) kl;
         }
-        immutable long vl = getVarlong(b, i, ok);
+        immutable long vl = getVarlong(rp, i, ok);
         if (!ok)
             return -1;
         const(ubyte)[] val;
@@ -1324,12 +1392,12 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
         {
             if (i + cast(size_t) vl > recEnd)
                 return -1;
-            val = b[i .. i + cast(size_t) vl];
+            val = rp[i .. i + cast(size_t) vl];
             i += cast(size_t) vl;
         }
         if (i > recEnd)
             return -1;
-        scope const(ubyte)[] hdrSection = b[i .. recEnd];
+        scope const(ubyte)[] hdrSection = rp[i .. recEnd];
         if (!validHeaderSection(hdrSection))
             return -1;
         rec(firstTs + tsDelta, key, keyNull, val, valNull, hdrSection);

@@ -173,7 +173,8 @@
 		"vendor/lz4/build/liblz4.lib"
 	],
 	"libs-posix": [
-		"sodium"
+		"sodium",
+		"z"
 	],
 	"libs-windows": [
 		"libsodium",
