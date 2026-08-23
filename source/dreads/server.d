@@ -2038,12 +2038,16 @@ private void shardDrainLoop() nothrow
                     // stage: [bytes][pending][reply] into the requester's batch
                     auto rb = &replyBatch[cast(size_t) meta];
                     immutable size_t sect = 12 + reply.length;
-                    auto space = rb.freeSpace(sect)[0 .. sect];
-                    *cast(uint*) space.ptr = cast(uint)(8 + reply.length);
-                    *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
-                    space[12 .. $] = reply.data[];
-                    rb.grow(sect);
-                    replyTouch |= 1UL << meta;
+                    auto raw = rb.freeSpace(sect);
+                    if (raw.length >= sect) // OOM-safe: skip staging if it can't grow
+                    {
+                        auto space = raw[0 .. sect];
+                        *cast(uint*) space.ptr = cast(uint)(8 + reply.length);
+                        *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
+                        space[12 .. $] = reply.data[];
+                        rb.grow(sect);
+                        replyTouch |= 1UL << meta;
+                    }
                 }
                 else // rare wide shard id: unbatched reply, immediate wake
                 {
@@ -2422,7 +2426,10 @@ private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) n
     static ByteBuffer pb; // TLS: one staging per shard thread, no yield inside
     pb.clear();
     immutable size_t len = 4 + chan.length + msg.length;
-    auto space = pb.freeSpace(len)[0 .. len];
+    auto raw = pb.freeSpace(len);
+    if (raw.length < len)
+        return; // OOM: drop the cross-shard fanout, keep the broker up
+    auto space = raw[0 .. len];
     *cast(uint*) space.ptr = cast(uint) chan.length;
     space[4 .. 4 + chan.length] = cast(const(ubyte)[]) chan[];
     space[4 + chan.length .. $] = cast(const(ubyte)[]) msg[];
@@ -2711,7 +2718,10 @@ private void shardMqttConnBcast(scope const(char)[] clientId, ulong gen) nothrow
         return;
     ByteBuffer mb;
     immutable size_t len = 8 + clientId.length;
-    auto space = mb.freeSpace(len)[0 .. len];
+    auto raw = mb.freeSpace(len);
+    if (raw.length < len)
+        return; // OOM: drop the broadcast, keep the broker up
+    auto space = raw[0 .. len];
     foreach (k; 0 .. 8)
         space[k] = cast(ubyte)(gen >> ((7 - k) * 8));
     space[8 .. $] = cast(const(ubyte)[]) clientId[];
@@ -2763,7 +2773,10 @@ private void shardMqttFanout(scope const(char)[] topic, scope const(char)[] msg,
     // silent loss. u32 carries the whole block, matching local delivery.
     immutable size_t plen = props.length;
     immutable size_t len = 12 + topic.length + 4 + plen + msg.length;
-    auto space = buf.freeSpace(len)[0 .. len];
+    auto raw = buf.freeSpace(len);
+    if (raw.length < len)
+        return; // OOM: drop the fanout, keep the broker up
+    auto space = raw[0 .. len];
     space[0] = retain ? 1 : 0;
     space[1] = pubQos;
     foreach (k; 0 .. 8)
@@ -2951,7 +2964,10 @@ private void appendHopCmd(ref ByteBuffer bc, const ref RVal cmd, scope const(uby
     immutable size_t sect = hdrBytes + rawCmd.length;
     // one reserve for the whole section, then indexed stores through typed
     // slices (bounds carried by the slice)
-    auto space = bc.freeSpace(sect)[0 .. sect];
+    auto raw = bc.freeSpace(sect);
+    if (raw.length < sect)
+        return; // OOM: can't stage the hop command; drop it rather than crash
+    auto space = raw[0 .. sect];
     auto w = cast(uint[]) space[0 .. 4];
     w[0] = cast(uint)(sect - 4); // bytes after this length field
     *cast(ulong*)(space.ptr + 4) = cast(ulong) pend;
