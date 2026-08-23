@@ -1336,6 +1336,8 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         if (avail == 0)
             return;
         auto space = inb.freeSpace(cast(size_t) avail);
+        if (space.length < cast(size_t) avail)
+            return; // OOM growing the input buffer: drop THIS client, not the broker
         try
             tcp.read(space[0 .. cast(size_t) avail]);
         catch (Exception)

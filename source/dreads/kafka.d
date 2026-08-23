@@ -391,6 +391,8 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
         if (avail == 0)
             return;
         auto space = inb.freeSpace(cast(size_t) avail);
+        if (space.length < cast(size_t) avail)
+            return; // OOM growing the input buffer: drop THIS client, not the broker
         try
             tcp.read(space[0 .. cast(size_t) avail]);
         catch (Exception)
@@ -409,12 +411,10 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
                 return; // insane frame
             if (d.length - pos < 4 + sz)
                 break;
+            tByteBufferOom = false; // clear any stale flag (leaked from another skin)
             handleRequest(d[pos + 4 .. pos + 4 + sz], outb);
             if (tByteBufferOom)
-            {
-                tByteBufferOom = false; // per-thread flag: clear before dropping
                 return; // OOM building this reply: drop THIS client, not the broker
-            }
             pos += 4 + sz;
         }
         if (!outb.empty)
