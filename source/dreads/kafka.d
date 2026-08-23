@@ -574,6 +574,7 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 /// stale correlation id against no in-flight request and disconnect).
 private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    tKafkaDecompUsed = 0; // reset the per-request decompression budget
     if (ver >= 3)
         cast(void) r.str(); // transactional_id (nullable) — ignored (no txn support)
     immutable acks = r.i16();
@@ -1347,20 +1348,74 @@ private bool lz4FrameInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t c
     }
 }
 
+// libsnappy C API (vendored static libsnappy.a). Kafka's v2 snappy payload is a
+// RAW snappy stream (leading uncompressed-length varint), NOT the v1 xerial
+// block framing — so the plain C API decodes it directly.
+private extern (C) @nogc nothrow @system
+{
+    int snappy_uncompressed_length(const(char)* compressed, size_t compressed_length, size_t* result);
+    int snappy_uncompress(const(char)* compressed, size_t compressed_length,
+            char* uncompressed, size_t* uncompressed_length);
+}
+
+/// Bounded raw-snappy decompress into `dst`. Returns false on malformed input or
+/// if the plaintext would exceed capMax (bomb — checked BEFORE allocating).
+private bool snappyInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMax) @nogc nothrow @trusted
+{
+    if (src.length == 0)
+        return false;
+    size_t ulen;
+    if (snappy_uncompressed_length(cast(const(char)*) src.ptr, src.length, &ulen) != 0)
+        return false;
+    if (ulen == 0 || ulen > capMax)
+        return false; // empty or decompression bomb
+    dst.clear();
+    auto space = dst.freeSpace(ulen); // writable region >= ulen bytes
+    size_t outLen = ulen;
+    if (snappy_uncompress(cast(const(char)*) src.ptr, src.length,
+            cast(char*) space.ptr, &outLen) != 0)
+        return false;
+    if (outLen != ulen)
+        return false;
+    dst.grow(outLen); // mark the decompressed bytes as filled
+    return true;
+}
+
+/// Request-level ceiling on TOTAL decompressed bytes, reset per Produce request
+/// (tKafkaDecompUsed). The per-partition KAFKA_DECOMP_MAX bounds ONE batch, but a
+/// request enumerating many partitions each carrying a ~1000:1 frame could
+/// otherwise amplify a 64 MB request into tens of GB of decompress+store work.
+private enum size_t KAFKA_DECOMP_REQ_MAX = 512 << 20;
+private size_t tKafkaDecompUsed; // TLS, reset at the top of handleProduce
+
 /// Decompress a v2 batch's compressed records region (codec = attrs & 0x07)
-/// into `dst`. 1=gzip, 3=lz4 implemented; snappy(2)/zstd(4) not yet wired
-/// (return false → the batch is rejected, exactly as before).
+/// into `dst`. 1=gzip, 2=snappy, 3=lz4 implemented; zstd(4) not yet wired
+/// (return false → the batch is rejected, exactly as before). Bounded by both
+/// the per-batch cap and the running per-request budget.
 private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst) nothrow @trusted
 {
+    if (tKafkaDecompUsed >= KAFKA_DECOMP_REQ_MAX)
+        return false; // request-level decompression budget exhausted
+    immutable size_t remain = KAFKA_DECOMP_REQ_MAX - tKafkaDecompUsed;
+    immutable size_t cap = remain < KAFKA_DECOMP_MAX ? remain : KAFKA_DECOMP_MAX;
+    bool ok;
     switch (codec)
     {
     case 1:
-        return gunzipInto(src, dst, KAFKA_DECOMP_MAX);
+        ok = gunzipInto(src, dst, cap);
+        break;
+    case 2:
+        ok = snappyInto(src, dst, cap);
+        break;
     case 3:
-        return lz4FrameInto(src, dst, KAFKA_DECOMP_MAX);
+        ok = lz4FrameInto(src, dst, cap);
+        break;
     default:
-        return false; // snappy/zstd: not yet supported
+        return false; // zstd: not yet supported
     }
+    if (ok)
+        tKafkaDecompUsed += dst.length;
+    return ok;
 }
 
 /// Decode a RecordBatch v2. Calls rec() per record with ABSOLUTE timestamp and
