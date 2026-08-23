@@ -52,8 +52,6 @@ public shared long gMqttSubTotal;
 public shared ulong gMqttConnGen;
 /// THIS shard's live clientId -> conn map (share-nothing).
 private MqttConn[string] gLocalClients; // TLS
-private MqttConn[] gOfflineConns; // TLS: held persistent sessions, reaped by the
-// maintenance sweep at their offlineDeadline (see MqttConn.offline)
 /// Broadcast a (clientId, connGen) takeover to every OTHER shard (installed by
 /// server.d). Null when unsharded.
 public __gshared void delegate(scope const(char)[] clientId, ulong gen) nothrow gMqttConnBcast;
@@ -100,8 +98,34 @@ public final class MqttConn
     // a fixed offline queue. A same-thread reconnect migrates the session; the
     // maintenance sweep reaps it at offlineDeadline. (SO_REUSEPORT cross-thread
     // reconnect is the deliberately-unhandled ostrich case.)
-    bool offline;
-    MonoTime offlineDeadline;
+    bool offline; // wrapper state: socket dead/disconnected, session held ALIVE
+    MonoTime offlineDeadline; // (legacy; park computes its own deadlines)
+    // Transparent-strategy (model A): on socket death the serve fiber does NOT
+    // return — it parks here, holding the whole session ALIVE (subs in the trie,
+    // obox as the offline queue), and vibe never learns the socket died. A
+    // reconnect on the SAME shard hands a new socket via pendingTcp + emits
+    // reconnectEvt (same-thread cooperative => no lock needed); the parked fiber
+    // rebinds c.tcp and resumes. Expiry is a timed wait (no separate Timer);
+    // will-delay is orchestrated in the same wait loop and cancelled by reconnect.
+    LocalManualEvent reconnectEvt;
+    TCPConnection pendingTcp; // socket handed off by a reconnecting fiber
+    const(char)[] pendingConnack; // CONNACK bytes the reconnect fiber stashed (sent on resume)
+    bool handedOff; // a throwaway reconnect conn that gave its socket to a parked session
+    bool discard; // set to make a parked session END now (clean_start=1 took it over)
+    ubyte discReason = 0x82; // v5 server-DISCONNECT reason on a protocol-error close
+    // (default 0x82 Protocol Error; a handler may set e.g. 0x93 Receive Maximum)
+    uint willDelay; // v5 will-delay-interval (seconds): 0 = fire will immediately on drop
+    // Publication-expiry: while offline, a queued PUBLISH carrying a message-
+    // expiry-interval records {its start offset in obox, absolute deadline}. On
+    // reconnect the flush drops the expired ones and rewrites the survivors'
+    // interval to the time remaining [MQTT-3.3.2-5].
+    OExpiry[] oExprQ;
+    // Outbound flow control: QoS1/2 deliveries that don't fit the send window
+    // (receive-maximum) are HELD here in FIFO order instead of degrading to QoS0,
+    // and released as PUBACK/PUBCOMP free window slots. Bounded by MQTT_OBOX_CAP
+    // (heldBytes) so a stalled consumer can't grow memory without limit.
+    HeldPub[] heldQ;
+    size_t heldBytes;
     ubyte protoVer = 4; // MQTT protocol level: 4 = 3.1.1, 5 = 5.0 (v5 packets
     // carry a property block; v5 CONNACK/SUBACK use reason codes)
     // v5 inbound topic aliases: a client maps a small int -> topic to save bytes;
@@ -176,6 +200,7 @@ public final class MqttConn
         {
             wlock = new TaskMutex;
             flushEvt = createManualEvent();
+            reconnectEvt = createManualEvent();
         }
         catch (Exception)
             assert(false, "mqtt: conn alloc failed");
@@ -217,6 +242,11 @@ private enum size_t MQTT_MAX_SUBS = 4096;
 private enum ushort MQTT_TOPIC_ALIAS_MAX = 1024;
 private enum ushort MQTT_SERVER_KEEPALIVE = 60; // cap the client's keep-alive at
 // 60s and tell it via CONNACK ServerKeepAlive (0x13) so idle clients keep pinging
+/// v5 receive-maximum WE advertise (CONNACK 0x21): the max concurrent unacked
+/// QoS2 the client may have in flight TOWARD us. Exceeding it is a Receive
+/// Maximum exceeded protocol error -> DISCONNECT 0x93 [MQTT-4.9]. 20 matches the
+/// common broker default (mosquitto), keeping legitimate bursts comfortable.
+private enum ushort MQTT_SERVER_RECEIVE_MAX = 20;
 /// ...and by BYTES: an aliased topic is idup'd (up to ~64KB), so the count cap
 /// alone would let one conn pin MAX*64KB; this bounds the whole table.
 private enum size_t MQTT_MAX_ALIAS_BYTES = 1 << 20; // 1MB of aliased topics/conn
@@ -424,8 +454,26 @@ private struct Match // one matched subscriber + its granted qos (fused so the
     uint subId; // v5 subscription-identifier to echo on delivery (0 = none)
 }
 
+private struct OExpiry // a queued offline PUBLISH with a message-expiry-interval
+{
+    size_t start; // byte offset of the PUBLISH within the conn's obox
+    MonoTime deadline; // absolute time the message expires (queue time + interval)
+}
+
+private struct HeldPub // a QoS1/2 delivery held behind a full send-window (flow control)
+{
+    const(char)[] topic;
+    const(char)[] payload;
+    const(char)[] props; // the forwarded v5 property block (no alias/subid prefix)
+    ubyte qos;
+    bool retain;
+}
+
 private Match[] tMatchBuf;
 private size_t tMatchLen;
+// TLS scratch: the subscription-identifiers of ALL overlapping subscriptions a
+// single client has for one delivery, coalesced into ONE PUBLISH [MQTT-3.3.4-4].
+private uint[] tCoSubIds;
 
 /// Collect the live subscribers matching `topic` into tMatchBuf[0..tMatchLen].
 /// The walk branches on the exact segment AND the `+` child at every level;
@@ -900,6 +948,10 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     pkt.clear();
     buildPublish(pkt, topic, payload, false);
     bool pktV5built = false; // build the v5 variant lazily (only if a v5 sub matches)
+    // The coalesced subscription-identifiers for the CURRENT delivery: when a
+    // client has several overlapping subscriptions matching this topic, all of
+    // their ids ride ONE PUBLISH (deliverTo reads this; empty => use m.subId).
+    const(uint)[] coSubIds = null;
     // Deliver one message to one matched subscriber (QoS/no-local/RAP-aware).
     // Returns TRUE iff the message was actually queued to the subscriber — a
     // shared-subscription round-robin uses this to FALL THROUGH to the next group
@@ -913,6 +965,22 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         if (m.noLocal && s is publisher)
             return false; // v5 no-local: don't echo the publisher's own message back
         immutable v5 = s.protoVer == 5;
+        // Publication-expiry: a message queued for an OFFLINE session that carries
+        // a message-expiry-interval is tracked (start offset + deadline) so the
+        // reconnect flush can drop it if expired / decrement it [MQTT-3.3.2-5].
+        immutable size_t oStart = s.obox.length;
+        immutable uint expE = (s.offline && v5) ? msgExpiryFromProps(props) : 0;
+        void recordExpiry() nothrow
+        {
+            if (expE != 0 && s.obox.length > oStart)
+                try
+                    s.oExprQ ~= OExpiry(oStart, MonoTime.currTime + dur!"seconds"(expE));
+                catch (Exception)
+                {
+                }
+        }
+        scope (exit)
+            recordExpiry();
         // v5 outbound topic alias: map this topic to a short alias for a client
         // that advertised topic-alias-maximum. First delivery of a topic REGISTERS
         // it (full topic + alias); later ones REUSE (empty topic + alias). The
@@ -962,7 +1030,10 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         // common no-alias/no-subId case leaves `props` untouched — zero extra work.
         static ByteBuffer sidBuf;
         const(char)[] dprops = props;
-        if (v5 && (aliasVal != 0 || m.subId != 0))
+        // emit the coalesced overlapping-subscription ids, or this match's single
+        // id when there was no coalescing (shared subs / non-overlapping)
+        immutable bool anySid = coSubIds.length != 0 || m.subId != 0;
+        if (v5 && (aliasVal != 0 || anySid))
         {
             sidBuf.clear();
             if (aliasVal != 0)
@@ -971,7 +1042,16 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 sidBuf.appendByte(cast(char)(aliasVal >> 8));
                 sidBuf.appendByte(cast(char)(aliasVal & 0xFF));
             }
-            if (m.subId != 0)
+            if (coSubIds.length != 0)
+            {
+                foreach (sid; coSubIds)
+                    if (sid != 0)
+                    {
+                        sidBuf.appendByte(cast(char) 0x0B); // subscription-identifier
+                        encodeVarint(sidBuf, sid);
+                    }
+            }
+            else if (m.subId != 0)
             {
                 sidBuf.appendByte(cast(char) 0x0B);
                 encodeVarint(sidBuf, m.subId);
@@ -990,8 +1070,14 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             // tightened by the client's v5 receive-maximum (flow control): we must
             // not hold more unacked QoS1/2 toward it than it advertised.
             immutable size_t win = s.sendMax < MQTT_QOS1_WINDOW ? s.sendMax : MQTT_QOS1_WINDOW;
+            // ONLINE flow control: deliver immediately only if the window has room
+            // AND nothing is already held (preserve FIFO order); otherwise HOLD and
+            // release on a PUBACK/PUBCOMP. OFFLINE sessions keep the prior behavior
+            // (queue in obox now, or degrade to QoS0 when the window is full).
+            immutable bool holdPath = !s.offline;
             ushort pid = 0;
-            if (s.inflight.length + s.outQos2.length < win)
+            if ((!holdPath || s.heldQ.length == 0)
+                && s.inflight.length + s.outQos2.length < win)
                 pid = nextDeliveryPid(s);
             if (pid != 0)
             {
@@ -1034,7 +1120,29 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
                 }
                 return true;
             }
-            // window saturated -> deliver at QoS0
+            // window saturated (or messages already held): HOLD as QoS1/2 and
+            // release on the next PUBACK/PUBCOMP, rather than degrading to QoS0.
+            // Bounded by MQTT_OBOX_CAP; only ONLINE sessions hold (offline queues
+            // in obox), and a full hold-queue falls through to the QoS0 path.
+            if (holdPath)
+            {
+                immutable msz = topic.length + payload.length + props.length;
+                if (s.heldBytes + msz <= MQTT_OBOX_CAP)
+                {
+                    try
+                    {
+                        s.heldQ ~= HeldPub(topic.idup, payload.idup,
+                                props.length ? props.idup : null,
+                                cast(ubyte) effQos, delRetain);
+                        s.heldBytes += msz;
+                        return true;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                // hold-queue full -> fall through to the QoS0 degradation below
+            }
         }
         if (delRetain)
         {
@@ -1051,7 +1159,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             s.obox.append(q1.data);
             recordAlias();
         }
-        else if (v5 && (m.subId != 0 || aliasVal != 0))
+        else if (v5 && (anySid || aliasVal != 0))
         {
             // per-sub property prefix (subscription-identifier and/or topic-alias):
             // distinct packet, so build a one-off instead of the pooled v5 packet
@@ -1107,9 +1215,7 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     }
     foreach (i, ref m; tMatchBuf[0 .. tMatchLen])
     {
-        if (m.shareGroup.length == 0)
-            cast(void) deliverTo(m);
-        else
+        if (m.shareGroup.length != 0)
         {
             anyShared = true;
             try
@@ -1117,7 +1223,49 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
             catch (Exception)
             {
             }
+            continue;
         }
+        // Non-shared: COALESCE a client's overlapping subscriptions into ONE
+        // PUBLISH carrying ALL their subscription-identifiers [MQTT-3.3.4-4] at
+        // the HIGHEST matching QoS [MQTT-3.3.4-2]. Deliver once, on the FIRST
+        // match for this client; later matches for it are skipped.
+        bool firstForClient = true;
+        foreach (j; 0 .. i)
+            if (tMatchBuf[j].shareGroup.length == 0 && tMatchBuf[j].c is m.c)
+            {
+                firstForClient = false;
+                break;
+            }
+        if (!firstForClient)
+            continue;
+        tCoSubIds.length = 0;
+        ubyte maxQos = 0;
+        bool rp = false, anyDeliverable = false;
+        foreach (j; i .. tMatchLen)
+        {
+            auto pm = tMatchBuf[j];
+            if (pm.shareGroup.length != 0 || pm.c !is m.c)
+                continue;
+            if (pm.noLocal && pm.c is publisher)
+                continue; // this subscription is no-local-suppressed for its owner
+            anyDeliverable = true;
+            if (pm.qos > maxQos)
+                maxQos = pm.qos;
+            rp = rp || pm.rap;
+            if (pm.subId != 0)
+                try
+                    tCoSubIds ~= pm.subId;
+                catch (Exception)
+                {
+                }
+        }
+        if (!anyDeliverable)
+            continue; // every matching subscription was no-local-suppressed
+        // noLocal already applied above => agg.noLocal = false (don't re-suppress)
+        auto agg = Match(m.c, maxQos, false, rp, null, 0);
+        coSubIds = tCoSubIds; // read by deliverTo (multiple 0x0B properties)
+        cast(void) deliverTo(agg);
+        coSubIds = null;
     }
     // Pass 2: shared subscriptions — ONE member of each group receives the message,
     // chosen round-robin. FALL THROUGH to the next member (in RR order, wrapping)
@@ -1206,14 +1354,16 @@ private enum size_t MQTT_OBOX_KEEP = 4 << 20;
 /// stuck-writer-can-never-be-reaped hole the previous design left.
 private void mqttWriter(MqttConn c) nothrow
 {
-    // Release only wbox here; obox is released by mqttTeardown (or the offline
-    // reaper), so a persistent session held offline keeps its queued obox after
-    // the writer stops.
+    // Release only wbox here; obox is released by mqttTeardown, so a session held
+    // offline (model A) keeps its queued obox while the writer is parked.
     scope (exit)
         c.wbox.release();
     for (;;)
     {
-        while (c.obox.empty && !c.closed)
+        // Park while there's nothing to send OR while offline — a dead socket
+        // must NOT be written (model A: the serve fiber owns the offline/expiry;
+        // deliveries accumulate in obox as the offline queue meanwhile).
+        while (!c.closed && (c.obox.empty || c.offline))
         {
             immutable ec = () @trusted {
                 try
@@ -1221,7 +1371,7 @@ private void mqttWriter(MqttConn c) nothrow
                 catch (Exception)
                     return 0;
             }();
-            if (!c.obox.empty || c.closed)
+            if (c.closed || (!c.obox.empty && !c.offline))
                 break;
             try
                 c.flushEvt.wait(ec);
@@ -1229,19 +1379,58 @@ private void mqttWriter(MqttConn c) nothrow
             {
             }
         }
-        if (c.obox.empty)
-        {
-            if (c.closed)
-                return;
+        if (c.closed)
+            return;
+        if (c.obox.empty || c.offline)
             continue;
-        }
         swapBufs(c.obox, c.wbox); // no yield between check and swap
         if (!sendTo(c, c.wbox.data))
         {
-            c.closed = true; // dead socket: stop delivering
-            return;
+            // Socket died mid-write: do NOT kill the writer (a reconnect needs
+            // it). Mark offline and park; the serve fiber drives the will/expiry
+            // and wakes us on rebind. The in-flight wbox is dropped — QoS0 loss
+            // is spec-legal, QoS1/2 are redelivered (inflightMsg) on reconnect.
+            c.offline = true;
+            continue;
         }
         c.wbox.trim(MQTT_OBOX_KEEP); // release a burst-grown block back down
+    }
+}
+
+/// After emitting a server DISCONNECT: keep the READ side open for a short window,
+/// draining (and discarding) whatever the peer still sends, so the peer can READ
+/// the DISCONNECT before we close. A full close() while the peer is mid-write
+/// makes its next send RST (BrokenPipe) — the peer would never see the reason.
+/// Returns as soon as the peer closes (waitForData false) or the window elapses.
+private void mqttLingerClose(MqttConn c) nothrow @trusted
+{
+    ubyte[512] scratch = void;
+    immutable deadline = MonoTime.currTime + dur!"msecs"(500);
+    for (;;)
+    {
+        immutable left = deadline - MonoTime.currTime;
+        if (left <= Duration.zero)
+            break;
+        bool alive;
+        try
+            alive = c.tcp.waitForData(left);
+        catch (Exception)
+            alive = false;
+        if (!alive)
+            break; // peer closed, or the linger window elapsed
+        immutable avail = () @trusted {
+            try
+                return c.tcp.leastSize;
+            catch (Exception)
+                return cast(ulong) 0;
+        }();
+        if (avail == 0)
+            break;
+        immutable n = avail > scratch.length ? scratch.length : cast(size_t) avail;
+        try
+            c.tcp.read(scratch[0 .. n]); // drain + discard
+        catch (Exception)
+            break;
     }
 }
 
@@ -1349,6 +1538,65 @@ private ushort nextDeliveryPid(MqttConn c) @trusted nothrow
     return 0; // window saturated (all ids in flight)
 }
 
+/// Release held QoS1/2 deliveries (flow control) into freed send-window slots, in
+/// FIFO order, until the window is full again or the hold-queue drains. Called
+/// after a PUBACK/PUBCOMP frees a slot, and after a reconnect resumes the window.
+/// Each released message is assigned a fresh packet-id, queued to obox, and
+/// tracked in flight exactly like an immediate QoS1/2 delivery.
+private void mqttReleaseHeld(MqttConn s) nothrow @trusted
+{
+    if (s.heldQ.length == 0)
+        return;
+    immutable v5 = s.protoVer == 5;
+    immutable size_t win = s.sendMax < MQTT_QOS1_WINDOW ? s.sendMax : MQTT_QOS1_WINDOW;
+    static ByteBuffer q1; // TLS
+    while (s.heldQ.length != 0 && s.inflight.length + s.outQos2.length < win)
+    {
+        auto h = s.heldQ[0];
+        immutable pid = nextDeliveryPid(s);
+        if (pid == 0)
+            break; // no free id despite window room (defensive)
+        q1.clear();
+        if (h.qos == 2)
+            buildPublishQos2(q1, h.topic, h.payload, h.retain, pid, v5, h.props);
+        else
+            buildPublishQos1(q1, h.topic, h.payload, h.retain, pid, v5, h.props);
+        if ((s.maxPktSize != 0 && q1.length > s.maxPktSize)
+            || s.obox.length + q1.length > MQTT_OBOX_CAP)
+            atomicOp!"+="(gMqttDropped, 1); // can't queue now: drop (obox full/too big)
+        else
+        {
+            s.obox.append(q1.data);
+            try
+            {
+                if (h.qos == 2)
+                    s.outQos2[pid] = 1; // awaiting PUBREC
+                else
+                    s.inflight[pid] = true;
+                if (s.sessionExpiry > 0 && !s.offline)
+                    s.inflightMsg[pid] = (cast(const(char)[]) q1.data).idup;
+            }
+            catch (Exception)
+            {
+            }
+            if (!s.dirty)
+            {
+                s.dirty = true;
+                try
+                    tDirty ~= s;
+                catch (Exception)
+                {
+                }
+            }
+        }
+        immutable msz = h.topic.length + h.payload.length + h.props.length;
+        s.heldBytes = s.heldBytes > msz ? s.heldBytes - msz : 0;
+        foreach (i; 1 .. s.heldQ.length)
+            s.heldQ[i - 1] = s.heldQ[i];
+        s.heldQ.length = s.heldQ.length - 1;
+    }
+}
+
 private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 {
     try
@@ -1370,81 +1618,218 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 // try/catch). Order matters: real subscription teardown, wake+close so a
 // stalled writer unblocks, then join so buffer release runs on THIS thread.
 // Remove an offline placeholder from the per-shard list (swap-remove).
-private void removeOffline(MqttConn c) nothrow @trusted
+/// Publish the Last Will now (local delivery + cross-shard fan-out + retained if
+/// the will-retain flag is set), then clear willTopic so it fires exactly once.
+private void fireWill(MqttConn c) nothrow @trusted
 {
-    foreach (i, o; gOfflineConns)
-        if (o is c)
+    if (c.willTopic.length == 0)
+        return;
+    immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+    mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
+            rseq, 0, null, c.willProps);
+    if (gMqttFanout !is null)
+        gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
+                rseq, 0, c.willProps);
+    c.willTopic = null;
+}
+
+/// The message-expiry-interval (0x02) value in a v5 PUBLISH property block, or 0
+/// if absent. Walks the (broker-built, well-formed) block; bounded by its length.
+private uint msgExpiryFromProps(scope const(char)[] props) @nogc nothrow @trusted
+{
+    auto p = cast(const(ubyte)[]) props;
+    size_t i = 0;
+    while (i < p.length)
+    {
+        immutable id = p[i++];
+        switch (id)
         {
-            gOfflineConns[i] = gOfflineConns[$ - 1];
-            gOfflineConns.length = gOfflineConns.length - 1;
-            return;
-        }
-}
-
-// Fully tear down an offline placeholder (its serve fiber is already gone): drop
-// its trie subs, its clientId registration (if still ours), its keyspace record,
-// and release its queued obox.
-private void dropOffline(MqttConn c) nothrow @trusted
-{
-    foreach (f; c.filters)
-        trieUnsubscribe(f, c);
-    c.filters = null;
-    c.subInfo = null;
-    c.gen++;
-    try
-        if (auto pc = c.clientId in gLocalClients)
-            if (*pc is c)
-                gLocalClients.remove(c.clientId);
-    catch (Exception)
-    {
-    }
-    mqttSessionDel(c.clientId);
-    c.offline = false;
-    c.obox.release();
-}
-
-/// A clean_start=0 CONNECT: if an OFFLINE session exists for this client id on
-/// THIS shard, migrate it (subscriptions + queued obox + in-flight QoS state)
-/// onto the new connection `c`, then drop the placeholder. Returns true if a
-/// session was resumed. (Cross-shard offline sessions are the ostrich case.)
-private bool mqttResumeOffline(MqttConn c) nothrow @trusted
-{
-    MqttConn old;
-    try
-        if (auto pc = c.clientId in gLocalClients)
-            if (*pc !is c && (*pc).offline)
-                old = *pc;
-    catch (Exception)
-    {
-    }
-    if (old is null)
-        return false;
-    foreach (i, f; old.filters)
-    {
-        if (i >= old.subInfo.length)
+        case 0x01: // payload-format-indicator
+            i += 1;
             break;
-        auto si = old.subInfo[i];
-        cast(void) trieSubscribe(f, c, si.qos, si.opts, si.shareGroup, si.subId);
-        try
-        {
-            c.filters ~= f;
-            c.subInfo ~= si;
+        case 0x02: // message-expiry-interval: u32
+            if (i + 4 > p.length)
+                return 0;
+            return (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                | (cast(uint) p[i + 2] << 8) | p[i + 3];
+        case 0x23: // topic-alias: u16
+            i += 2;
+            break;
+        case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data
+            if (i + 2 > p.length)
+                return 0;
+            i += 2 + ((cast(size_t) p[i] << 8) | p[i + 1]);
+            break;
+        case 0x0B: // subscription-identifier: varint
+            uint sv;
+            if (!decodeVarint(p, i, sv))
+                return 0;
+            break;
+        case 0x26: // user-property: two length-prefixed strings
+            foreach (_; 0 .. 2)
+            {
+                if (i + 2 > p.length)
+                    return 0;
+                i += 2 + ((cast(size_t) p[i] << 8) | p[i + 1]);
+            }
+            break;
+        default:
+            return 0; // unknown id in our own block: stop
         }
-        catch (Exception)
-        {
-        }
+        if (i > p.length)
+            return 0;
     }
-    try
-        if (!old.obox.empty)
-            c.obox.append(old.obox.data); // queued messages -> flushed after CONNACK
-    catch (Exception)
+    return 0;
+}
+
+/// Offset of the 4 message-expiry-interval value bytes within a v5 PUBLISH packet
+/// (`[hdr][remlen][topic]([pid])[proplen][props][payload]`), or -1 if absent.
+private long expiryValueOffsetInPacket(scope const(ubyte)[] pkt) @nogc nothrow @trusted
+{
+    if (pkt.length < 2)
+        return -1;
+    immutable qos = (pkt[0] >> 1) & 3;
+    size_t i = 1;
+    uint rem;
+    if (!decodeVarint(pkt, i, rem))
+        return -1;
+    if (i + 2 > pkt.length)
+        return -1;
+    i += 2 + ((cast(size_t) pkt[i] << 8) | pkt[i + 1]); // skip topic
+    if (qos >= 1)
+        i += 2; // skip packet-id
+    if (i > pkt.length)
+        return -1;
+    uint plen;
+    if (!decodeVarint(pkt, i, plen))
+        return -1;
+    immutable propsEnd = i + plen;
+    if (propsEnd > pkt.length)
+        return -1;
+    size_t j = i;
+    while (j < propsEnd)
     {
+        immutable id = pkt[j++];
+        switch (id)
+        {
+        case 0x01:
+            j += 1;
+            break;
+        case 0x02:
+            return (j + 4 <= propsEnd) ? cast(long) j : -1;
+        case 0x23:
+            j += 2;
+            break;
+        case 0x03, 0x08, 0x09:
+            if (j + 2 > propsEnd)
+                return -1;
+            j += 2 + ((cast(size_t) pkt[j] << 8) | pkt[j + 1]);
+            break;
+        case 0x0B:
+            uint sv;
+            if (!decodeVarint(pkt, j, sv))
+                return -1;
+            break;
+        case 0x26:
+            foreach (_; 0 .. 2)
+            {
+                if (j + 2 > propsEnd)
+                    return -1;
+                j += 2 + ((cast(size_t) pkt[j] << 8) | pkt[j + 1]);
+            }
+            break;
+        default:
+            return -1;
+        }
+        if (j > propsEnd)
+            return -1;
     }
-    c.inflight = old.inflight; // adopt in-flight QoS1/2 so acks match
-    c.outQos2 = old.outQos2;
-    c.inflightMsg = old.inflightMsg;
-    // redeliver unacked QoS1/2 with DUP=1 [MQTT-4.4.0-1]; a QoS2 past PUBREC
-    // (state 2) is re-driven with PUBREL. Appended to obox -> flushed post-CONNACK.
+    return -1;
+}
+
+/// Process a resuming session's offline queue for message-expiry [MQTT-3.3.2-5]:
+/// DROP the PUBLISHes whose deadline has passed, and rewrite the survivors'
+/// message-expiry-interval to the seconds remaining. Rebuilds obox in place;
+/// untracked packets (no expiry / redelivered PUBREL) are copied verbatim.
+private void mqttExpireOfflineQueue(MqttConn c) nothrow @trusted
+{
+    if (c.oExprQ.length == 0)
+        return;
+    immutable now = MonoTime.currTime;
+    auto d = c.obox.data;
+    static ByteBuffer filtered; // TLS: the surviving, decremented queue
+    filtered.clear();
+    size_t pos = 0;
+    while (pos < d.length)
+    {
+        immutable ubyte hdr = d[pos];
+        size_t p = pos + 1;
+        uint rem;
+        if (!decodeVarint(d, p, rem) || p + rem > d.length)
+        {
+            filtered.append(d[pos .. $]); // malformed tail: copy verbatim, stop
+            pos = d.length;
+            break;
+        }
+        immutable pktEnd = p + rem;
+        long di = -1;
+        foreach (k, ref e; c.oExprQ)
+            if (e.start == pos)
+            {
+                di = k;
+                break;
+            }
+        if (di >= 0 && (hdr >> 4) == PT_PUBLISH)
+        {
+            if (now >= c.oExprQ[di].deadline)
+            {
+                pos = pktEnd; // expired: drop the whole packet
+                continue;
+            }
+            immutable uint remain = cast(uint)((c.oExprQ[di].deadline - now).total!"seconds");
+            immutable fStart = filtered.length;
+            filtered.append(d[pos .. pktEnd]);
+            immutable eoff = expiryValueOffsetInPacket(d[pos .. pktEnd]);
+            if (eoff >= 0)
+            {
+                auto fb = filtered.data;
+                immutable o2 = fStart + cast(size_t) eoff;
+                if (o2 + 4 <= fb.length)
+                {
+                    fb[o2] = cast(ubyte)(remain >> 24);
+                    fb[o2 + 1] = cast(ubyte)(remain >> 16);
+                    fb[o2 + 2] = cast(ubyte)(remain >> 8);
+                    fb[o2 + 3] = cast(ubyte)(remain & 0xFF);
+                }
+            }
+        }
+        else
+            filtered.append(d[pos .. pktEnd]);
+        pos = pktEnd;
+    }
+    c.obox.clear();
+    c.obox.append(filtered.data);
+    c.oExprQ = null;
+}
+
+/// A reconnecting fiber (same shard) handed this parked session a fresh socket
+/// via pendingTcp + pendingConnack. Rebind to it, send the CONNACK, redeliver the
+/// unacked QoS1/2 in-flight (DUP=1 [MQTT-4.4.0-1]; a QoS2 past PUBREC re-driven
+/// with PUBREL), then wake the writer to flush the offline queue. Same-thread
+/// cooperative scheduling => the reconnect fiber set every field before emit and
+/// is suspended now, so these reads need no lock.
+private void mqttRebind(MqttConn c) nothrow @trusted
+{
+    c.tcp = c.pendingTcp;
+    c.pendingTcp = TCPConnection.init;
+    if (c.pendingConnack.length)
+        sendTo(c, cast(const(ubyte)[]) c.pendingConnack); // CONNACK first, writer parked
+    c.pendingConnack = null;
+    // publication-expiry: drop expired queued PUBLISHes + decrement the survivors
+    // BEFORE the in-flight redeliveries are appended (those aren't expiry-tracked)
+    mqttExpireOfflineQueue(c);
+    // redeliver unacked QoS1/2 (appended AFTER any offline-queued obox already
+    // present, BEFORE the writer is woken)
     try
         foreach (pid, msg; c.inflightMsg)
         {
@@ -1468,94 +1853,201 @@ private bool mqttResumeOffline(MqttConn c) nothrow @trusted
     catch (Exception)
     {
     }
-    // drop the placeholder (trie subs already re-pointed to c above)
-    foreach (f; old.filters)
-        trieUnsubscribe(f, old);
-    old.filters = null;
-    old.subInfo = null;
-    old.gen++;
-    removeOffline(old);
-    old.offline = false;
-    old.obox.release();
-    return true;
+    c.offline = false;
+    mqttReleaseHeld(c); // resume: flow any messages held behind the window pre-drop
+    try
+        c.flushEvt.emit(); // wake the writer to drain obox onto the new socket
+    catch (Exception)
+    {
+    }
 }
 
-/// Maintenance sweep: reap offline placeholders past their session-expiry.
+/// A clean_start=0 CONNECT (model A reconnect): the reconnecting fiber `newc`
+/// hands its socket to the parked session `old` on THIS shard instead of taking
+/// over. `old` keeps its subscriptions / in-flight / queued obox; only the live
+/// connection params are refreshed from the new CONNECT. The CONNACK (session-
+/// present=1) is built here and stashed for `old` to send on resume. Same-thread
+/// cooperative scheduling: every field is set before emit, and `old`'s fiber is
+/// suspended, so no lock is needed.
+private void mqttHandoffToParked(MqttConn old, MqttConn newc, ushort serverKa,
+        scope const(char)[] assignedId) nothrow @trusted
+{
+    old.protoVer = newc.protoVer;
+    old.readDeadline = newc.readDeadline;
+    old.sessionExpiry = newc.sessionExpiry;
+    old.cleanStart = false;
+    old.maxPktSize = newc.maxPktSize;
+    old.sendMax = newc.sendMax;
+    old.outAliasMax = newc.outAliasMax;
+    old.connGen = newc.connGen;
+    // a fresh socket => fresh topic-alias space in BOTH directions
+    old.inAlias = null;
+    old.inAliasBytes = 0;
+    old.outAlias = null;
+    old.outAliasNext = 1;
+    old.outAliasBytes = 0;
+    // a reconnect's CONNECT carries a (possibly new / possibly absent) will
+    old.willTopic = newc.willTopic;
+    old.willPayload = newc.willPayload;
+    old.willRetain = newc.willRetain;
+    old.willProps = newc.willProps;
+    old.willDelay = newc.willDelay;
+    // build the CONNACK (session-present = 1) for `old` to send on rebind
+    static ByteBuffer cbuf; // TLS: consumed into idup synchronously below
+    cbuf.clear();
+    mqttConnack(cbuf, old.protoVer, true, 0, assignedId, serverKa);
+    try
+        old.pendingConnack = (cast(const(char)[]) cbuf.data).idup;
+    catch (Exception)
+        old.pendingConnack = null;
+    old.pendingTcp = newc.tcp;
+    newc.tcp = TCPConnection.init; // the throwaway must never touch the real socket
+    newc.handedOff = true;
+    try
+        old.reconnectEvt.emit(); // wake old's parked serve fiber -> mqttRebind
+    catch (Exception)
+    {
+    }
+}
+
+/// clean_start=1 CONNECT for a client id whose session is parked offline on this
+/// shard: signal that parked session to END now (its fiber unsubscribes + drops
+/// its keyspace record), so the fresh session takes over cleanly.
+private void mqttDiscardParked(MqttConn old) nothrow @trusted
+{
+    old.discard = true;
+    try
+        old.reconnectEvt.emit();
+    catch (Exception)
+    {
+    }
+}
+
+/// The transparent-strategy park (model A). Called by the serve fiber when the
+/// socket dies / a keepalive lapses / a clean DISCONNECT arrives. If the session
+/// is persistent it is held ALIVE here — the fiber parks on reconnectEvt with a
+/// timed wait that also drives will-delay and session-expiry — and vibe never
+/// learns the socket died. Returns true when a reconnect rebound a new socket
+/// (the serve loop resumes reading c.tcp); false when the session ended (expiry,
+/// or non-persistent) and the caller must fall through to a real teardown.
+/// `cleanDisc` = a clean DISCONNECT (no will fires); otherwise an abnormal drop.
+private bool mqttParkOrEnd(MqttConn c, bool cleanDisc) nothrow @trusted
+{
+    immutable expirySecs0 = c.sessionExpiry == uint.max ? 0x7FFF_FFFF : c.sessionExpiry;
+    immutable wdEff = c.willDelay > expirySecs0 ? expirySecs0 : c.willDelay;
+    // Park when EITHER: (a) a persistent session (expiry > 0) with live subs must
+    // hold its offline queue for a reconnect, OR (b) an abnormal drop must DELAY
+    // the will by will-delay-interval (capped by session-expiry) [MQTT-3.1.3-9] —
+    // this holds even for a subscriber-less publisher. Must still be the
+    // registered owner of its client id.
+    immutable queueHold = c.sessionExpiry > 0 && c.filters.length > 0;
+    immutable willDelayHold = !cleanDisc && c.willTopic.length != 0 && wdEff > 0;
+    bool eligible = c.connected && c.clientId.length != 0
+        && (queueHold || willDelayHold);
+    if (eligible)
+        try
+            eligible = (c.clientId in gLocalClients) !is null
+                && *(c.clientId in gLocalClients) is c;
+        catch (Exception)
+            eligible = false;
+    if (!eligible)
+        return false; // real teardown (fires the will there if one is set)
+
+    closeTcp(c); // release the dead/disconnected fd; the SESSION lives on in us
+    c.offline = true;
+    mqttFlushDirty();
+    if (queueHold)
+        mqttSessionPut(c.clientId, c.sessionExpiry); // advertise session-present
+
+    immutable now = MonoTime.currTime;
+    immutable expirySecs = expirySecs0;
+    immutable expiryAt = now + dur!"seconds"(expirySecs);
+    // will-delay is capped by session-expiry [MQTT-3.1.3-9]; cleanDisc => no will
+    bool willPending = !cleanDisc && c.willTopic.length != 0;
+    MonoTime willAt = now + dur!"seconds"(wdEff);
+
+    for (;;)
+    {
+        immutable t = MonoTime.currTime;
+        // next deadline = the sooner of an unfired will and the session expiry
+        MonoTime next = expiryAt;
+        if (willPending && willAt < next)
+            next = willAt;
+        Duration timeout = next > t ? (next - t) : Duration.zero;
+
+        immutable ec = () @trusted {
+            try
+                return c.reconnectEvt.emitCount;
+            catch (Exception)
+                return 0;
+        }();
+        immutable newEc = () @trusted {
+            try
+                return c.reconnectEvt.waitUninterruptible(timeout, ec);
+            catch (Exception)
+                return ec;
+        }();
+        if (newEc != ec) // woken: reconnect (rebind) or discard (clean_start took over)
+        {
+            if (c.discard)
+            {
+                c.discard = false;
+                c.sessionExpiry = 0; // teardown discards the session record
+                return false;
+            }
+            mqttRebind(c);
+            return true;
+        }
+        // timed out: fire a due will, end at expiry
+        immutable t2 = MonoTime.currTime;
+        if (willPending && t2 >= willAt)
+        {
+            fireWill(c);
+            mqttFlushDirty(); // wake the will subscribers' writers to send it NOW
+            willPending = false;
+        }
+        if (t2 >= expiryAt)
+        {
+            if (willPending)
+                fireWill(c);
+            c.sessionExpiry = 0; // tell teardown to DISCARD the session record
+            return false;
+        }
+    }
+}
+
+/// A throwaway reconnect conn that handed its socket to a parked session: stop
+/// its writer and release its own buffers WITHOUT closing the socket (the parked
+/// session owns it now) and WITHOUT touching the session (it owns the client id).
+private void mqttReleaseHandedOff(MqttConn c, Task writer) nothrow @trusted
+{
+    c.closed = true;
+    try
+        c.flushEvt.emit();
+    catch (Exception)
+    {
+    }
+    try
+        writer.join();
+    catch (Exception)
+    {
+    }
+    c.obox.release();
+}
+
+/// Maintenance sweep hook (retained for server.d wiring). Model A holds offline
+/// sessions in their own parked serve fibers with per-session timed-wait expiry,
+/// so there is no placeholder list to reap here.
 public void mqttReapOfflineConns() nothrow @trusted
 {
-    if (gOfflineConns.length == 0)
-        return;
-    immutable now = MonoTime.currTime;
-    size_t w = 0;
-    foreach (i; 0 .. gOfflineConns.length)
-    {
-        auto c = gOfflineConns[i];
-        if (now >= c.offlineDeadline)
-            dropOffline(c);
-        else
-            gOfflineConns[w++] = c;
-    }
-    gOfflineConns.length = w;
 }
 
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
-    // Persistent-session offline-hold: a persistent client (session-expiry > 0)
-    // with live subscriptions keeps its MqttConn ALIVE — subs stay in the trie,
-    // deliveries accumulate in obox as the offline queue — so a same-thread
-    // reconnect resumes with the queued messages. Skipped on takeover (a newer
-    // conn owns the id) or when this is already the offline placeholder.
-    if (!c.offline && c.connected && c.clientId.length != 0
-        && c.sessionExpiry > 0 && c.filters.length > 0)
-    {
-        bool mine = false;
-        try
-            if (auto pc = c.clientId in gLocalClients)
-                mine = (*pc is c);
-        catch (Exception)
-        {
-        }
-        if (mine)
-        {
-            // the will fires on this abnormal disconnect before we park offline
-            if (c.willTopic.length != 0)
-            {
-                immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload,
-                        c.willRetain, rseq, 0, null, c.willProps);
-                if (gMqttFanout !is null)
-                    gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload,
-                            c.willRetain, rseq, 0, c.willProps);
-                c.willTopic = null;
-            }
-            mqttFlushDirty();
-            // stop the writer (the socket is dead) but keep obox as the queue
-            c.closed = true;
-            try
-                c.flushEvt.emit();
-            catch (Exception)
-            {
-            }
-            closeTcp(c);
-            try
-                writer.join();
-            catch (Exception)
-            {
-            }
-            c.closed = false; // deliverers may keep appending to obox while offline
-            c.offline = true;
-            immutable secs = c.sessionExpiry == uint.max ? 0x7FFF_FFFF : c.sessionExpiry;
-            c.offlineDeadline = MonoTime.currTime + dur!"seconds"(secs);
-            mqttSessionPut(c.clientId, c.sessionExpiry); // cross-thread present flag
-            try
-                gOfflineConns ~= c;
-            catch (Exception)
-            {
-            }
-
-            return; // the conn survives, held by gLocalClients + gOfflineConns
-        }
-    }
+    // Model A: a persistent session that dropped its socket is held ALIVE by its
+    // parked serve fiber (mqttParkOrEnd), NOT here. Teardown is the REAL end —
+    // reached only when the session ended (expiry, park set sessionExpiry=0) or
+    // was never persistent (protocol error / clean session / bad CONNECT).
     // tear down subscriptions for real (not just lazily): under connect/
     // subscribe churn the lazy-gen scheme leaked trie entries and pinned
     // gMqttSubTotal above zero forever, keeping the idle-skin gate open.
@@ -1594,16 +2086,8 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     // left willTopic set (a clean DISCONNECT cleared it) -> publish it now, the
     // same path a live PUBLISH takes (local delivery + cross-shard fan-out +
     // retained if the will-retain flag was set).
-    if (c.connected && c.willTopic.length != 0)
-    {
-        immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-        mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
-                rseq, 0, null, c.willProps);
-        if (gMqttFanout !is null)
-            gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
-                    rseq, 0, c.willProps);
-        c.willTopic = null;
-    }
+    if (c.connected)
+        fireWill(c); // no-op if a clean DISCONNECT or the park already fired it
     // wake OTHER subscribers whose outboxes this connection's last batch filled
     // (PUBLISH+DISCONNECT coalesced in one read batch is the standard
     // fire-and-forget pattern; their writers are alive and deliver). This
@@ -1650,36 +2134,69 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     }
 
     scope (exit)
-        mqttTeardown(c, writer);
+    {
+        if (c.handedOff)
+            mqttReleaseHandedOff(c, writer); // its socket lives on in a parked session
+        else
+            mqttTeardown(c, writer);
+    }
     ByteBuffer inb;
     ByteBuffer outb;
-    for (;;)
+    readloop: for (;;)
     {
         // read at least one byte; a keepalive-exceeded silence closes the conn
         // (waitForData returns false on BOTH the deadline and a real close —
-        // both mean "drop it", exactly the MQTT keepalive contract)
+        // both mean "drop it", exactly the MQTT keepalive contract). c.tcp (not
+        // the captured `tcp`) is read each time so a reconnect's rebind is picked
+        // up transparently.
         bool alive;
         try
-            alive = tcp.waitForData(c.readDeadline);
+            alive = c.tcp.waitForData(c.readDeadline);
         catch (Exception)
             alive = false;
         if (!alive)
+        {
+            // socket death / keepalive lapse: park the session (model A). A
+            // reconnect rebinds a fresh socket and we resume; expiry ends us.
+            if (mqttParkOrEnd(c, false))
+            {
+                inb.clear();
+                outb.clear();
+                continue readloop;
+            }
             return;
+        }
         auto avail = () @trusted {
             try
-                return tcp.leastSize;
+                return c.tcp.leastSize;
             catch (Exception)
                 return cast(ulong) 0;
         }();
         if (avail == 0)
+        {
+            if (mqttParkOrEnd(c, false))
+            {
+                inb.clear();
+                outb.clear();
+                continue readloop;
+            }
             return;
+        }
         auto space = inb.freeSpace(cast(size_t) avail);
         if (space.length < cast(size_t) avail)
             return; // OOM growing the input buffer: drop THIS client, not the broker
         try
-            tcp.read(space[0 .. cast(size_t) avail]);
+            c.tcp.read(space[0 .. cast(size_t) avail]);
         catch (Exception)
+        {
+            if (mqttParkOrEnd(c, false))
+            {
+                inb.clear();
+                outb.clear();
+                continue readloop;
+            }
             return;
+        }
         inb.grow(cast(size_t) avail);
 
         // parse complete packets off the front
@@ -1715,16 +2232,34 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             auto body_ = d[hp .. hp + rem];
             if (!handlePacket(c, h, body_, outb))
             {
+                if (c.handedOff)
+                    return; // socket given to a parked session; -> mqttReleaseHandedOff
                 // v5: on a protocol-error close of an ESTABLISHED session, send a
                 // server DISCONNECT with a reason so the client isn't left to
                 // infer a bare TCP reset. A clean client DISCONNECT (which also
                 // returns false) needs none; a failed/absent CONNECT is answered
                 // by CONNACK (c.connected is still false there), not DISCONNECT.
-                if (c.connected && c.protoVer == 5 && (h >> 4) != PT_DISCONNECT)
-                    mqttServerDisconnect(outb, 0x82); // Protocol Error
+                immutable cleanDisc = (h >> 4) == PT_DISCONNECT;
+                immutable sentDisc = c.connected && c.protoVer == 5 && !cleanDisc;
+                if (sentDisc)
+                    mqttServerDisconnect(outb, c.discReason); // 0x82, or a handler's reason
                 if (!outb.empty) // flush any acks built before the close
                     sendTo(c, outb.data);
-                return; // protocol error or DISCONNECT
+                // After a server DISCONNECT, LINGER: keep the read side open briefly
+                // so the peer can read the DISCONNECT (and its in-flight writes are
+                // drained, not RST) before we close [flow_control2 / Receive Maximum].
+                if (sentDisc)
+                    mqttLingerClose(c);
+                // Park the session (model A): a persistent session is held ALIVE
+                // for a reconnect; a clean DISCONNECT fires no will, an abnormal
+                // one fires it after will-delay. Non-persistent => real teardown.
+                if (mqttParkOrEnd(c, cleanDisc))
+                {
+                    inb.clear();
+                    outb.clear();
+                    continue readloop;
+                }
+                return; // session ended (expiry / non-persistent)
             }
             pos = hp + rem;
         }
@@ -2033,9 +2568,10 @@ private bool mqttParsePubProps(scope const(ubyte)[] p, ref size_t i, out PubProp
 // subscribers. Advances i to the block end; every read is bounded by `end`
 // (<= p.length), so a malformed CONNECT can't read OOB.
 private bool mqttParseWillProps(scope const(ubyte)[] p, ref size_t i,
-        ref ByteBuffer fwd) @nogc nothrow
+        ref ByteBuffer fwd, out uint willDelay) @nogc nothrow
 {
     fwd.clear();
+    willDelay = 0;
     uint plen;
     if (!decodeVarint(p, i, plen))
         return false;
@@ -2057,9 +2593,13 @@ private bool mqttParseWillProps(scope const(ubyte)[] p, ref size_t i,
         case 0x02, 0x18: // message-expiry-interval (fwd) / will-delay-interval (not): u32
             if (i + 4 > end)
                 return false;
-            i += 4;
             if (id == 0x18)
+            {
                 forward = false; // will-delay is consumed by the broker, not sent
+                willDelay = (cast(uint) p[i] << 24) | (cast(uint) p[i + 1] << 16)
+                    | (cast(uint) p[i + 2] << 8) | p[i + 3];
+            }
+            i += 4;
             break;
         case 0x03, 0x08, 0x09: // content-type / response-topic / correlation-data
             if (i + 2 > end)
@@ -2202,7 +2742,8 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
         // assignedId is broker-generated and short (<32), so every length here
         // stays in one varint byte.
         immutable size_t idLen = assignedId.length;
-        immutable size_t propLen = 3 + (idLen ? 3 + idLen : 0) + (serverKeepAlive ? 3 : 0);
+        // topic-alias-maximum (0x22) + receive-maximum (0x21), each 3 bytes, always
+        immutable size_t propLen = 3 + 3 + (idLen ? 3 + idLen : 0) + (serverKeepAlive ? 3 : 0);
         o.appendByte(cast(char)(2 + 1 + propLen)); // remaining length (< 127)
         o.appendByte(cast(char)(sessionPresent ? 1 : 0));
         o.appendByte(cast(char) code);
@@ -2210,6 +2751,9 @@ private void mqttConnack(ref ByteBuffer o, ubyte protoVer, bool sessionPresent,
         o.appendByte(cast(char) 0x22); // topic-alias-maximum
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX >> 8));
         o.appendByte(cast(char)(MQTT_TOPIC_ALIAS_MAX & 0xFF));
+        o.appendByte(cast(char) 0x21); // receive-maximum
+        o.appendByte(cast(char)(MQTT_SERVER_RECEIVE_MAX >> 8));
+        o.appendByte(cast(char)(MQTT_SERVER_RECEIVE_MAX & 0xFF));
         if (serverKeepAlive)
         {
             o.appendByte(cast(char) 0x13); // server-keep-alive
@@ -2391,8 +2935,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 // Round-trip the forwardable ones (will-delay-interval stripped)
                 // so the will PUBLISH carries content-type/user-props/etc.
                 static ByteBuffer wpBuf;
-                if (c.protoVer == 5 && !mqttParseWillProps(p, i, wpBuf))
+                uint wDelay = 0;
+                if (c.protoVer == 5 && !mqttParseWillProps(p, i, wpBuf, wDelay))
                     return false;
+                c.willDelay = wDelay;
                 const(char)[] wt, wm;
                 if (!rdStr(p, i, wt) || !rdStr(p, i, wm))
                     return false;
@@ -2462,7 +3008,6 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // existing session with the same id — locally now, and on the other
             // shards via a broadcast. connGen (global monotonic) makes the
             // newest win regardless of broadcast arrival order.
-            bool resumedOffline = false;
             if (okPair && clientId.length != 0)
             {
                 immutable g = atomicOp!"+="(gMqttConnGen, 1);
@@ -2473,22 +3018,25 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     c.clientId = null;
                 if (c.clientId.length != 0)
                 {
-                    // Resume/discard an OFFLINE session held on this shard BEFORE
-                    // takeover (which would only close it, not migrate it).
-                    if (!c.cleanStart)
-                        resumedOffline = mqttResumeOffline(c);
-                    else
-                        try
-                            if (auto pc = c.clientId in gLocalClients)
-                                if ((*pc).offline)
-                                {
-                                    auto od = *pc;
-                                    removeOffline(od);
-                                    dropOffline(od); // clean_start discards it
-                                }
-                        catch (Exception)
-                        {
-                        }
+                    // Model A reconnect: a parked OFFLINE session for this id on
+                    // THIS shard + clean_start=0 => HAND our socket to it (rebind)
+                    // rather than take it over. It resumes with its queued obox +
+                    // in-flight redelivery; this fiber becomes a throwaway.
+                    MqttConn parked;
+                    try
+                        if (auto pc = c.clientId in gLocalClients)
+                            if (*pc !is c && (*pc).offline)
+                                parked = *pc;
+                    catch (Exception)
+                    {
+                    }
+                    if (parked !is null && !c.cleanStart)
+                    {
+                        mqttHandoffToParked(parked, c, serverKa, assignedId);
+                        return false; // exit the serve loop -> mqttReleaseHandedOff
+                    }
+                    if (parked !is null && c.cleanStart)
+                        mqttDiscardParked(parked); // fresh session takes over
                     takeoverLocal(c.clientId, g);
                     try
                         gLocalClients[c.clientId] = c;
@@ -2499,13 +3047,13 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         gMqttConnBcast(c.clientId, g);
                 }
             }
-            // Persistent session: clean_start discards any prior session; a
-            // clean_start=0 connect resumes a live one (CONNACK session-present=1).
-            // A same-shard resume above sets resumedOffline; otherwise the keyspace
-            // record (mqtt.sess.<id>, Redis TTL) gives cross-shard session-present.
-            // These ops hop cross-shard and YIELD; o/clientId are fiber-local.
-            bool sessPresent = resumedOffline;
-            if (okPair && c.clientId.length != 0 && !resumedOffline)
+            // Persistent session: a same-shard offline session is resumed by the
+            // socket-rebind handoff above (which returns early). Here only the
+            // cross-shard case remains: the keyspace record (mqtt.sess.<id>, Redis
+            // TTL) gives session-present. These ops hop cross-shard and YIELD;
+            // o/clientId are fiber-local.
+            bool sessPresent = false;
+            if (okPair && c.clientId.length != 0)
             {
                 if (c.cleanStart)
                     mqttSessionDel(c.clientId);
@@ -2515,13 +3063,6 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // CONNACK: reason/rc 0 on success, else unacceptable-protocol-version.
             // assignedId is non-empty only for an empty-ClientId v5 client.
             mqttConnack(o, c.protoVer, sessPresent, okPair ? 0 : 1, assignedId, serverKa);
-            // A resumed session's queued messages go out right after the CONNACK,
-            // in the same response buffer (ordering guaranteed, no writer race).
-            if (resumedOffline && !c.obox.empty)
-            {
-                o.append(c.obox.data);
-                c.obox.clear();
-            }
             return okPair;
         }
     case PT_PUBLISH:
@@ -2625,8 +3166,15 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     }
                 if (!dup)
                 {
-                    if (c.q2pids.length >= 1024)
-                        return false; // receive-window abuse
+                    // Receive Maximum [MQTT-4.9]: at most MQTT_SERVER_RECEIVE_MAX
+                    // concurrent unacked inbound QoS2. The (max+1)th is a protocol
+                    // error -> server DISCONNECT 0x93 (set the reason; the serve
+                    // loop emits it + lingers on the false return).
+                    if (c.q2pids.length >= MQTT_SERVER_RECEIVE_MAX)
+                    {
+                        c.discReason = 0x93; // Receive Maximum exceeded
+                        return false;
+                    }
                     if (!clientReserved)
                     {
                         atomicOp!"+="(gMqttMessages, 1);
@@ -2676,6 +3224,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             catch (Exception)
             {
             }
+            mqttReleaseHeld(c); // a QoS1 slot freed -> release a held delivery
         }
         return true;
     case PT_PUBREC:
@@ -2710,6 +3259,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             catch (Exception)
             {
             }
+            mqttReleaseHeld(c); // a QoS2 slot freed -> release a held delivery
         }
         return true;
     case PT_PUBREL:
