@@ -1150,19 +1150,30 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
 /// topic produced into with N contiguous partitions reports N. Falls back to
 /// KAFKA_PARTITIONS for an empty/fresh topic so a producer always has partitions
 /// to write to. Derived from the keyspace — no per-topic partition-count state.
+/// Per-Metadata-request budget on CROSS-SHARD LLEN probes, so a request naming
+/// many topics (each with many populated partitions) can't drive a hop storm.
+/// Owner-shard probes (gKafkaLenRaw, no hop) are free and don't count.
+private enum size_t KAFKA_META_PROBE_BUDGET = 1024;
+private size_t tMetaProbes; // TLS, reset at the top of handleMetadata
+
 private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
 {
     if (!validTopic(topic))
         return cast(int) KAFKA_PARTITIONS;
     static ByteBuffer kb; // TLS scratch (consumed synchronously per probe)
     int count = 0;
-    foreach (p; 0 .. 256) // hard cap on the probe
+    foreach (p; 0 .. 64) // hard cap on partitions per topic
     {
         partKey(topic, p, kb);
         auto key = kb.data.asChars;
         long len = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
         if (len < 0)
+        {
+            if (tMetaProbes >= KAFKA_META_PROBE_BUDGET)
+                break; // hop budget exhausted: stop probing cross-shard
+            tMetaProbes++;
             len = partLen(key); // not the owner shard: data-plane LLEN (hops)
+        }
         if (len <= 0)
             break; // first empty partition ends the contiguous run
         count++;
@@ -1187,8 +1198,19 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
             break;
         auto t = r.str();
         if (nt < topics.length && t !is null && validTopic(t))
-            topics[nt++] = t;
+        {
+            bool dup = false;
+            foreach (k; 0 .. nt)
+                if (topics[k] == t)
+                {
+                    dup = true; // dedup: a repeated name must not multiply the probes
+                    break;
+                }
+            if (!dup)
+                topics[nt++] = t;
+        }
     }
+    tMetaProbes = 0; // reset the per-request cross-shard LLEN-probe budget
 
     // brokers: just us
     putI32(o, 1);
