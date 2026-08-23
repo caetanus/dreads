@@ -40,6 +40,7 @@ import vibe.core.net : TCPConnection;
 import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
 import dreads.mem : ByteBuffer;
+import dreads.acl : AclUser, aclUser, aclCheckPassword, aclCanAccessChannel;
 
 // ---------------------------------------------------------------------------
 // Global gate: total MQTT subscriptions across every thread's trie. A publish
@@ -79,6 +80,11 @@ public final class MqttConn
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
     uint gen; // bumped on disconnect: stale trie entries self-invalidate
+    // ACL: the authenticated user (CONNECT username -> ACL user, `default` when
+    // absent). SUBSCRIBE/PUBLISH topics are authorized as ACL CHANNELS against it
+    // (a denied topic -> SUBACK failure / dropped publish) so MQTT clients obey
+    // the same channel ACL as Redis pub/sub — including `&!pattern` topic denies.
+    const(AclUser)* aclUser;
     // Delivery outbox pair: deliverers append to `obox` and signal `flushEvt`;
     // the conn's writer fiber swaps obox<->wbox (no yield in between) and
     // writes wbox. All deliverers run on this conn's own shard thread, so the
@@ -589,6 +595,17 @@ package bool mqttValidTopicName(scope const(char)[] t) @nogc nothrow
 
 /// [MQTT-4.7.1] a topic FILTER: non-empty, no NUL; '+' and '#' only as whole
 /// segments; '#' only as the last segment. ("a//b" — empty levels — is legal.)
+/// True if the topic filter contains an MQTT wildcard ('+' or '#'). Used to pick
+/// the ACL channel-match mode: a wildcard filter matches an ACL pattern exactly,
+/// a literal one is glob-matched (so `&!literal` topic denies apply).
+private bool mqttHasWildcard(scope const(char)[] f) @nogc nothrow @safe
+{
+    foreach (ch; f)
+        if (ch == '+' || ch == '#')
+            return true;
+    return false;
+}
+
 package bool mqttValidFilter(scope const(char)[] f) @nogc nothrow
 {
     if (f.length == 0)
@@ -2962,17 +2979,37 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 }
                 c.willRetain = (flags & 0x20) != 0;
             }
+            const(char)[] username;
             if (flags & 0x80)
             {
-                const(char)[] u;
-                if (!rdStr(p, i, u))
+                if (!rdStr(p, i, username))
                     return false;
             }
+            const(char)[] password;
             if (flags & 0x40)
             {
-                const(char)[] pw;
-                if (!rdStr(p, i, pw))
+                if (!rdStr(p, i, password))
                     return false;
+            }
+            // ACL authentication: resolve the user (the `default` user when the
+            // CONNECT carries no username) and verify the password. On failure,
+            // CONNACK bad-user-name-or-password (v5 0x86 / v3 0x04) and drop —
+            // no session is set up. A null default user means the ACL subsystem
+            // isn't initialised: fall back to legacy unauthenticated behaviour.
+            if (okPair)
+            {
+                immutable hasUser = (flags & 0x80) != 0;
+                auto au = aclUser(hasUser ? username : "default");
+                if (au is null && !hasUser)
+                    c.aclUser = null; // ACL not initialised -> allow (legacy)
+                else if (au is null || !au.enabled
+                        || !aclCheckPassword(au, (flags & 0x40) ? password : ""))
+                {
+                    mqttConnack(o, c.protoVer, false, c.protoVer == 5 ? 0x86 : 4);
+                    return false; // bad user name or password
+                }
+                else
+                    c.aclUser = au;
             }
             c.connected = okPair;
             // [MQTT-3.1.3-6] empty ClientId on v5: the server assigns a unique one
@@ -3152,7 +3189,10 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // [MQTT reserved] $-topics belong to the broker: a CLIENT publish to
             // one (e.g. spoofing $SYS/broker/messages) is dropped — not delivered,
             // fanned, or retained — but still acked so the client isn't confused.
-            immutable clientReserved = topic.length != 0 && topic[0] == '$';
+            // ACL: a publish to a channel the user can't access is dropped the same
+            // way (drop-but-ack) so an unauthorized device can't inject messages.
+            immutable clientReserved = (topic.length != 0 && topic[0] == '$')
+                || (c.aclUser !is null && !aclCanAccessChannel(c.aclUser, topic));
             if (qos == 2)
             {
                 // dedup: a retransmit of an in-flight qos2 id is acked again
@@ -3354,6 +3394,20 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 if (!mqttValidFilter(actualFilter) || c.filters.length >= MQTT_MAX_SUBS)
                 {
                     granted[ng] = 0x80; // unusable filter / sub-cap: failure
+                    retainOk[ng] = false;
+                    filters[ng++] = null;
+                    continue;
+                }
+                // ACL: authorize the filter as a CHANNEL. A denied filter gets a
+                // SUBACK failure (0x80) and is NOT subscribed — the reason code the
+                // MQTT conformance suite expects for an unauthorized subscription
+                // in both v3.1.1 and v5. A wildcard filter matches ACL patterns
+                // exactly; a literal one is glob-matched (so `&!pattern` applies).
+                if (c.aclUser !is null
+                    && !aclCanAccessChannel(c.aclUser, actualFilter,
+                            mqttHasWildcard(actualFilter)))
+                {
+                    granted[ng] = 0x80;
                     retainOk[ng] = false;
                     filters[ng++] = null;
                     continue;

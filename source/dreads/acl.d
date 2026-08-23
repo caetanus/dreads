@@ -51,6 +51,11 @@ struct AclPerm
     bool allChannels;
     Vector!KeyPat keyPats;
     Vector!(const(char)[]) chanPats; // malloc'd
+    // dreads extension: NEGATIVE channel patterns (`&!pattern`). A channel is
+    // denied if it matches any of these, even under `allchannels`/`&*` — the
+    // only way to express "allow all channels except these". Checked BEFORE the
+    // allow set in aclCanAccessChannel. Useful for Redis pub/sub AND MQTT topics.
+    Vector!(const(char)[]) denyChanPats; // malloc'd
 
     // command-rule text, kept verbatim so ACL GETUSER/LIST can echo the rules
     // instead of reverse-engineering the bitset (Valkey's approach — a category
@@ -72,6 +77,8 @@ struct AclPerm
             freeSlice(keyPats[i].pat);
         foreach (i; 0 .. chanPats.length)
             freeSlice(chanPats[i]);
+        foreach (i; 0 .. denyChanPats.length)
+            freeSlice(denyChanPats[i]);
         foreach (i; 0 .. cmdRules.length)
             freeSlice(cmdRules[i]);
         foreach (i; 0 .. subRules.length)
@@ -88,6 +95,9 @@ struct AclPerm
         foreach (i; 0 .. chanPats.length)
             freeSlice(chanPats[i]);
         chanPats.clear();
+        foreach (i; 0 .. denyChanPats.length)
+            freeSlice(denyChanPats[i]);
+        denyChanPats.clear();
         cmdBaseAll = false;
         clearCmdRules();
         clearSubRules();
@@ -440,7 +450,11 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
     case '%':
         return applyKeyPatWithFlags(u, tok[1 .. $], err);
     case '&':
-        u.root.chanPats.put(cast(const(char)[]) mallocDup(tok[1 .. $]));
+        // dreads extension: `&!pattern` DENIES a channel (even under allchannels).
+        if (tok.length >= 2 && tok[1] == '!')
+            u.root.denyChanPats.put(cast(const(char)[]) mallocDup(tok[2 .. $]));
+        else
+            u.root.chanPats.put(cast(const(char)[]) mallocDup(tok[1 .. $]));
         return true;
     default:
         err = "ERR Error in ACL SETUSER modifier: Syntax error";
@@ -679,6 +693,9 @@ private void freeChanPats(AclUser* u) @nogc nothrow @trusted
     foreach (i; 0 .. u.root.chanPats.length)
         freeSlice(u.root.chanPats[i]);
     u.root.chanPats.clear();
+    foreach (i; 0 .. u.root.denyChanPats.length)
+        freeSlice(u.root.denyChanPats[i]);
+    u.root.denyChanPats.clear();
 }
 
 /// `reset`: back to a fresh, disabled, no-permission user (keeping the name).
@@ -1295,6 +1312,14 @@ bool aclCanAccessChannel(const(AclUser)* u, scope const(char)[] channel,
 {
     import dreads.commands : globMatch;
 
+    // dreads extension: NEGATIVE patterns deny first — a match here forbids the
+    // channel even under allchannels (the only way to say "all except these").
+    foreach (i; 0 .. u.root.denyChanPats.length)
+    {
+        auto pat = u.root.denyChanPats[i];
+        if (isPattern ? (pat == channel) : globMatch(pat, channel))
+            return false;
+    }
     if (u.root.allChannels)
         return true;
     foreach (i; 0 .. u.root.chanPats.length)
@@ -1368,19 +1393,36 @@ void aclDescribeKeys(const(AclUser)* u, ref ByteBuffer o) @trusted nothrow @nogc
 /// form uses it; the ACL GETUSER `channels` field does not).
 void aclDescribeChannels(const(AclUser)* u, ref ByteBuffer o, bool withReset = false) @trusted nothrow @nogc
 {
+    bool wrote = false;
     if (u.root.allChannels)
     {
         o.append("&*");
-        return;
+        wrote = true;
     }
-    if (withReset)
-        o.append("resetchannels");
-    foreach (i; 0 .. u.root.chanPats.length)
+    else
     {
-        if (withReset || i)
+        if (withReset)
+        {
+            o.append("resetchannels");
+            wrote = true;
+        }
+        foreach (i; 0 .. u.root.chanPats.length)
+        {
+            if (wrote)
+                o.append(" ");
+            o.append("&");
+            o.append(u.root.chanPats[i]);
+            wrote = true;
+        }
+    }
+    // dreads extension: negative channel patterns echo as `&!pattern`
+    foreach (i; 0 .. u.root.denyChanPats.length)
+    {
+        if (wrote)
             o.append(" ");
-        o.append("&");
-        o.append(u.root.chanPats[i]);
+        o.append("&!");
+        o.append(u.root.denyChanPats[i]);
+        wrote = true;
     }
 }
 
