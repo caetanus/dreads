@@ -474,12 +474,15 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
     if (apiKey != API_API_VERSIONS && apiVer > maxApiVer(apiKey))
     {
         putI16(o, E_UNSUPPORTED_VERSION);
-        auto de = cast(ubyte[]) o.data;
-        immutable esz = o.length - sizeAt - 4;
-        de[sizeAt] = cast(ubyte)(esz >> 24);
-        de[sizeAt + 1] = cast(ubyte)(esz >> 16);
-        de[sizeAt + 2] = cast(ubyte)(esz >> 8);
-        de[sizeAt + 3] = cast(ubyte)(esz & 0xFF);
+        if (o.length >= sizeAt + 4) // skip the raw patch on OOM (see epilogue note)
+        {
+            auto de = cast(ubyte[]) o.data;
+            immutable esz = o.length - sizeAt - 4;
+            de[sizeAt] = cast(ubyte)(esz >> 24);
+            de[sizeAt + 1] = cast(ubyte)(esz >> 16);
+            de[sizeAt + 2] = cast(ubyte)(esz >> 8);
+            de[sizeAt + 3] = cast(ubyte)(esz & 0xFF);
+        }
         return;
     }
 
@@ -606,13 +609,21 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         break;
     }
 
-    // patch the size
-    auto d2 = cast(ubyte[]) o.data;
-    immutable size = o.length - sizeAt - 4;
-    d2[sizeAt] = cast(ubyte)(size >> 24);
-    d2[sizeAt + 1] = cast(ubyte)(size >> 16);
-    d2[sizeAt + 2] = cast(ubyte)(size >> 8);
-    d2[sizeAt + 3] = cast(ubyte)(size & 0xFF);
+    // patch the size — but only if the 4 reserved length bytes were actually
+    // written. If the reserving putI32(o,0) above hit OOM (tByteBufferOom: the
+    // append no-ops and o.length stays at sizeAt), the buffer may have no space
+    // at [sizeAt..sizeAt+4], so this raw patch would be a 4-byte OOB write past
+    // the allocation under -release (heap corruption -> broker crash). Skip it;
+    // serveKafkaClient sees tByteBufferOom and drops THIS client (F2 semantics).
+    if (o.length >= sizeAt + 4)
+    {
+        auto d2 = cast(ubyte[]) o.data;
+        immutable size = o.length - sizeAt - 4;
+        d2[sizeAt] = cast(ubyte)(size >> 24);
+        d2[sizeAt + 1] = cast(ubyte)(size >> 16);
+        d2[sizeAt + 2] = cast(ubyte)(size >> 8);
+        d2[sizeAt + 3] = cast(ubyte)(size & 0xFF);
+    }
     cast(void) bodyAt;
 }
 
