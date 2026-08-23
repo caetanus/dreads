@@ -52,6 +52,8 @@ public shared long gMqttSubTotal;
 public shared ulong gMqttConnGen;
 /// THIS shard's live clientId -> conn map (share-nothing).
 private MqttConn[string] gLocalClients; // TLS
+private MqttConn[] gOfflineConns; // TLS: held persistent sessions, reaped by the
+// maintenance sweep at their offlineDeadline (see MqttConn.offline)
 /// Broadcast a (clientId, connGen) takeover to every OTHER shard (installed by
 /// server.d). Null when unsharded.
 public __gshared void delegate(scope const(char)[] clientId, ulong gen) nothrow gMqttConnBcast;
@@ -63,6 +65,16 @@ private enum Duration MQTT_CONNECT_TIMEOUT = 30.seconds;
 
 /// One MQTT connection (fiber-owned). The write mutex serializes deliveries
 /// from publisher fibers on the same thread with the conn's own replies.
+/// Full subscription record kept per-connection (parallel to MqttConn.filters)
+/// so a persistent-session resume can restore the exact subscriptions.
+private struct SubInfo
+{
+    ubyte qos;
+    ubyte opts;
+    string shareGroup;
+    uint subId;
+}
+
 public final class MqttConn
 {
     TCPConnection tcp;
@@ -82,6 +94,14 @@ public final class MqttConn
     LocalManualEvent flushEvt;
     bool dirty;
     bool closed; // serve fiber sets on exit; writer fiber then drains + stops
+    // Persistent-session offline-hold: on a persistent client's disconnect the
+    // MqttConn is NOT torn down — it stays in gLocalClients + the trie, marked
+    // offline, its writer stopped, and deliveries accumulate in obox (capped) as
+    // a fixed offline queue. A same-thread reconnect migrates the session; the
+    // maintenance sweep reaps it at offlineDeadline. (SO_REUSEPORT cross-thread
+    // reconnect is the deliberately-unhandled ostrich case.)
+    bool offline;
+    MonoTime offlineDeadline;
     ubyte protoVer = 4; // MQTT protocol level: 4 = 3.1.1, 5 = 5.0 (v5 packets
     // carry a property block; v5 CONNACK/SUBACK use reason codes)
     // v5 inbound topic aliases: a client maps a small int -> topic to save bytes;
@@ -117,6 +137,8 @@ public final class MqttConn
     // Filters this conn subscribed (idup'd): torn down on disconnect so trie
     // entries and gMqttSubTotal don't leak under connect/subscribe churn.
     const(char)[][] filters;
+    SubInfo[] subInfo; // parallel to `filters`: the granted qos/opts/share/subId,
+    // so a persistent-session resume can re-subscribe them on the new connection
     // Client identity for [MQTT-3.1.4-2] takeover: a new CONNECT with the same
     // (non-empty) clientId must disconnect the existing session. connGen is a
     // global monotonic stamp so the NEWEST connection wins regardless of the
@@ -439,11 +461,16 @@ private void addLive(ref SubEntry e) @trusted nothrow
 {
     if (e.c is null || e.gen != e.c.gen)
         return; // stale (unsubscribed/disconnected)
-    try
-        if (!e.c.tcp.connected)
+    // An OFFLINE persistent session has a closed socket but a live obox queue:
+    // include it (deliver into the queue). Otherwise require a live socket.
+    if (!e.c.offline)
+    {
+        try
+            if (!e.c.tcp.connected)
+                return;
+        catch (Exception)
             return;
-    catch (Exception)
-        return;
+    }
     if (tMatchLen >= tMatchBuf.length)
     {
         try
@@ -1170,11 +1197,11 @@ private enum size_t MQTT_OBOX_KEEP = 4 << 20;
 /// stuck-writer-can-never-be-reaped hole the previous design left.
 private void mqttWriter(MqttConn c) nothrow
 {
+    // Release only wbox here; obox is released by mqttTeardown (or the offline
+    // reaper), so a persistent session held offline keeps its queued obox after
+    // the writer stops.
     scope (exit)
-    {
-        c.obox.release();
         c.wbox.release();
-    }
     for (;;)
     {
         while (c.obox.empty && !c.closed)
@@ -1333,8 +1360,167 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 // Connection teardown (a named nothrow helper: scope(exit) may not hold a
 // try/catch). Order matters: real subscription teardown, wake+close so a
 // stalled writer unblocks, then join so buffer release runs on THIS thread.
+// Remove an offline placeholder from the per-shard list (swap-remove).
+private void removeOffline(MqttConn c) nothrow @trusted
+{
+    foreach (i, o; gOfflineConns)
+        if (o is c)
+        {
+            gOfflineConns[i] = gOfflineConns[$ - 1];
+            gOfflineConns.length = gOfflineConns.length - 1;
+            return;
+        }
+}
+
+// Fully tear down an offline placeholder (its serve fiber is already gone): drop
+// its trie subs, its clientId registration (if still ours), its keyspace record,
+// and release its queued obox.
+private void dropOffline(MqttConn c) nothrow @trusted
+{
+    foreach (f; c.filters)
+        trieUnsubscribe(f, c);
+    c.filters = null;
+    c.subInfo = null;
+    c.gen++;
+    try
+        if (auto pc = c.clientId in gLocalClients)
+            if (*pc is c)
+                gLocalClients.remove(c.clientId);
+    catch (Exception)
+    {
+    }
+    mqttSessionDel(c.clientId);
+    c.offline = false;
+    c.obox.release();
+}
+
+/// A clean_start=0 CONNECT: if an OFFLINE session exists for this client id on
+/// THIS shard, migrate it (subscriptions + queued obox + in-flight QoS state)
+/// onto the new connection `c`, then drop the placeholder. Returns true if a
+/// session was resumed. (Cross-shard offline sessions are the ostrich case.)
+private bool mqttResumeOffline(MqttConn c) nothrow @trusted
+{
+    MqttConn old;
+    try
+        if (auto pc = c.clientId in gLocalClients)
+            if (*pc !is c && (*pc).offline)
+                old = *pc;
+    catch (Exception)
+    {
+    }
+    if (old is null)
+        return false;
+    foreach (i, f; old.filters)
+    {
+        if (i >= old.subInfo.length)
+            break;
+        auto si = old.subInfo[i];
+        cast(void) trieSubscribe(f, c, si.qos, si.opts, si.shareGroup, si.subId);
+        try
+        {
+            c.filters ~= f;
+            c.subInfo ~= si;
+        }
+        catch (Exception)
+        {
+        }
+    }
+    try
+        if (!old.obox.empty)
+            c.obox.append(old.obox.data); // queued messages -> flushed after CONNACK
+    catch (Exception)
+    {
+    }
+    c.inflight = old.inflight; // adopt in-flight QoS1/2 so acks match
+    c.outQos2 = old.outQos2;
+    // drop the placeholder (trie subs already re-pointed to c above)
+    foreach (f; old.filters)
+        trieUnsubscribe(f, old);
+    old.filters = null;
+    old.subInfo = null;
+    old.gen++;
+    removeOffline(old);
+    old.offline = false;
+    old.obox.release();
+    return true;
+}
+
+/// Maintenance sweep: reap offline placeholders past their session-expiry.
+public void mqttReapOfflineConns() nothrow @trusted
+{
+    if (gOfflineConns.length == 0)
+        return;
+    immutable now = MonoTime.currTime;
+    size_t w = 0;
+    foreach (i; 0 .. gOfflineConns.length)
+    {
+        auto c = gOfflineConns[i];
+        if (now >= c.offlineDeadline)
+            dropOffline(c);
+        else
+            gOfflineConns[w++] = c;
+    }
+    gOfflineConns.length = w;
+}
+
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
+    // Persistent-session offline-hold: a persistent client (session-expiry > 0)
+    // with live subscriptions keeps its MqttConn ALIVE — subs stay in the trie,
+    // deliveries accumulate in obox as the offline queue — so a same-thread
+    // reconnect resumes with the queued messages. Skipped on takeover (a newer
+    // conn owns the id) or when this is already the offline placeholder.
+    if (!c.offline && c.connected && c.clientId.length != 0
+        && c.sessionExpiry > 0 && c.filters.length > 0)
+    {
+        bool mine = false;
+        try
+            if (auto pc = c.clientId in gLocalClients)
+                mine = (*pc is c);
+        catch (Exception)
+        {
+        }
+        if (mine)
+        {
+            // the will fires on this abnormal disconnect before we park offline
+            if (c.willTopic.length != 0)
+            {
+                immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
+                mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload,
+                        c.willRetain, rseq, 0, null, c.willProps);
+                if (gMqttFanout !is null)
+                    gMqttFanout(c.willTopic, cast(const(char)[]) c.willPayload,
+                            c.willRetain, rseq, 0, c.willProps);
+                c.willTopic = null;
+            }
+            mqttFlushDirty();
+            // stop the writer (the socket is dead) but keep obox as the queue
+            c.closed = true;
+            try
+                c.flushEvt.emit();
+            catch (Exception)
+            {
+            }
+            closeTcp(c);
+            try
+                writer.join();
+            catch (Exception)
+            {
+            }
+            c.closed = false; // deliverers may keep appending to obox while offline
+            c.offline = true;
+            immutable secs = c.sessionExpiry == uint.max ? 0x7FFF_FFFF : c.sessionExpiry;
+            c.offlineDeadline = MonoTime.currTime + dur!"seconds"(secs);
+            mqttSessionPut(c.clientId, c.sessionExpiry); // cross-thread present flag
+            try
+                gOfflineConns ~= c;
+            catch (Exception)
+            {
+            }
+
+            return; // the conn survives, held by gLocalClients + gOfflineConns
+        }
+    }
     // tear down subscriptions for real (not just lazily): under connect/
     // subscribe churn the lazy-gen scheme leaked trie entries and pinned
     // gMqttSubTotal above zero forever, keeping the idle-skin gate open.
@@ -1406,6 +1592,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     catch (Exception)
     {
     }
+    c.obox.release(); // the writer no longer releases obox (offline-hold keeps it)
 }
 
 public void serveMqttClient(TCPConnection tcp) nothrow
@@ -2240,6 +2427,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // existing session with the same id — locally now, and on the other
             // shards via a broadcast. connGen (global monotonic) makes the
             // newest win regardless of broadcast arrival order.
+            bool resumedOffline = false;
             if (okPair && clientId.length != 0)
             {
                 immutable g = atomicOp!"+="(gMqttConnGen, 1);
@@ -2250,6 +2438,22 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     c.clientId = null;
                 if (c.clientId.length != 0)
                 {
+                    // Resume/discard an OFFLINE session held on this shard BEFORE
+                    // takeover (which would only close it, not migrate it).
+                    if (!c.cleanStart)
+                        resumedOffline = mqttResumeOffline(c);
+                    else
+                        try
+                            if (auto pc = c.clientId in gLocalClients)
+                                if ((*pc).offline)
+                                {
+                                    auto od = *pc;
+                                    removeOffline(od);
+                                    dropOffline(od); // clean_start discards it
+                                }
+                        catch (Exception)
+                        {
+                        }
                     takeoverLocal(c.clientId, g);
                     try
                         gLocalClients[c.clientId] = c;
@@ -2262,11 +2466,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             }
             // Persistent session: clean_start discards any prior session; a
             // clean_start=0 connect resumes a live one (CONNACK session-present=1).
-            // The keyspace record (mqtt.sess.<id>, Redis TTL = expiry) survives
-            // across reconnects to any shard. These ops hop cross-shard and YIELD;
-            // o/clientId are fiber-local, so no cross-connection clobber.
-            bool sessPresent = false;
-            if (okPair && c.clientId.length != 0)
+            // A same-shard resume above sets resumedOffline; otherwise the keyspace
+            // record (mqtt.sess.<id>, Redis TTL) gives cross-shard session-present.
+            // These ops hop cross-shard and YIELD; o/clientId are fiber-local.
+            bool sessPresent = resumedOffline;
+            if (okPair && c.clientId.length != 0 && !resumedOffline)
             {
                 if (c.cleanStart)
                     mqttSessionDel(c.clientId);
@@ -2276,6 +2480,13 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
             // CONNACK: reason/rc 0 on success, else unacceptable-protocol-version.
             // assignedId is non-empty only for an empty-ClientId v5 client.
             mqttConnack(o, c.protoVer, sessPresent, okPair ? 0 : 1, assignedId, serverKa);
+            // A resumed session's queued messages go out right after the CONNACK,
+            // in the same response buffer (ordering guaranteed, no writer race).
+            if (resumedOffline && !c.obox.empty)
+            {
+                o.append(c.obox.data);
+                c.obox.clear();
+            }
             return okPair;
         }
     case PT_PUBLISH:
@@ -2586,6 +2797,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         cast(ubyte)(v5 ? optByte : 0), sg, subId);
                 if (!isNew)
                     c.filters.length = c.filters.length - 1; // replaced: no new entry
+                else // keep subInfo index-aligned with filters (for session resume)
+                    try
+                        c.subInfo ~= SubInfo(grant, cast(ubyte)(v5 ? optByte : 0), sg, subId);
+                    catch (Exception)
+                        c.filters.length = c.filters.length - 1; // drop to stay aligned
                 // retain-handling (opts bits 4-5): 0 = always send retained on
                 // subscribe, 1 = only if new, 2 = never. A SHARED subscription
                 // never gets retained-on-subscribe [MQTT-4.8.2].
@@ -2758,6 +2974,11 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                         c.filters[idx] = c.filters[$ - 1];
                         c.filters.length = c.filters.length - 1;
+                        if (idx < c.subInfo.length) // keep subInfo index-aligned
+                        {
+                            c.subInfo[idx] = c.subInfo[$ - 1];
+                            c.subInfo.length = c.subInfo.length - 1;
+                        }
                         break;
                     }
             }

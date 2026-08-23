@@ -7400,12 +7400,13 @@ private void maintEvictionTick() @trusted nothrow
     // $SYS/broker/* stats every ~10 ticks (10s), per shard, to its subscribers
     if (gConfig.mqttPort != 0)
     {
-        import dreads.mqtt : mqttPublishSys, mqttExpireRetained;
+        import dreads.mqtt : mqttPublishSys, mqttExpireRetained, mqttReapOfflineConns;
 
         // reap v5-message-expired retained messages every tick so dead data
         // can't pin the retained caps between SUBSCRIBEs (cheap: no-op when
         // nothing is expired)
         mqttExpireRetained();
+        mqttReapOfflineConns(); // reap persistent sessions past their expiry
         static uint sysTick;
         if (++sysTick >= 10)
         {
