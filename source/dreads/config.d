@@ -26,6 +26,13 @@ public struct Config
     uint mqttDb = 17;
     uint kafkaDb = 18;
     string appendfilename = "dreads.aof";
+    // TLS (production drop-in M1): a SEPARATE listener port — the plaintext
+    // port keeps serving exactly as before (zero-cost rule). Redis' knob names.
+    ushort tlsPort = 0;
+    string tlsCertFile;
+    string tlsKeyFile;
+    string tlsCaCertFile;
+    string tlsAuthClients = "no"; // no | optional | yes (mTLS)
     // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
     // log) and the rewrite/snapshot re-emit the cache — EVALSHA survives a
     // restart AND a master failover. `no` = Redis-faithful volatile cache.
@@ -287,6 +294,26 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "appendfilename":
         cfg.appendfilename = value.unquote;
+        return true;
+    case "tls-port":
+        try
+            cfg.tlsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "tls-cert-file":
+        cfg.tlsCertFile = value.unquote;
+        return true;
+    case "tls-key-file":
+        cfg.tlsKeyFile = value.unquote;
+        return true;
+    case "tls-ca-cert-file":
+        cfg.tlsCaCertFile = value.unquote;
+        return true;
+    case "tls-auth-clients":
+        if (value != "yes" && value != "no" && value != "optional")
+            return false;
+        cfg.tlsAuthClients = value.unquote;
         return true;
     case "persist-scripts":
         if (value == "yes")

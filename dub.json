@@ -192,5 +192,9 @@
 	"name": "dreads",
 	"targetPath": "bin",
 	"targetType": "executable",
-	"lflags-linux": []
+	"lflags-linux": [],
+	"libs": [
+		"ssl",
+		"crypto"
+	]
 }

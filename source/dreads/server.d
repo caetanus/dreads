@@ -49,6 +49,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
     return isPausedByWrite(uname);
 }
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, isCompatModeParam, parseMemory;
+import dreads.tls : SSL_CTX, TlsClientAuth, TlsConn, tlsServerCtx;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.alloc : ConnAllocator;
 import emplace.vector : Vector;
@@ -423,6 +424,21 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 : gPubSub.publish(chan, msg);
         };
     }
+    if (gConfig.tlsPort != 0)
+    {
+        // built BEFORE any listener/shard thread exists; a bad cert aborts boot
+        // (a TLS port that silently fell back to plaintext would be worse)
+        const(char)[] terr;
+        immutable ta = gConfig.tlsAuthClients == "yes" ? TlsClientAuth.yes
+            : gConfig.tlsAuthClients == "optional" ? TlsClientAuth.optional : TlsClientAuth.no;
+        gTlsCtx = tlsServerCtx(gConfig.tlsCertFile, gConfig.tlsKeyFile,
+                gConfig.tlsCaCertFile, ta, terr);
+        if (gTlsCtx is null)
+        {
+            printf("dreads: TLS setup failed: %.*s\n", cast(int) terr.length, terr.ptr);
+            return 1;
+        }
+    }
     {
         import dreads.cluster : initCluster;
         import dreads.shard : shardInit, gShardCount;
@@ -557,6 +573,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         serveClient(conn);
     }, listenOpts);
     printf("dreads listening on port %u\n", cast(uint) port);
+    if (gConfig.tlsPort != 0)
+    {
+        cast(void) listenTCP(gConfig.tlsPort, delegate(TCPConnection conn) @trusted nothrow {
+            serveClient(conn, true);
+        }, listenOpts);
+        printf("dreads TLS listening on port %u\n", cast(uint) gConfig.tlsPort);
+    }
     if (gConfig.mqttPort != 0)
     {
         // the MQTT skin (dreads.mqtt): same SO_REUSEPORT share-nothing model,
@@ -723,9 +746,20 @@ private void initReplication()
 // Bounds per-connection state (8 bytes each) and the group-commit batch depth.
 private enum PIPELINE_CAP = 256;
 
+// The RESP TLS listener's context (config tls-port; null = no TLS listener).
+// Built ONCE at boot before any listener/shard starts; SSL_CTX is thread-safe
+// for the per-connection SSL_new that follows.
+package __gshared SSL_CTX* gTlsCtx;
+
 private struct Conn
 {
     TCPConnection tcp;
+    // TLS leg (null on plaintext conns — every existing path is untouched).
+    // Created and freed by the serve fiber ON ITS OWN THREAD (allocator rule);
+    // the cipher buffers are per-conn so nothing static crosses a yield.
+    TlsConn* tls;
+    ByteBuffer tlsCipherIn;
+    ByteBuffer tlsCipherOut;
     TaskMutex wlock;
     Subscriber sub;
     Subscriber shardSub;
@@ -1773,6 +1807,52 @@ private struct OutQueue
 
 // Drains a subscriber connection's output queue to its socket. The only writer
 // of that socket once subMode is on, so writes stay ordered without a lock.
+// Encrypt-and-send one plaintext burst. wlock serializes the SSL engine AND
+// keeps the produced records in SSL's output order on the wire (the drain and
+// the socket write happen under the same hold — a second writer that overtook
+// the socket write would interleave records and corrupt the stream).
+// Best-effort close_notify, then free the engine ON THE OWNING THREAD (the
+// allocator rule; also a helper because scope(exit) bodies cannot hold catch).
+private void tlsTeardown(Conn* c, TCPConnection tcp) nothrow
+{
+    if (c.tls is null)
+        return;
+    c.tls.shutdown();
+    c.tlsCipherOut.clear();
+    c.tls.drainCipher(c.tlsCipherOut);
+    if (!c.tlsCipherOut.empty)
+    {
+        try
+            tcp.write(c.tlsCipherOut.data);
+        catch (Exception)
+        {
+        }
+    }
+    c.tls.free();
+    c.tls = null;
+    c.tlsCipherIn.release();
+    c.tlsCipherOut.release();
+}
+
+private void tlsSend(Conn* c, scope const(ubyte)[] plain) nothrow
+{
+    try
+    {
+        c.wlock.lock();
+        scope (exit)
+            c.wlock.unlock();
+        cast(void) c.tls.writePlain(plain);
+        c.tlsCipherOut.clear();
+        c.tls.drainCipher(c.tlsCipherOut);
+        if (!c.tlsCipherOut.empty && c.tcp.connected)
+            c.tcp.write(c.tlsCipherOut.data);
+        c.tlsCipherOut.clear();
+    }
+    catch (Exception)
+    {
+    }
+}
+
 private void oqWriterLoop(Conn* c) nothrow
 {
     ByteBuffer batch; // coalesce every queued message into one write per wakeup
@@ -1792,10 +1872,15 @@ private void oqWriterLoop(Conn* c) nothrow
             // fix: under N subscribers a publish storm was N writes per message.
             if (batch.length && c.tcp.connected)
             {
-                try
-                    c.tcp.write(batch.data);
-                catch (Exception)
+                if (c.tls !is null)
+                    tlsSend(c, cast(const(ubyte)[]) batch.data);
+                else
                 {
+                    try
+                        c.tcp.write(batch.data);
+                    catch (Exception)
+                    {
+                    }
                 }
             }
             if (c.oqClosing)
@@ -4429,9 +4514,15 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
     else
         enum sopts = TCPListenOptions.reuseAddress | TCPListenOptions.reusePort;
     try
+    {
         cast(void) listenTCP(port, delegate(TCPConnection conn) @trusted nothrow {
             serveClient(conn);
         }, sopts);
+        if (gConfig.tlsPort != 0)
+            cast(void) listenTCP(gConfig.tlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveClient(conn, true);
+            }, sopts);
+    }
     catch (Exception)
     {
     }
@@ -4515,7 +4606,7 @@ private void startShards(ushort port) nothrow
     }
 }
 
-private void serveClient(TCPConnection tcp) nothrow
+private void serveClient(TCPConnection tcp, bool tlsMode = false) nothrow
 {
     ByteBuffer inb;
     ByteBuffer outb;
@@ -4527,6 +4618,15 @@ private void serveClient(TCPConnection tcp) nothrow
     auto sc = Shared!Conn.make();
     Conn* c = &sc.get();
     c.tcp = tcp;
+    if (tlsMode)
+    {
+        c.tls = TlsConn.create(gTlsCtx, true);
+        if (c.tls is null)
+        {
+            closeQuiet(tcp);
+            return;
+        }
+    }
     // Capture the peer + local "ip:port" once, for CLIENT LIST/INFO addr=/laddr=
     // and CLIENT KILL ADDR/LADDR. vibe's toString may throw / GC-allocate; it's a
     // one-time connect cost, copied into the conn's owned buffers.
@@ -4577,6 +4677,7 @@ private void serveClient(TCPConnection tcp) nothrow
             atomicOp!"-="(gBlockedClients, 1);
         }
         waitPurgeConn(c); // drop any lingering block-waiter entries (no dangling c)
+        tlsTeardown(c, tcp); // close_notify + free on the owning thread
         // Close the socket LAST — after shutdownOutput has drained the output
         // queue. Closing earlier would make the writer see a disconnected socket
         // and silently drop the final reply (e.g. QUIT's +OK on a subscriber).
@@ -4618,6 +4719,8 @@ private void serveClient(TCPConnection tcp) nothrow
                     c.pendingInval.clear();
                 }
             }
+            else if (c.tls !is null)
+                tlsSend(c, cast(const(ubyte)[]) outb.data);
             else
             {
                 c.wlock.lock();
@@ -4766,11 +4869,30 @@ private void serveClient(TCPConnection tcp) nothrow
 
             if (ws == WaitForDataStatus.dataAvailable)
             {
-                auto space = inb.freeSpace(READ_CHUNK);
-                auto n = tcp.read(space, IOMode.once);
-                if (n == 0)
-                    break;
-                inb.grow(n);
+                size_t n;
+                if (c.tls is null)
+                {
+                    auto space = inb.freeSpace(READ_CHUNK);
+                    n = tcp.read(space, IOMode.once);
+                    if (n == 0)
+                        break;
+                    inb.grow(n);
+                }
+                else
+                {
+                    // cipher in → engine → plaintext lands in inb; the parser
+                    // below sees exactly the plaintext stream. Handshake output
+                    // produced by the feed goes straight back out.
+                    auto cs = c.tlsCipherIn.freeSpace(READ_CHUNK);
+                    n = tcp.read(cs, IOMode.once);
+                    if (n == 0)
+                        break;
+                    immutable ok = c.tls.feed(cast(const(ubyte)[]) cs[0 .. n])
+                        && c.tls.readPlain(inb);
+                    tlsSend(c, null); // flush pending handshake cipher, no app data
+                    if (!ok)
+                        break; // fatal TLS error or close_notify
+                }
                 // ONE clock read per chunk, amortized over the whole pipeline
                 // batch (a per-command gettimeofday was a real hit): primes the
                 // coarse cache freezeClock() reads AND stamps activity (idle=).
@@ -4879,6 +5001,8 @@ private void flushBeforeBlock(ref Conn c, ref ByteBuffer o) nothrow
                 c.oqEvt.emit();
             rcRelease(m);
         }
+        else if (c.tls !is null)
+            tlsSend(&c, cast(const(ubyte)[]) o.data);
         else
         {
             c.wlock.lock();
