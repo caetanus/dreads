@@ -73,6 +73,15 @@ básico, resume de link (unsettled map), multi-hop/link-routing, TLS.
 
 ## v2 (gate aprovado 2026-08-24: "ampq1v2") — streams + filter expressions
 
+**STATUS: CONVERGIDO.** SourceFiltersTest ALL PASS (3× estável);
+AddressFormat/AmqpMessage/ConsumerOutcome ALL PASS. Restam apenas
+estruturais: ManagementTest 5/7 (OAuth), AmqpTest pause+priority (Cli/flaky),
+AmqpConsumerTest 6/16 (10 recovery = kill de conexão via management plane).
+Bônus da campanha: bug LATENTE de detach cruzado corrigido (fiber detacha
+por resource-deleted + detach do cliente cruzando no fio → nosso echo era um
+TERCEIRO detach → proton derrubava a conexão; corrida exposta pela máquina
+em throttle).
+
 Alvo: SourceFiltersTest 4/16 → 16/16. Duas famílias:
 
 1. **Consumo de STREAM** (offset-specs): fila declarada type=stream consome

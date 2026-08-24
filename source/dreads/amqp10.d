@@ -1005,6 +1005,11 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
             break;
         case PERF_DETACH:
             {
+                debug (a10wire)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "A10 DETACH-IN ch=%u\n", cast(uint) fchan);
+                }
                 uint handle;
                 if (nf >= 1)
                 {
@@ -1012,12 +1017,30 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
                     if (h2.kind == A10Val.Kind.u64)
                         handle = cast(uint) h2.u;
                 }
+                bool weAlreadyDetached = false;
                 if (auto ps = fchan in c.sessions)
                 {
                     if (auto pl4 = handle in ps.links)
+                    {
+                        // detached==true means WE already sent a detach for
+                        // this link (spontaneous resource-deleted etc) and the
+                        // client's detach CROSSED ours on the wire. The pair
+                        // is complete — echoing again is a THIRD detach for a
+                        // handle the client has forgotten, which proton treats
+                        // as a connection error (uncorrelated handle).
+                        weAlreadyDetached = pl4.detached;
                         pl4.detached = true; // delivery fiber exits on its next pass
+                    }
                     a10RequeueUnsettled(c, fchan, handle);
                     ps.links.remove(handle);
+                }
+                if (weAlreadyDetached)
+                    break;
+                debug (a10wire)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "A10 DETACH-ECHO ch=%u h=%u\n",
+                            cast(uint) fchan, handle);
                 }
                 outb.clear();
                 {
@@ -1197,6 +1220,15 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     catch (Exception)
     {
+    }
+    debug (a10wire)
+    {
+        import core.stdc.stdio : fprintf, stderr;
+        fprintf(stderr, "A10 ATTACH ch=%u h=%u sender=%d addr='%.*s' ex='%.*s' rk='%.*s'\n",
+                cast(uint) fchan, lk.handle, lk.clientSender ? 1 : 0,
+                cast(int) address.length, address.ptr,
+                cast(int) lk.exchange.length, lk.exchange.ptr,
+                cast(int) lk.rkey.length, lk.rkey.ptr);
     }
     enum QP2 = "/queues/";
     immutable isV2Q = address.length > QP2.length && address[0 .. QP2.length] == QP2;
@@ -1591,6 +1623,12 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
         transferRouted = a10Publish(exch, rkey,
                 cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
     }
+    debug (a10wire)
+    {
+        import core.stdc.stdio : fprintf, stderr;
+        fprintf(stderr, "A10 TRANSFER ch=%u h=%u settled=%d routed=%d\n",
+                cast(uint) fchan, handle, settled ? 1 : 0, transferRouted);
+    }
     // settle back (rcv-settle-mode first): ACCEPTED when routed, RELEASED
     // when the message matched no queue (RabbitMQ's unroutable signal)
     if (!settled)
@@ -1668,9 +1706,17 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
         if (!d.ok || sec.kind != A10Val.Kind.described)
             break;
         immutable code = sec.u;
+        immutable valAt = d.i; // raw section VALUE start (with constructor)
         auto val = d.readValue();
         if (!d.ok)
             break;
+        immutable(ubyte)[] secRaw;
+        if (code == SEC_PROPERTIES)
+            try
+                secRaw = msg[valAt .. d.i].idup;
+            catch (Exception)
+            {
+            }
         switch (code)
         {
         case SEC_HEADER:
@@ -1709,6 +1755,18 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
             }
             break;
         case SEC_PROPERTIES:
+            // the WHOLE section rides a reserved raw header: the 1.0 rebuild
+            // replays it verbatim, so every field (numeric correlation-ids,
+            // user-id, timestamps, group-*) survives losslessly — the filter
+            // expressions match against the real values
+            if (secRaw.length)
+            {
+                hdrTbl.appendByte(cast(char) 11);
+                hdrTbl.append("x-a10-props");
+                hdrTbl.appendByte('x');
+                a10PutU32(hdrTbl, cast(uint) secRaw.length);
+                hdrTbl.append(cast(const(char)[]) secRaw);
+            }
             if (val.kind == A10Val.Kind.list)
             {
                 auto pd = A10Dec(val.bytes);
@@ -1765,11 +1823,14 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                         break;
                     hdrTbl.appendByte(cast(char) k2.bytes.length);
                     hdrTbl.append(cast(const(char)[]) k2.bytes);
-                    // FLOAT (0x72) must round-trip as float, not double, and
-                    // SYMBOL (0xA3/0xB3) as symbol, not string: preserve the
-                    // RAW 1.0 encoding ('x') for lossless replay
+                    // Types 0-9-1 tables can't represent losslessly keep the
+                    // RAW 1.0 encoding ('x'): float 0x72, symbol 0xA3/0xB3,
+                    // timestamp 0x83, uuid 0x98, binary 0xA0/0xB0 (the filter
+                    // tests assert exact type round-trips)
                     if (rawA.length && (rawA[0] == 0x72 || rawA[0] == 0xA3
-                            || rawA[0] == 0xB3))
+                            || rawA[0] == 0xB3 || rawA[0] == 0x83
+                            || rawA[0] == 0x98 || rawA[0] == 0xA0
+                            || rawA[0] == 0xB0))
                     {
                         hdrTbl.appendByte('x');
                         a10PutU32(hdrTbl, cast(uint) rawA.length);
@@ -2816,6 +2877,11 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
         }
         if (subject == "DELETE")
         {
+            debug (a10wire)
+            {
+                import core.stdc.stdio : fprintf, stderr;
+                fprintf(stderr, "A10 MGMT DELETE-X '%.*s'\n", cast(int) xn.length, xn.ptr);
+            }
             a10DeleteExchange(xn);
             a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
             return;
@@ -3094,7 +3160,24 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o,
 
         redelivered = recordRedelivered(blob) || hdrDeliveryCount0 > 0;
     }
-    // properties section (message-id replayed RAW from the reserved header)
+    // properties section: when the message was published via 1.0, the WHOLE
+    // original section rides the reserved x-a10-props header — replay it
+    // VERBATIM (lossless: numeric correlation-ids, user-id, timestamps,
+    // group-* all survive; the filter expressions depend on it)
+    const(ubyte)[] propsRaw;
+    {
+        auto hdrsP = propsHeaders(props);
+        if (hdrsP !is null && hdrsP.length)
+            cast(void) tableWalk(hdrsP, (scope const(char)[] k, char ty,
+                    scope const(ubyte)[] v) nothrow {
+                if (k == "x-a10-props" && ty == 'x')
+                {
+                    propsRaw = v;
+                    return false;
+                }
+                return true;
+            });
+    }
     const(ubyte)[] midRaw;
     auto hdrs0 = propsHeaders(props);
     if (hdrs0 !is null && hdrs0.length)
@@ -3118,7 +3201,13 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o,
             }
             return true;
         });
-    if (contentType.length || correlationId.length || replyTo.length
+    if (propsRaw.length)
+    {
+        o.appendByte(0x00);
+        a10SmallUlong(o, cast(ubyte) SEC_PROPERTIES);
+        o.append(cast(const(char)[]) propsRaw); // the original section, verbatim
+    }
+    else if (contentType.length || correlationId.length || replyTo.length
             || midRaw.length || subj.length)
     {
         auto pl = a10OpenPerf(o, cast(ubyte) SEC_PROPERTIES);
@@ -3194,7 +3283,8 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o,
             cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
                     scope const(ubyte)[] v) nothrow {
                 if (!(k.length >= 2 && k[0] == 'x' && k[1] == '-') || k == "x-death"
-                        || k == "x-a10-mid" || k == "x-a10-subj" || k == "x-a10-dc")
+                        || k == "x-a10-mid" || k == "x-a10-subj" || k == "x-a10-dc"
+                        || k == "x-a10-props")
                     return true;
                 if (ty == 'S')
                 {
@@ -3349,6 +3439,13 @@ private void a10SendDetachError(A10Conn c, ushort fchan, uint handle,
         scope const(char)[] condition, scope const(char)[] entity,
         ByteBuffer* stage = null) nothrow
 {
+    debug (a10wire)
+    {
+        import core.stdc.stdio : fprintf, stderr;
+        fprintf(stderr, "A10 DETACH-ERR ch=%u h=%u cond='%.*s' ent='%.*s'\n",
+                cast(uint) fchan, handle, cast(int) condition.length, condition.ptr,
+                cast(int) entity.length, entity.ptr);
+    }
     ByteBuffer local;
     ByteBuffer* o = stage !is null ? stage : &local;
     {
@@ -3748,6 +3845,13 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 }
                 if (pl5.outCredit == 0)
                 {
+                    debug (a10wire)
+                    {
+                        import core.stdc.stdio : fprintf, stderr;
+                        static int thr;
+                        if (thr++ % 4000 == 0)
+                            fprintf(stderr, "A10 FIBER h=%u nocredit\n", h5);
+                    }
                     if (pl5.drain)
                     {
                         // drain with nothing to send: burn the credit and echo
@@ -3802,6 +3906,10 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                                 ByteBuffer sb2, mb2;
                                 bool full = true;
                                 bool anyHit = false;
+                                // scan the WHOLE chunk (no early-out): a
+                                // partial tail chunk must be detected even
+                                // when an early message hits, so the tail
+                                // falls back to exact matching
                                 foreach (k9c; 0 .. CHUNK)
                                 {
                                     sb2.clear();
@@ -3810,15 +3918,14 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                                         full = false;
                                         break;
                                     }
+                                    if (anyHit)
+                                        continue; // fullness check only
                                     mb2.clear();
                                     a10BuildMessage(cast(const(ubyte)[]) sb2.data, mb2);
                                     if (a10BloomHit(cast(const(ubyte)[]) mb2.data, pl5))
-                                    {
                                         anyHit = true;
-                                        break;
-                                    }
                                 }
-                                if (full || anyHit)
+                                if (full)
                                 {
                                     pl5.bloomChunk = chunk;
                                     pl5.bloomPass = anyHit;
@@ -3883,6 +3990,12 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                         return;
                     continue;
                 }
+                debug (a10wire)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "A10 DELIVER h=%u credit=%u pos=%lld\n", h5,
+                            pl5.outCredit, pl5.streamPos);
+                }
                 // build transfer + message
                 immutable did = ps5.nextOutgoingId++;
                 pl5.deliveryCount++;
@@ -3918,6 +4031,15 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 a10Close(outd, lT);
                 msg.clear();
                 a10BuildMessage(cast(const(ubyte)[]) pay.data, msg, streamOffThis);
+                debug (a10wire)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    auto md0 = cast(const(ubyte)[]) msg.data;
+                    fprintf(stderr, "A10 MSGBYTES len=%zu: ", md0.length);
+                    foreach (bx; md0[0 .. (md0.length < 96 ? md0.length : 96)])
+                        fprintf(stderr, "%02x", bx);
+                    fprintf(stderr, "\n");
+                }
                 outd.append(cast(const(char)[]) msg.data);
                 a10FrameFinish(outd, fT);
                 a10Send(cc, cast(const(ubyte)[]) outd.data);
