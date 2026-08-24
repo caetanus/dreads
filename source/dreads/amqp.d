@@ -1598,14 +1598,32 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         scope const(ubyte)[] p, ref ByteBuffer o) nothrow @trusted
 {
     if (ftype == FRAME_HEARTBEAT)
+    {
+        if (chan != 0)
+        {
+            connectionClose(o, 505, "UNEXPECTED_FRAME - heartbeat on non-zero channel", 0, 0);
+            return true;
+        }
         return true;
+    }
     if (ftype == FRAME_HEADER)
     {
         auto ch = chan in c.chans;
-        if (ch is null || !ch.pub.active)
+        if (ch is null)
+            return true; // closed-channel content is discarded (spec)
+        if (!ch.pub.active)
+        {
+            connectionClose(o, 505, "UNEXPECTED_FRAME - content header without method", 60, 0);
             return true;
+        }
         Rd r = Rd(p);
-        cast(void) r.u16(); // class
+        immutable hcls = r.u16(); // class: must echo the method's (basic = 60)
+        if (hcls != 60)
+        {
+            connectionClose(o, 505, "UNEXPECTED_FRAME - header class mismatch", 60, 0);
+            ch.pub.active = false;
+            return true;
+        }
         cast(void) r.u16(); // weight
         ch.pub.bodySize = r.u64();
         if (ch.pub.bodySize > AMQP_MAX_BODY)
@@ -1620,18 +1638,36 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
     if (ftype == FRAME_BODY)
     {
         auto ch = chan in c.chans;
-        if (ch is null || !ch.pub.active)
+        if (ch is null)
+            return true; // closed-channel content: discard
+        if (!ch.pub.active || ch.pub.bodySize == 0)
+        {
+            connectionClose(o, 505, "UNEXPECTED_FRAME - unexpected content body", 60, 0);
+            ch.pub.active = false;
             return true;
+        }
         ch.pub.payload.append(p);
         if (ch.pub.payload.length >= ch.pub.bodySize)
             finishPublish(c, chan, *ch, o);
         return true;
     }
     if (ftype != FRAME_METHOD)
+    {
+        connectionClose(o, 501, "FRAME_ERROR - unknown frame type", 0, 0);
         return true;
+    }
 
     Rd r = Rd(p);
     immutable cls = r.u16();
+    if (cls != 10 && cls != 20)
+        if (auto mch = chan in c.chans)
+            if (mch.pub.active && mch.pub.bodySize > 0
+                    && mch.pub.payload.length < mch.pub.bodySize)
+            {
+                connectionClose(o, 505, "UNEXPECTED_FRAME - incomplete content", cast(ushort) cls, 0);
+                mch.pub.active = false;
+                return true;
+            }
     immutable mth = r.u16();
     switch (cls)
     {
@@ -2937,65 +2973,8 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     scope (exit)
         if (rec is &recStatic)
             recBusy = false;
-    // --- CC/BCC sender-selected routing (RabbitMQ): the "CC"/"BCC" headers
-    // are string-arrays of EXTRA routing keys; BCC is stripped from the
-    // delivered properties. Keys keep pointing into the ORIGINAL props (they
-    // outlive the strip); the stripped copy is consumed by buildRecord below.
-    const(ubyte)[] effProps = ch.pub.props.data;
-    const(char)[][32] ccKeys;
-    size_t nCc = 0;
-    bool hasBcc = false;
-    {
-        auto h0 = propsHeaders(effProps);
-        if (h0 !is null && h0.length)
-        {
-            static immutable string[2] ccNames = ["CC", "BCC"];
-            foreach (cn; ccNames)
-            {
-                cast(void) tableWalk(h0, (scope const(char)[] k, char ty,
-                        scope const(ubyte)[] v) @nogc nothrow {
-                    if (k != cn)
-                        return true;
-                    if (cn == "BCC")
-                        hasBcc = true; // stripped regardless of value type
-                    if (ty != 'A')
-                        return false; // non-array CC/BCC: no extra routes
-                    size_t i2 = 0;
-                    while (i2 + 5 <= v.length && nCc < ccKeys.length)
-                    {
-                        immutable et = v[i2];
-                        immutable ln = (cast(size_t) v[i2 + 1] << 24)
-                            | (cast(size_t) v[i2 + 2] << 16)
-                            | (cast(size_t) v[i2 + 3] << 8) | v[i2 + 4];
-                        i2 += 5;
-                        if (et != 'S' || i2 + ln > v.length)
-                            break; // only longstr members route
-                        if (ln > 0)
-                            ccKeys[nCc++] = cast(const(char)[]) v[i2 .. i2 + ln];
-                        i2 += ln;
-                    }
-                    return false;
-                });
-            }
-            if (hasBcc)
-            {
-                // splice the headers table minus BCC back into the props
-                static ByteBuffer sp; // TLS: consumed into rec before any yield
-                sp.clear();
-                immutable off = cast(size_t)(h0.ptr - effProps.ptr);
-                sp.append(cast(const(char)[]) effProps[0 .. off - 4]);
-                immutable lenAt = sp.length;
-                putU32(sp, 0);
-                immutable tblStart2 = sp.length;
-                appendHeadersExcept(sp, h0, "BCC");
-                patchU32(sp, lenAt, cast(uint)(sp.length - tblStart2));
-                sp.append(cast(const(char)[]) effProps[off + h0.length .. $]);
-                effProps = cast(const(ubyte)[]) sp.data;
-            }
-        }
-    }
     rec.clear();
-    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, effProps,
+    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data,
             ch.pub.payload.data, ch.pub.exchange);
     if (ch.txMode)
     {
@@ -3016,33 +2995,17 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         return;
     }
     auto payload = rec.data.asChars;
-    auto hdrs = propsHeaders(effProps);
+    auto hdrs = propsHeaders(ch.pub.props.data);
     atomicOp!"+="(gAmqpMessages, 1);
-    // collect destinations first (the collection sink never yields), deduped
-    // ACROSS the rk + CC/BCC routeTo calls — a CC naming the routing key again
-    // must still deliver once (noDuplicates).
-    string[64] dests;
-    size_t nd = 0;
-    scope void delegate(string) nothrow addDest = (string q) nothrow {
-        foreach (d; dests[0 .. nd])
-            if (d == q)
-                return;
-        if (nd < dests.length)
-            dests[nd++] = q;
-    };
-    routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, addDest);
-    foreach (ck; ccKeys[0 .. nCc])
-        routeTo(ch.pub.exchange, ck, hdrs, addDest);
     int routed = 0;
-    foreach (q; dests[0 .. nd])
-    {
-        static ByteBuffer kb3; // TLS: consumed by the push before its yield
+    routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, (string q) nothrow {
+        static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
         if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;
-        enforceMaxLen(q);
-    }
+            enforceMaxLen(q);
+});
     // [basic.return] a mandatory publish that matched no queue must come BACK
     // to the publisher (312 NO_ROUTE) instead of vanishing while confirmed
     if (mandatory && routed == 0)
