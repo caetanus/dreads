@@ -556,8 +556,10 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path,
     if (emitGlobals)
     {
         import dreads.acl : aclDumpUsers;
+        import dreads.scripting : scriptDumpAll;
 
         aclDumpUsers(buf);
+        scriptDumpAll(buf); // upload persistence: EVALSHA survives restart
     }
     // the rewrite is the format-upgrade point: always v2 — header + ONE RAW
     // record wrapping the SELECT-framed dump (it already sits fully in buf)
@@ -667,6 +669,21 @@ private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer s
             if (up == "EVAL")
             {
                 evalCommand(cmd.arr[1 .. $], ks, sink, arena, false);
+                return;
+            }
+        }
+        else if (name.length == 6 && cmd.arr.length >= 2)
+        {
+            // SCRIPT LOAD/FLUSH: dispatch() has no case for it (it is a
+            // server-layer command) — route to the script cache directly
+            char[6] up6 = void;
+            foreach (i, c; name)
+                up6[i] = c >= 'a' && c <= 'z' ? cast(char)(c - 32) : c;
+            if (up6 == "SCRIPT")
+            {
+                import dreads.scripting : scriptCommand;
+
+                scriptCommand(cmd.arr[1 .. $], sink);
                 return;
             }
         }
@@ -1498,4 +1515,51 @@ unittest // v2: kill-9 mid-record — the partial trailing record is tolerated
     assert(aofLoad(path, ks) == 1);
     assert(runOne(ks, "GET", "whole") == "$1\r\n1\r\n");
     assert(runOne(ks, "EXISTS", "cut") == ":0\r\n");
+}
+
+unittest // SCRIPT LOAD replays into the script cache (upload persistence)
+{
+    import dreads.scripting : scriptCommand;
+
+    enum path = "/tmp/dreads_aof_test_scriptload.aof";
+    rmPath(path);
+    scope (exit)
+        rmPath(path);
+
+    enum src = "return 'aofscript'";
+    // compute the sha by loading once, then FLUSH so the replay must restore it
+    ByteBuffer o;
+    RVal[2] la;
+    la[0].type = RType.BulkString;
+    la[0].str = "LOAD";
+    la[1].type = RType.BulkString;
+    la[1].str = src;
+    scriptCommand(la[0 .. 2], o);
+    auto rep = (cast(string) o.data).idup;
+    assert(rep[0 .. 4] == "$40\r"[0 .. 4]);
+    auto sha = rep[5 .. 45].idup;
+    o.clear();
+    RVal[1] fl;
+    fl[0].type = RType.BulkString;
+    fl[0].str = "FLUSH";
+    scriptCommand(fl[0 .. 1], o);
+    o.clear();
+
+    Aof aof;
+    assert(aof.open(path));
+    aof.append(cast(const(ubyte)[]) respCmd("SCRIPT", "LOAD", src));
+    aof.close();
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    assert(aofLoad(path, ks) == 1);
+
+    RVal[2] ex;
+    ex[0].type = RType.BulkString;
+    ex[0].str = "EXISTS";
+    ex[1].type = RType.BulkString;
+    ex[1].str = sha;
+    scriptCommand(ex[0 .. 2], o);
+    assert((cast(string) o.data) == "*1\r\n:1\r\n");
 }

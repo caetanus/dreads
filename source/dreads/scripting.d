@@ -158,6 +158,27 @@ public bool scriptRemove(scope const(char)[] shaLower) nothrow @nogc
     return had;
 }
 
+/// Re-emit every cached script as a `SCRIPT LOAD <source>` command — the AOF
+/// rewrite's globals pass (like aclDumpUsers): upload persistence, so EVALSHA
+/// survives a restart. EVAL itself never enters the log (effects replication).
+public void scriptDumpAll(ref ByteBuffer buf) nothrow @nogc
+{
+    import dreads.resp : repArrayHeader, repBulk;
+
+    gLuaLock.lock_nothrow();
+    scope (exit)
+        gLuaLock.unlock_nothrow();
+    foreach (i; 0 .. gScripts.capacity)
+    {
+        if (!gScripts.slotLive(i))
+            continue;
+        repArrayHeader(buf, 3);
+        repBulk(buf, "SCRIPT");
+        repBulk(buf, "LOAD");
+        repBulk(buf, cast(const(char)[]) gScripts.valAt(i).rawView());
+    }
+}
+
 /// Append every cached script as a RESP array of [sha1, source] pairs — for the
 /// dashboard's "list all scripts" (guarded by gLuaLock, so it is thread-safe).
 public void appendScriptsResp(ref ByteBuffer o) nothrow @nogc

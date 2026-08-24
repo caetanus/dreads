@@ -6574,7 +6574,26 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         }
     case "SCRIPT":
         {
+            immutable sob = o.length;
             scriptCommand(args, o);
+            // upload persistence (mirrors propagateAclLog's AOF leg): LOAD and
+            // FLUSH are durable global state, logged verbatim on this shard's
+            // file — replayed via replayCommand's SCRIPT case, applyGlobals
+            // routing. EVAL never enters the log (effects replication above).
+            if (myAof().enabled && args.length >= 1
+                    && !(o.length > sob && o.data[sob] == '-'))
+            {
+                auto ssub = args[0].str;
+                char[8] sub2 = void;
+                if (ssub.length <= sub2.length)
+                {
+                    foreach (i, ch; ssub)
+                        sub2[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+                    auto su2 = cast(const(char)[]) sub2[0 .. ssub.length];
+                    if (su2 == "LOAD" || su2 == "FLUSH")
+                        myAof().append(rawCmd);
+                }
+            }
             return true;
         }
     case "MIGRATE":
