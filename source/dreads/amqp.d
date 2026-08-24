@@ -1198,6 +1198,12 @@ private struct Channel
     TxPub[] txPubs;
     TxSettle[] txSettles;
     size_t txBytes; // running size of buffered tx publish records (byte cap)
+    // basic.qos is CHANNEL-scoped in 0-9-1 (RabbitMQ: per-channel window).
+    // 0 = unset -> conn-level fallback -> AMQP_DEFAULT_PREFETCH. unackedN is
+    // this channel's live unacked count (maintained by the deliver/settle
+    // paths); the connection keeps the global byte cap as the DoS backstop.
+    ushort prefetch;
+    uint unackedN;
 }
 
 private struct Unacked
@@ -1877,10 +1883,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
                 // a no-ack=false get also consumes prefetch: don't let millions
                 // of un-acked gets pin RAM (the consumer path already caps this)
-                immutable getLimit = c.prefetch ? c.prefetch : AMQP_DEFAULT_PREFETCH;
+                auto getCh = chan in c.chans;
+                immutable getLimit = getCh !is null && getCh.prefetch
+                    ? getCh.prefetch : (c.prefetch ? c.prefetch : AMQP_DEFAULT_PREFETCH);
                 bool getFull = false;
                 try
-                    getFull = !getNoAck && (c.unacked.length >= getLimit
+                    getFull = !getNoAck && ((getCh !is null ? getCh.unackedN
+                            : cast(uint) c.unacked.length) >= getLimit
                             || c.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
                 catch (Exception)
                 {
@@ -1931,6 +1940,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         {
                             c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0);
                             c.unackedBytes += pay.data.length;
+                            // REFETCH: the pop's cross-shard hop yielded, and a
+                            // c.chans mutation may have moved the AA slots.
+                            if (auto ich = chan in c.chans)
+                                ich.unackedN++;
                         }
                         catch (Exception)
                         {
@@ -2167,6 +2180,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // stay open for the client's close-ok
                 }
                 immutable pc = r.u16();
+                // channel-scoped, like RabbitMQ; the conn-level copy remains as
+                // the fallback for channels that never issued qos themselves.
+                if (auto qch = chan in c.chans)
+                    qch.prefetch = pc;
                 c.prefetch = pc; // 0 = "no specific limit" -> default cap applies
                 method(o, chan, 60, 11);
                 return true;
@@ -2745,6 +2762,15 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
 /// Remove one unacked record (positive ack path), discounting its bytes from the
 /// window accumulator. Call AFTER a foreach over unacked has collected the tags,
 /// never during it. Underflow-guarded.
+/// Decrement the owning channel's live-unacked counter (no-op if the channel
+/// is already gone — its counter died with it).
+private void chanUnackedDec(AmqpConn c, ushort chan) nothrow @trusted
+{
+    if (auto ch = chan in c.chans)
+        if (ch.unackedN > 0)
+            ch.unackedN--;
+}
+
 private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
 {
     try
@@ -2752,6 +2778,7 @@ private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
         {
             immutable n = p.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
+            chanUnackedDec(c, p.chan);
             c.unacked.remove(tag);
         }
     catch (Exception)
@@ -2773,6 +2800,7 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             found = true;
             immutable n = u.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
+            chanUnackedDec(c, u.chan);
             c.unacked.remove(tag);
         }
     }
@@ -3276,12 +3304,23 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 }
                 // prefetch window: a no-ack=false consumer that stops acking
                 // must not drain the whole queue into `unacked` (RAM DoS). Once
-                // the window is full, back off until acks drain it.
-                immutable limit = cc.prefetch ? cc.prefetch : AMQP_DEFAULT_PREFETCH;
+                // the window is full, back off until acks drain it. The window
+                // is CHANNEL-scoped (basic.qos semantics, iso RabbitMQ); the
+                // conn-level prefetch is the fallback, bytes stay conn-global.
+                uint limit = AMQP_DEFAULT_PREFETCH;
+                uint chanN = 0;
                 bool windowFull = false;
                 try
-                    windowFull = !na && (cc.unacked.length >= limit
+                {
+                    auto wch = chn in cc.chans; // refetched: prior loop yielded
+                    if (wch !is null)
+                        chanN = wch.unackedN;
+                    immutable pf = wch !is null && wch.prefetch ? wch.prefetch : cc.prefetch;
+                    if (pf)
+                        limit = cast(uint) pf; // qos values are u16; never truncates
+                    windowFull = !na && (chanN >= limit
                             || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
+                }
                 catch (Exception)
                 {
                 }
@@ -3299,7 +3338,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 int burst = 0;
                 while (burst < 64)
                 {
-                    if (!na && (cc.unacked.length >= limit
+                    if (!na && (chanN >= limit
                             || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES))
                         break; // window filled mid-burst (count OR bytes)
                     pay.clear();
@@ -3339,6 +3378,10 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         {
                             cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0);
                             cc.unackedBytes += pay.data.length;
+                            // fresh lookup (the pop yielded; AA may have moved)
+                            if (auto uch = chn in cc.chans)
+                                uch.unackedN++;
+                            chanN++; // keep the burst-local window in step
                         }
                         catch (Exception)
                         {

@@ -83,7 +83,13 @@ all() ->
     {hard_error_loop, [{repeat, 100}, parallel], [hard_error]}
   ]).
 -define(COMMON_NON_PARALLEL_TEST_CASES, [
-    basic_qos, %% Not parallel because it's time-based, or has mocks
+    %% basic_qos: DROPPED (dreads laundering, triaged NOT-A-BUG) — the test
+    %% asserts no-qos must be ~10x SLOWER than qos=1, an emergent property of
+    %% RabbitMQ's round-robin PUSH dispatch (half the backlog lands in the slow
+    %% consumer's buffer). dreads uses competing-consumer PULL dispatch: without
+    %% qos the fast consumer already wins the pops (measured 0.60s vs RabbitMQ's
+    %% ~2.6s pathological baseline), so the ratio the test demands cannot exist.
+    %% Per-channel prefetch itself works (qos=1 run: correct windowing).
     %% connection_failure: DROPPED (dreads laundering) — closes the REMOTE end
     %% of the socket via rpc into the broker VM.
     channel_death,
