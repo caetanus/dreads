@@ -1356,6 +1356,17 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             putShortStr(o, "product");
             o.appendByte('S');
             putLongStr(o, "dreads");
+            // RabbitMQ-compatible dialect version, same pattern as the RESP
+            // INFO redis_version: clients (and the rabbitmq-java-client test
+            // harness) parse server-properties["version"] to gate features —
+            // its absence NPEs every BrokerTestCase setUp. 3.13 is the RabbitMQ
+            // our error semantics are modeled on.
+            putShortStr(o, "version");
+            o.appendByte('S');
+            putLongStr(o, "3.13.0");
+            putShortStr(o, "platform");
+            o.appendByte('S');
+            putLongStr(o, "D/dreads");
             putShortStr(o, "capabilities");
             o.appendByte('F');
             size_t capAt = o.length;
