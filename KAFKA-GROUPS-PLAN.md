@@ -1,4 +1,9 @@
-# Kafka consumer groups — plano (aprovado pelo usuário 2026-08-24: "vai")
+# Kafka consumer groups — plano (aprovado 2026-08-24: "vai")
+
+**STATUS 2026-08-24: M1-M4 COMPLETOS.** librdkafka 156 pass / 10 fail — a
+cauda de grupos zerou; os 10 restantes = 4 txn-gated (0090 0094 0103 0129) +
+6 estruturais (CLIs externas/SSL build). Static membership e cooperative
+(0113) verdes. Detalhes/comandos em conformance/README.md.
 
 Substituir o stub de membro único por um coordenador de grupo REAL (protocolo
 clássico, KIP-848 fora de escopo), destravando os 37 testes librdkafka gated.

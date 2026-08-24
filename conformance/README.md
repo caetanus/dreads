@@ -88,13 +88,17 @@ ISOLATED runner process (the stock runner aborts the batch on one timeout),
     cp ../conformance/kafka-librdkafka/test.conf tests/ && bash ../conformance/kafka-librdkafka/driver.sh
 
 Baseline 2026-08-24 (dreads flexible/Kafka-2.5 dialect): 99 pass / 66 fail /
-1 skip. **CONVERGED (non-gated) 2026-08-24: 127 pass / 38 fail / 1 skip.**
-Source-based classification of the failures (does the test call
-subscribe/rebalance APIs?): **37 of the 38 remaining failures are
-consumer-group/transaction tests** — a gated feature milestone awaiting user
-approval, not bugs. The 38th, 0115-producer_auth, shells out to an external
-`kafka-acls.sh` CLI and needs broker-side Kafka ACL enforcement (structural,
-same category as the rabbitmqctl exclusions in the java 0-9-1 suite).
+1 skip; 127/38 after the non-gated bug tail. **REAL CONSUMER GROUPS landed
+2026-08-24 (user-approved milestone; dreads.kafkagroup coordinator, see
+KAFKA-GROUPS-PLAN.md): 156 pass / 10 fail.** The 10: four need
+idempotence/transactions (0090 0094 0103 0129 — still gated), six are
+structural (0052 0077 need kafka-topics.sh, 0109 0115 0119 need kafka-acls.sh
++ broker ACL enforcement, 0064 needs an SSL-enabled librdkafka build).
+The admin surface grew along 0081's ladder: ACLs (29/30/31), DeleteRecords 21
+(real log-start-offset, epoch-gated so hot paths pay zero until the first
+truncation), ListGroups 16, DeleteGroups 42, OffsetDelete 47, AlterConfigs 33,
+IncrementalAlterConfigs 44, CreateTopics/DeleteTopics/CreatePartitions
+validation, authorized-operations masks, committed leader epochs.
 
 The real-bug tail fixed during convergence (all extend-only in kafka.d):
 Metadata cluster_id (was null; 0063), CreatePartitions API 37 (0044, 0112),
