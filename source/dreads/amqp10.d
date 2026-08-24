@@ -1883,6 +1883,99 @@ private A10Val a10MapGet(scope const(ubyte)[] mapBytes, uint count,
     return none;
 }
 
+/// Convert a 1.0 map's CONTENTS into a 0-9-1 field table (str/long/bool/
+/// double mapped; anything else RAW as 'x').
+private void a10MapToTable(scope const(ubyte)[] mapBytes, uint count,
+        ref ByteBuffer tbl) nothrow @trusted
+{
+    auto md = A10Dec(mapBytes);
+    foreach (mi; 0 .. count / 2)
+    {
+        auto k2 = md.readValue();
+        immutable vAt = md.i;
+        auto v2 = md.readValue();
+        auto raw = mapBytes[vAt .. md.i];
+        if (!md.ok || k2.kind != A10Val.Kind.str || k2.bytes.length > 127)
+            break;
+        tbl.appendByte(cast(char) k2.bytes.length);
+        tbl.append(cast(const(char)[]) k2.bytes);
+        if (v2.kind == A10Val.Kind.str)
+        {
+            tbl.appendByte('S');
+            a10PutU32(tbl, cast(uint) v2.bytes.length);
+            tbl.append(cast(const(char)[]) v2.bytes);
+        }
+        else if (v2.kind == A10Val.Kind.u64 || v2.kind == A10Val.Kind.i64)
+        {
+            tbl.appendByte('l');
+            immutable lv = v2.kind == A10Val.Kind.u64 ? cast(long) v2.u : v2.i;
+            foreach (k3; 0 .. 8)
+                tbl.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+        }
+        else if (v2.kind == A10Val.Kind.boolean)
+        {
+            tbl.appendByte('t');
+            tbl.appendByte(v2.b ? 1 : 0);
+        }
+        else
+        {
+            tbl.appendByte('x');
+            a10PutU32(tbl, cast(uint) raw.length);
+            tbl.append(cast(const(char)[]) raw);
+        }
+    }
+}
+
+/// Convert a 0-9-1 field table back to a 1.0 MAP value (encoded with
+/// constructor) — the inverse of a10MapToTable for management listings.
+private void a10TableToMap(scope const(ubyte)[] tbl, ref ByteBuffer o) nothrow @trusted
+{
+    import dreads.amqp : tableWalk;
+
+    o.appendByte(0xD1); // map32
+    immutable szAt = o.length;
+    a10PutU32(o, 0);
+    immutable cntAt = o.length;
+    a10PutU32(o, 0);
+    uint n2 = 0;
+    if (tbl !is null && tbl.length)
+        cast(void) tableWalk(tbl, (scope const(char)[] k, char ty,
+                scope const(ubyte)[] v) nothrow {
+            if (ty == 'S')
+            {
+                a10Str(o, k);
+                a10Str(o, cast(const(char)[]) v);
+                n2 += 2;
+            }
+            else if ((ty == 'l' || ty == 'T') && v.length == 8)
+            {
+                long lv = 0;
+                foreach (b3; v)
+                    lv = (lv << 8) | b3;
+                a10Str(o, k);
+                o.appendByte(0x81);
+                foreach (k3; 0 .. 8)
+                    o.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+                n2 += 2;
+            }
+            else if (ty == 't' && v.length == 1)
+            {
+                a10Str(o, k);
+                a10Bool(o, v[0] != 0);
+                n2 += 2;
+            }
+            else if (ty == 'x')
+            {
+                a10Str(o, k);
+                o.append(cast(const(char)[]) v);
+                n2 += 2;
+            }
+            return true;
+        });
+    a10PatchU32(o, szAt, cast(uint)(o.length - cntAt));
+    a10PatchU32(o, cntAt, n2);
+}
+
 /// Send a management RESPONSE on the session's mgmt receiver link.
 /// bodyKind: 0 = none, 1 = map (pre-encoded map WITH constructor), 2 = string.
 private void a10MgmtRespond(A10Conn c, ushort fchan, scope const(char)[] code,
@@ -2366,9 +2459,112 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
         auto key = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "binding_key"));
         auto dq = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "destination_queue"));
         auto dx = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "destination_exchange"));
+        static ByteBuffer bArgs; // TLS: consumed by the broadcast synchronously
+        bArgs.clear();
+        {
+            auto am = a10MapGet(bodyMapBytes, bodyMapCount, "arguments");
+            if (am.kind == A10Val.Kind.map && am.count)
+                a10MapToTable(am.bytes, am.count, bArgs);
+        }
         if (src.length && (dq.length || dx.length))
-            a10Bind(src, dq.length ? dq : dx, key, dx.length != 0);
+            a10Bind(src, dq.length ? dq : dx, key, dx.length != 0,
+                    cast(const(ubyte)[]) bArgs.data);
         a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
+        return;
+    }
+    else if (to.length > 10 && to[0 .. 10] == "/bindings?" && subject == "GET")
+    {
+        // /bindings?src=S&dstq|dste=D&key=K -> 200 list of
+        // {binding_key, arguments, location}
+        auto spec = to[10 .. $];
+        const(char)[] src, dst, key;
+        bool dstIsX = false;
+        size_t i3 = 0;
+        while (i3 < spec.length)
+        {
+            size_t amp = spec.length;
+            foreach (k5, ch8; spec[i3 .. $])
+                if (ch8 == '&')
+                {
+                    amp = i3 + k5;
+                    break;
+                }
+            auto part = spec[i3 .. amp];
+            i3 = amp < spec.length ? amp + 1 : spec.length;
+            size_t eq = part.length;
+            foreach (k5, ch8; part)
+                if (ch8 == '=')
+                {
+                    eq = k5;
+                    break;
+                }
+            if (eq == part.length)
+                continue;
+            auto pk = part[0 .. eq];
+            auto pv = part[eq + 1 .. $];
+            if (pk == "src")
+                src = pv;
+            else if (pk == "dstq")
+                dst = pv;
+            else if (pk == "dste")
+            {
+                dst = pv;
+                dstIsX = true;
+            }
+            else if (pk == "key")
+                key = pv;
+        }
+        char[256] sb3 = void, db3 = void, kb3 = void;
+        auto srcD = a10UriDecode(src, sb3);
+        auto dstD = a10UriDecode(dst, db3);
+        auto keyD = a10UriDecode(key, kb3);
+        bodyOut.clear();
+        // amqp-value LIST of binding maps
+        bodyOut.appendByte(0xD0);
+        immutable lszAt = bodyOut.length;
+        a10PutU32(bodyOut, 0);
+        immutable lcntAt = bodyOut.length;
+        a10PutU32(bodyOut, 0);
+        uint ln2 = 0;
+        {
+            import dreads.amqp : a10ListBindings;
+
+            a10ListBindings(srcD, dstD, dstIsX,
+                    (scope const(char)[] bkey, scope const(ubyte)[] bargs) nothrow {
+                if (keyD.length && bkey != keyD)
+                    return;
+                // one map: binding_key, arguments, location
+                bodyOut.appendByte(0xD1);
+                immutable mszAt = bodyOut.length;
+                a10PutU32(bodyOut, 0);
+                immutable mcntAt = bodyOut.length;
+                a10PutU32(bodyOut, 0);
+                a10Str(bodyOut, "binding_key");
+                a10Str(bodyOut, bkey);
+                a10Str(bodyOut, "arguments");
+                a10TableToMap(bargs, bodyOut);
+                a10Str(bodyOut, "location");
+                {
+                    char[900] loc = void;
+                    import core.stdc.stdio : snprintf;
+
+                    immutable lnn = snprintf(loc.ptr, loc.length,
+                            "/bindings/src=%.*s;%s=%.*s;key=%.*s;args=",
+                            cast(int) src.length, src.ptr,
+                            dstIsX ? "dste".ptr : "dstq".ptr,
+                            cast(int) dst.length, dst.ptr,
+                            cast(int) key.length, key.ptr);
+                    a10Str(bodyOut, loc[0 .. lnn]);
+                }
+                a10PatchU32(bodyOut, mszAt, cast(uint)(bodyOut.length - mcntAt));
+                a10PatchU32(bodyOut, mcntAt, 6);
+                ln2++;
+            });
+        }
+        a10PatchU32(bodyOut, lszAt, cast(uint)(bodyOut.length - lcntAt));
+        a10PatchU32(bodyOut, lcntAt, ln2);
+        a10MgmtRespond(c, fchan, "200", corrRaw, 1,
+                cast(const(ubyte)[]) bodyOut.data, "");
         return;
     }
     else if (to.length > 10 && to[0 .. 10] == "/bindings/" && subject == "DELETE")

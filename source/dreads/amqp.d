@@ -5247,13 +5247,30 @@ package void a10DeleteExchange(scope const(char)[] x) nothrow @trusted
 }
 
 package void a10Bind(scope const(char)[] source, scope const(char)[] dest,
-        scope const(char)[] key, bool destIsExchange) nothrow @trusted
+        scope const(char)[] key, bool destIsExchange,
+        scope const(ubyte)[] args = null) nothrow @trusted
 {
     try
         if (destIsExchange)
-            ctlBroadcast(6, source, dest, key, null);
+            ctlBroadcast(6, source, dest, key, args);
         else
-            ctlBroadcast(2, source, dest, key, null);
+            ctlBroadcast(2, source, dest, key, args);
+    catch (Exception)
+    {
+    }
+}
+
+/// Enumerate LIVE bindings from `source` to `dest` (queue or exchange) —
+/// the 1.0 management GET /bindings listing. Sink gets (key, rawArgsTable).
+package void a10ListBindings(scope const(char)[] source, scope const(char)[] dest,
+        bool destIsExchange,
+        scope void delegate(scope const(char)[] key, scope const(ubyte)[] args) nothrow sink) nothrow @trusted
+{
+    try
+        if (auto bl = (cast(string) source) in gBindings)
+            foreach (ref bd; *bl)
+                if (bd.alive && bd.toExchange == destIsExchange && bd.queue == dest)
+                    sink(bd.key, bd.args);
     catch (Exception)
     {
     }
