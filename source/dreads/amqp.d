@@ -147,6 +147,11 @@ private bool[string] gQueues; // TLS: present => queue currently exists
 // op 9 clears with the queue). An access from any OTHER connection is a 405
 // RESOURCE_LOCKED channel error; the owner's teardown deletes the queue.
 private ulong[string] gQueueOwner; // TLS, broadcast-replicated
+// Declare flags (durable=2 | exclusive=4 | auto-delete=8), for redeclare
+// equivalence (406 on mismatch) and auto-delete-on-last-cancel. Replicated
+// with the existence set (op 8 carries them; op 9 clears).
+private ubyte[string] gQueueFlags; // TLS
+private ubyte[string] gExchFlags; // TLS (durable=2 | auto-delete=4 | internal=8)
 private shared ulong gAmqpConnGen; // atomic source for AmqpConn.connId
 private ulong[string] gQueueSeq; // TLS: per-name LWW seq (tombstones survive delete)
 // Live consumer count per queue, shard-local (a consumer and the queue.declare
@@ -296,6 +301,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 return;
             }
             gExchanges[ex] = t;
+            {
+                auto b0 = rd(); // declare flags (1 byte; may be empty from old peers)
+                if (b0.length >= 1 && gExchFlags.length < AMQP_MAX_EXCHANGES)
+                    gExchFlags[ex] = cast(ubyte) b0[0];
+            }
             // bound the seq map: gExchanges shrinks on delete but gExchangeSeq
             // KEEPS a tombstone (rejects a stale declare), so declare+delete of
             // unique names would grow it without bound (per-shard, replicated).
@@ -469,6 +479,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     if (seq <= *sp)
                         return; // stale vs a newer declare/delete
                 gExchanges.remove(cast(string) ex);
+                gExchFlags.remove(cast(string) ex);
                 // tombstone (usually an update — declare recorded the key); the
                 // cap guard mirrors the declare so a delete can't grow it either
                 if ((cast(string) ex) in gExchangeSeq || gExchangeSeq.length < AMQP_MAX_EXCHANGES)
@@ -480,7 +491,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             {
             }
         }
-        else if (op == 8) // queue.declare: ex=queue name (existence set)
+        else if (op == 8) // queue.declare: ex=queue name, a=declare flags (1 byte)
         {
             if (auto sp = (cast(string) ex) in gQueueSeq)
                 if (seq <= *sp)
@@ -492,6 +503,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             }
             gQueues[ex] = true;
             gQueueSeq[ex] = seq;
+            if (a.length >= 1)
+                gQueueFlags[ex] = cast(ubyte) a[0];
         }
         else if (op == 9) // queue.delete: ex=queue name (tombstone)
         {
@@ -501,6 +514,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             gQueues.remove(cast(string) ex);
             gQueueOwner.remove(cast(string) ex); // exclusivity dies with the queue
             gQueueMeta.remove(cast(string) ex); // dlx/ttl die with the queue too
+            gQueueFlags.remove(cast(string) ex);
             if ((cast(string) ex) in gQueueSeq || gQueueSeq.length < AMQP_MAX_QUEUEMETA)
                 gQueueSeq[ex] = seq; // tombstone: rejects a stale later declare
         }
@@ -1859,7 +1873,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 return true;
             }
             // equivalence: redeclaring an EXISTING exchange with a different
-            // type is a 406 PRECONDITION_FAILED (RabbitMQ inequivalent-args)
+            // type OR different durable/auto-delete/internal flags is a 406
+            // PRECONDITION_FAILED (RabbitMQ inequivalent-args)
             if (typ.length)
                 if (auto pt = (cast(string) ex) in gExchanges)
                 {
@@ -1873,8 +1888,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         c.chans.remove(chan);
                         return true;
                     }
+                    if (auto pfx = (cast(string) ex) in gExchFlags)
+                        if (*pfx != (flags & 0x0E))
+                        {
+                            channelClose(o, chan, 406,
+                                    "PRECONDITION_FAILED - inequivalent flags", 40, 10);
+                            c.chans.remove(chan);
+                            return true;
+                        }
                 }
-            ctlBroadcast(1, ex, typ, "");
+            char[1] xfb = [cast(char)(flags & 0x0E)];
+            ctlBroadcast(1, ex, typ, xfb[]);
             method(o, chan, 40, 11);
             return true;
         }
@@ -2025,6 +2049,18 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 // existence set so later passive/consume probes resolve it.
                 if (exclusiveDenied(c, chan, o, qq, 50, 10))
                     return true; // another connection's exclusive queue: 405
+                // redeclare with different durable/exclusive/auto-delete is a
+                // 406 PRECONDITION_FAILED (RabbitMQ inequivalence). Passive
+                // declares never flag-check.
+                if (!passive)
+                    if (auto pf = (cast(string) qq) in gQueueFlags)
+                        if (*pf != (qflags & 0x0E))
+                        {
+                            channelClose(o, chan, 406,
+                                    "PRECONDITION_FAILED - inequivalent flags", 50, 10);
+                            c.chans.remove(chan);
+                            return true;
+                        }
                 if (passive)
                 {
                     if (q.length && !queueExists(qq))
@@ -2040,7 +2076,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // every use, so announce only the FIRST time this shard sees
                     // a name (or the first after a tombstone). LWW seq still
                     // orders the genuine announce and a post-delete resurrection.
-                    ctlBroadcast(8, qq, "", "");
+                    char[1] fb = [cast(char)(qflags & 0x0E)];
+                    ctlBroadcast(8, qq, fb[], "");
                     if (qflags & 4) // exclusive: claim it for THIS connection
                     {
                         char[24] idb = void;
@@ -3662,13 +3699,31 @@ private void qConsumerInc(string q) nothrow @trusted
 
 private void qConsumerDec(string q) nothrow @trusted
 {
+    bool last = false;
     if (auto p = q in gQueueConsumers)
     {
         if (*p > 0)
             --*p;
         if (*p == 0)
+        {
             gQueueConsumers.remove(q);
+            last = true;
+        }
     }
+    if (!last)
+        return;
+    // auto-delete: the queue dies when its LAST consumer goes away (it had
+    // at least one — this decrement proves it). Runs on the consumer fiber,
+    // where the tombstone broadcast + backing DEL may yield freely.
+    if (auto pf = q in gQueueFlags)
+        if (*pf & 0x08)
+        {
+            ctlBroadcast(9, q, "", "");
+            static ByteBuffer adk; // TLS: consumed by the DEL before any yield
+            queueKey(q, adk);
+            if (gAmqpDelKey !is null)
+                gAmqpDelKey(adk.data.asChars);
+        }
 }
 
 private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
