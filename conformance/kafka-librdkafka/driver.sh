@@ -12,7 +12,7 @@ ls 0*.c* 2>/dev/null | sed -E 's/^([0-9]{4})-.*/\1/' | sort -u > $SP/rdk_tests.t
 # sockem slow-connect simulation) that the speed multiplier 0.5 in test.conf
 # falsely times out. They run SERIALLY at the end under multiplier 2 — all of
 # them PASS against dreads at real-time pacing (verified 2026-08-24).
-SLOW="0030 0049 0059 0075 0084 0088 0091 0093 0104 0106 0113 0117 0121 0123 0125 0131 0146 0149 0155 0179 0183"
+SLOW="0030 0049 0059 0075 0081 0084 0088 0091 0093 0104 0106 0113 0117 0121 0123 0125 0131 0146 0149 0155 0179 0183"
 is_slow() { case " $SLOW " in *" $1 "*) return 0;; esac; return 1; }
 run_one() {
   local n=$1

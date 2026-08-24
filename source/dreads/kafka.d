@@ -31,7 +31,7 @@ import dreads.mem : ByteBuffer, tByteBufferOom;
 import dreads.kafkagroup : KGOP_JOIN, KGOP_JOIN_POLL, KGOP_SYNC, KGOP_HEARTBEAT,
     KGOP_LEAVE, KGOP_DESCRIBE, KGOP_COMMIT_CHECK, KG_NONE, KG_WAIT,
     KG_ILLEGAL_GENERATION, KG_INCONSISTENT_PROTOCOL, KG_UNKNOWN_MEMBER,
-    KG_REBALANCE_IN_PROGRESS, KG_MEMBER_ID_REQUIRED;
+    KG_REBALANCE_IN_PROGRESS, KG_MEMBER_ID_REQUIRED, KGOP_DROP, KGOP_SUBSCRIBED;
 import std.digest.crc : crc32Of;
 
 /// Data-plane hook installed by server.d: execute a synthesized RESP command
@@ -56,7 +56,10 @@ private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_CREATE_TOPICS = 19, API_DESCRIBE_GROUPS = 15;
 // Transaction coordinator APIs (single-node = own coordinator).
 private enum short API_CREATE_PARTITIONS = 37, API_DELETE_TOPICS = 20,
-        API_INCREMENTAL_ALTER_CONFIGS = 44, API_ALTER_CONFIGS = 33;
+        API_INCREMENTAL_ALTER_CONFIGS = 44, API_ALTER_CONFIGS = 33,
+        API_DESCRIBE_ACLS = 29, API_CREATE_ACLS = 30, API_DELETE_ACLS = 31,
+        API_DELETE_RECORDS = 21, API_LIST_GROUPS = 16, API_DELETE_GROUPS = 42,
+        API_OFFSET_DELETE = 47;
 private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
         API_ADD_OFFSETS_TO_TXN = 25, API_END_TXN = 26, API_TXN_OFFSET_COMMIT = 28;
 
@@ -115,6 +118,13 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_DELETE_TOPICS: return 1; // v4+ flexible
     case API_INCREMENTAL_ALTER_CONFIGS: return 0; // v1+ flexible
     case API_ALTER_CONFIGS: return 1; // v2+ flexible
+    case API_DESCRIBE_ACLS: return 1; // v2+ flexible
+    case API_CREATE_ACLS: return 1; // v2+ flexible
+    case API_DELETE_ACLS: return 1; // v2+ flexible
+    case API_DELETE_RECORDS: return 1; // v2+ flexible
+    case API_LIST_GROUPS: return 0; // v3+ flexible
+    case API_DELETE_GROUPS: return 1; // v2+ flexible
+    case API_OFFSET_DELETE: return 0; // v0 only (KIP-496)
     case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
     case API_INIT_PRODUCER_ID: return 3; // v2+ flexible
     case API_ADD_PARTITIONS_TO_TXN: return 2; // v3+ flexible
@@ -590,6 +600,86 @@ private long partLen(scope const(char)[] key) nothrow
     return v;
 }
 
+// --- log start offset (DeleteRecords truncation, KIP-107) -----------------
+// A partition's base offset lives in the keyspace string `kafka.tb.<t>.<p>`
+// (a NEW key family — the list layout is untouched). The HOT PATHS pay ZERO
+// for it until the first truncation anywhere: gKafkaTruncEpoch stays 0 and
+// partBase() answers 0 with one relaxed atomic load. After a truncation the
+// epoch bumps and lookups go through a per-shard TLS cache keyed by epoch.
+public shared ulong gKafkaTruncEpoch;
+
+private long[string] tBaseVal; // TLS cache: partition key -> base
+private ulong[string] tBaseEpoch; // TLS: epoch the cached value was read at
+
+private void baseKey(scope const(char)[] topic, int part, ref ByteBuffer o) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    o.clear();
+    o.append("kafka.tb.");
+    o.append(topic);
+    char[16] nb = void;
+    immutable n = snprintf(nb.ptr, nb.length, ".%d", part);
+    o.append(nb[0 .. n]);
+}
+
+/// The partition's log start offset. Zero-cost while nothing was ever
+/// truncated; cached per shard afterwards (invalidated by epoch bumps).
+private long partBase(scope const(char)[] topic, int part) nothrow @trusted
+{
+    import core.atomic : atomicLoad;
+
+    immutable ep = atomicLoad(gKafkaTruncEpoch);
+    if (ep == 0)
+        return 0;
+    static ByteBuffer kb4; // TLS: consumed before the hop below
+    partKey(topic, part, kb4);
+    auto pk = cast(const(char)[]) kb4.data;
+    if (auto pe = pk in tBaseEpoch)
+        if (*pe == ep)
+            if (auto pv = pk in tBaseVal)
+                return *pv;
+    // miss/stale: GET the base (routed hop), then cache under this epoch
+    long v = 0;
+    if (gKafkaExec !is null)
+    {
+        static ByteBuffer bkb, rb;
+        baseKey(topic, part, bkb);
+        char[10 + KAFKA_MAX_TOPIC + 16] bst = void;
+        immutable bl = bkb.length <= bst.length ? bkb.length : bst.length;
+        bst[0 .. bl] = cast(const(char)[]) bkb.data[0 .. bl];
+        char[8 + KAFKA_MAX_TOPIC + 16] pst = void;
+        immutable pl = pk.length <= pst.length ? pk.length : pst.length;
+        pst[0 .. pl] = pk[0 .. pl];
+        const(char)[][2] a = ["get", cast(const(char)[]) bst[0 .. bl]];
+        gKafkaExec(a[], rb);
+        auto d = rb.data;
+        if (d.length >= 4 && d[0] == '$' && d[1] != '-')
+        {
+            size_t i2 = 1;
+            long blen = 0;
+            while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9')
+                blen = blen * 10 + (d[i2++] - '0');
+            i2 += 2;
+            long got = 0;
+            while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9' && got < blen)
+            {
+                v = v * 10 + (d[i2++] - '0');
+                got++;
+            }
+        }
+        if (tBaseVal.length > 4096)
+        {
+            tBaseVal = null; // bounded cache: reset on overflow
+            tBaseEpoch = null;
+        }
+        auto pkStr = (cast(const(char)[]) pst[0 .. pl]).idup;
+        tBaseVal[pkStr] = v;
+        tBaseEpoch[pkStr] = ep;
+    }
+    return v;
+}
+
 /// LRANGE [from .. from+max-1]; calls sink(blob) per record, returns count.
 private int rangeRecords(scope const(char)[] key, long from, int maxN,
         scope void delegate(scope const(ubyte)[]) nothrow sink) nothrow @trusted
@@ -760,7 +850,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
     immutable apiKey = r.i16();
     immutable apiVer = r.i16();
     immutable corr = r.i32();
-    cast(void) r.str(); // client_id (nullable) — a normal i16 string even in the
+    tKafkaClientId = r.str(); // client_id (nullable) — a normal i16 string even in the
     // flexible request header v2, which then adds tagged fields:
     immutable flex = isFlexible(apiKey, apiVer);
     if (flex)
@@ -803,7 +893,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 24); // array count
+        putI32(o, 31); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -829,6 +919,13 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_DELETE_TOPICS, 0, 1);
         row(o, API_INCREMENTAL_ALTER_CONFIGS, 0, 0);
         row(o, API_ALTER_CONFIGS, 0, 1);
+        row(o, API_DESCRIBE_ACLS, 0, 1);
+        row(o, API_CREATE_ACLS, 0, 1);
+        row(o, API_DELETE_ACLS, 0, 1);
+        row(o, API_DELETE_RECORDS, 0, 1);
+        row(o, API_LIST_GROUPS, 0, 0);
+        row(o, API_DELETE_GROUPS, 0, 1);
+        row(o, API_OFFSET_DELETE, 0, 0);
         row(o, API_DESCRIBE_GROUPS, 0, 4);
         row(o, API_INIT_PRODUCER_ID, 0, 3);
         row(o, API_ADD_PARTITIONS_TO_TXN, 0, 2);
@@ -909,6 +1006,34 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         handleAlterConfigs(r, apiVer, o);
         break;
 
+    case API_DESCRIBE_ACLS:
+        handleDescribeAcls(r, apiVer, o);
+        break;
+
+    case API_CREATE_ACLS:
+        handleCreateAcls(r, apiVer, o);
+        break;
+
+    case API_DELETE_ACLS:
+        handleDeleteAcls(r, apiVer, o);
+        break;
+
+    case API_DELETE_RECORDS:
+        handleDeleteRecords(r, apiVer, o);
+        break;
+
+    case API_LIST_GROUPS:
+        handleListGroups(r, apiVer, o);
+        break;
+
+    case API_DELETE_GROUPS:
+        handleDeleteGroups(r, apiVer, o);
+        break;
+
+    case API_OFFSET_DELETE:
+        handleOffsetDelete(r, apiVer, o);
+        break;
+
     case API_DESCRIBE_GROUPS:
         handleDescribeGroups(r, apiVer, o);
         break;
@@ -972,6 +1097,9 @@ public __gshared bool gKafkaAutoCreate = true;
 /// (v4+; librdkafka consumers send FALSE — KIP-361/0109). ANDed with
 /// gKafkaAutoCreate wherever a missing topic would auto-exist.
 private bool tMetaAllowAuto = true;
+/// The current request's header client_id (slice of the request buffer —
+/// valid for the request's lifetime; joins record it per member).
+private const(char)[] tKafkaClientId;
 
 /// Emit a JoinGroup ERROR response (classic or flex). MEMBER_ID_REQUIRED
 /// carries the broker-assigned id the client must re-join with.
@@ -1003,6 +1131,224 @@ private void emitJoinErr(ref ByteBuffer o, short ver, bool flex, short err,
     putStr(o, ""); // leader
     putStr(o, mid);
     putI32(o, 0); // members
+}
+
+/// Group-name registry backing ListGroups: hash `kafka.groups`, field =
+/// group, value = protocol_type. Written on every join (cheap, joins are
+/// rebalance-rare), removed by DeleteGroups.
+private void registerGroupName(scope const(char)[] group, scope const(char)[] ptype) nothrow @trusted
+{
+    if (gKafkaExec is null || group.length == 0)
+        return;
+    static ByteBuffer rb;
+    const(char)[][4] a = ["hset", "kafka.groups", group,
+        ptype.length ? ptype : "consumer"];
+    gKafkaExec(a[], rb);
+}
+
+/// ListGroups (v0): every registered group. No filters at v0 — clients
+/// filter client-side.
+private void handleListGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    static ByteBuffer rb;
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms (v1+)
+    putI16(o, E_NONE); // error_code
+    immutable gOff = o.length;
+    putI32(o, 0);
+    int ng = 0;
+    if (gKafkaExec !is null)
+    {
+        const(char)[][2] a = ["hgetall", "kafka.groups"];
+        gKafkaExec(a[], rb);
+        auto d = cast(const(char)[]) rb.data;
+        if (d.length >= 4 && d[0] == '*')
+        {
+            size_t i2 = 1;
+            long cnt = 0;
+            while (i2 < d.length && d[i2] != '\r')
+                cnt = cnt * 10 + (d[i2++] - '0');
+            i2 += 2;
+            for (long e = 0; e + 1 < cnt && ng < 512; e += 2)
+            {
+                if (i2 >= d.length || d[i2] != '$')
+                    break;
+                i2++;
+                long fl = 0;
+                while (i2 < d.length && d[i2] != '\r')
+                    fl = fl * 10 + (d[i2++] - '0');
+                i2 += 2;
+                if (i2 + fl + 2 > d.length)
+                    break;
+                auto g = d[i2 .. i2 + cast(size_t) fl];
+                i2 += cast(size_t) fl + 2;
+                if (i2 >= d.length || d[i2] != '$')
+                    break;
+                i2++;
+                long vl = 0;
+                while (i2 < d.length && d[i2] != '\r')
+                    vl = vl * 10 + (d[i2++] - '0');
+                i2 += 2;
+                if (i2 + vl + 2 > d.length)
+                    break;
+                auto pt = d[i2 .. i2 + cast(size_t) vl];
+                i2 += cast(size_t) vl + 2;
+                putStr(o, g); // group_id
+                putStr(o, pt); // protocol_type
+                ng++;
+            }
+        }
+    }
+    patchI32(o, gOff, ng);
+}
+
+/// DeleteGroups (v0-v1): drop empty groups' coordinator state + registry
+/// entry. Unknown = 69 (GROUP_ID_NOT_FOUND), live members = 68
+/// (NON_EMPTY_GROUP).
+private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable ngr = safeCount(r.i32());
+    const(char)[][64] names;
+    size_t ng;
+    foreach (_; 0 .. ngr)
+    {
+        if (!r.ok)
+            break;
+        auto g = r.str();
+        if (ng < names.length && r.ok)
+            names[ng++] = g;
+    }
+    short[64] errs = 69;
+    foreach (i; 0 .. ng)
+    {
+        if (names[i].length == 0)
+            continue;
+        static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+        req.clear();
+        req.appendByte(cast(char) KGOP_DROP);
+        putStr(req, names[i]);
+        if (kgOp(names[i], cast(const(ubyte)[]) req.data, rep))
+        {
+            Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+            errs[i] = rr.i16();
+        }
+        // dropped (or never had FSM state): a registered name with committed
+        // offsets still deletes — clear the registry entry unless non-empty
+        if (errs[i] == 69 && gKafkaExec !is null)
+        {
+            // known in the registry (joined at some point) but FSM-empty on
+            // its owner: treat as deletable
+            static ByteBuffer rb2;
+            const(char)[][3] ha = ["hexists", "kafka.groups", names[i]];
+            gKafkaExec(ha[], rb2);
+            auto d = rb2.data;
+            if (d.length >= 4 && d[0] == ':' && d[1] == '1')
+                errs[i] = E_NONE;
+        }
+        if (errs[i] == E_NONE && gKafkaExec !is null)
+        {
+            static ByteBuffer rb3;
+            const(char)[][3] a = ["hdel", "kafka.groups", names[i]];
+            gKafkaExec(a[], rb3);
+            // a deleted group loses its committed offsets too
+            static ByteBuffer kb6, rb4;
+            groupOffKey(names[i], kb6);
+            char[9 + 256] gst = void;
+            immutable gl = kb6.length <= gst.length ? kb6.length : gst.length;
+            gst[0 .. gl] = cast(const(char)[]) kb6.data[0 .. gl];
+            const(char)[][2] a2 = ["del", cast(const(char)[]) gst[0 .. gl]];
+            gKafkaExec(a2[], rb4);
+        }
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) ng); // results
+    foreach (i; 0 .. ng)
+    {
+        putStr(o, names[i]);
+        putI16(o, errs[i]);
+    }
+}
+
+/// OffsetDelete (v0, KIP-496): remove committed offsets for the named
+/// partitions. Partitions of a topic the group's LIVE members still subscribe
+/// to answer GROUP_SUBSCRIBED_TO_TOPIC(86). Response order is peculiar:
+/// top-level error FIRST, then throttle, then topics.
+private void handleOffsetDelete(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    auto group = r.str();
+    immutable ntopics = safeCount(r.i32());
+    putI16(o, E_NONE); // top-level error_code
+    putI32(o, 0); // throttle_time_ms
+    immutable tOff = o.length;
+    putI32(o, ntopics);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto topic = r.str();
+        immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break;
+        putStr(o, topic);
+        immutable pOff = o.length;
+        putI32(o, nparts);
+        et++;
+        // live subscription check, once per topic (routed FSM op)
+        bool subscribed = false;
+        {
+            static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+            req.clear();
+            req.appendByte(cast(char) KGOP_SUBSCRIBED);
+            putStr(req, group);
+            putStr(req, topic);
+            if (kgOp(group, cast(const(ubyte)[]) req.data, rep))
+            {
+                Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+                cast(void) rr.i16();
+                subscribed = rr.i8() != 0;
+            }
+        }
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok)
+                break;
+            immutable part = r.i32();
+            short perr = E_NONE;
+            if (subscribed)
+                perr = 86; // GROUP_SUBSCRIBED_TO_TOPIC
+            else if (gKafkaExec !is null && validTopic(topic) && part >= 0)
+            {
+                static ByteBuffer keyb2, rb;
+                groupOffKey(group, keyb2);
+                char[9 + 256] gst = void;
+                immutable gl = keyb2.length <= gst.length ? keyb2.length : gst.length;
+                gst[0 .. gl] = cast(const(char)[]) keyb2.data[0 .. gl];
+                auto gkey = cast(const(char)[]) gst[0 .. gl];
+                char[KAFKA_MAX_TOPIC + 16] fb = void;
+                auto field = partField(topic, part, fb);
+                const(char)[][3] a = ["hdel", gkey, field];
+                gKafkaExec(a[], rb);
+                // the metadata sibling too
+                char[KAFKA_MAX_TOPIC + 18] mfb = void;
+                immutable fl = field.length + 2 <= mfb.length ? field.length : mfb.length - 2;
+                mfb[0 .. fl] = field[0 .. fl];
+                mfb[fl] = '#';
+                mfb[fl + 1] = 'm';
+                const(char)[][3] a2 = ["hdel", gkey,
+                    cast(const(char)[]) mfb[0 .. fl + 2]];
+                gKafkaExec(a2[], rb);
+            }
+            putI32(o, part);
+            putI16(o, perr);
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+    }
+    patchI32(o, tOff, et);
 }
 
 /// Drive the join barrier for a parsed JoinGroup request: send KGOP_JOIN once,
@@ -1134,6 +1480,7 @@ private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
     putI32(req, rebMs);
     req.appendByte(v4plus ? 1 : 0);
     putStr(req, protocolType);
+    putStr(req, tKafkaClientId is null ? "" : tKafkaClientId);
     return cast(int) req.length; // caller appends [i32 nproto]{...} itself
 }
 
@@ -1178,6 +1525,7 @@ private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow 
         emitJoinErr(o, ver, true, KG_INCONSISTENT_PROTOCOL, memberId);
         return;
     }
+    registerGroupName(group, protocolType is null ? "consumer" : protocolType);
     joinLoop(o, ver, true, group, req);
 }
 
@@ -1229,6 +1577,7 @@ private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         emitJoinErr(o, ver, false, KG_INCONSISTENT_PROTOCOL, memberId);
         return;
     }
+    registerGroupName(group, protocolType);
     joinLoop(o, ver, false, group, req);
 }
 
@@ -1370,6 +1719,76 @@ private void storeGroupMeta(scope const(char)[] group, scope const(char)[] topic
     }
 }
 
+/// Committed leader epoch lives in sibling field `<topic>/<partition>#e`
+/// (stored only when the commit names one; OffsetFetch answers -1 otherwise).
+private void storeGroupEpoch(scope const(char)[] group, scope const(char)[] topic,
+        int part, int epoch) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer keyb, rb;
+    groupOffKey(group, keyb);
+    char[KAFKA_MAX_TOPIC + 16] fb = void;
+    auto field = partField(topic, part, fb);
+    char[KAFKA_MAX_TOPIC + 18] efb = void;
+    immutable fl = field.length + 2 <= efb.length ? field.length : efb.length - 2;
+    efb[0 .. fl] = field[0 .. fl];
+    efb[fl] = '#';
+    efb[fl + 1] = 'e';
+    auto efield = cast(const(char)[]) efb[0 .. fl + 2];
+    if (epoch < 0)
+    {
+        const(char)[][3] a = ["hdel", cast(const(char)[]) keyb.data, efield];
+        gKafkaExec(a[], rb);
+        return;
+    }
+    char[16] eb = void;
+    immutable k = snprintf(eb.ptr, eb.length, "%d", epoch);
+    const(char)[][4] a = ["hset", cast(const(char)[]) keyb.data, efield,
+        cast(const(char)[]) eb[0 .. (k > 0 ? k : 0)]];
+    gKafkaExec(a[], rb);
+}
+
+/// The committed leader epoch for one partition, or -1 when unset.
+private int fetchGroupEpoch(scope const(char)[] group, scope const(char)[] topic,
+        int part) nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return -1;
+    static ByteBuffer keyb, rb;
+    groupOffKey(group, keyb);
+    char[KAFKA_MAX_TOPIC + 16] fb = void;
+    auto field = partField(topic, part, fb);
+    char[KAFKA_MAX_TOPIC + 18] efb = void;
+    immutable fl = field.length + 2 <= efb.length ? field.length : efb.length - 2;
+    efb[0 .. fl] = field[0 .. fl];
+    efb[fl] = '#';
+    efb[fl + 1] = 'e';
+    const(char)[][3] a = ["hget", cast(const(char)[]) keyb.data,
+        cast(const(char)[]) efb[0 .. fl + 2]];
+    gKafkaExec(a[], rb);
+    auto d = rb.data;
+    if (d.length < 4 || d[0] != '$' || d[1] == '-')
+        return -1;
+    size_t i2 = 1;
+    long blen = 0;
+    while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9')
+        blen = blen * 10 + (d[i2++] - '0');
+    if (i2 + 2 > d.length)
+        return -1;
+    i2 += 2;
+    int v = 0;
+    long got = 0;
+    while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9' && got < blen)
+    {
+        v = v * 10 + (d[i2++] - '0');
+        got++;
+    }
+    return got ? v : -1;
+}
+
 /// HGET the committed metadata for one partition into mb. Returns false when
 /// absent (fetch answers a null string).
 private bool fetchGroupMeta(scope const(char)[] group, scope const(char)[] topic,
@@ -1474,13 +1893,15 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             immutable off = r.i64();
             if (ver == 1)
                 cast(void) r.i64(); // commit_timestamp (v1 only)
+            int cEpoch = -1;
             if (ver >= 6)
-                cast(void) r.i32(); // committed_leader_epoch
+                cEpoch = r.i32(); // committed_leader_epoch
             auto meta = r.str(); // committed_metadata (nullable)
             if (topicErr == E_NONE && r.ok && part >= 0 && off >= 0)
             {
                 storeGroupOffset(group, topic, part, off);
                 storeGroupMeta(group, topic, part, meta);
+                storeGroupEpoch(group, topic, part, cEpoch);
             }
             putI32(o, part);
             putI16(o, topicErr); // fence/unknown-topic: same error per partition
@@ -1751,6 +2172,7 @@ private const(ubyte)[] respBulk(scope const(ubyte)[] d, ref size_t i) nothrow @t
 private const(char)[][4096] tGoTf; // topic slice
 private int[4096] tGoTp; // partition
 private long[4096] tGoTo; // committed offset
+private int[4096] tGoEp; // committed leader epoch (-1 = none)
 private bool[4096] tGoDone; // grouping marker
 private ByteBuffer tGoRb; // HGETALL reply (backing for tGoTf slices)
 
@@ -1772,6 +2194,7 @@ private size_t parseGroupOffsets(scope const(char)[] group) nothrow @trusted
         while (i < d.length && d[i] >= '0' && d[i] <= '9')
             n = n * 10 + (d[i++] - '0');
         i += 2; // \r\n
+        immutable ri = i; // entries start: the epoch pass re-walks from here
         for (long e = 0; e + 1 < n && nf < tGoTf.length; e += 2)
         {
             auto field = respBulk(d, i);
@@ -1787,8 +2210,9 @@ private size_t parseGroupOffsets(scope const(char)[] group) nothrow @trusted
                 }
             if (sl >= field.length)
                 continue;
-            if (field.length >= 2 && field[$ - 2] == '#' && field[$ - 1] == 'm')
-                continue; // metadata sibling field (`topic/part#m`), not a partition
+            if (field.length >= 2 && field[$ - 2] == '#'
+                    && (field[$ - 1] == 'm' || field[$ - 1] == 'e'))
+                continue; // metadata/epoch sibling fields, matched below
             int part = 0;
             foreach (c; field[sl + 1 .. $])
                 if (c >= '0' && c <= '9')
@@ -1801,8 +2225,50 @@ private size_t parseGroupOffsets(scope const(char)[] group) nothrow @trusted
             tGoTf[nf] = cast(const(char)[]) field[0 .. sl];
             tGoTp[nf] = part;
             tGoTo[nf] = neg ? -off : off;
+            tGoEp[nf] = -1;
             tGoDone[nf] = false;
             nf++;
+        }
+        // second pass over the SAME reply: match `#e` epoch fields to their
+        // partitions (hash field order is arbitrary, so this runs after all
+        // partitions are collected — no extra hop, same buffer)
+        i = ri;
+        for (long e = 0; e + 1 < n; e += 2)
+        {
+            auto field = respBulk(d, i);
+            auto val = respBulk(d, i);
+            if (field is null || val is null)
+                break;
+            if (field.length < 3 || field[$ - 2] != '#' || field[$ - 1] != 'e')
+                continue;
+            auto core = field[0 .. $ - 2];
+            size_t sl = core.length;
+            foreach_reverse (k; 0 .. core.length)
+                if (core[k] == '/')
+                {
+                    sl = k;
+                    break;
+                }
+            if (sl >= core.length)
+                continue;
+            int part = 0;
+            foreach (c; core[sl + 1 .. $])
+                if (c >= '0' && c <= '9')
+                    part = part * 10 + (c - '0');
+            int ev = 0;
+            long got;
+            foreach (c; val)
+                if (c >= '0' && c <= '9')
+                {
+                    ev = ev * 10 + (c - '0');
+                    got++;
+                }
+            foreach (j; 0 .. nf)
+                if (tGoTp[j] == part && tGoTf[j] == cast(const(char)[]) core[0 .. sl])
+                {
+                    tGoEp[j] = got ? ev : -1;
+                    break;
+                }
         }
     }
     return nf;
@@ -1830,7 +2296,7 @@ private void emitAllGroupOffsets(scope const(char)[] group, short ver, ref ByteB
             putI32(o, tGoTp[j]);
             putI64(o, tGoTo[j]);
             if (ver >= 5)
-                putI32(o, -1); // committed_leader_epoch
+                putI32(o, tGoEp[j]); // committed_leader_epoch
             putI16(o, -1); // metadata = null
             putI16(o, E_NONE);
             ep++;
@@ -1861,7 +2327,7 @@ private void emitAllGroupOffsetsFlex(scope const(char)[] group, short ver, ref B
             tGoDone[j] = true;
             putI32(o, tGoTp[j]);
             putI64(o, tGoTo[j]);
-            putI32(o, -1); // committed_leader_epoch (v5+)
+            putI32(o, tGoEp[j]); // committed_leader_epoch (v5+)
             putCStrNull(o, null, true); // metadata = null
             putI16(o, E_NONE);
             putTaggedFields(o); // partition tagged fields
@@ -1916,7 +2382,7 @@ private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothro
                 immutable hasMeta = off >= 0 && fetchGroupMeta(group, topic, part, mbf);
                 putI32(o, part);
                 putI64(o, off); // committed_offset (-1 = none)
-                putI32(o, -1); // committed_leader_epoch (v5+)
+                putI32(o, off >= 0 ? fetchGroupEpoch(group, topic, part) : -1);
                 if (hasMeta)
                     putCStr(o, cast(const(char)[]) mbf.data);
                 else
@@ -1983,7 +2449,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
                 putI32(o, part);
                 putI64(o, off); // committed_offset (-1 = none)
                 if (ver >= 5)
-                    putI32(o, -1); // committed_leader_epoch
+                    putI32(o, off >= 0 ? fetchGroupEpoch(group, topic, part) : -1);
                 if (hasMeta)
                     putStr(o, cast(const(char)[]) mb.data);
                 else
@@ -2301,6 +2767,13 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
             }
         }
     }
+    debug (kgroup)
+    {
+        import core.stdc.stdio : fprintf, stderr;
+        fprintf(stderr, "KG WIRE-LEAVE v%d flex=%d group=%.*s nm=%d ok=%d\n",
+                cast(int) ver, flex ? 1 : 0, cast(int) group.length, group.ptr,
+                cast(int) nm, r.ok ? 1 : 0);
+    }
     // one atomic LEAVE op removes every named member and rebalances once
     short[32] perr = KG_UNKNOWN_MEMBER;
     if (r.ok && group.length && nm > 0)
@@ -2362,8 +2835,10 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     immutable nres = safeCount(r.i32());
-    static byte[256] rtype;
-    static const(char)[][256] rname;
+    // STACK-local: the existence probe below hops cross-shard and yields; a
+    // TLS static would be clobbered by another connection during the park.
+    byte[256] rtype;
+    const(char)[][256] rname;
     size_t nr;
     foreach (_; 0 .. nres)
     {
@@ -2390,13 +2865,19 @@ private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothro
     putI32(o, cast(int) nr); // results
     foreach (i; 0 .. nr)
     {
-        putI16(o, E_NONE); // error_code
+        // describing a topic nobody created answers 3 with no entries (0081);
+        // GROUP configs (wire type 32) answer INVALID_REQUEST in this dialect
+        immutable missing = rtype[i] == 2
+            && (!validTopic(rname[i]) || registeredTopicPartitions(rname[i]) < 0);
+        immutable isGroup = rtype[i] == 32 || rtype[i] == 3;
+        putI16(o, isGroup ? cast(short) 42
+                : (missing ? E_UNKNOWN_TOPIC : E_NONE)); // error_code
         putI16(o, -1); // error_message = null
         o.appendByte(cast(char) rtype[i]); // resource_type
         putStr(o, rname[i]); // resource_name
         // resource_type 2 == TOPIC: emit the fixed defaults an inspector needs
         // (a stateless broker has no per-topic overrides); others: empty.
-        if (rtype[i] == 2)
+        if (rtype[i] == 2 && !missing)
         {
             putI32(o, cast(int) KAFKA_TOPIC_CONFIGS.length);
             foreach (cfg; KAFKA_TOPIC_CONFIGS)
@@ -2472,6 +2953,15 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
         if (ng < groups.length && r.ok)
             groups[ng++] = g;
     }
+    bool wantAuthz = false;
+    if (ver >= 3 && r.ok)
+    {
+        immutable f = r.i8(); // include_authorized_operations (v3+)
+        if (r.ok)
+            wantAuthz = f != 0;
+        else
+            r.ok = true;
+    }
     if (ver >= 1)
         putI32(o, 0); // throttle_time_ms
     putI32(o, cast(int) ng); // groups count
@@ -2508,6 +2998,7 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
             auto mid = rr.str();
             immutable gN = rr.i8() != 0;
             auto gii = rr.str();
+            auto cid = rr.str();
             auto meta = rr.bytesI32();
             auto assign = rr.bytesI32();
             putStr(o, mid); // member_id
@@ -2518,13 +3009,18 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 else
                     putStr(o, gii);
             }
-            putStr(o, mid); // client_id (not tracked: the member id)
+            putStr(o, cid.length ? cid : mid); // client_id (recorded at join)
             putStr(o, ""); // client_host (not tracked)
             putBytesI32(o, meta, false); // member_metadata
             putBytesI32(o, assign, false); // member_assignment
         }
         if (ver >= 3)
-            putI32(o, 0); // authorized_operations
+        {
+            // INT32_MIN = "not requested" (clients must see NULL); when
+            // requested: READ+DELETE+DESCRIBE — the group ops we allow
+            enum int GROUP_OPS = (1 << 3) | (1 << 6) | (1 << 8);
+            putI32(o, wantAuthz ? GROUP_OPS : int.min);
+        }
     }
 }
 
@@ -2788,29 +3284,37 @@ private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         }
     }
     immutable validateOnly = r.ok && r.i8() != 0;
-    if (!validateOnly && gKafkaExec !is null)
-        foreach (i; 0 .. nr)
+    foreach (i; 0 .. nr)
+    {
+        if (rerrs[i] != E_NONE || rtypes[i] != 2)
+            continue;
+        // altering a non-existent topic: pre-2.7 brokers answer
+        // UNKNOWN_SERVER_ERROR(-1) — the dialect we present (0081 expects it)
+        if (!validTopic(rnames[i]) || registeredTopicPartitions(rnames[i]) < 0)
         {
-            if (rerrs[i] != E_NONE || rtypes[i] != 2 || !validTopic(rnames[i]))
-                continue;
-            foreach (k; cfgFrom[i] .. cfgFrom[i] + cfgCount[i])
+            rerrs[i] = -1;
+            continue;
+        }
+        if (validateOnly || gKafkaExec is null)
+            continue;
+        foreach (k; cfgFrom[i] .. cfgFrom[i] + cfgCount[i])
+        {
+            static ByteBuffer ckey, crb;
+            topicCfgKey(rnames[i], ckey);
+            if (cfgNull[k])
             {
-                static ByteBuffer ckey, crb;
-                topicCfgKey(rnames[i], ckey);
-                if (cfgNull[k])
-                {
-                    const(char)[][3] a = ["hdel", cast(const(char)[]) ckey.data,
-                        cfgNames[k]];
-                    gKafkaExec(a[], crb);
-                }
-                else
-                {
-                    const(char)[][4] a = ["hset", cast(const(char)[]) ckey.data,
-                        cfgNames[k], cfgVals[k]];
-                    gKafkaExec(a[], crb);
-                }
+                const(char)[][3] a = ["hdel", cast(const(char)[]) ckey.data,
+                    cfgNames[k]];
+                gKafkaExec(a[], crb);
+            }
+            else
+            {
+                const(char)[][4] a = ["hset", cast(const(char)[]) ckey.data,
+                    cfgNames[k], cfgVals[k]];
+                gKafkaExec(a[], crb);
             }
         }
+    }
     putI32(o, 0); // throttle_time_ms
     putI32(o, cast(int) nr); // resources
     foreach (i; 0 .. nr)
@@ -2820,6 +3324,99 @@ private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         o.appendByte(cast(char) rtypes[i]);
         putStr(o, rnames[i]);
     }
+}
+
+/// DeleteRecords (v0-v1, KIP-107): advance a partition's log start offset,
+/// dropping the truncated head records. offset -1 = truncate to the high
+/// watermark; past-the-end/negative = OFFSET_OUT_OF_RANGE(1).
+private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    import core.atomic : atomicOp;
+    import core.stdc.stdio : snprintf;
+
+    immutable ntopics = safeCount(r.i32());
+    putI32(o, 0); // throttle_time_ms (v0+)
+    immutable tOff = o.length;
+    putI32(o, ntopics);
+    int et = 0;
+    foreach (_; 0 .. ntopics)
+    {
+        if (!r.ok)
+            break;
+        auto topic = r.str();
+        immutable nparts = safeCount(r.i32());
+        if (!r.ok)
+            break;
+        putStr(o, topic);
+        immutable pOff = o.length;
+        putI32(o, nparts);
+        et++;
+        int ep = 0;
+        foreach (_2; 0 .. nparts)
+        {
+            if (!r.ok)
+                break;
+            immutable part = r.i32();
+            immutable target = r.i64();
+            if (!r.ok)
+                break;
+            long low = -1;
+            short err = E_NONE;
+            if (!validTopic(topic) || part < 0)
+                err = E_UNKNOWN_TOPIC;
+            else
+            {
+                static ByteBuffer kb5; // TLS: consumed before the hops below
+                partKey(topic, part, kb5);
+                char[8 + KAFKA_MAX_TOPIC + 16] kst = void;
+                immutable kl = kb5.length <= kst.length ? kb5.length : kst.length;
+                kst[0 .. kl] = cast(const(char)[]) kb5.data[0 .. kl];
+                auto key = cast(const(char)[]) kst[0 .. kl];
+                immutable base = partBase(topic, part);
+                immutable llen = partLen(key);
+                immutable hw = base + llen;
+                immutable want = target == -1 ? hw : target;
+                if (want < base || want > hw)
+                {
+                    err = E_OFFSET_OUT_OF_RANGE;
+                    low = -1;
+                }
+                else
+                {
+                    immutable drop = want - base;
+                    if (drop > 0 && gKafkaExec !is null)
+                    {
+                        static ByteBuffer rb;
+                        char[24] b1 = void;
+                        immutable n1 = snprintf(b1.ptr, b1.length, "%lld", drop);
+                        const(char)[][4] a = ["ltrim", key,
+                            cast(const(char)[]) b1[0 .. n1], "-1"];
+                        gKafkaExec(a[], rb);
+                        // persist the new base + invalidate every shard's cache
+                        static ByteBuffer bkb, rb2;
+                        baseKey(topic, part, bkb);
+                        char[10 + KAFKA_MAX_TOPIC + 16] bst = void;
+                        immutable bl = bkb.length <= bst.length ? bkb.length : bst.length;
+                        bst[0 .. bl] = cast(const(char)[]) bkb.data[0 .. bl];
+                        char[24] b2 = void;
+                        immutable n2 = snprintf(b2.ptr, b2.length, "%lld", want);
+                        const(char)[][3] a2 = ["set",
+                            cast(const(char)[]) bst[0 .. bl],
+                            cast(const(char)[]) b2[0 .. n2]];
+                        gKafkaExec(a2[], rb2);
+                        atomicOp!"+="(gKafkaTruncEpoch, 1);
+                    }
+                    low = want;
+                }
+            }
+            putI32(o, part);
+            putI64(o, low); // low_watermark
+            putI16(o, err);
+            ep++;
+        }
+        patchI32(o, pOff, ep);
+    }
+    patchI32(o, tOff, et);
 }
 
 /// CreatePartitions (v0-v1): grow a registered topic's partition count. The
@@ -2937,6 +3534,357 @@ private bool topicCompacted(scope const(char)[] topic) nothrow @trusted
     return false;
 }
 
+// --- Kafka ACL admin (KIP-140): CreateAcls(30)/DescribeAcls(29)/DeleteAcls(31)
+// v0-v1, LITERAL+PREFIXED patterns. Bindings live in the keyspace hash
+// `kafka.acls`, field = type\x1f pattern\x1f name\x1f principal\x1f host\x1f
+// op\x1f perm — routed like any key, AOF-persisted for free. This is the
+// ADMIN surface (store + filter semantics); broker-side enforcement is a
+// separate (gated) concern.
+private enum string KAFKA_ACL_KEY = "kafka.acls";
+
+private struct KAclBinding
+{
+    byte rtype;
+    byte pattern;
+    const(char)[] name;
+    const(char)[] principal;
+    const(char)[] host;
+    byte op;
+    byte perm;
+}
+
+/// Serialize a binding into the hash-field form.
+private void aclField(const ref KAclBinding b, ref ByteBuffer o) nothrow
+{
+    o.clear();
+    o.appendByte(cast(char)('0' + b.rtype));
+    o.appendByte('\x1f');
+    o.appendByte(cast(char)('0' + b.pattern));
+    o.appendByte('\x1f');
+    o.append(b.name);
+    o.appendByte('\x1f');
+    o.append(b.principal);
+    o.appendByte('\x1f');
+    o.append(b.host);
+    o.appendByte('\x1f');
+    o.appendByte(cast(char)('0' + b.op));
+    o.appendByte('\x1f');
+    o.appendByte(cast(char)('0' + b.perm));
+}
+
+/// Parse a stored field back; false on malformed.
+private bool aclParse(scope const(char)[] f, out KAclBinding b) nothrow @trusted
+{
+    const(char)[][7] parts;
+    size_t np, st;
+    foreach (i2, ch; f)
+        if (ch == '\x1f')
+        {
+            if (np < 7)
+                parts[np++] = f[st .. i2];
+            st = i2 + 1;
+        }
+    if (np != 6)
+        return false;
+    parts[np++] = f[st .. $];
+    if (parts[0].length != 1 || parts[1].length != 1 || parts[5].length != 1
+            || parts[6].length != 1)
+        return false;
+    b.rtype = cast(byte)(parts[0][0] - '0');
+    b.pattern = cast(byte)(parts[1][0] - '0');
+    b.name = parts[2];
+    b.principal = parts[3];
+    b.host = parts[4];
+    b.op = cast(byte)(parts[5][0] - '0');
+    b.perm = cast(byte)(parts[6][0] - '0');
+    return true;
+}
+
+/// KIP-140 filter match. Filter name/principal/host may be null (= any);
+/// pattern: ANY(1) = any pattern (name exact when given), MATCH(2) = LITERAL
+/// equal OR PREFIXED prefixing the filter name, LITERAL(3)/PREFIXED(4) exact.
+private bool aclMatch(const ref KAclBinding f, const ref KAclBinding b) nothrow @trusted
+{
+    if (f.rtype != 1 && f.rtype != 0 && f.rtype != b.rtype)
+        return false;
+    if (f.op != 1 && f.op != 0 && f.op != b.op)
+        return false;
+    if (f.perm != 1 && f.perm != 0 && f.perm != b.perm)
+        return false;
+    if (f.principal !is null && f.principal.length && f.principal != b.principal)
+        return false;
+    if (f.host !is null && f.host.length && f.host != b.host)
+        return false;
+    switch (f.pattern)
+    {
+    default:
+        return false;
+    case 0: // UNKNOWN -> treat as ANY
+    case 1: // ANY: any pattern type; name exact when given
+        return f.name is null || f.name.length == 0 || f.name == b.name;
+    case 2: // MATCH: acls affecting the named resource
+        if (f.name is null || f.name.length == 0)
+            return true;
+        if (b.pattern == 3) // LITERAL: equal or the wildcard resource
+            return b.name == f.name || b.name == "*";
+        if (b.pattern == 4) // PREFIXED: binding name prefixes the filter name
+            return b.name.length <= f.name.length && f.name[0 .. b.name.length] == b.name;
+        return false;
+    case 3: // LITERAL
+    case 4: // PREFIXED
+        return b.pattern == f.pattern
+            && (f.name is null || f.name.length == 0 || f.name == b.name);
+    }
+}
+
+private bool aclMatchDefault(const ref KAclBinding f, const ref KAclBinding b) nothrow @trusted
+{
+    if (f.pattern >= 0 && f.pattern <= 4)
+        return aclMatch(f, b);
+    return false;
+}
+
+/// Read one ACL creation/filter from the classic wire (v0 has no pattern
+/// field — LITERAL implied).
+private KAclBinding aclReadWire(ref Rd r, short ver, bool filter) nothrow @trusted
+{
+    KAclBinding b;
+    b.rtype = r.i8();
+    b.name = r.str(); // nullable in filters
+    b.pattern = ver >= 1 ? r.i8() : cast(byte)(filter ? 1 : 3);
+    b.principal = r.str();
+    b.host = r.str();
+    b.op = r.i8();
+    b.perm = r.i8();
+    return b;
+}
+
+/// Enumerate every stored binding into bs (parsing the HGETALL reply).
+/// Returns the count. The slices point into the TLS reply buffer — consume
+/// them before the next hop.
+private size_t aclLoadAll(ref ByteBuffer rb, ref KAclBinding[128] bs,
+        ref const(char)[][128] fields) nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return 0;
+    const(char)[][2] a = ["hgetall", KAFKA_ACL_KEY];
+    gKafkaExec(a[], rb);
+    auto d = cast(const(char)[]) rb.data;
+    size_t n, i2;
+    if (d.length < 4 || d[0] != '*')
+        return 0;
+    i2 = 1;
+    long cnt = 0;
+    while (i2 < d.length && d[i2] != '\r')
+        cnt = cnt * 10 + (d[i2++] - '0');
+    i2 += 2;
+    for (long e = 0; e + 1 < cnt && n < bs.length; e += 2)
+    {
+        // field bulk
+        if (i2 >= d.length || d[i2] != '$')
+            break;
+        i2++;
+        long fl = 0;
+        while (i2 < d.length && d[i2] != '\r')
+            fl = fl * 10 + (d[i2++] - '0');
+        i2 += 2;
+        if (i2 + fl + 2 > d.length)
+            break;
+        auto f = d[i2 .. i2 + cast(size_t) fl];
+        i2 += cast(size_t) fl + 2;
+        // value bulk (ignored)
+        if (i2 >= d.length || d[i2] != '$')
+            break;
+        i2++;
+        long vl = 0;
+        while (i2 < d.length && d[i2] != '\r')
+            vl = vl * 10 + (d[i2++] - '0');
+        i2 += 2;
+        if (i2 + vl + 2 > d.length)
+            break;
+        i2 += cast(size_t) vl + 2;
+        KAclBinding b;
+        if (aclParse(f, b))
+        {
+            bs[n] = b;
+            fields[n] = f;
+            n++;
+        }
+    }
+    return n;
+}
+
+private void putStrNullable(ref ByteBuffer o, scope const(char)[] v, bool isNull) nothrow
+{
+    if (isNull)
+        putI16(o, -1);
+    else
+        putStr(o, v);
+}
+
+/// CreateAcls (v0-v1): store each binding. LITERAL/PREFIXED only.
+private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable n = safeCount(r.i32());
+    KAclBinding[64] bs;
+    short[64] errs;
+    size_t nb;
+    foreach (_; 0 .. n)
+    {
+        if (!r.ok)
+            break;
+        auto b = aclReadWire(r, ver, false);
+        if (nb < bs.length && r.ok)
+        {
+            errs[nb] = (b.pattern == 3 || b.pattern == 4) ? E_NONE
+                : cast(short) 44; // INVALID_REQUEST-ish for filter patterns
+            bs[nb] = b;
+            nb++;
+        }
+    }
+    foreach (i; 0 .. nb)
+    {
+        if (errs[i] != E_NONE || gKafkaExec is null)
+            continue;
+        static ByteBuffer fb, rb;
+        aclField(bs[i], fb);
+        const(char)[][4] a = ["hset", KAFKA_ACL_KEY,
+            cast(const(char)[]) fb.data, "1"];
+        gKafkaExec(a[], rb);
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nb); // results
+    foreach (i; 0 .. nb)
+    {
+        putI16(o, errs[i]);
+        putI16(o, -1); // error_message = null
+    }
+}
+
+/// DescribeAcls (v0-v1): filter the store, grouped by resource.
+private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    auto f = aclReadWire(r, ver, true);
+    static ByteBuffer rb;
+    KAclBinding[128] all;
+    const(char)[][128] fields;
+    immutable n = aclLoadAll(rb, all, fields);
+    bool[128] hit;
+    bool[128] done;
+    size_t nhit;
+    foreach (i; 0 .. n)
+        if (aclMatchDefault(f, all[i]))
+        {
+            hit[i] = true;
+            nhit++;
+        }
+    putI32(o, 0); // throttle_time_ms
+    putI16(o, E_NONE); // error_code
+    putI16(o, -1); // error_message = null
+    // group matches by (type, name, pattern)
+    immutable resOff = o.length;
+    putI32(o, 0);
+    int nres = 0;
+    foreach (i; 0 .. n)
+    {
+        if (!hit[i] || done[i])
+            continue;
+        o.appendByte(cast(char) all[i].rtype);
+        putStr(o, all[i].name);
+        if (ver >= 1)
+            o.appendByte(cast(char) all[i].pattern);
+        immutable aOff = o.length;
+        putI32(o, 0);
+        int na = 0;
+        foreach (j; i .. n)
+        {
+            if (!hit[j] || done[j] || all[j].rtype != all[i].rtype
+                    || all[j].pattern != all[i].pattern || all[j].name != all[i].name)
+                continue;
+            done[j] = true;
+            putStr(o, all[j].principal);
+            putStr(o, all[j].host);
+            o.appendByte(cast(char) all[j].op);
+            o.appendByte(cast(char) all[j].perm);
+            na++;
+        }
+        patchI32(o, aOff, na);
+        nres++;
+    }
+    patchI32(o, resOff, nres);
+}
+
+/// DeleteAcls (v0-v1): per filter, delete + echo the matching bindings.
+private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable nf = safeCount(r.i32());
+    KAclBinding[16] filters;
+    size_t nfl;
+    foreach (_; 0 .. nf)
+    {
+        if (!r.ok)
+            break;
+        auto f = aclReadWire(r, ver, true);
+        if (nfl < filters.length && r.ok)
+            filters[nfl++] = f;
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nfl); // filter_results
+    foreach (fi; 0 .. nfl)
+    {
+        static ByteBuffer rb;
+        KAclBinding[128] all;
+        const(char)[][128] fields;
+        immutable n = aclLoadAll(rb, all, fields);
+        putI16(o, E_NONE); // filter error_code
+        putI16(o, -1); // error_message
+        immutable mOff = o.length;
+        putI32(o, 0);
+        int nm = 0;
+        // emit matches FIRST (slices point into rb — the HDEL hops below
+        // would clobber them), collecting the field copies for deletion
+        // STACK-local: the HDEL hops below yield; a TLS static would be
+        // clobbered by another fiber's DeleteAcls during the park.
+        ByteBuffer delArena;
+        size_t[64] delFrom;
+        size_t[64] delLen;
+        size_t ndel;
+        foreach (i; 0 .. n)
+        {
+            if (!aclMatchDefault(filters[fi], all[i]))
+                continue;
+            putI16(o, E_NONE); // matching acl error_code
+            putI16(o, -1); // error_message
+            o.appendByte(cast(char) all[i].rtype);
+            putStr(o, all[i].name);
+            if (ver >= 1)
+                o.appendByte(cast(char) all[i].pattern);
+            putStr(o, all[i].principal);
+            putStr(o, all[i].host);
+            o.appendByte(cast(char) all[i].op);
+            o.appendByte(cast(char) all[i].perm);
+            nm++;
+            if (ndel < delFrom.length)
+            {
+                delFrom[ndel] = delArena.length;
+                delArena.append(fields[i]);
+                delLen[ndel] = fields[i].length;
+                ndel++;
+            }
+        }
+        patchI32(o, mOff, nm);
+        foreach (k; 0 .. ndel)
+        {
+            if (gKafkaExec is null)
+                break;
+            static ByteBuffer rb2;
+            auto fslice = cast(const(char)[]) delArena.data[delFrom[k] .. delFrom[k] + delLen[k]];
+            const(char)[][3] a = ["hdel", KAFKA_ACL_KEY, fslice];
+            gKafkaExec(a[], rb2);
+        }
+    }
+}
+
 /// IncrementalAlterConfigs v0: SET/DELETE/APPEND/SUBTRACT on per-topic configs.
 /// Non-topic resource types are acked without effect (broker configs are
 /// compile-time here). validate_only skips the writes.
@@ -2990,11 +3938,21 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
         }
     }
     immutable validateOnly = r.ok && r.i8() != 0;
+    foreach (i; 0 .. nr)
+    {
+        if (rerrs[i] != E_NONE)
+            continue;
+        if (rtypes[i] == 32 || rtypes[i] == 3)
+            rerrs[i] = 42; // GROUP configs (wire 32): INVALID_REQUEST here (0081)
+        else if (rtypes[i] == 2
+                && (!validTopic(rnames[i]) || registeredTopicPartitions(rnames[i]) < 0))
+            rerrs[i] = -1; // unknown topic: UNKNOWN_SERVER_ERROR pre-2.7
+    }
     if (!validateOnly && gKafkaExec !is null)
         foreach (i; 0 .. nops)
         {
             auto op = ops[i];
-            if (op.res >= nr || rtypes[op.res] != 2) // 2 = TOPIC resource
+            if (op.res >= nr || rtypes[op.res] != 2 || rerrs[op.res] != E_NONE)
                 continue;
             auto topic = rnames[op.res];
             if (!validTopic(topic) || op.name.length == 0 || op.name.length > 64)
@@ -3286,6 +4244,8 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     // metadata WITHOUT creating (KIP-361, test 0109). Default true when the
     // read fails (truncated request) — the historic behavior.
     tMetaAllowAuto = true;
+    bool wantTopicAuthz = false;
+    bool wantClusterAuthz = false;
     if (r.ok)
     {
         immutable aat = r.i8();
@@ -3293,6 +4253,20 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             tMetaAllowAuto = aat != 0;
         else
             r.ok = true; // flag absent: tolerate (header-only probes)
+    }
+    if (r.ok && ver <= 10)
+    {
+        if (ver >= 8 && ver <= 10)
+        {
+            immutable ica = r.i8(); // include_cluster_authorized_operations
+            if (r.ok)
+                wantClusterAuthz = ica != 0;
+        }
+        immutable ita = r.i8(); // include_topic_authorized_operations (v8+)
+        if (r.ok)
+            wantTopicAuthz = ita != 0;
+        else
+            r.ok = true;
     }
     // The explicit-topic Metadata request is Kafka's auto-create moment:
     // register each VALID requested topic so the all-topics form lists it —
@@ -3351,10 +4325,19 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             putCArrLen(o, 0); // offline_replicas (v5+): none
             putTaggedFields(o); // partition tagged fields
         }
-        putI32(o, -2147483648); // topic_authorized_operations (v8+): not computed
+        // INT32_MIN = "not requested"; else the full topic-op set the
+        // DescribeTopics admin test expects (ALTER, ALTER_CONFIGS, CREATE,
+        // DELETE, DESCRIBE, DESCRIBE_CONFIGS, READ, WRITE)
+        enum int TOPIC_OPS = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
+            | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11);
+        putI32(o, wantTopicAuthz ? TOPIC_OPS : int.min); // (v8+)
         putTaggedFields(o); // topic tagged fields
     }
-    putI32(o, -2147483648); // cluster_authorized_operations (v8..v10)
+    // cluster ops when requested: ALTER, ALTER_CONFIGS, CLUSTER_ACTION,
+    // CREATE, DESCRIBE, DESCRIBE_CONFIGS, IDEMPOTENT_WRITE (0081)
+    enum int CLUSTER_OPS = (1 << 5) | (1 << 7) | (1 << 8) | (1 << 9)
+        | (1 << 10) | (1 << 11) | (1 << 12);
+    putI32(o, wantClusterAuthz ? CLUSTER_OPS : int.min); // (v8..v10)
     putTaggedFields(o); // response-level tagged fields
 }
 
@@ -3514,6 +4497,10 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             // stable request buffer).
             immutable compacted = err == E_NONE && validTopic(topic) && part >= 0
                 && topicCompacted(topic);
+            // log start offset for the reply's baseOffset (epoch-gated: free
+            // until a DeleteRecords ever ran) — hops BEFORE the TLS staging
+            immutable pbase = err == E_NONE && validTopic(topic) && part >= 0
+                ? partBase(topic, part) : 0;
             int[1024] invIdx = void; // batch indices of keyless records
             size_t ninv = 0;
             // topic registration happens in Metadata (the auto-create moment):
@@ -3650,7 +4637,7 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                     err = E_CORRUPT;
                 else
                 {
-                    baseOffset = newLen - cast(long) nrec;
+                    baseOffset = pbase + newLen - cast(long) nrec;
                     import core.atomic : atomicOp;
                     atomicOp!"+="(gKafkaProduced, nrec);
                 }
@@ -3758,20 +4745,25 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             // survives the yield with zero per-partition heap alloc (the
             // stack-local ByteBuffer that first fixed this churned the
             // allocator on the fetch hot path).
+            // base BEFORE staging kbBuild: partBase may hop (only after a
+            // truncation ever happened — zero-cost epoch gate otherwise)
+            immutable base = validTopic(topic) && part >= 0 ? partBase(topic, part) : 0;
             static ByteBuffer kbBuild; // TLS scratch (only used pre-yield)
             partKey(topic, part, kbBuild);
             char[8 + KAFKA_MAX_TOPIC + 16] keyStore = void;
             immutable klen = kbBuild.length <= keyStore.length ? kbBuild.length : keyStore.length;
             keyStore[0 .. klen] = cast(const(char)[]) kbBuild.data[0 .. klen];
             auto key = cast(const(char)[]) keyStore[0 .. klen];
-            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
-            if (hw < 0)
+            long llen = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
+            if (llen < 0)
             {
                 tHopProbes++; // count the cross-shard hop against the budget
-                hw = partLen(key);
+                llen = partLen(key);
             }
+            immutable hw = base + llen; // absolute high watermark
+            immutable fetchIdx = fetchOff - base; // list index of the offset
             immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
-            immutable bad = fetchOff < 0 || fetchOff > hw || !validTopic(topic) || part < 0;
+            immutable bad = fetchOff < base || fetchOff > hw || !validTopic(topic) || part < 0;
             putI32(o, part);
             putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
             putI64(o, hw); // high watermark
@@ -3779,7 +4771,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             {
                 putI64(o, hw); // last_stable_offset (no transactions => == hw)
                 if (ver >= 5)
-                    putI64(o, 0); // log_start_offset (v5+)
+                    putI64(o, base); // log_start_offset (v5+)
                 putI32(o, 0); // aborted_transactions: empty array
                 if (ver >= 11)
                     putI32(o, -1); // preferred_read_replica (v11+): none
@@ -3814,7 +4806,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     size_t nb = 0, fbytes = 0;
                     int direct = -1;
                     if (gKafkaFetchRaw !is null)
-                        direct = gKafkaFetchRaw(key, fetchOff, maxN,
+                        direct = gKafkaFetchRaw(key, fetchIdx, maxN,
                                 (scope const(ubyte)[] blob) @nogc nothrow{
                             if (nb >= cast(size_t) maxN || (nb > 0 && fbytes + blob.length > budget))
                                 return 1;
@@ -3826,7 +4818,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     {
                         nb = 0;
                         fbytes = 0;
-                        cast(void) rangeRecords(key, fetchOff, maxN,
+                        cast(void) rangeRecords(key, fetchIdx, maxN,
                                 (scope const(ubyte)[] blob) nothrow{
                             if (nb < cast(size_t) maxN && (nb == 0 || fbytes + blob.length <= budget))
                             {
@@ -3846,7 +4838,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     long off = fetchOff;
                     int direct = -1;
                     if (gKafkaFetchRaw !is null)
-                        direct = gKafkaFetchRaw(key, fetchOff, maxN,
+                        direct = gKafkaFetchRaw(key, fetchIdx, maxN,
                                 (scope const(ubyte)[] blob) @nogc nothrow{
                             if (off > fetchOff && o.length - startLen > budget)
                                 return 1; // budget filled (always emit at least one)
@@ -3859,7 +4851,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     if (direct < 0)
                     {
                         bool first = true;
-                        cast(void) rangeRecords(key, fetchOff, maxN,
+                        cast(void) rangeRecords(key, fetchIdx, maxN,
                                 (scope const(ubyte)[] blob) nothrow{
                             if (!first && o.length - startLen + 8 + blob.length > budget)
                                 return;
@@ -3925,25 +4917,30 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 cast(void) r.i32(); // max_num_offsets (v0)
             if (!r.ok)
                 break; // truncated mid-partition: don't emit a phantom entry
+            immutable base = validTopic(topic) && part >= 0 ? partBase(topic, part) : 0;
             static ByteBuffer kb3build; // TLS scratch (pre-yield only)
             partKey(topic, part, kb3build);
             char[8 + KAFKA_MAX_TOPIC + 16] k3store = void;
             immutable k3len = kb3build.length <= k3store.length ? kb3build.length : k3store.length;
             k3store[0 .. k3len] = cast(const(char)[]) kb3build.data[0 .. k3len];
             auto k3 = cast(const(char)[]) k3store[0 .. k3len];
-            long hw = gKafkaLenRaw !is null ? gKafkaLenRaw(k3) : -1;
-            if (hw < 0)
+            long llen = gKafkaLenRaw !is null ? gKafkaLenRaw(k3) : -1;
+            if (llen < 0)
             {
                 tHopProbes++; // count the cross-shard hop against the budget
-                hw = partLen(k3);
+                llen = partLen(k3);
             }
             long off;
             if (ts == -2)
-                off = 0; // earliest
+                off = base; // earliest = log start offset
             else if (ts < 0)
-                off = hw; // -1 = latest (high watermark)
+                off = base + llen; // -1 = latest (high watermark)
             else
-                off = offsetForTime(k3, hw, ts); // KIP-79; -1 = no match
+            {
+                off = offsetForTime(k3, llen, ts); // KIP-79; -1 = no match
+                if (off >= 0)
+                    off += base;
+            }
             putI32(o, part);
             putI16(o, E_NONE);
             if (ver >= 1)

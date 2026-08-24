@@ -40,6 +40,8 @@ public enum ubyte KGOP_HEARTBEAT = 4;
 public enum ubyte KGOP_LEAVE = 5;
 public enum ubyte KGOP_DESCRIBE = 6;
 public enum ubyte KGOP_COMMIT_CHECK = 7; // OffsetCommit generation fencing
+public enum ubyte KGOP_DROP = 8; // DeleteGroups: drop an EMPTY group's state
+public enum ubyte KGOP_SUBSCRIBED = 9; // OffsetDelete: is any member subscribed?
 
 private enum ubyte ST_EMPTY = 0, ST_PREPARING = 1, ST_COMPLETING = 2, ST_STABLE = 3;
 
@@ -50,6 +52,7 @@ private enum size_t KG_MAX_GROUPS = 4096; // sanity cap per shard
 private struct KgMember
 {
     string gii; // group.instance.id; "" = dynamic member
+    string clientId; // the joining request's header client.id (DescribeGroups)
     string protoType;
     string[] protoNames; // supported protocols, preference order
     immutable(ubyte)[][] protoMetas; // metadata per protocol (same order)
@@ -339,6 +342,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             immutable rebMs = r.i32();
             immutable v4plus = r.u8() != 0;
             auto ptype = r.str16();
+            auto clientId = r.str16();
             immutable np = r.i32();
             string[] pnames;
             immutable(ubyte)[][] pmetas;
@@ -400,6 +404,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                     {
                         KgMember nm;
                         nm.gii = giiNull ? "" : gii.idup;
+                        nm.clientId = clientId.idup;
                         nm.protoType = ptype.idup;
                         nm.protoNames = pnames;
                         nm.protoMetas = pmetas;
@@ -408,6 +413,14 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                         nm.lastMs = now;
                         g.members[useMid] = nm;
                         g.order ~= useMid;
+                        debug (kgroup)
+                        {
+                            import core.stdc.stdio : fprintf, stderr;
+                            fprintf(stderr, "KG JOIN-79 %.*s member %.*s n=%d\n",
+                                    cast(int) groupName.length, groupName.ptr,
+                                    cast(int) useMid.length, useMid.ptr,
+                                    cast(int) g.members.length);
+                        }
                     }
                     wI16(o, KG_MEMBER_ID_REQUIRED);
                     wStr16(o, useMid);
@@ -425,8 +438,17 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 g.members[useMid] = KgMember.init;
                 g.order ~= useMid;
                 mp = useMid in g.members;
+                debug (kgroup)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "KG JOIN-NEW %.*s member %.*s n=%d\n",
+                            cast(int) groupName.length, groupName.ptr,
+                            cast(int) useMid.length, useMid.ptr,
+                            cast(int) g.members.length);
+                }
             }
             mp.gii = giiNull ? "" : gii.idup;
+            mp.clientId = clientId.idup;
             mp.protoType = ptype.idup;
             mp.protoNames = pnames;
             mp.protoMetas = pmetas;
@@ -611,6 +633,14 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 short perr = KG_UNKNOWN_MEMBER;
                 if (g !is null && (mid in g.members) !is null)
                 {
+                    debug (kgroup)
+                    {
+                        import core.stdc.stdio : fprintf, stderr;
+                        fprintf(stderr, "KG LEAVE %.*s member %.*s n=%d\n",
+                                cast(int) groupName.length, groupName.ptr,
+                                cast(int) mid.length, mid.ptr,
+                                cast(int) g.members.length);
+                    }
                     g.members.remove(mid.idup);
                     string[] keep;
                     foreach (id; g.order)
@@ -655,9 +685,81 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 wStr16(o, id);
                 wU8(o, m.gii.length ? 0 : 1);
                 wStr16(o, m.gii);
+                wStr16(o, m.clientId);
                 wBytes32(o, memberMeta(m, g.protoName));
                 wBytes32(o, m.assignment);
             }
+            return;
+        }
+
+    case KGOP_DROP:
+        {
+            if (g is null)
+            {
+                wI16(o, 69); // GROUP_ID_NOT_FOUND
+                return;
+            }
+            evictStale(g, now); // exact-session-timeout truth (static members)
+            if (g.members.length > 0 && g.state != ST_EMPTY)
+            {
+                debug (kgroup)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    auto fm = g.order.length ? (g.order[0] in g.members) : null;
+                    fprintf(stderr,
+                            "KG DROP-NONEMPTY %.*s n=%d state=%d first=%.*s age=%lld sess=%d\n",
+                            cast(int) groupName.length, groupName.ptr,
+                            cast(int) g.members.length, cast(int) g.state,
+                            cast(int)(g.order.length ? g.order[0].length : 0),
+                            g.order.length ? g.order[0].ptr : "".ptr,
+                            fm !is null ? cast(long)(now - fm.lastMs) : -1L,
+                            fm !is null ? fm.sessMs : -1);
+                }
+                wI16(o, 68); // NON_EMPTY_GROUP
+                return;
+            }
+            tGroups.remove(groupName.idup);
+            wI16(o, KG_NONE);
+            return;
+        }
+
+    case KGOP_SUBSCRIBED:
+        {
+            // [str topic] -> [i16 0][u8 subscribed] — parses each live
+            // member's consumer-protocol metadata ([i16 ver][topics arr]).
+            auto topic = r.str16();
+            wI16(o, KG_NONE);
+            ubyte sub = 0;
+            if (g !is null && g.state != ST_EMPTY)
+                outer2: foreach (id; g.order)
+                {
+                    auto m = id in g.members;
+                    if (m is null)
+                        continue;
+                    auto meta = memberMeta(m, g.protoName);
+                    if (meta.length < 6)
+                        continue;
+                    size_t i2 = 2; // skip version
+                    immutable nt = (cast(int) meta[i2] << 24) | (cast(int) meta[i2 + 1] << 16)
+                        | (cast(int) meta[i2 + 2] << 8) | meta[i2 + 3];
+                    i2 += 4;
+                    foreach (_2; 0 .. (nt < 0 || nt > 4096 ? 0 : nt))
+                    {
+                        if (i2 + 2 > meta.length)
+                            break;
+                        immutable tl = (cast(size_t) meta[i2] << 8) | meta[i2 + 1];
+                        i2 += 2;
+                        if (i2 + tl > meta.length)
+                            break;
+                        if (cast(const(char)[]) meta[i2 .. i2 + tl] == topic)
+                        {
+                            sub = 1;
+                            break outer2;
+                        }
+                        i2 += tl;
+                    }
+                }
+            wU8(o, sub);
             return;
         }
 
@@ -694,6 +796,41 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
     }
 }
 
+/// Evict members whose session timeout lapsed (no slack: a live member
+/// heartbeats at a third of its session timeout, and real Kafka evicts static
+/// members at EXACTLY the timeout — DeleteGroups right after it must see the
+/// group empty, 0081).
+private void evictStale(KgGroup* g, long now) nothrow
+{
+    string[] dead;
+    foreach (id; g.order)
+        if (auto m = id in g.members)
+            if (now - m.lastMs >= cast(long) m.sessMs)
+                dead ~= id; // AT the timeout, like the real broker's timer
+    if (dead.length == 0)
+        return;
+    foreach (id; dead)
+        g.members.remove(id);
+    string[] keep;
+    foreach (id; g.order)
+    {
+        bool gone = false;
+        foreach (d; dead)
+            if (d == id)
+            {
+                gone = true;
+                break;
+            }
+        if (!gone)
+            keep ~= id;
+    }
+    g.order = keep;
+    if (g.order.length == 0)
+        g.state = ST_EMPTY;
+    else if (g.state == ST_STABLE || g.state == ST_COMPLETING)
+        enterPreparing(g, now); // survivors re-join next heartbeat
+}
+
 /// Per-shard maintenance (piggybacks the 50ms tick): close overdue barriers,
 /// evict members whose session timeout lapsed, drop empty groups.
 public void kgroupSweep() nothrow @trusted
@@ -706,35 +843,7 @@ public void kgroupSweep() nothrow @trusted
     {
         if (g.state == ST_PREPARING && now >= g.deadlineMs)
             cast(void) closeBarrier(g);
-        // session-timeout eviction (500ms slack for scheduling jitter)
-        string[] dead;
-        foreach (id; g.order)
-            if (auto m = id in g.members)
-                if (now - m.lastMs > cast(long) m.sessMs + 500)
-                    dead ~= id;
-        if (dead.length)
-        {
-            foreach (id; dead)
-                g.members.remove(id);
-            string[] keep;
-            foreach (id; g.order)
-            {
-                bool gone = false;
-                foreach (d; dead)
-                    if (d == id)
-                    {
-                        gone = true;
-                        break;
-                    }
-                if (!gone)
-                    keep ~= id;
-            }
-            g.order = keep;
-            if (g.order.length == 0)
-                g.state = ST_EMPTY;
-            else if (g.state == ST_STABLE || g.state == ST_COMPLETING)
-                enterPreparing(g, now); // survivors re-join next heartbeat
-        }
+        evictStale(g, now);
         if (g.state == ST_EMPTY && g.members.length == 0)
             drop ~= name;
     }
