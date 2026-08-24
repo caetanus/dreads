@@ -151,6 +151,7 @@ private int[string] gQueueConsGlobal; // TLS
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
 
 private ExType[string] gExchanges; // TLS
+private string[string] gExchangeAE; // TLS: exchange -> alternate-exchange (replicated via op-1)
 /// Last op seq per exchange NAME. A deleted exchange is removed from gExchanges
 /// but keeps its seq here (tombstone) so a stale lower-seq declare is rejected.
 private ulong[string] gExchangeSeq; // TLS
@@ -322,6 +323,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 auto b0 = rd(); // declare flags (1 byte; may be empty from old peers)
                 if (b0.length >= 1 && gExchFlags.length < AMQP_MAX_EXCHANGES)
                     gExchFlags[ex] = cast(ubyte) b0[0];
+                auto ae0 = rd(); // alternate-exchange name (may be empty)
+                if (ae0.length && gExchangeAE.length < AMQP_MAX_EXCHANGES)
+                    gExchangeAE[ex] = cast(string) ae0.idup;
+                else if (ae0 !is null)
+                    gExchangeAE.remove(cast(string) ex); // redeclare without AE clears it
             }
             // bound the seq map: gExchanges shrinks on delete but gExchangeSeq
             // KEEPS a tombstone (rejects a stale declare), so declare+delete of
@@ -523,6 +529,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                         return; // stale vs a newer declare/delete
                 gExchanges.remove(cast(string) ex);
                 gExchFlags.remove(cast(string) ex);
+                gExchangeAE.remove(cast(string) ex);
                 // tombstone (usually an update — declare recorded the key); the
                 // cap guard mirrors the declare so a delete can't grow it either
                 if ((cast(string) ex) in gExchangeSeq || gExchangeSeq.length < AMQP_MAX_EXCHANGES)
@@ -2235,7 +2242,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         }
                 }
             char[1] xfb = [cast(char)(flags & 0x0E)];
-            ctlBroadcast(1, ex, typ, xfb[]);
+            auto exArgsTbl = r.tableRaw();
+            auto aeName = tableGetStr(exArgsTbl, "alternate-exchange");
+            ctlBroadcast(1, ex, typ, xfb[], cast(const(ubyte)[]) aeName);
             if (!(flags & 16)) // nowait: the client forbade declare-ok — an
                 method(o, chan, 40, 11); // extra reply desyncs its RPC stream
             return true;
@@ -2660,6 +2669,18 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto ex = r.shortStr();
                 auto rk = r.shortStr();
                 immutable pubBits = r.u8(); // mandatory bit 0, immediate bit 1
+                try
+                    if (auto pfx = (cast(string) ex) in gExchFlags)
+                        if (*pfx & 8) // internal: only e2e routing may reach it
+                        {
+                            channelClose(o, chan, 403,
+                                    "ACCESS_REFUSED - cannot publish to internal exchange", 60, 40);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                catch (Exception)
+                {
+                }
                 if (pubBits & 2)
                 {
                     // immediate=true was REMOVED in RabbitMQ 3.0: a hard
@@ -3210,7 +3231,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
         }
         auto payload = (cast(const(ubyte)[]) stamped).asChars;
         int routed = 0;
-        routeTo(tp.exchange, tp.rkey, propsHeaders(props), (string q) nothrow {
+        scope void delegate(string) nothrow txSink = (string q) nothrow {
             if (!queueExists(q))
                 return; // same existing-queues-only rule as the live publish path
             static ByteBuffer kbT; // TLS
@@ -3219,7 +3240,35 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
                 gAmqpPush(kbT.data.asChars, payload);
             routed++;
             enforceMaxLen(q);
-        });
+        };
+        routeTo(tp.exchange, tp.rkey, propsHeaders(props), txSink);
+        if (routed == 0) // alternate-exchange cascade, as in finishPublish
+        {
+            string[8] seenAE;
+            size_t nAE = 0;
+            seenAE[nAE++] = tp.exchange;
+            auto cur = tp.exchange;
+            while (routed == 0 && nAE < seenAE.length)
+            {
+                string ae;
+                if (auto pae = cur in gExchangeAE)
+                    ae = *pae;
+                if (ae.length == 0)
+                    break;
+                bool revisit = false;
+                foreach (sx; seenAE[0 .. nAE])
+                    if (sx == ae)
+                    {
+                        revisit = true;
+                        break;
+                    }
+                if (revisit)
+                    break;
+                seenAE[nAE++] = ae;
+                routeTo(ae, tp.rkey, propsHeaders(props), txSink);
+                cur = ae;
+            }
+        }
         atomicOp!"+="(gAmqpMessages, 1);
         if (tp.mandatory && routed == 0)
         {
@@ -3682,6 +3731,45 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink);
     foreach (ck; ccKeys[0 .. nCc])
         routeTo(ch.pub.exchange, ck, hdrs, pushSink);
+    // alternate-exchange: an UNROUTED message cascades through the AE chain
+    // (same routing key + CC); a revisit or depth cap breaks x->u->v->x cycles
+    if (routed == 0)
+    {
+        string[8] seenAE;
+        size_t nAE = 0;
+        try
+            seenAE[nAE++] = ch.pub.exchange;
+        catch (Exception)
+        {
+        }
+        auto cur = cast(string) ch.pub.exchange;
+        while (routed == 0 && nAE < seenAE.length)
+        {
+            string ae;
+            try
+                if (auto pae = cur in gExchangeAE)
+                    ae = *pae;
+            catch (Exception)
+            {
+            }
+            if (ae.length == 0)
+                break;
+            bool revisit = false;
+            foreach (sx; seenAE[0 .. nAE])
+                if (sx == ae)
+                {
+                    revisit = true;
+                    break;
+                }
+            if (revisit)
+                break;
+            seenAE[nAE++] = ae;
+            routeTo(ae, ch.pub.rkey, hdrs, pushSink);
+            foreach (ck; ccKeys[0 .. nCc])
+                routeTo(ae, ck, hdrs, pushSink);
+            cur = ae;
+        }
+    }
     // [basic.return] a mandatory publish that matched no queue must come BACK
     // to the publisher (312 NO_ROUTE) instead of vanishing while confirmed
     if (mandatory && routed == 0)
