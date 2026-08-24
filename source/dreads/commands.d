@@ -15,7 +15,7 @@ import dreads.acl : aclCmdIndex;
 import dreads.smallset : SmallSet;
 import dreads.mem : Arena, ByteBuffer, mallocAppend;
 import dreads.notify : notifyKeyspaceEvent, notifyKeyspaceEventDb, NClass, gNotifyDb;
-import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, gExpiredFields, gImportMode,
+import dreads.obj : Keyspace, ObjType, RObj, gDbs, NUM_DBS, RESP_DBS, gExpiredFields, gImportMode,
     gImportSourceActive;
 import dreads.resp;
 import dreads.stream : FieldPair, Stream, StreamID;
@@ -256,21 +256,24 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
     case cmdIx!"flushall":
         {
             import dreads.shard : sharded, siblingDb;
-            import dreads.obj : NUM_DBS;
+            import dreads.obj : RESP_DBS;
 
             if (sharded())
             {
                 // SHARE-NOTHING: clear THIS shard's own 16 dbs (siblingDb), never
                 // gDbs (the coleguinha's). The broadcast fans FLUSHALL to every
                 // shard, so each clears its own partition → the whole keyspace.
-                foreach (uint db; 0 .. NUM_DBS)
+                // RESP_DBS, not NUM_DBS: the skin-private dbs (16-18) are broker
+                // state — a client FLUSHALL must not wipe queues/sessions.
+                foreach (uint db; 0 .. RESP_DBS)
                     siblingDb(db).clear();
             }
             else
             {
                 ks.clear(); // the current db (may be a detached test keyspace)
-                foreach (ref d; gDbs) // every database
-                    d.clear();
+                foreach (i, ref d; gDbs) // every RESP database (skin dbs spared)
+                    if (i < RESP_DBS)
+                        d.clear();
             }
             repSimple(o, "OK");
             break;
@@ -2900,7 +2903,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
             // the real per-connection db switch happens at the server layer; this
             // path (MULTI replay / apply) only validates the index.
             long n;
-            if (args.length == 1 && parseLong(args[0].str, n) && n >= 0 && n < NUM_DBS)
+            if (args.length == 1 && parseLong(args[0].str, n) && n >= 0 && n < RESP_DBS)
                 repSimple(o, "OK");
             else
                 repError(o, "ERR DB index is out of range");
@@ -3909,7 +3912,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                         repError(o, "ERR value is not an integer or out of range");
                         return true;
                     }
-                    if (destDb < 0 || destDb >= NUM_DBS)
+                    if (destDb < 0 || destDb >= RESP_DBS)
                     {
                         repError(o, "ERR DB index is out of range");
                         return true;
@@ -4009,7 +4012,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR value is not an integer or out of range");
                 break;
             }
-            if (dst < 0 || dst >= NUM_DBS)
+            if (dst < 0 || dst >= RESP_DBS)
             {
                 repError(o, "ERR DB index is out of range");
                 break;
@@ -4075,7 +4078,7 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repError(o, "ERR invalid second DB index");
                 break;
             }
-            if (a < 0 || a >= NUM_DBS || b < 0 || b >= NUM_DBS)
+            if (a < 0 || a >= RESP_DBS || b < 0 || b >= RESP_DBS)
             {
                 repError(o, "ERR DB index is out of range");
                 break;

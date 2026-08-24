@@ -55,7 +55,8 @@ import emplace.vector : Vector;
 import emplace.smartptr : Shared, Weak;
 import dreads.notify : flushPendingNotify, gNotifyFlags, gNotifyDb;
 import dreads.stream : nowMs;
-import dreads.obj : Keyspace, gDbs, NUM_DBS, ObjType, gBlockedClients, gConnectedClients,
+import dreads.obj : Keyspace, gDbs, NUM_DBS, RESP_DBS,
+    ObjType, gBlockedClients, gConnectedClients,
     gImportSourceActive;
 import dreads.dict : Dict, Unit;
 import dreads.pubsub : PubSub, Subscriber, RcMsg, rcFromBytes, rcData, rcRetain, rcRelease, rcAsPush,
@@ -554,7 +555,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec, gMqttResume;
 
         gMqttExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
-            amqpDataExec(args, reply); // persistent-session state in the keyspace
+            amqpDataExec(args, reply, cast(int) gConfig.mqttDb); // persistent-session state, MQTT's db
         };
         cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
             serveMqttClient(conn);
@@ -587,7 +588,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             gKafkaFetchRaw, gKafkaLenRaw;
 
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
-            amqpDataExec(args, reply); // the generic RESP-over-data-plane exec
+            amqpDataExec(args, reply, cast(int) gConfig.kafkaDb); // generic exec, Kafka's db
         };
         gKafkaFetchRaw = &kafkaFetchDirect;
         gKafkaLenRaw = &kafkaLenDirect;
@@ -2470,7 +2471,8 @@ private void shardPubFanout(scope const(char)[] chan, scope const(char)[] msg) n
 // synthesized RESP command through the SAME data plane every client write uses
 // — self-shard direct dispatch (with the full write tail: epoch, wakes, AOF)
 // or a synchronous cross-shard hop. Runs on AMQP connection fibers.
-private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) nothrow @trusted
+private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply,
+        int db = -1) nothrow @trusted
 {
     import dreads.acl : aclCmdIndex;
     import dreads.commands : cmdWriteByIdx;
@@ -2478,6 +2480,8 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
         shardEnqueue, shardWake, ShardMsg, shardOfSlot;
     import dreads.slots : keyToSlot;
 
+    if (db < 0)
+        db = cast(int) gConfig.amqpDb; // default: the AMQP skin's configured db
     static ByteBuffer raw; // TLS: the synthesized RESP bytes
     raw.clear();
     repArrayHeader(raw, args.length);
@@ -2496,12 +2500,21 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
     {
         gRespProto = 2;
         gWriteNoOp = false;
-        cast(void) dispatch(cmd, *(sharded() ? myKeyspace2(0) : &gDbs[0]), reply, arena, 0, opcode);
+        {
+            // ambient db: the AOF prefixes a `SELECT <gNotifyDb>` frame on
+            // change and notifications name their channel by it. Without this,
+            // a skin write after a RESP client's SELECT n was framed under n —
+            // replaying broker state into a USER db (latent AOF corruption).
+            import dreads.notify : gNotifyDb;
+
+            gNotifyDb = db;
+        }
+        cast(void) dispatch(cmd, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]), reply, arena, 0, opcode);
         if (cmdWriteByIdx(opcode) && !gWriteNoOp && reply.length && reply.data[0] != '-')
         {
             gWriteEpoch++;
             wakeKeyActivity();
-            signalReadyKeys(0, *(sharded() ? myKeyspace2(0) : &gDbs[0]));
+            signalReadyKeys(db, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]));
             if (myAof().enabled)
             {
                 import dreads.commands : propagationOverride;
@@ -2527,7 +2540,7 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply) noth
     // fiber's hop during that yield (its hop bytes would then replay ours).
     auto p = acquireShardPending();
     ByteBuffer hb;
-    appendHopCmd(hb, cmd, raw.data, opcode, 0, cast(void*) p);
+    appendHopCmd(hb, cmd, raw.data, opcode, cast(uint) db, cast(void*) p);
     if (hb.length == 0)
     {
         // OOM: appendHopCmd staged nothing. Don't enqueue an empty hop and then
@@ -2576,7 +2589,7 @@ private int kafkaFetchDirect(scope const(char)[] key, long from, int maxN,
     if (sharded() && cast(uint) shardOfSlot(keyToSlot(key)) != tShard)
         return -1; // not the owner: caller takes the data-plane hop
     bool wrong;
-    auto ks = sharded() ? myKeyspace2(0) : &gDbs[0];
+    auto ks = sharded() ? myKeyspace2(gConfig.kafkaDb) : &gDbs[gConfig.kafkaDb];
     auto obj = ks.lookupTyped(key, ObjType.list, wrong);
     if (wrong || obj is null || maxN <= 0 || from < 0)
         return 0;
@@ -2624,7 +2637,7 @@ private long kafkaLenDirect(scope const(char)[] key) nothrow @trusted
     if (sharded() && cast(uint) shardOfSlot(keyToSlot(key)) != tShard)
         return -1;
     bool wrong;
-    auto ks = sharded() ? myKeyspace2(0) : &gDbs[0];
+    auto ks = sharded() ? myKeyspace2(gConfig.kafkaDb) : &gDbs[gConfig.kafkaDb];
     auto obj = ks.lookupTyped(key, ObjType.list, wrong);
     if (wrong || obj is null)
         return 0;
@@ -5192,7 +5205,7 @@ private bool handleCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[] 
                 parseLong(cmd.arr[1].str, n);
             if (cmd.arr.length != 2)
                 repError(o, "ERR wrong number of arguments for 'select' command");
-            else if (n < 0 || n >= NUM_DBS)
+            else if (n < 0 || n >= RESP_DBS) // skin dbs (16-18) are not selectable
                 repError(o, "ERR DB index is out of range");
             else if (sharded())
             {
@@ -6939,7 +6952,7 @@ private void configCmd(const(RVal)[] args, ref ByteBuffer o) nothrow
                 repBulk(o, "10000");
                 break;
             case "databases":
-                auto n = snprintf(b.ptr, b.length, "%d", cast(int) NUM_DBS);
+                auto n = snprintf(b.ptr, b.length, "%d", cast(int) RESP_DBS);
                 repBulk(o, b[0 .. n]);
                 break;
             case "repl-diskless-load":

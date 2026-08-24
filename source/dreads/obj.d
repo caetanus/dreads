@@ -130,7 +130,14 @@ public ulong gPauseIssuer; // conn id that set the pause (exempt from it)
 /// (`Conn.db`); the connection dispatches against `gDbs[conn.db]`, SELECT just
 /// moves that per-connection index, and the replay/apply path takes the db from
 /// the log. Default db 0, so single-DB workloads are unchanged.
-public enum NUM_DBS = 16;
+public enum RESP_DBS = 16; // SELECT/MOVE/COPY/SWAPDB/FLUSH* cap: the Redis 0-15
+/// Three extra keyspaces sit ABOVE the RESP-visible range for the protocol
+/// skins (config: amqp-db/mqtt-db/kafka-db, defaults 16/17/18): invisible to
+/// SELECT and spared by FLUSHALL, so a client's KEYS*/FLUSH can neither see
+/// nor nuke broker state. A skin db may be pointed back at 0-15 to share with
+/// RESP deliberately. The AOF's SELECT framing carries any db index, so they
+/// persist and reload unchanged.
+public enum NUM_DBS = 19; // total per-shard keyspaces (RESP 0-15 + 3 skin slots)
 public __gshared Keyspace[NUM_DBS] gDbs;
 
 /// Stamp each slot with its identity at startup, so `gDbs[i].db == i`.

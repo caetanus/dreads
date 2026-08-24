@@ -18,6 +18,13 @@ public struct Config
     ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     ushort amqpPort = 0; // AMQP 0-9-1 skin listener (0 = disabled); e.g. 5672
     ushort kafkaPort = 0; // Kafka skin listener (0 = disabled); e.g. 9092
+    // Skin-private database indexes (which logical db each skin stores state
+    // in). Defaults sit ABOVE the RESP-visible range (SELECT caps at 16), so
+    // broker state is invisible to KEYS* and spared by FLUSHALL; point one at
+    // 0-15 to deliberately share it with RESP clients (the historical layout).
+    uint amqpDb = 16;
+    uint mqttDb = 17;
+    uint kafkaDb = 18;
     string appendfilename = "dreads.aof";
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
@@ -245,6 +252,24 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "mqtt-port":
         try
             cfg.mqttPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "amqp-db":
+    case "mqtt-db":
+    case "kafka-db":
+        try
+        {
+            immutable n = value.to!uint;
+            if (n > 18) // must fit the per-shard keyspace array (NUM_DBS)
+                return false;
+            if (name == "amqp-db")
+                cfg.amqpDb = n;
+            else if (name == "mqtt-db")
+                cfg.mqttDb = n;
+            else
+                cfg.kafkaDb = n;
+        }
         catch (Exception)
             return false;
         return true;
