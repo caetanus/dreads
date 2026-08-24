@@ -88,12 +88,15 @@ ISOLATED runner process (the stock runner aborts the batch on one timeout),
     cp ../conformance/kafka-librdkafka/test.conf tests/ && bash ../conformance/kafka-librdkafka/driver.sh
 
 Baseline 2026-08-24 (dreads flexible/Kafka-2.5 dialect): 99 pass / 66 fail /
-1 skip; 127/38 after the non-gated bug tail. **REAL CONSUMER GROUPS landed
-2026-08-24 (user-approved milestone; dreads.kafkagroup coordinator, see
-KAFKA-GROUPS-PLAN.md): 156 pass / 10 fail.** The 10: four need
-idempotence/transactions (0090 0094 0103 0129 — still gated), six are
-structural (0052 0077 need kafka-topics.sh, 0109 0115 0119 need kafka-acls.sh
-+ broker ACL enforcement, 0064 needs an SSL-enabled librdkafka build).
+1 skip; 127/38 after the non-gated bug tail; 156/10 with real consumer
+groups. **CONVERGED 2026-08-24 with idempotence + transactions (KIP-98, see
+KAFKA-TXN-PLAN.md): 160 pass / 6 fail.** Every remaining failure is
+structural: 0052/0077 need kafka-topics.sh, 0109/0115/0119 need kafka-acls.sh
++ broker-side ACL enforcement, 0064 needs an SSL-enabled librdkafka build.
+Consumer groups are a real coordinator (dreads.kafkagroup,
+KAFKA-GROUPS-PLAN.md); idempotent producers dedup on (pid, epoch, seq);
+transactions have control markers, aborted-range tracking, LSO-capped
+read_committed fetches and commit-buffered TxnOffsetCommit.
 The admin surface grew along 0081's ladder: ACLs (29/30/31), DeleteRecords 21
 (real log-start-offset, epoch-gated so hot paths pay zero until the first
 truncation), ListGroups 16, DeleteGroups 42, OffsetDelete 47, AlterConfigs 33,
