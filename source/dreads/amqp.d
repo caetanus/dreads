@@ -136,6 +136,13 @@ private ExType[string] gExchanges; // TLS
 /// Last op seq per exchange NAME. A deleted exchange is removed from gExchanges
 /// but keeps its seq here (tombstone) so a stale lower-seq declare is rejected.
 private ulong[string] gExchangeSeq; // TLS
+// Declared-queue existence set (LWW-element-set), mirroring the exchange
+// registry: op 8 declares a queue name, op 9 tombstones it. gQueueSeq keeps a
+// per-name seq so a stale declare can't resurrect a deleted queue. This is what
+// backs the passive-declare / basic.consume NOT_FOUND (404) checks that
+// RabbitMQ clients rely on to probe existence.
+private bool[string] gQueues; // TLS: present => queue currently exists
+private ulong[string] gQueueSeq; // TLS: per-name LWW seq (tombstones survive delete)
 private Binding[][string] gBindings; // TLS: exchange -> bindings
 
 /// The AMQP 0-9-1 default exchanges exist on every vhost with NO explicit
@@ -456,10 +463,41 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             {
             }
         }
+        else if (op == 8) // queue.declare: ex=queue name (existence set)
+        {
+            if (auto sp = (cast(string) ex) in gQueueSeq)
+                if (seq <= *sp)
+                    return; // stale vs a newer declare/delete on this name
+            if ((cast(string) ex) !in gQueueSeq && gQueueSeq.length >= AMQP_MAX_QUEUEMETA)
+            {
+                atomicOp!"+="(gAmqpCtlDrops, 1);
+                return;
+            }
+            gQueues[ex] = true;
+            gQueueSeq[ex] = seq;
+        }
+        else if (op == 9) // queue.delete: ex=queue name (tombstone)
+        {
+            if (auto sp = (cast(string) ex) in gQueueSeq)
+                if (seq <= *sp)
+                    return; // stale vs a newer declare/delete
+            gQueues.remove(cast(string) ex);
+            if ((cast(string) ex) in gQueueSeq || gQueueSeq.length < AMQP_MAX_QUEUEMETA)
+                gQueueSeq[ex] = seq; // tombstone: rejects a stale later declare
+        }
     }
     catch (Exception)
     {
     }
+}
+
+/// True iff `q` names a queue that is currently declared (op 8, not yet op 9)
+/// on this shard. The registry is broadcast-replicated with LWW seq ordering,
+/// so a declare on the owning shard is visible here after fan-out; a same-shard
+/// declare→consume is synchronous (ctlBroadcast applies locally first).
+private bool queueExists(scope const(char)[] q) nothrow @trusted
+{
+    return (cast(string) q in gQueues) !is null;
 }
 
 private void ctlBroadcast(ubyte op, scope const(char)[] ex, scope const(char)[] a,
@@ -1223,6 +1261,29 @@ private void method(ref ByteBuffer o, ushort chan, ushort cls, ushort mth,
     frameFinish(o, at);
 }
 
+/// The four AMQP 0-9-1 core exchange types dreads implements. RabbitMQ also
+/// admits plugin types (x-*), but with no plugins loaded an unknown type is a
+/// hard error — see exchangeTypeError below.
+private bool validExType(scope const(char)[] t) @nogc nothrow pure @safe
+{
+    return t == "direct" || t == "fanout" || t == "topic" || t == "headers";
+}
+
+/// Send a soft channel-level close (class 20, method 40) and drop the channel;
+/// the connection survives (the client opens a fresh channel). `cls`/`mth` name
+/// the offending method. The caller must also `c.chans.remove(chan)` — see the
+/// NOT_FOUND sites — so the dead channel's state (consumers, tx) is released.
+private void channelClose(ref ByteBuffer o, ushort chan, ushort code,
+        scope const(char)[] text, ushort cls, ushort mth) nothrow @trusted
+{
+    method(o, chan, 20, 40, (ref ByteBuffer b) @nogc nothrow {
+        putU16(b, code);
+        putShortStr(b, text);
+        putU16(b, cls);
+        putU16(b, mth);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Serve loop
 
@@ -1465,6 +1526,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             return false;
         case 51: // close-ok
             return false;
+        case 70: // update-secret: new-secret (longstr), reason (shortstr)
+            // dreads carries no per-connection secret to rotate (auth is
+            // accept-any PLAIN), so just acknowledge and keep the connection
+            // open — a client's periodic credential refresh must not drop it.
+            method(o, 0, 10, 71); // update-secret-ok
+            return true;
         default:
             return true;
         }
@@ -1533,6 +1600,32 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             cast(void) r.u16();
             auto ex = r.shortStr();
             auto typ = r.shortStr();
+            immutable flags = r.u8(); // passive/durable/auto-delete/internal/no-wait
+            immutable passive = (flags & 0x01) != 0;
+            if (passive)
+            {
+                // existence probe: an unknown exchange is a channel 404
+                // NOT_FOUND. The default exchange ("") and the seeded amq.*
+                // always exist; a passive declare never creates or type-checks.
+                if (ex.length && (cast(string) ex !in gExchanges))
+                {
+                    channelClose(o, chan, 404, "NOT_FOUND - no exchange", 40, 10);
+                    c.chans.remove(chan);
+                    return true;
+                }
+                method(o, chan, 40, 11);
+                return true;
+            }
+            // An unknown exchange type is a channel 406 PRECONDITION_FAILED (the
+            // connection survives), matching what RabbitMQ returns for a declare
+            // with a type no plugin provides. An empty type keeps the historical
+            // default-to-direct.
+            if (typ.length && !validExType(typ))
+            {
+                channelClose(o, chan, 406, "PRECONDITION_FAILED - invalid exchange type", 40, 10);
+                c.chans.remove(chan);
+                return true;
+            }
             ctlBroadcast(1, ex, typ, "");
             method(o, chan, 40, 11);
             return true;
@@ -1577,7 +1670,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 cast(void) r.u16();
                 auto q = r.shortStr();
-                cast(void) r.u8(); // passive/durable/exclusive/auto-delete/no-wait bits
+                immutable qflags = r.u8(); // passive/durable/exclusive/auto-delete/no-wait
+                immutable passive = (qflags & 0x01) != 0;
                 auto argsTbl = r.tableRaw();
                 // [queue.declare] an EMPTY name means the server assigns a unique
                 // one and returns it (the RPC reply-queue / temporary-queue
@@ -1614,6 +1708,27 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
                 }
+                // passive declare probes existence only: an unknown NAMED queue
+                // is a channel-level 404 NOT_FOUND (the connection lives, the
+                // client opens a fresh channel), exactly like RabbitMQ. An empty
+                // name is never passive-checked (it always names a fresh server
+                // queue). A non-passive declare records the name in the
+                // existence set so later passive/consume probes resolve it.
+                if (passive)
+                {
+                    if (q.length && !queueExists(qq))
+                    {
+                        channelClose(o, chan, 404, "NOT_FOUND - no queue", 50, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                }
+                else if (!queueExists(qq))
+                    // broadcast is a stream — clients redeclare a queue before
+                    // every use, so announce only the FIRST time this shard sees
+                    // a name (or the first after a tombstone). LWW seq still
+                    // orders the genuine announce and a post-delete resurrection.
+                    ctlBroadcast(8, qq, "", "");
                 static ByteBuffer kb; // TLS
                 queueKey(qq, kb);
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
@@ -1685,6 +1800,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable n = gAmqpLen !is null ? gAmqpLen(delKey) : 0;
                 if (gAmqpDelKey !is null)
                     gAmqpDelKey(delKey); // DEL the backing list
+                if (queueExists(q)) // dedupe: only stream a delete for a known queue
+                    ctlBroadcast(9, q, "", ""); // tombstone in the existence set
                 method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
                     putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
                 });
@@ -1808,6 +1925,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // consume on an unopened channel: ignore
                 cast(void) r.u16();
                 auto q = r.shortStr();
+                // Consuming from a queue that was never declared is a channel
+                // 404 NOT_FOUND, like RabbitMQ. The connection survives.
+                if (q.length && !queueExists(q))
+                {
+                    channelClose(o, chan, 404, "NOT_FOUND - no queue", 60, 20);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 auto tag = r.shortStr();
                 immutable bits = r.u8();
                 immutable noAck = (bits & 2) != 0;
