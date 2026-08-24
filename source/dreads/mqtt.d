@@ -41,7 +41,7 @@ import vibe.core.sync : LocalManualEvent, TaskMutex, createManualEvent;
 
 import dreads.mem : ByteBuffer;
 import dreads.acl : AclUser, aclUser, aclCheckPassword, aclCanAccessChannel;
-import dreads.shard : tShard, ShardMsg, sharded;
+import dreads.shard : tShard, ShardMsg;
 
 // ---------------------------------------------------------------------------
 // Global gate: total MQTT subscriptions across every thread's trie. A publish
@@ -990,11 +990,7 @@ public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trust
 /// Deliver `topic`/`payload` to THIS thread's matching subscribers, and update
 /// this thread's retained map when asked. Called for local publishes AND for
 /// fan-in from other shards (the drain's mqttPub case).
-/// Delivers to THIS shard's matching subscribers; returns the LOCAL match count
-/// (captured before any fan-out yield). The count feeds the v5 PUBACK/PUBREC
-/// "no matching subscribers" reason (0x10) — meaningful only at shards=1, where
-/// local == global; sharded builds keep success (0x00), which is spec-valid.
-public int mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
+public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payload,
         bool retain, ulong seq, ubyte pubQos = 0, MqttConn publisher = null,
         scope const(char)[] props = null) nothrow @trusted
 {
@@ -1070,12 +1066,11 @@ public int mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] paylo
         }
     }
     if (atomicLoad!(MemoryOrder.raw)(gMqttSubTotal) == 0)
-        return 0;
+        return;
     tMatchLen = 0;
     trieMatch(gTrieRoot, topic, 0);
-    immutable int localMatches = cast(int) tMatchLen; // captured BEFORE any fan-out yield
     if (tMatchLen == 0)
-        return 0;
+        return;
     // QoS0 packet built ONCE and shared (the hot path); QoS1 subscribers get a
     // per-conn packet with their own packet-id (a separate, slower branch that
     // does NOT touch the QoS0 fast path).
@@ -1434,7 +1429,6 @@ public int mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] paylo
         {
         }
     }
-    return localMatches;
 }
 
 // Round-robin cursor per shared-subscription group (TLS; persists across
@@ -3392,7 +3386,6 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                         dup = true;
                         break;
                     }
-                int localMatches = -1; // -1 = not delivered here (dup / reserved)
                 if (!dup)
                 {
                     // Receive Maximum [MQTT-4.9]: at most MQTT_SERVER_RECEIVE_MAX
@@ -3408,7 +3401,7 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     {
                         atomicOp!"+="(gMqttMessages, 1);
                         immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                        localMatches = mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
+                        mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
                         if (gMqttFanout !is null)
                             gMqttFanout(topic, payload, retain, rseq, qos, props);
                     }
@@ -3417,38 +3410,26 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     catch (Exception)
                         return false;
                 }
-                // v5 PUBREC: "No matching subscribers" (0x10) when nothing matched
-                // (shards=1 only, as for PUBACK). A dup retransmit keeps success.
-                immutable bool noSubs = c.protoVer == 5 && !sharded() && localMatches == 0;
                 o.appendByte(cast(char)(PT_PUBREC << 4));
-                o.appendByte(cast(char)(noSubs ? 3 : 2));
+                o.appendByte(cast(char) 2);
                 o.appendByte(cast(char)(pid >> 8));
                 o.appendByte(cast(char)(pid & 0xFF));
-                if (noSubs)
-                    o.appendByte(cast(char) 0x10); // No matching subscribers
                 return true;
             }
-            int localMatches = -1;
             if (!clientReserved)
             {
                 atomicOp!"+="(gMqttMessages, 1);
                 immutable rseq = retain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
-                localMatches = mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
+                mqttDeliverLocal(topic, payload, retain, rseq, qos, c, props);
                 if (gMqttFanout !is null)
                     gMqttFanout(topic, payload, retain, rseq, qos, props);
             }
             if (qos == 1)
             {
-                // v5 PUBACK: report "No matching subscribers" (0x10) when nothing
-                // matched — only at shards=1, where the LOCAL count is the global
-                // truth (sharded fan-out is fire-and-forget, so keep success there).
-                immutable bool noSubs = c.protoVer == 5 && !sharded() && localMatches == 0;
                 o.appendByte(cast(char)(PT_PUBACK << 4));
-                o.appendByte(cast(char)(noSubs ? 3 : 2)); // +1 remaining length for the reason
+                o.appendByte(cast(char) 2);
                 o.appendByte(cast(char)(pid >> 8));
                 o.appendByte(cast(char)(pid & 0xFF));
-                if (noSubs)
-                    o.appendByte(cast(char) 0x10); // No matching subscribers
             }
             return true;
         }
