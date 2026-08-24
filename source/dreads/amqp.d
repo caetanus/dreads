@@ -1458,7 +1458,15 @@ private bool settleTagUnknown(AmqpConn c, ushort chan, ulong tag, bool multiple)
     try
     {
         if (multiple)
-            return tag != 0 && tag >= c.nextTag;
+        {
+            if (tag == 0)
+                return false; // "all outstanding" is always known
+            // beyond the highest tag ever ISSUED ON THIS CHANNEL = unknown —
+            // per-channel, so another channel's higher tag doesn't launder it
+            if (auto mch = chan in c.chans)
+                return tag > mch.lastTag;
+            return tag >= c.nextTag;
+        }
         auto u = tag in c.unacked;
         if (u is null || u.chan != chan)
             return true;
@@ -1505,6 +1513,8 @@ private struct Channel
     string lastQueue; // "current queue": last queue DECLARED on this channel —
     // the spec default for an empty queue field in queue.bind/unbind/purge/
     // delete and basic.consume/get
+    ulong lastTag; // highest delivery-tag ISSUED on this channel (tags are
+    // conn-monotonic): a multiple-form settle beyond it is "unknown" (406)
     size_t txBytes; // running size of buffered tx publish records (byte cap)
     // basic.qos is CHANNEL-scoped in 0-9-1 (RabbitMQ: per-channel window).
     // 0 = unset -> conn-level fallback -> AMQP_DEFAULT_PREFETCH. unackedN is
@@ -2676,6 +2686,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 {
                     immutable remaining = gAmqpLen !is null ? gAmqpLen(getKey) : 0;
                     immutable gtag = c.nextTag++;
+                    try
+                        if (auto gch = chan in c.chans)
+                            gch.lastTag = gtag; // multiple-settle window bound
+                    catch (Exception)
+                    {
+                    }
                     // no-ack=false: record for later ack/requeue; the old code
                     // hardcoded tag 1 and never recorded it, so a get+ack
                     // workflow could neither ack nor requeue (message lost)
@@ -2909,7 +2925,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         case 100: // recover-async (deprecated): requeue unacked, NO reply
         case 110: // recover: requeue this channel's unacked, reply recover-ok
             {
-                cast(void) r.u8(); // requeue bit — we always requeue to the front
+                immutable recRequeue = (r.u8() & 1) != 0;
+                // recover with requeue=false ("redeliver to the ORIGINAL
+                // consumer") was never implemented by RabbitMQ: hard 540
+                if (mth == 110 && !recRequeue)
+                {
+                    connectionClose(o, 540, "NOT_IMPLEMENTED - requeue=false", 60, 110);
+                    return true;
+                }
                 try
                 {
                     // requeue every unacked delivery on THIS channel, FIFO-
@@ -3104,7 +3127,17 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
         const(char)[] rk;
         const(ubyte)[] props, body_;
         splitRecord(tp.record, pm, d, rk, props, body_);
-        auto payload = tp.record.asChars;
+        // the TTL clock starts at COMMIT, not at the buffered publish: an
+        // uncommitted message isn't in the queue yet (transactionalPublishWithGet
+        // pins this). Re-stamp publishMs (record bytes 4..12, after the magic).
+        auto stamped = cast(ubyte[]) tp.record.dup;
+        if (stamped.length >= 12 && stamped[0] == 0x04)
+        {
+            immutable nowc = cast(ulong) nowMs();
+            foreach (k; 0 .. 8)
+                stamped[4 + k] = cast(ubyte)(nowc >> ((7 - k) * 8));
+        }
+        auto payload = (cast(const(ubyte)[]) stamped).asChars;
         int routed = 0;
         routeTo(tp.exchange, tp.rkey, propsHeaders(props), (string q) nothrow {
             if (!queueExists(q))
@@ -3775,6 +3808,22 @@ private long queueTtl(scope const(char)[] q) nothrow @trusted
     return -1;
 }
 
+/// The record's EFFECTIVE TTL: the smaller of the queue x-message-ttl and the
+/// per-message expiration, -1 when neither applies. Mirrors isExpired's merge.
+private long effectiveTtl(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
+{
+    long pm;
+    int dths;
+    const(char)[] rk;
+    const(ubyte)[] props, body_;
+    splitRecord(blob, pm, dths, rk, props, body_);
+    immutable msgTtl = propsExpiration(props);
+    long ttl = ttlMs >= 0 ? ttlMs : -1;
+    if (msgTtl >= 0 && (ttl < 0 || msgTtl < ttl))
+        ttl = msgTtl;
+    return ttl;
+}
+
 /// Has this record outlived `ttlMs` since it was published? (v3 records carry
 /// the publish time; older records report 0 = never expire lazily.)
 /// `ttlMs` contract: -1 = the queue has no TTL, 0 = expire immediately.
@@ -4344,6 +4393,9 @@ public void amqpTtlSweep() nothrow @trusted
                     break; // empty queue
                 if (!isExpired(head.data, ttl))
                     break; // head is fresh -> everything behind it is younger
+                if (effectiveTtl(head.data, ttl) == 0 && !recordRedelivered(head.data)
+                        && (q in gQueueConsGlobal) !is null)
+                    break; // 0-TTL head with an ACTIVE consumer: it gets delivered
                 popped.clear();
                 if (!gAmqpPop(key, popped))
                     break;
@@ -4563,8 +4615,15 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     // x-message-ttl: an expired head is dead-lettered (or
                     // dropped), never delivered. Count it toward the burst so a
                     // backlog of expired heads can't drain unboundedly in one
-                    // pass (it yields between bursts).
-                    if (isExpired(pay.data, queueTtl(qq)))
+                    // pass (it yields between bursts). EXCEPT: TTL 0 means
+                    // "expire unless deliverable IMMEDIATELY" — a fresh (never
+                    // redelivered) message reaching an active consumer is
+                    // delivered; only its requeued copy expires
+                    // (zeroTTLDelivery pins both halves).
+                    immutable qttl = queueTtl(qq);
+                    if (isExpired(pay.data, qttl)
+                            && !(effectiveTtl(pay.data, qttl) == 0
+                                && !recordRedelivered(pay.data)))
                     {
                         deadLetter(qq, pay.data, "expired");
                         burst++;
@@ -4594,6 +4653,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         break;
                     }
                     immutable tg = cc.nextTag++;
+                    try
+                        if (auto tch2 = chn in cc.chans)
+                            tch2.lastTag = tg; // multiple-settle window bound
+                    catch (Exception)
+                    {
+                    }
                     if (!na)
                         try
                         {
