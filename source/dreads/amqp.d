@@ -751,16 +751,20 @@ private bool headersMatch(scope const(ubyte)[] bindArgs,
     if (bindArgs is null || bindArgs.length == 0)
         return true; // no args = x-match "all" with zero criteria: vacuously ALL
     bool any = false;
+    bool withX = false; // "all-with-x"/"any-with-x": x-* keys ARE wants too
     {
         auto xm = tableGetStr(bindArgs, "x-match");
-        any = xm == "any";
+        any = xm == "any" || xm == "any-with-x";
+        withX = xm == "any-with-x" || xm == "all-with-x";
     }
     bool allOk = true;
     bool anyOk = false;
     bool sawWant = false;
     cast(void) tableWalk(bindArgs, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
-        if (k.length >= 2 && k[0] == 'x' && k[1] == '-')
-            return true; // x-match etc are directives, not header wants
+        if (k == "x-match")
+            return true; // always a directive, never a want
+        if (!withX && k.length >= 2 && k[0] == 'x' && k[1] == '-')
+            return true; // x-* are directives unless the -with-x variants ask
         sawWant = true;
         immutable hit = msgHeaders !is null && headerWantMatches(msgHeaders, k, ty, v);
         if (hit)
@@ -1442,6 +1446,9 @@ private struct Channel
     bool txMode; // tx.select: buffer pubs/settles until tx.commit
     TxPub[] txPubs;
     TxSettle[] txSettles;
+    string lastQueue; // "current queue": last queue DECLARED on this channel —
+    // the spec default for an empty queue field in queue.bind/unbind/purge/
+    // delete and basic.consume/get
     size_t txBytes; // running size of buffered tx publish records (byte cap)
     // basic.qos is CHANNEL-scoped in 0-9-1 (RabbitMQ: per-channel window).
     // 0 = unset -> conn-level fallback -> AMQP_DEFAULT_PREFETCH. unackedN is
@@ -2046,6 +2053,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 method(o, chan, 40, 11);
                 return true;
             }
+            // [bug 22101] the default exchange cannot be (re)declared: 403
+            if (ex.length == 0)
+            {
+                channelClose(o, chan, 403,
+                        "ACCESS_REFUSED - operation not permitted on the default exchange",
+                        40, 10);
+                c.chans.remove(chan);
+                return true;
+            }
             // An unknown exchange type is a channel 406 PRECONDITION_FAILED (the
             // connection survives), matching what RabbitMQ returns for a declare
             // with a type no plugin provides. An empty type keeps the historical
@@ -2092,6 +2108,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             cast(void) r.u16();
             auto ex = r.shortStr();
             immutable dbits = r.ok && r.i < p.length ? p[r.i] : 0; // if-unused|nowait
+            if (ex.length == 0) // [bug 22101] no delete on the default exchange
+            {
+                channelClose(o, chan, 403,
+                        "ACCESS_REFUSED - operation not permitted on the default exchange",
+                        40, 20);
+                c.chans.remove(chan);
+                return true;
+            }
             if ((dbits & 1) && exchangeHasLiveBindings(cast(string) ex))
             {
                 // if-unused: an exchange with live bindings is "in use" — the
@@ -2322,6 +2346,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         }
                     }
                 }
+                try
+                    if (auto lch = chan in c.chans)
+                        lch.lastQueue = qq.idup; // the channel's "current queue"
+                catch (Exception)
+                {
+                }
                 static ByteBuffer kb; // TLS
                 queueKey(qq, kb);
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
@@ -2343,6 +2373,25 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto rk = r.shortStr();
                 immutable bnw = r.u8() & 1; // no-wait
                 auto bindArgs = r.tableRaw();
+                // spec "current queue" defaults: an empty queue field names the
+                // last queue DECLARED on this channel; an empty routing key,
+                // when the queue field was ALSO empty, is that queue's name
+                immutable qWasEmpty = q.length == 0;
+                if (qWasEmpty)
+                    if (auto bch = chan in c.chans)
+                        q = bch.lastQueue;
+                if (rk.length == 0 && qWasEmpty)
+                    rk = q;
+                // [bug 22101] publish and declare are the ONLY operations
+                // permitted on the default exchange: bind -> channel 403
+                if (ex.length == 0)
+                {
+                    channelClose(o, chan, 403,
+                            "ACCESS_REFUSED - operation not permitted on the default exchange",
+                            50, 20);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 // Binding an unknown queue — or a named unknown exchange — is a
                 // channel 404 NOT_FOUND, like RabbitMQ: bindings must reference
                 // objects that exist. An empty queue name keeps the historical
@@ -2373,6 +2422,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto ex = r.shortStr();
                 auto rk = r.shortStr();
                 cast(void) r.tableRaw(); // arguments (ignored on unbind)
+                if (ex.length == 0) // [bug 22101] no unbind on the default exchange
+                {
+                    channelClose(o, chan, 403,
+                            "ACCESS_REFUSED - operation not permitted on the default exchange",
+                            50, 50);
+                    c.chans.remove(chan);
+                    return true;
+                }
+                if (exclusiveDenied(c, chan, o, q, 50, 50))
+                    return true; // another connection's exclusive queue: 405
                 ctlBroadcast(4, ex, q, rk); // op 4: drop the matching binding
                 try
                     autoDeleteExchangeSweep([cast(string) ex.idup]);
@@ -2387,6 +2446,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u16();
                 auto q = r.shortStr();
                 cast(void) r.u8(); // no-wait
+                if (exclusiveDenied(c, chan, o, q, 50, 30))
+                    return true; // another connection's exclusive queue: 405
                 static ByteBuffer pk; // TLS
                 queueKey(q, pk);
                 // stack-copy the key across gAmqpLen's yield (same hazard as
@@ -2449,6 +2510,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto ex = r.shortStr();
                 auto rk = r.shortStr();
                 immutable pubBits = r.u8(); // mandatory bit 0, immediate bit 1
+                if (pubBits & 2)
+                {
+                    // immediate=true was REMOVED in RabbitMQ 3.0: a hard
+                    // connection-level 540 NOT_IMPLEMENTED, exactly like rabbit
+                    connectionClose(o, 540, "NOT_IMPLEMENTED - immediate=true", 60, 40);
+                    return true;
+                }
                 try
                 {
                     ch.pub.active = true;
@@ -2468,6 +2536,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u16();
                 auto q = r.shortStr();
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                if (exclusiveDenied(c, chan, o, q, 60, 70))
+                    return true; // another connection's exclusive queue: 405
                 // a no-ack=false get also consumes prefetch: don't let millions
                 // of un-acked gets pin RAM (the consumer path already caps this)
                 // basic.qos does NOT govern basic.get (RabbitMQ: prefetch is a
@@ -2960,13 +3030,15 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
         auto payload = tp.record.asChars;
         int routed = 0;
         routeTo(tp.exchange, tp.rkey, propsHeaders(props), (string q) nothrow {
+            if (!queueExists(q))
+                return; // same existing-queues-only rule as the live publish path
             static ByteBuffer kbT; // TLS
             queueKey(q, kbT);
             if (gAmqpPush !is null)
                 gAmqpPush(kbT.data.asChars, payload);
             routed++;
-                    enforceMaxLen(q);
-});
+            enforceMaxLen(q);
+        });
         atomicOp!"+="(gAmqpMessages, 1);
         if (tp.mandatory && routed == 0)
         {
@@ -3414,6 +3486,11 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             catch (Exception)
             {
             }
+        // route only to queues that EXIST (RabbitMQ): the default exchange
+        // routes by name, and a push to an undeclared name would create a
+        // ghost list — and defeat the mandatory basic.return (312 NO_ROUTE)
+        if (!queueExists(q))
+            return;
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
         if (gAmqpPush !is null)
