@@ -5168,6 +5168,50 @@ package void a10PurgeQueue(scope const(char)[] q) nothrow @trusted
         gAmqpDelKey(kpp.data.asChars);
 }
 
+/// Snapshot the stored queue meta for 1.0 redeclare-equivalence (409).
+package void a10QueueMetaGet(scope const(char)[] q, out bool ttlSet,
+        out long ttlMs, out bool expSet, out long expMs, out long maxLenEnc,
+        out bool dlxSet, out const(char)[] dlx, out const(char)[] dlrk) nothrow @trusted
+{
+    try
+        if (auto m = (cast(string) q) in gQueueMeta)
+        {
+            ttlSet = m.ttlSet;
+            ttlMs = m.ttlMs;
+            expSet = m.expSet;
+            expMs = m.expMs;
+            maxLenEnc = m.maxLen;
+            dlxSet = m.dlxSet;
+            dlx = m.dlx;
+            dlrk = m.dlrk;
+        }
+    catch (Exception)
+    {
+    }
+}
+
+/// The stored exchange type name ("" when unknown).
+package const(char)[] a10ExchangeType(scope const(char)[] x) nothrow @trusted
+{
+    try
+        if (auto t = (cast(string) x) in gExchanges)
+            final switch (*t)
+            {
+            case ExType.direct:
+                return "direct";
+            case ExType.fanout:
+                return "fanout";
+            case ExType.topic:
+                return "topic";
+            case ExType.headers:
+                return "headers";
+            }
+    catch (Exception)
+    {
+    }
+    return "";
+}
+
 package bool a10ExchangeExists(scope const(char)[] x) nothrow @trusted
 {
     try

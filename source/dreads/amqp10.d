@@ -513,6 +513,8 @@ private struct A10Link
     bool fiberLive;
     bool isMgmt; // "/management" pseudo-node (HTTP-over-AMQP topology ops)
     bool anonymous; // empty sender target: per-message properties.to routing
+    bool v2Queue; // "/queues/..." address: existence is ENFORCED (the v2
+    // client declares via $management; attach/deliver must 404 when gone)
 }
 
 /// Address grammar shared by attach targets/sources and per-message `to`.
@@ -1113,14 +1115,37 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     catch (Exception)
     {
     }
+    enum QP2 = "/queues/";
+    immutable isV2Q = address.length > QP2.length && address[0 .. QP2.length] == QP2;
     if (address == "/management")
     {
         lk.isMgmt = true;
         if (!lk.clientSender)
             ps.mgmtRecvHandle = lk.handle; // responses flow back on this link
     }
+    else if (isV2Q)
+    {
+        lk.v2Queue = true;
+        import dreads.amqp : a10QueueExists;
+
+        if (!a10QueueExists(lk.rkey))
+        {
+            a10RefuseAttach(c, fchan, lk, "amqp:not-found", lk.rkey);
+            return;
+        }
+    }
+    else if (lk.exchange.length)
+    {
+        import dreads.amqp : a10ExchangeExists;
+
+        if (!a10ExchangeExists(lk.exchange))
+        {
+            a10RefuseAttach(c, fchan, lk, "amqp:not-found", lk.exchange);
+            return;
+        }
+    }
     else if (lk.exchange.length == 0 && lk.rkey.length)
-        a10EnsureQueue(lk.rkey); // queue address: attach declares it
+        a10EnsureQueue(lk.rkey); // BARE-name address keeps the declare-on-attach
     try
         ps.links[lk.handle] = lk;
     catch (Exception)
@@ -1284,6 +1309,18 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
         a10HandleMgmt(c, fchan, msg);
     else
     {
+        if (plk.v2Queue)
+        {
+            import dreads.amqp : a10QueueExists;
+
+            if (!a10QueueExists(plk.rkey))
+            {
+                a10SendDetachError(c, fchan, handle, "amqp:resource-deleted",
+                        plk.rkey);
+                plk.detached = true;
+                return;
+            }
+        }
         static ByteBuffer props; // TLS: consumed by a10Publish before any yield
         static ByteBuffer bodyBuf; // TLS
         const(char)[] msgTo;
@@ -2025,6 +2062,30 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                             "x-dead-letter-routing-key"));
                 }
             }
+            // redeclare with DIFFERENT flags/args is a 409 conflict (the
+            // client-named retry flow depends on it)
+            if (a10QueueExists(qn))
+            {
+                import dreads.amqp : a10QueueMetaGet;
+
+                bool sTtl, sExp, sDlx;
+                long sTtlV, sExpV, sMlEnc;
+                const(char)[] sDlxN, sDlrk;
+                a10QueueMetaGet(qn, sTtl, sTtlV, sExp, sExpV, sMlEnc, sDlx,
+                        sDlxN, sDlrk);
+                immutable mismatch = a10QueueFlags(qn) != (flags & 0x0E)
+                    || sTtl != ttlSet || (sTtl && sTtlV != ttlV)
+                    || sExp != expSet || (sExp && sExpV != expV)
+                    || sMlEnc != (mlSet ? mlV + 1 : 0)
+                    || sDlx != dlxSet || (sDlx && sDlxN != dlx)
+                    || sDlrk != (dlrk is null ? "" : dlrk);
+                if (mismatch)
+                {
+                    a10MgmtRespond(c, fchan, "409", corrRaw, 2, null,
+                            "inequivalent arguments");
+                    return;
+                }
+            }
             immutable created = a10DeclareQueue(qn, flags, ttlSet, ttlV,
                     expSet, expV, mlSet, mlV, dlx, dlxSet,
                     dlrk is null ? "" : dlrk);
@@ -2036,6 +2097,16 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
         }
         if (subject == "DELETE")
         {
+            if (!a10QueueExists(qn))
+            {
+                char[600] eb2 = void;
+                import core.stdc.stdio : snprintf;
+
+                immutable en2 = snprintf(eb2.ptr, eb2.length,
+                        "no queue '%.*s' in vhost '/'", cast(int) qn.length, qn.ptr);
+                a10MgmtRespond(c, fchan, "404", corrRaw, 2, null, eb2[0 .. en2]);
+                return;
+            }
             immutable n3 = a10QueueLen(qn);
             if (purge)
                 a10PurgeQueue(qn);
@@ -2099,6 +2170,16 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                     flags |= 4;
                 if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "internal")))
                     flags |= 8;
+            }
+            {
+                import dreads.amqp : a10ExchangeExists, a10ExchangeType;
+
+                if (a10ExchangeExists(xn) && a10ExchangeType(xn) != typ)
+                {
+                    a10MgmtRespond(c, fchan, "409", corrRaw, 2, null,
+                            "inequivalent arguments");
+                    return;
+                }
             }
             a10DeclareExchange(xn, typ, flags, "");
             a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
@@ -2423,6 +2504,72 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
     }
 }
 
+/// Refuse an attach: echo it with NULL terminus, then detach(closed) with an
+/// error condition — the 1.0 not-found pattern the java client maps to
+/// AmqpEntityDoesNotExistException.
+private void a10RefuseAttach(A10Conn c, ushort fchan, ref A10Link lk,
+        scope const(char)[] condition, scope const(char)[] entity) nothrow
+{
+    ByteBuffer o;
+    {
+        auto f = a10FrameStart(o, FRAME_TYPE_AMQP, fchan);
+        auto l = a10OpenPerf(o, cast(ubyte) PERF_ATTACH);
+        a10Str(o, lk.name);
+        l.n++;
+        a10UInt(o, lk.handle);
+        l.n++;
+        a10Bool(o, lk.clientSender);
+        l.n++;
+        a10Null(o); // snd
+        l.n++;
+        a10Null(o); // rcv
+        l.n++;
+        a10Null(o); // source: NULL = not granted
+        l.n++;
+        a10Null(o); // target
+        l.n++;
+        a10Close(o, l);
+        a10FrameFinish(o, f);
+    }
+    a10SendDetachError(c, fchan, lk.handle, condition, entity, &o);
+    a10Send(c, cast(const(ubyte)[]) o.data);
+}
+
+private void a10SendDetachError(A10Conn c, ushort fchan, uint handle,
+        scope const(char)[] condition, scope const(char)[] entity,
+        ByteBuffer* stage = null) nothrow
+{
+    ByteBuffer local;
+    ByteBuffer* o = stage !is null ? stage : &local;
+    {
+        auto f = a10FrameStart(*o, FRAME_TYPE_AMQP, fchan);
+        auto l = a10OpenPerf(*o, cast(ubyte) PERF_DETACH);
+        a10UInt(*o, handle);
+        l.n++;
+        a10Bool(*o, true); // closed
+        l.n++;
+        {
+            auto el = a10OpenPerf(*o, cast(ubyte) DESC_ERROR);
+            a10Sym(*o, condition);
+            el.n++;
+            char[600] eb = void;
+            import core.stdc.stdio : snprintf;
+
+            immutable en = snprintf(eb.ptr, eb.length,
+                    "no queue '%.*s' in vhost '/'", cast(int) entity.length,
+                    entity.ptr);
+            a10Str(*o, eb[0 .. en]);
+            el.n++;
+            a10Close(*o, el);
+        }
+        l.n++;
+        a10Close(*o, l);
+        a10FrameFinish(*o, f);
+    }
+    if (stage is null)
+        a10Send(c, cast(const(ubyte)[]) local.data);
+}
+
 /// Delivery fiber for one client-receiver link: pops from the source queue
 /// while the client has granted credit, sends transfers, tracks unsettled.
 private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
@@ -2448,6 +2595,19 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 auto pl5 = h5 in ps5.links;
                 if (pl5 is null || pl5.detached)
                     return;
+                if (pl5.v2Queue)
+                {
+                    import dreads.amqp : a10QueueExists;
+
+                    if (!a10QueueExists(pl5.rkey))
+                    {
+                        // v2 semantics: a deleted source closes the link
+                        a10SendDetachError(cc, ch5, h5, "amqp:resource-deleted",
+                                pl5.rkey);
+                        pl5.detached = true;
+                        return;
+                    }
+                }
                 if (pl5.outCredit == 0)
                 {
                     if (pl5.drain)
