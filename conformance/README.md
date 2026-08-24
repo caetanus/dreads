@@ -59,3 +59,25 @@ ExchangeDeclare equivalence (406 on redeclare mismatch).
 
 Note: both suites needed dreads to advertise `version` in the Connection.Start
 server-properties — its absence NPE'd every java BrokerTestCase setUp.
+
+## kafka-librdkafka — librdkafka's own test suite
+
+librdkafka's tests/ (177 numbered C tests, confluentinc/librdkafka master) run
+natively against an external broker — near-zero laundering: `test.conf` points
+bootstrap.servers at dreads' Kafka skin, and `driver.sh` runs each test in an
+ISOLATED runner process (the stock runner aborts the batch on one timeout),
+5-way parallel, 90s cap per test, `-Q` quick mode.
+
+    docker stop kafka                     # BENCH TRAP: the Apache container owns 9092
+    ./bin/dreads --port=16399 --kafka-port=9092 &
+    git clone --depth 1 https://github.com/confluentinc/librdkafka && cd librdkafka
+    ./configure --disable-gssapi --disable-ssl && make -j && (cd tests && make build -j)
+    cp ../conformance/kafka-librdkafka/test.conf tests/ && bash ../conformance/kafka-librdkafka/driver.sh
+
+Baseline 2026-08-24 (dreads flexible/Kafka-2.5 dialect): **99 pass / 66 fail /
+1 skip**. Failure clusters: consumer groups (JoinGroup/SyncGroup/Heartbeat/
+OffsetCommit — a gated feature milestone, not a bug), idempotence +
+transactions (InitProducerId/EndTxn), admin APIs, `*_mock` tests (client-side
+mock cluster — do not exercise dreads; exclude from the conformance count),
+and a real produce/fetch bug tail (produce_batch, compression, partial_fetch,
+fetch_max_bytes, msg_timestamps, offset_time, invalid_topic, purge, headers…).
