@@ -504,8 +504,25 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 // cap guard mirrors the declare so a delete can't grow it either
                 if ((cast(string) ex) in gExchangeSeq || gExchangeSeq.length < AMQP_MAX_EXCHANGES)
                     gExchangeSeq[ex] = seq; // rejects a stale later declare
-                // bindings under a deleted exchange are inert (routeTo needs the
-                // exchange); leave them so a concurrent bind's LWW state is kept
+                // the exchange's bindings die with it (RabbitMQ): both its own
+                // (as source) and every e2e binding pointing AT it (as
+                // destination). Leaving them "inert" split-brained a REDECLARE
+                // of the same name, which revived routing through stale
+                // bindings. Seq-guarded tombstones keep concurrent-bind LWW.
+                if (auto bl = (cast(string) ex) in gBindings)
+                    foreach (ref bd; *bl)
+                        if (bd.alive && bd.seq < seq)
+                        {
+                            bd.alive = false;
+                            bd.seq = seq;
+                        }
+                foreach (bex, ref blist; gBindings)
+                    foreach (ref bd; blist)
+                        if (bd.alive && bd.toExchange && bd.queue == ex && bd.seq < seq)
+                        {
+                            bd.alive = false;
+                            bd.seq = seq;
+                        }
             }
             catch (Exception)
             {
@@ -630,6 +647,77 @@ private void ctlBroadcast(ubyte op, scope const(char)[] ex, scope const(char)[] 
         gAmqpCtlFanout(cbp.data);
 }
 
+/// Does exchange `x` still have any LIVE binding as SOURCE (queue-binds and
+/// e2e binds both live under gBindings[x])?
+private bool exchangeHasLiveBindings(string x) nothrow @trusted
+{
+    try
+        if (auto bl = x in gBindings)
+            foreach (ref bd; *bl)
+                if (bd.alive)
+                    return true;
+    catch (Exception)
+    {
+    }
+    return false;
+}
+
+/// Exchanges holding a LIVE binding whose destination is `dest` (a queue name
+/// by default; e2e destinations when `e2e`). Callers snapshot BEFORE the
+/// removal broadcast so the auto-delete sweep knows who just lost a binding.
+private string[] bindingSourcesTo(scope const(char)[] dest, bool e2e) nothrow @trusted
+{
+    string[] outv;
+    try
+        foreach (bex, ref blist; gBindings)
+            foreach (ref bd; blist)
+                if (bd.alive && bd.toExchange == e2e && bd.queue == dest)
+                {
+                    outv ~= bex;
+                    break;
+                }
+    catch (Exception)
+    {
+    }
+    return outv;
+}
+
+/// RabbitMQ auto-delete exchanges: an auto-delete exchange dies when a binding
+/// removal leaves it with ZERO live bindings as source (it necessarily had at
+/// least one — the sweep only runs on removals). Its death tombstones the e2e
+/// bindings pointing AT it, which can cascade into THEIR sources. Runs on the
+/// shard that originated the removal, AFTER that broadcast applied locally;
+/// each death broadcasts its own op-5, so every shard replays the same
+/// deterministic delete sequence (no per-shard decisions).
+private void autoDeleteExchangeSweep(string[] seeds) nothrow @trusted
+{
+    try
+    {
+        string[] cand = seeds;
+        int guard = 0;
+        while (cand.length && ++guard <= AMQP_MAX_EXCHANGES)
+        {
+            auto x = cand[$ - 1];
+            cand.length = cand.length - 1;
+            if (x !in gExchanges)
+                continue; // already gone (or never declared)
+            auto fp = x in gExchFlags;
+            if (fp is null || !(*fp & 4))
+                continue; // not auto-delete
+            if (exchangeHasLiveBindings(x))
+                continue;
+            // who loses a binding when x dies (collect BEFORE the broadcast
+            // tombstones them; the broadcast's local apply is synchronous)
+            auto next = bindingSourcesTo(x, true);
+            ctlBroadcast(5, x, "", "");
+            cand ~= next;
+        }
+    }
+    catch (Exception)
+    {
+    }
+}
+
 /// Compare a header WANT (type/value from the binding args) against message
 /// headers by key. Void ('V') or empty want = presence-only (any value);
 /// every other type must match by value bytes AND compatible type. This is
@@ -660,8 +748,8 @@ private bool headerWantMatches(scope const(ubyte)[] msgHeaders,
 private bool headersMatch(scope const(ubyte)[] bindArgs,
         scope const(ubyte)[] msgHeaders) @nogc nothrow
 {
-    if (bindArgs is null)
-        return false;
+    if (bindArgs is null || bindArgs.length == 0)
+        return true; // no args = x-match "all" with zero criteria: vacuously ALL
     bool any = false;
     {
         auto xm = tableGetStr(bindArgs, "x-match");
@@ -682,7 +770,7 @@ private bool headersMatch(scope const(ubyte)[] bindArgs,
         return true;
     });
     if (!sawWant)
-        return false;
+        return !any; // vacuous "all" matches everything; vacuous "any" nothing
     return any ? anyOk : allOk;
 }
 
@@ -1363,6 +1451,11 @@ private final class AmqpConn
     size_t prefetch;    // basic.qos prefetch-count (0 = AMQP_DEFAULT_PREFETCH)
     uint chanGenCtr; // monotonic per-conn source for Channel.openGen (channel-reuse safe)
     size_t consumerCount; // live basic.consume fibers (per-conn cap)
+    // live consumer fibers per (channel, gen) — key chan<<32|gen. channel.close
+    // waits on this before its close-ok so no staged delivery trails it
+    // ("Unsolicited delivery" kills the java client). Gen-keyed so a reopened
+    // channel's fresh consumers don't block the OLD close.
+    uint[ulong] chanConsumers;
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     bool hbStarted;  // the sender fiber is spawned exactly once
     const(void)* aclAuth; // authenticated ACL user (AclUser*); null = legacy accept-any
@@ -1485,7 +1578,9 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             if (auto po = q in gQueueOwner)
                 if (*po == c.connId)
                 {
+                    auto adSeeds = bindingSourcesTo(q, false);
                     ctlBroadcast(9, q, "", "");
+                    autoDeleteExchangeSweep(adSeeds);
                     static ByteBuffer xk; // TLS: teardown runs serially per conn
                     queueKey(q, xk);
                     if (gAmqpDelKey !is null)
@@ -1858,12 +1953,31 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             });
             return true;
         case 40: // close
-            // requeue this channel's in-flight (unacked) records and stop its
-            // consumer fibers (they observe the gen/existence mismatch and exit)
-            // before dropping the channel — else those popped messages are lost.
-            requeueAndDropChannel(c, chan);
-            method(o, chan, 20, 41);
-            return true;
+            {
+                // requeue this channel's in-flight (unacked) records and stop its
+                // consumer fibers (they observe the gen/existence mismatch and exit)
+                // before dropping the channel — else those popped messages are lost.
+                uint cgen = 0;
+                if (auto pcc = chan in c.chans)
+                    cgen = pcc.openGen;
+                requeueAndDropChannel(c, chan);
+                // HOLD the close-ok until this channel's consumer fibers exit: a
+                // delivery burst staged during the close would hit the wire AFTER
+                // the close-ok — the java client reads a delivery on a closed
+                // channel as "Unsolicited delivery" and kills the connection.
+                try
+                {
+                    immutable ckey = (cast(ulong) chan) << 32 | cgen;
+                    int spins = 0;
+                    while ((ckey in c.chanConsumers) !is null && spins++ < 200)
+                        sleep(1.msecs);
+                }
+                catch (Exception)
+                {
+                }
+                method(o, chan, 20, 41);
+                return true;
+            }
         case 20: // flow: we never throttle -> acknowledge, echoing the state
             {
                 immutable active = r.u8() & 1;
@@ -1943,7 +2057,18 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             cast(void) r.u16();
             auto ex = r.shortStr();
             immutable dbits = r.ok && r.i < p.length ? p[r.i] : 0; // if-unused|nowait
+            if ((dbits & 1) && exchangeHasLiveBindings(cast(string) ex))
+            {
+                // if-unused: an exchange with live bindings is "in use" — the
+                // delete is a channel 406 PRECONDITION_FAILED (RabbitMQ)
+                channelClose(o, chan, 406, "PRECONDITION_FAILED - in use", 40, 20);
+                c.chans.remove(chan);
+                return true;
+            }
+            // e2e sources pointing AT this exchange lose a binding when it dies
+            auto adSeeds = bindingSourcesTo(ex, true);
             ctlBroadcast(5, ex, "", ""); // op 5: drop the exchange + its bindings
+            autoDeleteExchangeSweep(adSeeds);
             if (!(dbits & 2))
                 method(o, chan, 40, 21); // delete-ok (suppressed by nowait)
             return true;
@@ -1970,6 +2095,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             immutable eunw = r.u8() & 1; // no-wait
             cast(void) r.tableRaw();
             ctlBroadcast(7, source, dest, rk); // op 7: drop the e2e binding
+            try
+                autoDeleteExchangeSweep([cast(string) source.idup]);
+            catch (Exception)
+            {
+            }
             if (!eunw)
                 method(o, chan, 40, 51); // unbind-ok (suppressed by nowait)
             return true;
@@ -2198,6 +2328,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto rk = r.shortStr();
                 cast(void) r.tableRaw(); // arguments (ignored on unbind)
                 ctlBroadcast(4, ex, q, rk); // op 4: drop the matching binding
+                try
+                    autoDeleteExchangeSweep([cast(string) ex.idup]);
+                catch (Exception)
+                {
+                }
                 method(o, chan, 50, 51); // unbind-ok
                 return true;
             }
@@ -2242,7 +2377,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 if (gAmqpDelKey !is null)
                     gAmqpDelKey(delKey); // DEL the backing list
                 if (queueExists(q)) // dedupe: only stream a delete for a known queue
+                {
+                    auto adSeeds = bindingSourcesTo(q, false);
                     ctlBroadcast(9, q, "", ""); // tombstone in the existence set
+                    autoDeleteExchangeSweep(adSeeds); // sources that lost this queue's bindings
+                }
                 if (!(qdel & 4))
                     method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
                         putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
@@ -2292,6 +2431,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 try
                     getFull = !getNoAck && (c.unacked.length >= AMQP_DEFAULT_PREFETCH
                             || c.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
+                catch (Exception)
+                {
+                }
+                // live consumers first: RabbitMQ dispatches a published message
+                // to consumers before processing the channel's next RPC, so a
+                // publish-then-get with an attached consumer deterministically
+                // gets get-empty. Our consumers POLL (1ms backoff) — without
+                // this yield the get races them and steals the delivery.
+                try
+                    if ((cast(string) q) in gQueueConsumers)
+                        sleep(2.msecs);
                 catch (Exception)
                 {
                 }
@@ -2599,22 +2749,37 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 // pending cancels never exceed the live-consumer count (both
                 // capped at AMQP_MAX_CONSUMERS) and each is removed on the
                 // consumer's exit, so a healthy connection never hits the cap.
+                // stack copy FIRST: the wait below yields, and `tag` slices the
+                // conn read buffer another fiber could refill during the park
+                char[128] tb = void;
+                auto tn = tag.length <= tb.length ? tag.length : tb.length;
+                tb[0 .. tn] = tag[0 .. tn];
+                auto tg2 = cast(const(char)[]) tb[0 .. tn];
                 try
                     if (c.cancelledTags.length < AMQP_MAX_CONSUMERS)
                         c.cancelledTags[tag.idup] = true;
                 catch (Exception)
                 {
                 }
-                if (!noWait)
+                // HOLD the cancel-ok until the consumer fiber exits (it removes
+                // its marker on exit): a burst staged during the cancel would
+                // otherwise hit the wire AFTER the cancel-ok — the java client
+                // treats a post-cancel-ok delivery as "Unsolicited delivery"
+                // and kills the whole connection. Bounded: an unknown tag has
+                // no fiber and just costs the full spin.
+                try
                 {
-                    static char[128] tb = void;
-                    auto tn = tag.length <= tb.length ? tag.length : tb.length;
-                    tb[0 .. tn] = tag[0 .. tn];
-                    auto tg2 = cast(const(char)[]) tb[0 .. tn];
+                    int spins = 0;
+                    while (((cast(string) tg2) in c.cancelledTags) !is null && spins++ < 200)
+                        sleep(1.msecs);
+                }
+                catch (Exception)
+                {
+                }
+                if (!noWait)
                     method(o, chan, 60, 31, (ref ByteBuffer b) @nogc nothrow {
                         putShortStr(b, tg2);
                     });
-                }
                 return true;
             }
         default:
@@ -3963,11 +4128,13 @@ private void qConsumerDec(string q) nothrow @trusted
     if (auto pf = q in gQueueFlags)
         if (*pf & 0x08)
         {
+            auto adSeeds = bindingSourcesTo(q, false);
             ctlBroadcast(9, q, "", "");
             static ByteBuffer adk; // TLS: consumed by the DEL before any yield
             queueKey(q, adk);
             if (gAmqpDelKey !is null)
                 gAmqpDelKey(adk.data.asChars);
+            autoDeleteExchangeSweep(adSeeds); // sources that lost this queue's bindings
         }
 }
 
@@ -3989,6 +4156,14 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     c.consumerCount++;
     qConsumerInc(qs); // live consumer_count for queue.declare-ok
     try
+    {
+        immutable ck0 = (cast(ulong) chan) << 32 | myGen;
+        c.chanConsumers[ck0] = (ck0 in c.chanConsumers ? c.chanConsumers[ck0] : 0u) + 1;
+    }
+    catch (Exception)
+    {
+    }
+    try
         cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg) nothrow {
             scope (exit)
             {
@@ -4002,6 +4177,14 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 // AA.remove on a string key is nothrow — no try/catch (which a
                 // scope(exit) can't contain anyway).
                 cc.cancelledTags.remove(tt);
+                immutable ckx = (cast(ulong) chn) << 32 | mg;
+                if (auto pcn = ckx in cc.chanConsumers)
+                {
+                    if (*pcn > 1)
+                        --*pcn;
+                    else
+                        cc.chanConsumers.remove(ckx);
+                }
             }
             ByteBuffer kb;
             kb.append("amq.q.");
@@ -4114,6 +4297,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     {
                         auto pc2 = chn in cc.chans;
                         gone = gone || pc2 is null || pc2.openGen != mg;
+                        // basic.cancel landed during the pop's yield: stop NOW.
+                        // The cancel handler holds its cancel-ok until this
+                        // fiber exits, so no delivery can trail the cancel-ok
+                        // ("Unsolicited delivery" kills the java client).
+                        gone = gone || (tt in cc.cancelledTags) !is null;
                     }
                     catch (Exception)
                     {
@@ -4167,6 +4355,20 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
         atomicOp!"-="(gAmqpConsumers, 1);
         if (c.consumerCount > 0)
             c.consumerCount--;
+        try
+        {
+            immutable cky = (cast(ulong) chan) << 32 | myGen;
+            if (auto pcn = cky in c.chanConsumers)
+            {
+                if (*pcn > 1)
+                    --*pcn;
+                else
+                    c.chanConsumers.remove(cky);
+            }
+        }
+        catch (Exception)
+        {
+        }
         qConsumerDec(qs); // the fiber never ran; undo the pre-increment
     }
 }
