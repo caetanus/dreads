@@ -1920,6 +1920,17 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         }
         if (hdr[0 .. 4] != "AMQP" || hdr[4] != 0 || hdr[5] != 0 || hdr[6] != 9 || hdr[7] != 1)
         {
+            // AMQP 1.0 speaks on the SAME port with its own headers: protocol
+            // id 3 = SASL layer, 0 = bare 1.0 (both versioned 1.0.0). Hand the
+            // connection to the 1.0 skin (dreads.amqp10).
+            if (hdr[0 .. 4] == "AMQP" && hdr[5] == 1 && hdr[6] == 0 && hdr[7] == 0
+                    && (hdr[4] == 3 || hdr[4] == 0))
+            {
+                import dreads.amqp10 : amqp10Serve;
+
+                amqp10Serve(tcp, hdr[4] == 3);
+                return;
+            }
             // bad/unsupported protocol header: reply with the header we DO
             // support, then close (the 0-9-1 spec's negotiation-failure path —
             // the java suite's crazyProtocolHeader reads it back)
