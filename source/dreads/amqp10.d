@@ -516,6 +516,8 @@ private struct A10Link
     bool v2Queue; // "/queues/..." address: existence is ENFORCED (the v2
     // client declares via $management; attach/deliver must 404 when gone)
     int prio; // attach properties "rabbitmq:priority" (consumer preference)
+    immutable(ubyte)[] srcFilterRaw; // client source filter-set (echoed back:
+    // stream consumers refuse an attach whose source drops their filters)
 }
 
 /// Address grammar shared by attach targets/sources and per-message `to`.
@@ -1101,9 +1103,42 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
 
     if (nf >= 6)
     {
-        if (!lk.clientSender && grabAddr(fields, addrBuf, addrLen))
-            address = addrBuf[0 .. addrLen];
-        else if (lk.clientSender)
+        if (!lk.clientSender)
+        {
+            // source: address (0) + FILTER set (7) — parse both
+            auto tgt = fields.readValue();
+            if (tgt.kind == A10Val.Kind.described)
+            {
+                auto inner = fields.readValue();
+                if (inner.kind == A10Val.Kind.list && inner.count >= 1)
+                {
+                    auto td = A10Dec(inner.bytes);
+                    auto av = td.readValue();
+                    if (av.kind == A10Val.Kind.str && av.bytes.length <= addrBuf.length)
+                    {
+                        addrBuf[0 .. av.bytes.length] = cast(const(char)[]) av.bytes;
+                        addrLen = av.bytes.length;
+                        address = addrBuf[0 .. addrLen];
+                    }
+                    // skip fields 1..6, capture field 7 (filter) RAW
+                    foreach (fi3; 1 .. 7)
+                        if (inner.count > fi3)
+                            td.skipValue();
+                    if (inner.count >= 8)
+                    {
+                        immutable fAt = td.i;
+                        td.skipValue();
+                        if (td.ok && td.i > fAt)
+                            try
+                                lk.srcFilterRaw = inner.bytes[fAt .. td.i].idup;
+                            catch (Exception)
+                            {
+                            }
+                    }
+                }
+            }
+        }
+        else
             fields.skipValue(); // source unused for a client sender
     }
     if (nf >= 7 && lk.clientSender)
@@ -1203,6 +1238,17 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
             auto sl = a10OpenPerf(outb, 0x28); // source (we deliver FROM it)
             a10Str(outb, address);
             sl.n++;
+            if (lk.srcFilterRaw.length)
+            {
+                // pad fields 1-6, then echo the client's filter-set verbatim
+                foreach (fi4; 1 .. 7)
+                {
+                    a10Null(outb);
+                    sl.n++;
+                }
+                outb.append(cast(const(char)[]) lk.srcFilterRaw);
+                sl.n++;
+            }
             a10Close(outb, sl);
         }
         l.n++;
@@ -1223,6 +1269,21 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
             a10Null(outb); // incomplete-unsettled
             l.n++;
             a10UInt(outb, 0); // initial-delivery-count (we are the sender)
+            l.n++;
+        }
+        else
+        {
+            a10Null(outb); // unsettled
+            l.n++;
+            a10Null(outb); // incomplete-unsettled
+            l.n++;
+            a10Null(outb); // initial-delivery-count (receiver: none)
+            l.n++;
+            // max-message-size (ulong): the client enforces it sender-side
+            outb.appendByte(0x80);
+            immutable ulong mms = 16 * 1024 * 1024;
+            foreach (k9; 0 .. 8)
+                outb.appendByte(cast(char)(mms >> ((7 - k9) * 8)));
             l.n++;
         }
         a10Close(outb, l);
@@ -1357,13 +1418,41 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
     {
         if (plk.v2Queue)
         {
-            import dreads.amqp : a10QueueExists;
+            import dreads.amqp : a10QueueExists, a10QueueFull;
 
             if (!a10QueueExists(plk.rkey))
             {
                 a10SendDetachError(c, fchan, handle, "amqp:resource-deleted",
                         plk.rkey);
                 plk.detached = true;
+                return;
+            }
+            if (a10QueueFull(plk.rkey))
+            {
+                // x-max-length reached: REJECT the publish (1.0 semantics —
+                // the classic head-drop stays for the 0-9-1 path)
+                if (!settled)
+                {
+                    ByteBuffer or;
+                    auto fr = a10FrameStart(or, FRAME_TYPE_AMQP, fchan);
+                    auto lr = a10OpenPerf(or, cast(ubyte) PERF_DISPOSITION);
+                    a10Bool(or, true); // role: receiver
+                    lr.n++;
+                    a10UInt(or, deliveryId);
+                    lr.n++;
+                    a10UInt(or, deliveryId);
+                    lr.n++;
+                    a10Bool(or, true); // settled
+                    lr.n++;
+                    {
+                        auto sr = a10OpenPerf(or, 0x25); // rejected
+                        a10Close(or, sr);
+                    }
+                    lr.n++;
+                    a10Close(or, lr);
+                    a10FrameFinish(or, fr);
+                    a10Send(c, cast(const(ubyte)[]) or.data);
+                }
                 return;
             }
         }
@@ -2263,10 +2352,15 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
             bool ttlSet, expSet, mlSet, dlxSet;
             long ttlV, expV, mlV;
             const(char)[] dlx, dlrk;
+            {
+                // RabbitMQ 4 v2 queues are DURABLE BY DEFAULT: only an
+                // explicit durable=false clears the bit
+                auto dv = a10MapGet(bodyMapBytes, bodyMapCount, "durable");
+                if (!(dv.kind == A10Val.Kind.boolean && !dv.b))
+                    flags |= 2;
+            }
             if (bodyIsMap)
             {
-                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "durable")))
-                    flags |= 2;
                 if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "exclusive")))
                     flags |= 4;
                 if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "auto_delete")))
@@ -2326,12 +2420,36 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                             if (v8.kind == A10Val.Kind.str && tv.length)
                                 qType = tv;
                         }
-                        else if (kn8 != "x-message-ttl" && kn8 != "x-expires"
-                                && kn8 != "x-max-length"
+                        else if (kn8.length >= 2 && kn8[0] == 'x' && kn8[1] == '-'
+                                && kn8 != "x-message-ttl" && kn8 != "x-expires"
+                                && kn8 != "x-max-length" && kn8 != "x-max-length-bytes"
                                 && kn8 != "x-dead-letter-exchange"
                                 && kn8 != "x-dead-letter-routing-key"
-                                && kn8.length >= 2 && kn8[0] == 'x' && kn8[1] == '-')
+                                && kn8 != "x-single-active-consumer"
+                                && kn8 != "x-overflow" && kn8 != "x-delivery-limit"
+                                && kn8 != "x-max-age" && kn8 != "x-initial-cluster-size"
+                                && kn8 != "x-quorum-initial-group-size")
                             badArg = kn8;
+                    }
+                    // per-type validity (RabbitMQ 4): x-max-age is
+                    // stream-only; dead-lettering is NOT a stream feature
+                    if (!badArg.length)
+                    {
+                        auto chk = A10Dec(args.bytes);
+                        foreach (mi2; 0 .. args.count / 2)
+                        {
+                            auto k9 = chk.readValue();
+                            chk.skipValue();
+                            if (!chk.ok || k9.kind != A10Val.Kind.str)
+                                break;
+                            auto kn9 = cast(const(char)[]) k9.bytes;
+                            if (kn9 == "x-max-age" && qType != "stream")
+                                badArg = kn9;
+                            else if ((kn9 == "x-dead-letter-exchange"
+                                    || kn9 == "x-dead-letter-routing-key")
+                                    && qType == "stream")
+                                badArg = kn9;
+                        }
                     }
                     if (badArg.length)
                     {

@@ -5245,6 +5245,19 @@ package void a10ConsumerDec(scope const(char)[] q) nothrow @trusted
     }
 }
 
+/// Is the queue at (or beyond) its x-max-length bound?
+package bool a10QueueFull(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto m = (cast(string) q) in gQueueMeta)
+            if (m.maxLen > 0) // +1-encoded: bound = maxLen-1
+                return a10QueueLen(q) >= m.maxLen - 1;
+    catch (Exception)
+    {
+    }
+    return false;
+}
+
 /// 1.0 consumer x-priority registration (shared registry with 0-9-1).
 package void a10PrioAdd(scope const(char)[] q, int prio) nothrow @trusted
 {
