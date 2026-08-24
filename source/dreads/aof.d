@@ -556,10 +556,11 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path,
     if (emitGlobals)
     {
         import dreads.acl : aclDumpUsers;
-        import dreads.scripting : scriptDumpAll;
+        import dreads.scripting : gScriptPersist, scriptDumpAll;
 
         aclDumpUsers(buf);
-        scriptDumpAll(buf); // upload persistence: EVALSHA survives restart
+        if (gScriptPersist)
+            scriptDumpAll(buf); // upload persistence: EVALSHA survives restart
     }
     // the rewrite is the format-upgrade point: always v2 — header + ONE RAW
     // record wrapping the SELECT-framed dump (it already sits fully in buf)

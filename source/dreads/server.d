@@ -377,9 +377,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     initAuthPw(); // libsodium (Argon2 builds); no-op otherwise
     aclInit(); // seed the default ACL user (on nopass +@all ~* &*)
     {
-        import dreads.commands : gAclApplyHook;
+        import dreads.commands : gAclApplyHook, gScriptApplyHook;
+        import dreads.scripting : gScriptPersist;
 
         gAclApplyHook = &aclApplyCanonical; // apply-path (replay/commit) ACL
+        gScriptApplyHook = &scriptCommand; // apply-path SCRIPT (raft/snapshot)
+        gScriptPersist = gConfig.persistScripts;
     }
     // AOF replay is DEFERRED until after shardInit (phase 2.6): the keyspaces
     // it loads into are per-shard, and each shard's values must come from that
@@ -6576,22 +6579,50 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         {
             immutable sob = o.length;
             scriptCommand(args, o);
-            // upload persistence (mirrors propagateAclLog's AOF leg): LOAD and
-            // FLUSH are durable global state, logged verbatim on this shard's
-            // file — replayed via replayCommand's SCRIPT case, applyGlobals
-            // routing. EVAL never enters the log (effects replication above).
-            if (myAof().enabled && args.length >= 1
-                    && !(o.length > sob && o.data[sob] == '-'))
+            // upload persistence (config persist-scripts, mirrors
+            // propagateAclLog): a successful LOAD/FLUSH is durable global
+            // state — proposed through raft when replicating (a failover
+            // must not lose the cache: the client never re-EVALs), else
+            // appended verbatim to this shard's AOF. EVAL never enters the
+            // log (effects replication above).
             {
-                auto ssub = args[0].str;
-                char[8] sub2 = void;
-                if (ssub.length <= sub2.length)
+                import dreads.scripting : gScriptPersist;
+
+                if (gScriptPersist && args.length >= 1
+                        && !(o.length > sob && o.data[sob] == '-'))
                 {
-                    foreach (i, ch; ssub)
-                        sub2[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
-                    auto su2 = cast(const(char)[]) sub2[0 .. ssub.length];
-                    if (su2 == "LOAD" || su2 == "FLUSH")
-                        myAof().append(rawCmd);
+                    auto ssub = args[0].str;
+                    char[8] sub2 = void;
+                    if (ssub.length <= sub2.length)
+                    {
+                        foreach (i, ch; ssub)
+                            sub2[i] = ch >= 'a' && ch <= 'z' ? cast(char)(ch - 32) : ch;
+                        auto su2 = cast(const(char)[]) sub2[0 .. ssub.length];
+                        if (su2 == "LOAD" || su2 == "FLUSH")
+                        {
+                            if (gReplicator !is null)
+                            {
+                                // best-effort: the sha reply is already out, a
+                                // propose error cannot become a protocol error.
+                                // A follower keeps its local (per-node) load.
+                                if (gReplicator.isLeader)
+                                {
+                                    import dreads.stream : nowMs;
+
+                                    static ByteBuffer sdiscard;
+                                    sdiscard.clear();
+                                    try
+                                        cast(void) gReplicator.proposeWrite(rawCmd,
+                                                nowMs(), 0, sdiscard);
+                                    catch (Exception)
+                                    {
+                                    }
+                                }
+                            }
+                            else if (myAof().enabled)
+                                myAof().append(rawCmd);
+                        }
+                    }
                 }
             }
             return true;

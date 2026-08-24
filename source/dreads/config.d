@@ -26,6 +26,10 @@ public struct Config
     uint mqttDb = 17;
     uint kafkaDb = 18;
     string appendfilename = "dreads.aof";
+    // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
+    // log) and the rewrite/snapshot re-emit the cache — EVALSHA survives a
+    // restart AND a master failover. `no` = Redis-faithful volatile cache.
+    bool persistScripts = true;
     string dir; // working directory (chdir at boot)
     ulong maxmemory = 0; // bytes; 0 = unlimited
     string maxmemoryPolicy = "noeviction"; // noeviction | allkeys-lru | volatile-lru
@@ -283,6 +287,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "appendfilename":
         cfg.appendfilename = value.unquote;
+        return true;
+    case "persist-scripts":
+        if (value == "yes")
+            cfg.persistScripts = true;
+        else if (value == "no")
+            cfg.persistScripts = false;
+        else
+            return false;
         return true;
     case "active-expire":
         if (value == "yes")

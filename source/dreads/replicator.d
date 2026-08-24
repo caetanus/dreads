@@ -582,6 +582,14 @@ final class Replicator
         dump.clear();
         dumpAllKeyspaces(dump); // every non-empty db, SELECT-framed
         aclDumpUsers(dump); // global ACL registry rides in the snapshot too
+        {
+            // script cache too (persist-scripts): a learner catching up from a
+            // snapshot must answer EVALSHA — the failover story end to end
+            import dreads.scripting : gScriptPersist, scriptDumpAll;
+
+            if (gScriptPersist)
+                scriptDumpAll(dump);
+        }
         ctlQ.put(dump.data, null, appliedIndex, CtlKind.compact);
         lastCompactApplied = appliedIndex;
     }

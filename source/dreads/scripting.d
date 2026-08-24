@@ -158,6 +158,12 @@ public bool scriptRemove(scope const(char)[] shaLower) nothrow @nogc
     return had;
 }
 
+/// Scripts-as-durable-state switch (config `persist-scripts`, default yes):
+/// gates the live SCRIPT LOAD/FLUSH log append/raft propose and the
+/// rewrite/snapshot re-emission. Replay always ACCEPTS script records — a
+/// file that carries them must restore them regardless of the current knob.
+public __gshared bool gScriptPersist = true;
+
 /// Re-emit every cached script as a `SCRIPT LOAD <source>` command — the AOF
 /// rewrite's globals pass (like aclDumpUsers): upload persistence, so EVALSHA
 /// survives a restart. EVAL itself never enters the log (effects replication).

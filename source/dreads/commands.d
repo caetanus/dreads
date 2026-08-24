@@ -60,6 +60,13 @@ public __gshared FcallHook gFcallHook;
 // handles ACL before dispatch. Set by dreads.server at boot.
 public alias AclApplyHook = void function(const(RVal)[] args) nothrow;
 public __gshared AclApplyHook gAclApplyHook;
+
+/// Apply-path hook for SCRIPT LOAD/FLUSH entries (raft commit, snapshot load):
+/// a client's SCRIPT is fully handled by the server layer before dispatch, so
+/// this only fires on replayed/committed entries. Installed at boot
+/// (scriptCommand) — same pattern as gAclApplyHook.
+public alias ScriptApplyHook = void function(const(RVal)[] args, ref ByteBuffer o) nothrow;
+public __gshared ScriptApplyHook gScriptApplyHook;
 /// number of scripts in the EVAL cache (INFO Memory); set by the scripting
 /// module so commands.d need not import it (would be a cyclic import)
 public alias ScriptCountHook = size_t function() nothrow @nogc;
@@ -4262,6 +4269,19 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 (cast(NoGcFn) gAclApplyHook)(args);
             }
             repSimple(o, "OK");
+            break;
+        }
+    case cmdIx!"script":
+        {
+            // apply path only (raft commit/snapshot): live clients are served
+            // by the server layer before dispatch ever sees SCRIPT.
+            if (gScriptApplyHook !is null)
+            {
+                alias NoGcFn = void function(const(RVal)[], ref ByteBuffer) @nogc nothrow;
+                (cast(NoGcFn) gScriptApplyHook)(args, o);
+            }
+            else
+                repSimple(o, "OK");
             break;
         }
     case cmdIx!"function":
