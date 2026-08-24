@@ -1274,6 +1274,23 @@ private bool validExType(scope const(char)[] t) @nogc nothrow pure @safe
     return t == "direct" || t == "fanout" || t == "topic" || t == "headers";
 }
 
+/// Send a connection-level close (class 10, method 50) on channel 0 — the HARD
+/// error path: the client kills every channel and answers close-ok, which the
+/// serve loop turns into the socket close (case 51). The caller returns TRUE
+/// (keep reading for that close-ok); frames a pipelining client already sent
+/// after the offending one are still processed — acceptable for now, RabbitMQ
+/// discards them.
+private void connectionClose(ref ByteBuffer o, ushort code, scope const(char)[] text,
+        ushort cls, ushort mth) nothrow @trusted
+{
+    method(o, 0, 10, 50, (ref ByteBuffer b) @nogc nothrow {
+        putU16(b, code);
+        putShortStr(b, text);
+        putU16(b, cls);
+        putU16(b, mth);
+    });
+}
+
 /// Send a soft channel-level close (class 20, method 40) and drop the channel;
 /// the connection survives (the client opens a fresh channel). `cls`/`mth` name
 /// the offending method. The caller must also `c.chans.remove(chan)` — see the
@@ -1748,6 +1765,22 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto rk = r.shortStr();
                 cast(void) r.u8(); // no-wait
                 auto bindArgs = r.tableRaw();
+                // Binding an unknown queue — or a named unknown exchange — is a
+                // channel 404 NOT_FOUND, like RabbitMQ: bindings must reference
+                // objects that exist. An empty queue name keeps the historical
+                // pass-through (dreads does not track last-declared-per-channel).
+                if (q.length && !queueExists(q))
+                {
+                    channelClose(o, chan, 404, "NOT_FOUND - no queue", 50, 20);
+                    c.chans.remove(chan);
+                    return true;
+                }
+                if (ex.length && (cast(string) ex !in gExchanges))
+                {
+                    channelClose(o, chan, 404, "NOT_FOUND - no exchange", 50, 20);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 ctlBroadcast(2, ex, q, rk, bindArgs);
                 method(o, chan, 50, 21);
                 return true;
@@ -2106,7 +2139,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             }
         case 10: // qos: prefetch-size u32, prefetch-count u16, global bit
             {
-                cast(void) r.u32(); // prefetch-size (byte window: unsupported)
+                immutable psize = r.u32();
+                // The byte-window prefetch (prefetch-size != 0) is not
+                // implemented; RabbitMQ answers with a HARD error — a
+                // connection-level 540 NOT_IMPLEMENTED that kills every channel.
+                if (psize != 0)
+                {
+                    connectionClose(o, 540, "NOT_IMPLEMENTED - prefetch_size!=0", 60, 10);
+                    return true; // stay open for the client's close-ok
+                }
                 immutable pc = r.u16();
                 c.prefetch = pc; // 0 = "no specific limit" -> default cap applies
                 method(o, chan, 60, 11);
