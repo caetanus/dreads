@@ -1681,6 +1681,11 @@ private struct Channel
     bool txMode; // tx.select: buffer pubs/settles until tx.commit
     TxPub[] txPubs;
     TxSettle[] txSettles;
+    bool prefetchGlobal; // basic.qos global bit: true = the prefetch window is
+    // per-CHANNEL (shared); false (the default) = per-CONSUMER
+    string lastServed; // consumer tag of the LAST delivery under a global
+    // window — the freed slot is offered to the OTHER consumers first (the
+    // QosTests fairness pair pins round-robin-ish dispatch)
     string lastQueue; // "current queue": last queue DECLARED on this channel —
     // the spec default for an empty queue field in queue.bind/unbind/purge/
     // delete and basic.consume/get
@@ -1706,6 +1711,9 @@ private struct Unacked
     bool fromGet; // basic.get delivery: OUTSIDE the consumer qos window
     // (RabbitMQ: qos governs consumers only), so its settle must not
     // decrement the channel's consumer-window counter.
+    string ctag; // delivering consumer's tag ("" for basic.get): qos with
+    // global=false is a PER-CONSUMER window (the 0-9-1 java default), so
+    // settles must credit the right consumer's counter.
 }
 
 private final class AmqpConn
@@ -1729,6 +1737,7 @@ private final class AmqpConn
     // ("Unsolicited delivery" kills the java client). Gen-keyed so a reopened
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
+    uint[string] consumerUnacked; // live unacked per consumer tag (qos global=false)
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     uint hbSecs; // NEGOTIATED heartbeat (seconds): reads stalling past 2x this close the conn
     long lastReadMs; // MONOTONIC ms of the last bytes read (MonoTime — the
@@ -3356,10 +3365,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // stay open for the client's close-ok
                 }
                 immutable pc = r.u16();
-                // channel-scoped, like RabbitMQ; the conn-level copy remains as
-                // the fallback for channels that never issued qos themselves.
+                immutable qosGlobal = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                // global=true: the window is CHANNEL-shared; global=false (the
+                // default): PER-CONSUMER, applied to consumers started after
+                // this qos. The conn-level copy remains as the fallback for
+                // channels that never issued qos themselves.
                 if (auto qch = chan in c.chans)
+                {
                     qch.prefetch = pc;
+                    qch.prefetchGlobal = qosGlobal;
+                }
                 c.prefetch = pc; // 0 = "no specific limit" -> default cap applies
                 method(o, chan, 60, 11);
                 return true;
@@ -4276,6 +4291,7 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
                     gAmqpPushFront(kb6.data.asChars, rq6.data.asChars);
             }
         c.unacked.clear();
+        c.consumerUnacked.clear();
         c.unackedBytes = 0;
     }
     catch (Exception)
@@ -4296,6 +4312,23 @@ private void chanUnackedDec(AmqpConn c, ushort chan) nothrow @trusted
             ch.unackedN--;
 }
 
+private void consumerUnackedDec(AmqpConn c, scope const(char)[] ctag) nothrow @trusted
+{
+    if (ctag.length == 0)
+        return;
+    try
+        if (auto p = (cast(string) ctag) in c.consumerUnacked)
+        {
+            if (*p > 1)
+                --*p;
+            else
+                c.consumerUnacked.remove(cast(string) ctag);
+        }
+    catch (Exception)
+    {
+    }
+}
+
 private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
 {
     try
@@ -4304,7 +4337,10 @@ private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
             immutable n = p.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
             if (!p.fromGet)
+            {
                 chanUnackedDec(c, p.chan);
+                consumerUnackedDec(c, p.ctag);
+            }
             c.unacked.remove(tag);
         }
     catch (Exception)
@@ -4327,7 +4363,10 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             immutable n = u.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
             if (!u.fromGet)
+            {
                 chanUnackedDec(c, u.chan);
+                consumerUnackedDec(c, u.ctag);
+            }
             c.unacked.remove(tag);
         }
     }
@@ -5166,6 +5205,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 sleep(1.msecs);
             catch (Exception)
                 return;
+            bool yieldedTurn = false; // one-shot fairness deferral (global qos)
             while (!cc.closing)
             {
                 try
@@ -5210,6 +5250,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 uint limit = AMQP_DEFAULT_PREFETCH;
                 uint chanN = 0;
                 bool windowFull = false;
+                bool perConsumer = false;
                 try
                 {
                     auto wch = chn in cc.chans; // refetched: prior loop yielded
@@ -5218,8 +5259,31 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     immutable pf = wch !is null && wch.prefetch ? wch.prefetch : cc.prefetch;
                     if (pf)
                         limit = cast(uint) pf; // qos values are u16; never truncates
-                    windowFull = !na && (chanN >= limit
+                    // qos global=false (the wire default) is a PER-CONSUMER
+                    // window: count only THIS consumer's unacked deliveries
+                    perConsumer = wch !is null && wch.prefetch && !wch.prefetchGlobal;
+                    if (perConsumer)
+                        chanN = (tt in cc.consumerUnacked) ? cc.consumerUnacked[tt] : 0u;
+                    // a GLOBAL window gates no-ack consumers too: their
+                    // deliveries don't ADD to the window, but they must wait
+                    // while it is full (noAckObeysLimit pins this)
+                    immutable gatesNoAck = wch !is null && wch.prefetch && wch.prefetchGlobal;
+                    windowFull = (!na || gatesNoAck) && (chanN >= limit
                             || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
+                    // fairness: after WE were served under a global window,
+                    // offer the freed slot to the channel's other consumers
+                    // first (one 1ms deferral, then proceed regardless)
+                    if (!windowFull && gatesNoAck && !yieldedTurn
+                            && wch.lastServed == tt)
+                    {
+                        immutable ckk = (cast(ulong) chn) << 32 | mg;
+                        if (auto pcn2 = ckk in cc.chanConsumers)
+                            if (*pcn2 > 1)
+                            {
+                                yieldedTurn = true;
+                                windowFull = true; // treat as one back-off tick
+                            }
+                    }
                 }
                 catch (Exception)
                 {
@@ -5304,11 +5368,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (!na)
                         try
                         {
-                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0);
+                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0, false, tt);
                             cc.unackedBytes += pay.data.length;
                             // fresh lookup (the pop yielded; AA may have moved)
                             if (auto uch = chn in cc.chans)
                                 uch.unackedN++;
+                            cc.consumerUnacked[tt] = ((tt in cc.consumerUnacked)
+                                    ? cc.consumerUnacked[tt] : 0u) + 1;
                             chanN++; // keep the burst-local window in step
                         }
                         catch (Exception)
@@ -5334,6 +5400,16 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     catch (Exception)
                         return;
                     continue;
+                }
+                try
+                    if (auto sch = chn in cc.chans)
+                        if (sch.prefetch && sch.prefetchGlobal)
+                        {
+                            sch.lastServed = tt; // fairness rotation marker
+                            yieldedTurn = false;
+                        }
+                catch (Exception)
+                {
                 }
                 sendTo(cc, ob.data);
             }
