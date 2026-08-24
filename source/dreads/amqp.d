@@ -82,7 +82,11 @@ enum size_t AMQP_MAX_CHANNELS = 2047;   // matches the advertised channel-max
 enum size_t AMQP_MAX_CONSUMERS = 4096;
 /// A dead-letter is dropped once it has been dead-lettered this many times
 /// (the x-death hop count) — bounds an A->X->A dead-letter cycle.
-enum int AMQP_MAX_DEATHS = 16;
+// Backstop only: PURE-automatic dead-letter loops (TTL->DLX->...->same queue,
+// no client rejection anywhere in the history) are detected and dropped in
+// deadLetter() itself, RabbitMQ-style. Rejection-driven cycles legitimately
+// live for many hops (rabbit loops them indefinitely), so the cap is generous.
+enum int AMQP_MAX_DEATHS = 4096;
 public shared ulong gAmqpCtlDrops; // control-plane declares refused at a cap
 
 /// Queue key namespace: visible from RESP on purpose (cross-protocol is a
@@ -125,10 +129,12 @@ private struct Binding
 
 private struct QueueMeta
 {
-    string dlx; // x-dead-letter-exchange ("" = none)
+    string dlx; // x-dead-letter-exchange (meaningful only when dlxSet; "" = the DEFAULT exchange)
     string dlrk; // x-dead-letter-routing-key ("" = original queue name)
-    long ttlMs; // x-message-ttl (0 = no expiry); lazily dead-lettered/dropped
+    long ttlMs; // x-message-ttl (meaningful only when ttlSet; 0 = expire immediately)
     long maxLen; // x-max-length ENCODED +1 (0 = unset, N+1 = bound N); overflow drops the HEAD
+    bool dlxSet; // x-dead-letter-exchange arg present ("" alone can't tell: it names the default exchange)
+    bool ttlSet; // x-message-ttl arg present (0 is a VALID immediate-expiry TTL)
 }
 
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
@@ -372,17 +378,31 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 atomicOp!"+="(gAmqpCtlDrops, 1);
                 return;
             }
+            // presence flags (17th byte): bit0 dlx arg present, bit2 ttl arg
+            // present — "" is a real dlx (the default exchange) and 0 a real
+            // ttl (expire immediately), so value alone can't signal absence.
+            ubyte fl = 0;
+            if (tb.length >= 17)
+                fl = tb[16];
+            else // legacy encode: infer presence from a non-empty/non-zero value
+                fl = cast(ubyte)((a.length ? 1 : 0) | (ttl > 0 ? 4 : 0));
             // merge, don't clobber: a redeclare that sets only ttl must not
             // erase a previously-configured DLX (and vice-versa)
-            QueueMeta qm = QueueMeta(a, b, ttl, mxl);
+            QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
-                if (a.length == 0)
+                if (!(fl & 1))
+                {
                     qm.dlx = ex0.dlx;
+                    qm.dlxSet = ex0.dlxSet;
+                }
                 if (b.length == 0)
                     qm.dlrk = ex0.dlrk;
-                if (ttl == 0)
+                if (!(fl & 4))
+                {
                     qm.ttlMs = ex0.ttlMs;
+                    qm.ttlSet = ex0.ttlSet;
+                }
                 if (mxl == 0)
                     qm.maxLen = ex0.maxLen;
             }
@@ -515,6 +535,18 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             gQueueOwner.remove(cast(string) ex); // exclusivity dies with the queue
             gQueueMeta.remove(cast(string) ex); // dlx/ttl die with the queue too
             gQueueFlags.remove(cast(string) ex);
+            // ... and so do its BINDINGS (RabbitMQ removes them with the queue).
+            // A stale binding would keep routing dead-letters/publishes into a
+            // ghost list under the deleted name — a queue redeclared later
+            // inherits those strays. Tombstoned with THIS delete's seq: a later
+            // re-bind carries a higher seq and revives the element (LWW).
+            foreach (bex, ref blist; gBindings)
+                foreach (ref bd; blist)
+                    if (bd.alive && !bd.toExchange && bd.queue == ex && bd.seq < seq)
+                    {
+                        bd.alive = false;
+                        bd.seq = seq;
+                    }
             if ((cast(string) ex) in gQueueSeq || gQueueSeq.length < AMQP_MAX_QUEUEMETA)
                 gQueueSeq[ex] = seq; // tombstone: rejects a stale later declare
         }
@@ -2014,10 +2046,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         {
                             auto rdlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                             auto rdrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
-                            immutable rttl = tk > 0 ? ttlV : 0;
                             immutable rml = mk > 0 ? mlV + 1 : 0; // +1-encoded like the meta
-                            immutable mm = (m0.ttlMs != rttl)
+                            immutable mm = (m0.ttlSet != (tk > 0))
+                                || (m0.ttlSet && m0.ttlMs != ttlV)
                                 || (m0.maxLen != rml)
+                                || (m0.dlxSet != (rdlx !is null))
                                 || (m0.dlx != (rdlx is null ? "" : rdlx))
                                 || (m0.dlrk != (rdrk is null ? "" : rdrk));
                             if (mm)
@@ -2031,21 +2064,25 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     }
                     auto dlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                     auto dlrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
-                    immutable ttl = tableGetInt(argsTbl, "x-message-ttl");
+                    immutable ttl = tk > 0 ? ttlV : 0;
                     long mxl2;
                     immutable mlPresent = tableIntKind(argsTbl, "x-max-length", mxl2) > 0;
                     // ENCODED as value+1 on the wire and in the meta: maxlen 0
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
-                    if (dlx !is null || ttl > 0 || mlEnc > 0)
+                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0)
                     {
-                        ubyte[16] tb = void;
+                        ubyte[17] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
                             tb[8 + k] = cast(ubyte)(mlEnc >> ((7 - k) * 8));
-                                            ctlBroadcast(3, qq, dlx is null ? "" : dlx,
+                        // presence flags: "" dlx (default exchange) and ttl 0
+                        // (expire immediately) are real values, not absence
+                        tb[16] = cast(ubyte)((dlx !is null ? 1 : 0)
+                                | (dlrk !is null ? 2 : 0) | (tk > 0 ? 4 : 0));
+                        ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
                 }
@@ -3310,20 +3347,22 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
     deadLetter(u.queue, u.blob, "rejected");
 }
 
-/// The queue's x-message-ttl in ms (0 = none). Looked up per delivery.
+/// The queue's x-message-ttl in ms (-1 = none; 0 = expire immediately).
+/// Looked up per delivery.
 private long queueTtl(scope const(char)[] q) nothrow @trusted
 {
     try
         if (auto m = q in gQueueMeta)
-            return m.ttlMs;
+            return m.ttlSet ? m.ttlMs : -1;
     catch (Exception)
     {
     }
-    return 0;
+    return -1;
 }
 
 /// Has this record outlived `ttlMs` since it was published? (v3 records carry
 /// the publish time; older records report 0 = never expire lazily.)
+/// `ttlMs` contract: -1 = the queue has no TTL, 0 = expire immediately.
 private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
 {
     long pm;
@@ -3332,20 +3371,18 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
     const(ubyte)[] props, body_;
     splitRecord(blob, pm, dths, rk, props, body_);
     // effective TTL = the SMALLER of the queue x-message-ttl and the message's
-    // own `expiration` property (RabbitMQ semantics), ignoring a 0 (unset) on
-    // either side. A per-message expiration expires even on a queue with no
-    // x-message-ttl (lazily at delivery; the active reaper only sweeps queues
-    // that have a queue-level TTL).
+    // own `expiration` property (RabbitMQ semantics), each side ignored when
+    // absent (-1; -2 = invalid expiration). A per-message expiration expires
+    // even on a queue with no x-message-ttl (lazily at delivery; the active
+    // reaper only sweeps queues that have a queue-level TTL).
     immutable msgTtl = propsExpiration(props);
-    if (msgTtl == 0)
-        return pm > 0; // expiration "0": expired the moment it was stored
-    long ttl;
-    if (ttlMs > 0 && msgTtl > 0)
-        ttl = ttlMs < msgTtl ? ttlMs : msgTtl;
-    else
-        ttl = ttlMs > 0 ? ttlMs : (msgTtl > 0 ? msgTtl : 0);
-    if (ttl <= 0)
+    long ttl = ttlMs >= 0 ? ttlMs : -1;
+    if (msgTtl >= 0 && (ttl < 0 || msgTtl < ttl))
+        ttl = msgTtl;
+    if (ttl < 0)
         return false;
+    if (ttl == 0)
+        return pm > 0; // TTL 0: expired the moment it was stored
     // compare as `published <= now - ttl` (NOT `now > published + ttl`): the
     // sum form overflows i64 for a client-supplied huge x-message-ttl and
     // wraps negative, falsely expiring fresh messages. `now - ttl` underflows
@@ -3364,9 +3401,12 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
 /// verbatim into `others` ('F' + u32 + table each) — RabbitMQ keeps ONE entry
 /// per (queue, reason), incrementing its count, and preserves the rest.
 private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
-        scope const(char)[] reason, ref ByteBuffer others) @nogc nothrow @trusted
+        scope const(char)[] reason, ref ByteBuffer others,
+        ref bool sawQueue, ref bool sawRejected) @nogc nothrow @trusted
 {
     long prior = 0;
+    sawQueue = false;
+    sawRejected = false;
     auto h = propsHeaders(props);
     if (h is null || h.length == 0)
         return 0;
@@ -3399,6 +3439,10 @@ private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
                 }
                 return true;
             });
+            if (eq == queue)
+                sawQueue = true; // any reason: cycle-detection input
+            if (er == "rejected")
+                sawRejected = true; // a client action breaks a pure-expiry cycle
             if (eq == queue && er == reason)
                 prior = ec;
             else
@@ -3408,6 +3452,39 @@ private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
         return false;
     });
     return prior;
+}
+
+/// First 'S' (longstr) value under `key` in the props' headers table, or null.
+private const(char)[] headerStr(scope const(ubyte)[] props, scope const(char)[] key) @nogc nothrow @trusted
+{
+    const(char)[] val;
+    auto h = propsHeaders(props);
+    if (h is null || h.length == 0)
+        return null;
+    cast(void) tableWalk(h, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+        if (k != key || ty != 'S')
+            return true;
+        val = cast(const(char)[]) v;
+        return false;
+    });
+    return val;
+}
+
+/// Raw contents of the first field-array ('A') value under `key` in the props'
+/// headers table, or null.
+private const(ubyte)[] headerArr(scope const(ubyte)[] props, scope const(char)[] key) @nogc nothrow @trusted
+{
+    const(ubyte)[] val;
+    auto h = propsHeaders(props);
+    if (h is null || h.length == 0)
+        return null;
+    cast(void) tableWalk(h, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+        if (k != key || ty != 'A')
+            return true;
+        val = v;
+        return false;
+    });
+    return val;
 }
 
 private void patchU32(ref ByteBuffer o, size_t at, uint v) @nogc nothrow @trusted
@@ -3433,10 +3510,17 @@ private void xtStr(ref ByteBuffer o, scope const(char)[] key, scope const(char)[
 
 /// Encode the `x-death` headers entry: [keyLen]["x-death"]['A'] array of one
 /// table {count 'l', reason/queue/exchange 'S', routing-keys 'A', }.
+/// `ccRaw` is the raw contents of a CC header field-array ('S' elements): the
+/// death's routing-keys are the keys the message was PUBLISHED with — original
+/// rk + CC, BCC excluded (already stripped at publish). An x-dead-letter-
+/// routing-key override is NOT recorded here (it only names the re-publish key;
+/// the java suite's deadLetterNewRK asserts exactly [rk, CC...]).
+/// `origExp` non-empty = the per-message `expiration` being removed on this
+/// death, preserved as original-expiration (RabbitMQ 3.x).
 private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] reason,
         scope const(char)[] queue, scope const(char)[] rk,
-        scope const(char)[] origEx, scope const(char)[] dlrk,
-        scope const(ubyte)[] othersRaw) @nogc nothrow
+        scope const(char)[] origEx, scope const(ubyte)[] ccRaw,
+        scope const(char)[] origExp, scope const(ubyte)[] othersRaw) @nogc nothrow
 {
     o.appendByte(cast(char) 7);
     o.append("x-death");
@@ -3455,23 +3539,33 @@ private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] 
     xtStr(o, "reason", reason);
     xtStr(o, "queue", queue);
     xtStr(o, "exchange", origEx); // the v4 record carries the original exchange
+    if (origExp.length)
+        xtStr(o, "original-expiration", origExp);
     o.appendByte(cast(char) 12);
     o.append("routing-keys");
     o.appendByte('A');
     immutable rkAt = o.length;
     putU32(o, 0);
     immutable rkStart = o.length;
-    if (dlrk.length && dlrk != rk)
-    {
-        // an x-dead-letter-routing-key override records BOTH keys, override
-        // first — the java suite asserts [dlrk, original] exactly.
-        o.appendByte('S');
-        putU32(o, cast(uint) dlrk.length);
-        o.append(dlrk);
-    }
     o.appendByte('S');
     putU32(o, cast(uint) rk.length);
     o.append(rk);
+    // CC keys ride along verbatim ('S' elements only, deduped vs the rk)
+    {
+        size_t ci = 0;
+        while (ci + 5 <= ccRaw.length)
+        {
+            immutable ct = ccRaw[ci];
+            immutable cl = (cast(size_t) ccRaw[ci + 1] << 24) | (cast(size_t) ccRaw[ci + 2] << 16)
+                | (cast(size_t) ccRaw[ci + 3] << 8) | ccRaw[ci + 4];
+            if (ct != 'S' || ci + 5 + cl > ccRaw.length)
+                break;
+            auto cv = cast(const(char)[]) ccRaw[ci + 5 .. ci + 5 + cl];
+            if (cv != rk)
+                o.append(cast(const(char)[]) ccRaw[ci .. ci + 5 + cl]);
+            ci += 5 + cl;
+        }
+    }
     patchU32(o, rkAt, cast(uint)(o.length - rkStart));
     patchU32(o, tblAt, cast(uint)(o.length - tblStart));
     // OTHER (queue, reason) entries survive verbatim after ours
@@ -3484,8 +3578,16 @@ private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] 
 /// message dead-lettered N times carries ONE x-death (with the live count), not
 /// N stale duplicates. Bails (copying nothing further) on a malformed entry.
 private void appendHeadersExcept(ref ByteBuffer dst, scope const(ubyte)[] t,
-        scope const(char)[] skipKey) @nogc nothrow
+        scope const(char)[] skipKey, bool dropDeathMeta = false) @nogc nothrow
 {
+    static bool deathMetaKey(scope const(char)[] k) @nogc nothrow
+    {
+        // the six 3.7+/3.10+ death-tracking headers (re-emitted fresh on merge)
+        enum fp = "x-first-death-", lp = "x-last-death-";
+        return (k.length > fp.length && k[0 .. fp.length] == fp)
+            || (k.length > lp.length && k[0 .. lp.length] == lp);
+    }
+
     size_t i = 0;
     while (i < t.length)
     {
@@ -3534,7 +3636,7 @@ private void appendHeadersExcept(ref ByteBuffer dst, scope const(ubyte)[] t,
         }
         if (i > t.length)
             return;
-        if (key != skipKey)
+        if (key != skipKey && !(dropDeathMeta && deathMetaKey(key)))
             dst.append(cast(const(char)[]) t[entryStart .. i]);
     }
 }
@@ -3557,7 +3659,10 @@ private void mergeXDeath(ref ByteBuffer dst, scope const(ubyte)[] props,
     }
     immutable flags = (cast(ushort) props[0] << 8) | props[1];
     size_t i = 2;
-    immutable nf = cast(ushort)(flags | 0x2000);
+    // + headers (the x-death lives there), - expiration (removed on
+    // dead-lettering so the message can't re-expire downstream; preserved as
+    // original-expiration inside the x-death entry)
+    immutable nf = cast(ushort)((flags | 0x2000) & ~0x0100);
     dst.appendByte(cast(char)(nf >> 8));
     dst.appendByte(cast(char)(nf & 0xFF));
     // content-type, then content-encoding: copy each shortstr verbatim
@@ -3606,11 +3711,32 @@ private void mergeXDeath(ref ByteBuffer dst, scope const(ubyte)[] props,
     // single x-death with the live count, not one stale duplicate per hop
     static ByteBuffer hstrip; // TLS (consumed synchronously, no yield in here)
     hstrip.clear();
-    appendHeadersExcept(hstrip, existing, "x-death");
+    appendHeadersExcept(hstrip, existing, "x-death", true);
     putU32(dst, cast(uint)(xentry.length + hstrip.length));
     dst.append(cast(const(char)[]) xentry);
     dst.append(cast(const(char)[]) hstrip.data);
-    dst.append(cast(const(char)[]) props[i .. $]); // delivery-mode onward verbatim
+    // delivery-mode onward: verbatim EXCEPT the expiration shortstr (its flag
+    // bit is already cleared in nf). Walk the fixed order: delivery-mode(1B),
+    // priority(1B), correlation-id(ss), reply-to(ss), expiration(ss).
+    if (flags & 0x1000) // delivery-mode
+        if (i < props.length)
+            dst.appendByte(cast(char) props[i++]);
+    if (flags & 0x0800) // priority
+        if (i < props.length)
+            dst.appendByte(cast(char) props[i++]);
+    static immutable int[3] ssBits = [0x0400, 0x0200, 0x0100]; // correlation-id, reply-to, expiration
+    foreach (bit; ssBits)
+    {
+        if (!(flags & bit))
+            continue;
+        if (i >= props.length || i + 1 + props[i] > props.length)
+            return; // malformed: stop (never OOB)
+        immutable seg = 1 + props[i];
+        if (bit != 0x0100)
+            dst.append(cast(const(char)[]) props[i .. i + seg]);
+        i += seg;
+    }
+    dst.append(cast(const(char)[]) props[i .. $]); // message-id onward verbatim
 }
 
 private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
@@ -3623,8 +3749,8 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     catch (Exception)
     {
     }
-    if (meta.dlx.length == 0)
-        return; // no dead-letter exchange: drop
+    if (!meta.dlxSet)
+        return; // no dead-letter exchange: drop ("" is VALID: the default exchange)
     long pm;
     int deaths;
     const(char)[] origRk;
@@ -3663,9 +3789,52 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     xbuf.clear();
     static ByteBuffer xoth; // TLS: prior x-death entries for OTHER (queue,reason)
     xoth.clear();
-    immutable prior = xDeathOthers(props, queue, reason, xoth);
+    bool sawQueue, sawRejected;
+    immutable prior = xDeathOthers(props, queue, reason, xoth, sawQueue, sawRejected);
+    // pure-automatic cycle drop (RabbitMQ): a message dead-lettered AGAIN from
+    // a queue it already died in, with no client rejection anywhere in its
+    // history, is in a fully-automatic loop (TTL->DLX->...->same queue) and is
+    // dropped. One "rejected" death anywhere (a client acted) keeps it alive.
+    if (reason != "rejected" && sawQueue && !sawRejected)
+        return;
+    // a per-message `expiration` is REMOVED on dead-lettering (it must not
+    // re-expire downstream) and preserved as original-expiration in the entry
+    char[24] expBuf = void;
+    const(char)[] origExp;
+    immutable expMs = propsExpiration(props);
+    if (expMs >= 0)
+    {
+        size_t ep = expBuf.length;
+        long ev = expMs;
+        do
+        {
+            expBuf[--ep] = cast(char)('0' + (ev % 10));
+            ev /= 10;
+        }
+        while (ev > 0);
+        origExp = expBuf[ep .. $];
+    }
     buildXDeathEntry(xbuf, prior + 1, reason, queue, origRk, recordExchange(blob),
-            meta.dlrk, xoth.data);
+            headerArr(props, "CC"), origExp, xoth.data);
+    // RabbitMQ 3.7+/3.10+ death-tracking headers, appended as sibling entries
+    // (mergeXDeath splices xbuf verbatim into the table front and strips the
+    // stale copies): x-first-death-* records the FIRST death and survives
+    // every later hop; x-last-death-* always reflects THIS one.
+    auto fdq = headerStr(props, "x-first-death-queue");
+    auto fdr = headerStr(props, "x-first-death-reason");
+    auto fdx = headerStr(props, "x-first-death-exchange");
+    if (fdq.length == 0)
+    {
+        fdq = queue;
+        fdr = reason;
+        fdx = recordExchange(blob);
+    }
+    xtStr(xbuf, "x-first-death-queue", fdq);
+    xtStr(xbuf, "x-first-death-reason", fdr);
+    xtStr(xbuf, "x-first-death-exchange", fdx);
+    xtStr(xbuf, "x-last-death-queue", queue);
+    xtStr(xbuf, "x-last-death-reason", reason);
+    xtStr(xbuf, "x-last-death-exchange", recordExchange(blob));
     mergeXDeath(paug, props, xbuf.data);
     dlrec.clear();
     buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_, meta.dlx);
@@ -3703,7 +3872,7 @@ public void amqpTtlSweep() nothrow @trusted
         size_t nq = 0;
         foreach (q, ref meta; gQueueMeta)
         {
-            if (meta.ttlMs <= 0)
+            if (!meta.ttlSet)
                 continue;
             if (ttlQ.length <= nq)
                 ttlQ.length = nq + 8;
@@ -3715,7 +3884,7 @@ public void amqpTtlSweep() nothrow @trusted
             // re-read the meta (a declare during a prior queue's yield may have
             // changed it; a delete leaves it absent -> skip)
             auto mp = q in gQueueMeta;
-            if (mp is null || mp.ttlMs <= 0)
+            if (mp is null || !mp.ttlSet)
                 continue;
             immutable ttl = mp.ttlMs;
             // COPY the key to the stack: deadLetter() below yields (cross-shard

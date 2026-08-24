@@ -531,6 +531,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             releaseIdleMigrateConns(); // close MIGRATE sockets idle > 10s
             pubsubTapExpire(nowMs()); // disarm the dashboard message tap if polling stopped
         }, true);
+        if (gConfig.amqpPort != 0)
+            cast(void) setTimer(50.msecs, () @trusted nothrow { amqpTtlTick(); }, true);
     }
     initReplication();
     // SO_REUSEADDR + SO_REUSEPORT: without reusePort a restarted server can
@@ -4359,6 +4361,8 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
     {
         cast(void) setTimer(200.msecs, () @trusted nothrow { maintExpireTick(); }, true);
         cast(void) setTimer(1.seconds, () @trusted nothrow { maintEvictionTick(); }, true);
+        if (gConfig.amqpPort != 0)
+            cast(void) setTimer(50.msecs, () @trusted nothrow { amqpTtlTick(); }, true);
     }
     catch (Exception)
     {
@@ -7416,6 +7420,20 @@ private void maintExpireTick() @trusted nothrow
         flushTrackingInval(0);
 }
 
+// Active AMQP x-message-ttl expiry on its own FAST timer (50ms): RabbitMQ
+// fires a per-queue timer, so expiry latency is ~TTL + tens of ms — riding the
+// 1s eviction tick left 1ms-TTL messages sitting for up to a second. Cheap
+// when no TTL queues exist (one pass over this shard's gQueueMeta).
+private void amqpTtlTick() @trusted nothrow
+{
+    import dreads.det : freezeClock;
+    import dreads.amqp : amqpTtlSweep;
+
+    freezeClock(0); // pin this cycle's clock to wall time (see maintEvictionTick)
+    amqpTtlSweep();
+    flushPendingNotify(); // deliver any events the sweep queued
+}
+
 // Eviction tick for the databases THIS thread owns (see maintExpireTick).
 private void maintEvictionTick() @trusted nothrow
 {
@@ -7432,14 +7450,8 @@ private void maintEvictionTick() @trusted nothrow
     flushPendingNotify(); // deliver any events the eviction cycle queued
     if (gTrackCount)
         flushTrackingInval(0);
-    // active AMQP x-message-ttl expiry (dead-letter/drop expired heads even in
-    // an unconsumed queue — lazy expiry only fires on read)
-    if (gConfig.amqpPort != 0)
-    {
-        import dreads.amqp : amqpTtlSweep;
-
-        amqpTtlSweep();
-    }
+    // (the AMQP x-message-ttl reaper runs on its own fast 50ms timer —
+    // amqpTtlTick — so a 1ms-TTL queue expires promptly, RabbitMQ-style)
     // $SYS/broker/* stats every ~10 ticks (10s), per shard, to its subscribers
     if (gConfig.mqttPort != 0)
     {
