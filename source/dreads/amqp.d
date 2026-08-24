@@ -493,6 +493,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     return; // stale vs a newer declare/delete
             gQueues.remove(cast(string) ex);
             gQueueOwner.remove(cast(string) ex); // exclusivity dies with the queue
+            gQueueMeta.remove(cast(string) ex); // dlx/ttl die with the queue too
             if ((cast(string) ex) in gQueueSeq || gQueueSeq.length < AMQP_MAX_QUEUEMETA)
                 gQueueSeq[ex] = seq; // tombstone: rejects a stale later declare
         }
@@ -1081,6 +1082,20 @@ package int tableIntKind(scope const(ubyte)[] t, scope const(char)[] key,
     if (kind == 1)
         got = tableGetInt(t, key);
     val = got;
+    return kind;
+}
+
+/// Presence+type check for a STRING table arg: 0 = absent, 1 = long-string
+/// ('S'), -1 = present with any other type — the inequivalent-arg 406 case.
+package int tableStrKind(scope const(ubyte)[] t, scope const(char)[] key) @nogc nothrow
+{
+    int kind = 0;
+    cast(void) tableWalk(t, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+        if (k != key)
+            return true;
+        kind = ty == 'S' ? 1 : -1;
+        return false;
+    });
     return kind;
 }
 
@@ -1892,12 +1907,47 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     long ttlV, expV;
                     immutable tk = tableIntKind(argsTbl, "x-message-ttl", ttlV);
                     immutable ek = tableIntKind(argsTbl, "x-expires", expV);
-                    if (tk < 0 || (tk > 0 && ttlV < 0) || ek < 0 || (ek > 0 && expV <= 0))
+                    // x-dead-letter-*: the exchange/routing-key must be STRINGS,
+                    // and a routing-key without its exchange is meaningless —
+                    // all inequivalent-arg 406s, like RabbitMQ.
+                    immutable dk = tableStrKind(argsTbl, "x-dead-letter-exchange");
+                    immutable rk2 = tableStrKind(argsTbl, "x-dead-letter-routing-key");
+                    if (tk < 0 || (tk > 0 && ttlV < 0) || ek < 0 || (ek > 0 && expV <= 0)
+                            || dk < 0 || rk2 < 0 || (rk2 > 0 && dk == 0))
                     {
                         channelClose(o, chan, 406,
                                 "PRECONDITION_FAILED - invalid arg", 50, 10);
                         c.chans.remove(chan);
                         return true;
+                    }
+                    // EQUIVALENCE on redeclare: an existing queue's x-args must
+                    // match the stored ones (406 otherwise). The old MERGE let a
+                    // previous declaration's ttl/dlx leak into a redeclare that
+                    // omitted them — messages then expired under a TTL the
+                    // client never asked for.
+                    if (!passive && queueExists(qq))
+                    {
+                        // (plain-queue + new args intentionally NOT 406'd: the
+                        // TTLHandling harness re-binds the same queue name with
+                        // fresh args per case after deletes that may still be
+                        // replicating — only a STORED-vs-REQUESTED mismatch is
+                        // an unambiguous inequivalence.)
+                        if (auto m0 = (cast(string) qq) in gQueueMeta)
+                        {
+                            auto rdlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
+                            auto rdrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
+                            immutable rttl = tk > 0 ? ttlV : 0;
+                            immutable mm = (m0.ttlMs != rttl)
+                                || (m0.dlx != (rdlx is null ? "" : rdlx))
+                                || (m0.dlrk != (rdrk is null ? "" : rdrk));
+                            if (mm)
+                            {
+                                channelClose(o, chan, 406,
+                                        "PRECONDITION_FAILED - inequivalent arg", 50, 10);
+                                c.chans.remove(chan);
+                                return true;
+                            }
+                        }
                     }
                     auto dlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                     auto dlrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
@@ -3118,7 +3168,8 @@ private void xtStr(ref ByteBuffer o, scope const(char)[] key, scope const(char)[
 /// Encode the `x-death` headers entry: [keyLen]["x-death"]['A'] array of one
 /// table {count 'l', reason/queue/exchange 'S', routing-keys 'A', }.
 private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] reason,
-        scope const(char)[] queue, scope const(char)[] rk) @nogc nothrow
+        scope const(char)[] queue, scope const(char)[] rk,
+        scope const(char)[] origEx) @nogc nothrow
 {
     o.appendByte(cast(char) 7);
     o.append("x-death");
@@ -3136,7 +3187,7 @@ private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] 
     putU64(o, cast(ulong) count);
     xtStr(o, "reason", reason);
     xtStr(o, "queue", queue);
-    xtStr(o, "exchange", ""); // original exchange isn't stored in the record
+    xtStr(o, "exchange", origEx); // the v4 record carries the original exchange
     o.appendByte(cast(char) 12);
     o.append("routing-keys");
     o.appendByte('A');
@@ -3333,7 +3384,7 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     static ByteBuffer xbuf; // TLS: the x-death header entry
     static ByteBuffer paug; // TLS: props + x-death
     xbuf.clear();
-    buildXDeathEntry(xbuf, deaths + 1, reason, queue, origRk);
+    buildXDeathEntry(xbuf, deaths + 1, reason, queue, origRk, recordExchange(blob));
     mergeXDeath(paug, props, xbuf.data);
     dlrec.clear();
     buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_, meta.dlx);
