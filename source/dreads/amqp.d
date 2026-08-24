@@ -3801,7 +3801,7 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
 /// bits are free, and splitRecord masks it off the count. Set on requeue only;
 /// a fresh publish and a dead-lettered copy (rebuilt by buildRecord, no bit 7)
 /// both read false, matching RabbitMQ (dead-letter starts a fresh delivery).
-private bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
+package bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
 {
     return blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04) && blob[1] == 'A'
         && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
@@ -5274,6 +5274,84 @@ package void a10Requeue(scope const(char)[] q, scope const(ubyte)[] blob) nothro
     markRedelivered(rqr, blob);
     if (gAmqpPushFront !is null)
         gAmqpPushFront(kbr.data.asChars, rqr.data.asChars);
+    try
+        enforceMaxLen(q.idup);
+    catch (Exception)
+    {
+    }
+}
+
+/// Requeue with EXTRA header-table entries spliced in (1.0 modified-state
+/// annotations land in the 0-9-1 headers table; x-* keys re-emit as
+/// annotations on the next 1.0 delivery). Prepend-wins on key collision.
+package void a10RequeueAnn(scope const(char)[] q, scope const(ubyte)[] blob,
+        scope const(ubyte)[] extraTbl, bool requeue = true) nothrow @trusted
+{
+    if (requeue && !queueExists(q))
+        return;
+    long pm;
+    int deaths;
+    const(char)[] rk;
+    const(ubyte)[] props, body_;
+    splitRecord(blob, pm, deaths, rk, props, body_);
+    // rebuild props with headers = extra + existing (mergeXDeath-style)
+    static ByteBuffer np; // TLS: consumed by buildRecord below (no yield)
+    np.clear();
+    ushort flags = 0;
+    size_t i = 2;
+    if (props.length >= 2)
+        flags = cast(ushort)((props[0] << 8) | props[1]);
+    immutable nf2 = cast(ushort)(flags | 0x2000);
+    np.appendByte(cast(char)(nf2 >> 8));
+    np.appendByte(cast(char)(nf2 & 0xFF));
+    static bool cpShort(ref ByteBuffer d2, scope const(ubyte)[] pp, ref size_t j) @nogc nothrow
+    {
+        if (j >= pp.length || j + 1 + pp[j] > pp.length)
+            return false;
+        immutable seg = 1 + pp[j];
+        d2.append(cast(const(char)[]) pp[j .. j + seg]);
+        j += seg;
+        return true;
+    }
+
+    if (flags & 0x8000)
+        if (!cpShort(np, props, i))
+            return;
+    if (flags & 0x4000)
+        if (!cpShort(np, props, i))
+            return;
+    const(ubyte)[] existing;
+    if (flags & 0x2000)
+    {
+        if (i + 4 > props.length)
+            return;
+        immutable hl = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        i += 4;
+        if (i + hl > props.length)
+            return;
+        existing = props[i .. i + hl];
+        i += hl;
+    }
+    putU32(np, cast(uint)(extraTbl.length + existing.length));
+    np.append(cast(const(char)[]) extraTbl);
+    np.append(cast(const(char)[]) existing);
+    np.append(cast(const(char)[]) props[i .. $]);
+    static ByteBuffer nrec; // TLS
+    nrec.clear();
+    buildRecord(nrec, pm, deaths, rk, cast(const(ubyte)[]) np.data, body_, recordExchange(blob));
+    if (!requeue)
+    {
+        // modified + undeliverable-here: dead-letter WITH the annotations
+        deadLetter(q, cast(const(ubyte)[]) nrec.data, "rejected");
+        return;
+    }
+    static ByteBuffer kra; // TLS
+    queueKey(q, kra);
+    static ByteBuffer rqa; // TLS
+    markRedelivered(rqa, cast(const(ubyte)[]) nrec.data);
+    if (gAmqpPushFront !is null)
+        gAmqpPushFront(kra.data.asChars, rqa.data.asChars);
     try
         enforceMaxLen(q.idup);
     catch (Exception)

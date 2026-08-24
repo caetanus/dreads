@@ -512,6 +512,37 @@ private struct A10Link
     bool detached; // stops the delivery fiber
     bool fiberLive;
     bool isMgmt; // "/management" pseudo-node (HTTP-over-AMQP topology ops)
+    bool anonymous; // empty sender target: per-message properties.to routing
+}
+
+/// Address grammar shared by attach targets/sources and per-message `to`.
+private void a10ResolveAddress(scope const(char)[] address,
+        return scope char[] exBuf, return scope char[] rkBuf,
+        out const(char)[] exch, out const(char)[] rk) @nogc nothrow
+{
+    exch = "";
+    rk = address;
+    enum QP = "/queues/";
+    if (address.length > QP.length && address[0 .. QP.length] == QP)
+    {
+        rk = a10UriDecode(address[QP.length .. $], rkBuf);
+        return;
+    }
+    foreach (pfx; ["/exchanges/", "/exchange/"])
+        if (address.length > pfx.length && address[0 .. pfx.length] == pfx)
+        {
+            auto rest = address[pfx.length .. $];
+            size_t slash = rest.length;
+            foreach (k, ch3; rest)
+                if (ch3 == '/')
+                {
+                    slash = k;
+                    break;
+                }
+            exch = a10UriDecode(rest[0 .. slash], exBuf);
+            rk = slash < rest.length ? a10UriDecode(rest[slash + 1 .. $], rkBuf) : "";
+            return;
+        }
 }
 
 /// One in-flight (unsettled) delivery we sent on a receiver link.
@@ -1065,25 +1096,15 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
         if (grabAddr(fields, addrBuf, addrLen))
             address = addrBuf[0 .. addrLen];
     }
-    // resolve address -> (exchange, rkey): "/exchanges/X/RK" or "/exchange/X/RK"
-    // routes through X; a plain name is a queue on the default exchange
-    const(char)[] exch = "";
-    const(char)[] rk = address;
-    foreach (pfx; ["/exchanges/", "/exchange/"])
-        if (address.length > pfx.length && address[0 .. pfx.length] == pfx)
-        {
-            auto rest = address[pfx.length .. $];
-            size_t slash = rest.length;
-            foreach (k, ch3; rest)
-                if (ch3 == '/')
-                {
-                    slash = k;
-                    break;
-                }
-            exch = rest[0 .. slash];
-            rk = slash < rest.length ? rest[slash + 1 .. $] : "";
-            break;
-        }
+    // resolve address -> (exchange, rkey): "/queues/N" is a queue,
+    // "/exchanges/X[/RK]" routes through X, a plain name is a queue on the
+    // default exchange, and an EMPTY sender target is the anonymous relay
+    // (each message routes by its own properties.to)
+    char[512] exBuf = void, rkBuf = void;
+    const(char)[] exch, rk;
+    a10ResolveAddress(address, exBuf, rkBuf, exch, rk);
+    if (lk.clientSender && addrLen == 0)
+        lk.anonymous = true;
     try
     {
         lk.exchange = exch.idup;
@@ -1265,8 +1286,14 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
     {
         static ByteBuffer props; // TLS: consumed by a10Publish before any yield
         static ByteBuffer bodyBuf; // TLS
-        a10MapMessage(msg, props, bodyBuf);
-        cast(void) a10Publish(plk.exchange, plk.rkey,
+        const(char)[] msgTo;
+        a10MapMessage(msg, props, bodyBuf, msgTo);
+        auto exch = cast(const(char)[]) plk.exchange;
+        auto rkey = cast(const(char)[]) plk.rkey;
+        char[512] exB = void, rkB = void;
+        if (plk.anonymous && msgTo.length)
+            a10ResolveAddress(msgTo, exB, rkB, exch, rkey); // anonymous relay
+        cast(void) a10Publish(exch, rkey,
                 cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
     }
     // settle back (rcv-settle-mode first): disposition accepted+settled
@@ -1323,13 +1350,14 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
 /// correlation-id/reply-to, application-properties -> headers table,
 /// data/amqp-value -> body. Sections we don't map are skipped whole.
 private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
-        ref ByteBuffer bodyBuf) nothrow @trusted
+        ref ByteBuffer bodyBuf, out const(char)[] msgTo) nothrow @trusted
 {
     props.clear();
     bodyBuf.clear();
     ushort flags = 0;
     // staging for the fixed-order 0-9-1 property list
     const(char)[] contentType, correlationId, replyTo;
+    msgTo = null;
     char[24] expBuf = void;
     const(char)[] expiration;
     ubyte deliveryMode = 0, priority = 0;
@@ -1391,10 +1419,24 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                 // correlation-id(5) content-type(6) ...
                 foreach (fi; 0 .. val.count)
                 {
+                    immutable at9 = pd.i;
                     auto v2 = pd.readValue();
                     if (!pd.ok)
                         break;
-                    if (fi == 4 && v2.kind == A10Val.Kind.str)
+                    if (fi == 0 && v2.kind != A10Val.Kind.null_)
+                    {
+                        // message-id: ANY type — preserve the RAW 1.0 encoding
+                        // in a reserved 'x'-typed header for lossless replay
+                        auto raw9 = val.bytes[at9 .. pd.i];
+                        hdrTbl.appendByte(cast(char) 9);
+                        hdrTbl.append("x-a10-mid");
+                        hdrTbl.appendByte('x');
+                        a10PutU32(hdrTbl, cast(uint) raw9.length);
+                        hdrTbl.append(cast(const(char)[]) raw9);
+                    }
+                    else if (fi == 2 && v2.kind == A10Val.Kind.str)
+                        msgTo = cast(const(char)[]) v2.bytes;
+                    else if (fi == 4 && v2.kind == A10Val.Kind.str)
                         replyTo = cast(const(char)[]) v2.bytes;
                     else if (fi == 5 && v2.kind == A10Val.Kind.str)
                         correlationId = cast(const(char)[]) v2.bytes;
@@ -1572,13 +1614,38 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
     if (nf >= 4)
         fields.skipValue(); // settled
     ulong state = STATE_ACCEPTED;
+    const(ubyte)[] modAnnBytes;
+    uint modAnnCount;
+    bool modUndeliverable;
     if (nf >= 5)
     {
         auto st = fields.readValue();
         if (st.kind == A10Val.Kind.described && st.u != ulong.max)
         {
             state = st.u;
-            fields.skipValue(); // the state's (empty) list
+            auto stv = fields.readValue(); // the state's field list
+            if (state == 0x27 && stv.kind == A10Val.Kind.list)
+            {
+                // modified: delivery-failed(0) undeliverable-here(1)
+                // message-annotations(2)
+                auto sd = A10Dec(stv.bytes);
+                if (stv.count >= 1)
+                    sd.skipValue();
+                if (stv.count >= 2)
+                {
+                    auto uh = sd.readValue();
+                    modUndeliverable = uh.kind == A10Val.Kind.boolean && uh.b;
+                }
+                if (stv.count >= 3)
+                {
+                    auto ann = sd.readValue();
+                    if (ann.kind == A10Val.Kind.map)
+                    {
+                        modAnnBytes = ann.bytes;
+                        modAnnCount = ann.count;
+                    }
+                }
+            }
         }
     }
     foreach (id; first .. last + 1)
@@ -1588,8 +1655,60 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
             continue;
         switch (state)
         {
+        case 0x27: // modified: requeue, splicing any annotations into headers
+            if (modAnnBytes.length)
+            {
+                import dreads.amqp : a10RequeueAnn;
+
+                static ByteBuffer annTbl; // TLS: consumed synchronously
+                annTbl.clear();
+                auto md2 = A10Dec(modAnnBytes);
+                foreach (mi; 0 .. modAnnCount / 2)
+                {
+                    auto k6 = md2.readValue();
+                    immutable vAt6 = md2.i;
+                    auto v6 = md2.readValue();
+                    auto raw6 = modAnnBytes[vAt6 .. md2.i];
+                    if (!md2.ok || k6.kind != A10Val.Kind.str || k6.bytes.length > 127)
+                        break;
+                    annTbl.appendByte(cast(char) k6.bytes.length);
+                    annTbl.append(cast(const(char)[]) k6.bytes);
+                    if (v6.kind == A10Val.Kind.str)
+                    {
+                        annTbl.appendByte('S');
+                        a10PutU32(annTbl, cast(uint) v6.bytes.length);
+                        annTbl.append(cast(const(char)[]) v6.bytes);
+                    }
+                    else if (v6.kind == A10Val.Kind.u64 || v6.kind == A10Val.Kind.i64)
+                    {
+                        annTbl.appendByte('l');
+                        immutable lv6 = v6.kind == A10Val.Kind.u64 ? cast(long) v6.u : v6.i;
+                        foreach (k7; 0 .. 8)
+                            annTbl.appendByte(cast(char)(lv6 >> ((7 - k7) * 8)));
+                    }
+                    else if (v6.kind == A10Val.Kind.boolean)
+                    {
+                        annTbl.appendByte('t');
+                        annTbl.appendByte(v6.b ? 1 : 0);
+                    }
+                    else
+                    {
+                        // ANY other 1.0 value: keep the RAW encoding ('x'
+                        // byte-array header) for a lossless redelivery
+                        annTbl.appendByte('x');
+                        a10PutU32(annTbl, cast(uint) raw6.length);
+                        annTbl.append(cast(const(char)[]) raw6);
+                    }
+                }
+                a10RequeueAnn(po.queue, po.blob, cast(const(ubyte)[]) annTbl.data,
+                        !modUndeliverable);
+            }
+            else if (modUndeliverable)
+                a10Reject(po.queue, po.blob); // undeliverable-here: dead-letter
+            else
+                a10Requeue(po.queue, po.blob);
+            break;
         case 0x26: // released
-        case 0x27: // modified
             a10Requeue(po.queue, po.blob);
             break;
         case 0x25: // rejected
@@ -1864,6 +1983,9 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
         if (subject == "PUT" && !purge)
         {
             ubyte flags = 0;
+            bool ttlSet, expSet, mlSet, dlxSet;
+            long ttlV, expV, mlV;
+            const(char)[] dlx, dlrk;
             if (bodyIsMap)
             {
                 if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "durable")))
@@ -1872,9 +1994,40 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                     flags |= 4;
                 if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "auto_delete")))
                     flags |= 8;
+                auto args = a10MapGet(bodyMapBytes, bodyMapCount, "arguments");
+                if (args.kind == A10Val.Kind.map)
+                {
+                    static bool numOf(A10Val v, out long outv) @nogc nothrow
+                    {
+                        if (v.kind == A10Val.Kind.u64)
+                        {
+                            outv = cast(long) v.u;
+                            return true;
+                        }
+                        if (v.kind == A10Val.Kind.i64)
+                        {
+                            outv = v.i;
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    ttlSet = numOf(a10MapGet(args.bytes, args.count,
+                            "x-message-ttl"), ttlV);
+                    expSet = numOf(a10MapGet(args.bytes, args.count,
+                            "x-expires"), expV);
+                    mlSet = numOf(a10MapGet(args.bytes, args.count,
+                            "x-max-length"), mlV);
+                    dlx = strOf(a10MapGet(args.bytes, args.count,
+                            "x-dead-letter-exchange"));
+                    dlxSet = dlx !is null;
+                    dlrk = strOf(a10MapGet(args.bytes, args.count,
+                            "x-dead-letter-routing-key"));
+                }
             }
-            immutable created = a10DeclareQueue(qn, flags, false, 0, false, 0,
-                    false, 0, "", false, "");
+            immutable created = a10DeclareQueue(qn, flags, ttlSet, ttlV,
+                    expSet, expV, mlSet, mlV, dlx, dlxSet,
+                    dlrk is null ? "" : dlrk);
             bodyOut.clear();
             a10QueueInfoMap(bodyOut, qn, flags, a10QueueLen(qn));
             a10MgmtRespond(c, fchan, created ? "201" : "200", corrRaw, 1,
@@ -2090,11 +2243,34 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
         }
         a10Close(o, hl);
     }
-    // properties section
-    if (contentType.length || correlationId.length || replyTo.length)
+    // (x-delivery-count joins the single annotations section below — two
+    // message-annotations sections are invalid and the client keeps the last)
+    bool redelivered;
+    {
+        import dreads.amqp : recordRedelivered;
+
+        redelivered = recordRedelivered(blob);
+    }
+    // properties section (message-id replayed RAW from the reserved header)
+    const(ubyte)[] midRaw;
+    auto hdrs0 = propsHeaders(props);
+    if (hdrs0 !is null && hdrs0.length)
+        cast(void) tableWalk(hdrs0, (scope const(char)[] k, char ty,
+                scope const(ubyte)[] v) nothrow {
+            if (k == "x-a10-mid" && ty == 'x')
+            {
+                midRaw = v;
+                return false;
+            }
+            return true;
+        });
+    if (contentType.length || correlationId.length || replyTo.length || midRaw.length)
     {
         auto pl = a10OpenPerf(o, cast(ubyte) SEC_PROPERTIES);
-        a10Null(o); // message-id
+        if (midRaw.length)
+            o.append(cast(const(char)[]) midRaw); // raw 1.0 value re-emit
+        else
+            a10Null(o); // message-id
         pl.n++;
         a10Null(o); // user-id
         pl.n++;
@@ -2119,8 +2295,76 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
         pl.n++;
         a10Close(o, pl);
     }
-    // application-properties from the 0-9-1 headers table
+    // x-* headers re-emit as MESSAGE ANNOTATIONS (1.0 convention: annotation
+    // keys are x-prefixed symbols); everything else is application-properties
     auto hdrs = propsHeaders(props);
+    {
+        bool anyX = redelivered;
+        if (hdrs !is null && hdrs.length)
+            cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
+                    scope const(ubyte)[] v) nothrow {
+                if (k.length >= 2 && k[0] == 'x' && k[1] == '-' && k != "x-death")
+                    anyX = true;
+                return true;
+            });
+        if (anyX)
+        {
+            o.appendByte(0x00);
+            a10SmallUlong(o, cast(ubyte) SEC_MESSAGE_ANN);
+            o.appendByte(0xD1); // map32
+            immutable szX = o.length;
+            a10PutU32(o, 0);
+            immutable cntX = o.length;
+            a10PutU32(o, 0);
+            uint nx = 0;
+            if (redelivered)
+            {
+                a10Sym(o, "x-delivery-count");
+                o.appendByte(0x55); // smalllong: the client asserts a Long
+                o.appendByte(1);
+                nx += 2;
+            }
+            if (hdrs !is null && hdrs.length)
+            cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
+                    scope const(ubyte)[] v) nothrow {
+                if (!(k.length >= 2 && k[0] == 'x' && k[1] == '-') || k == "x-death"
+                        || k == "x-a10-mid")
+                    return true;
+                if (ty == 'S')
+                {
+                    a10Sym(o, k);
+                    a10Str(o, cast(const(char)[]) v);
+                    nx += 2;
+                }
+                else if ((ty == 'l' || ty == 'T') && v.length == 8)
+                {
+                    long lv = 0;
+                    foreach (b3; v)
+                        lv = (lv << 8) | b3;
+                    a10Sym(o, k);
+                    o.appendByte(0x81);
+                    foreach (k3; 0 .. 8)
+                        o.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+                    nx += 2;
+                }
+                else if (ty == 't' && v.length == 1)
+                {
+                    a10Sym(o, k);
+                    a10Bool(o, v[0] != 0);
+                    nx += 2;
+                }
+                else if (ty == 'x')
+                {
+                    a10Sym(o, k);
+                    o.append(cast(const(char)[]) v); // raw 1.0 value re-emit
+                    nx += 2;
+                }
+                return true;
+            });
+            a10PatchU32(o, szX, cast(uint)(o.length - cntX));
+            a10PatchU32(o, cntX, nx);
+        }
+    }
     if (hdrs !is null && hdrs.length)
     {
         o.appendByte(0x00);
@@ -2133,6 +2377,8 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
         uint n2 = 0;
         cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
                 scope const(ubyte)[] v) nothrow {
+            if (k.length >= 2 && k[0] == 'x' && k[1] == '-')
+                return true; // x-* went out as message annotations
             if (ty == 'S')
             {
                 a10Str(o, k);
