@@ -483,7 +483,10 @@ private void registerTopic(scope const(char)[] t) nothrow @trusted
         if (gKafkaExec is null)
             return;
         static ByteBuffer rreg; // TLS
-        const(char)[][3] a = ["sadd", "kafka.topics", t];
+        // ONE registry: the same hash CreateTopics writes (topic -> partition
+        // count). HSETNX so an explicit CreateTopics count is never clobbered
+        // by a later auto-create default.
+        const(char)[][4] a = ["hsetnx", KAFKA_TOPIC_REGISTRY, t, "4"];
         gKafkaExec(a[], rreg);
         tTopicsSeen[t.idup] = true;
     }
@@ -2181,7 +2184,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     {
         // all-topics request: list the produce-time registry (kafka.topics).
         allBuf.clear();
-        const(char)[][2] aq = ["smembers", "kafka.topics"];
+        const(char)[][2] aq = ["hkeys", KAFKA_TOPIC_REGISTRY];
         gKafkaExec(aq[], allBuf);
         // parse *N\r\n($L\r\n<member>\r\n)* into the same topics[] window
         auto d = cast(const(char)[]) allBuf.data;
