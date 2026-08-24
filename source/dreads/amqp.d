@@ -5245,6 +5245,48 @@ package void a10ConsumerDec(scope const(char)[] q) nothrow @trusted
     }
 }
 
+/// 1.0 exclusivity: mint a conn id, claim a queue, test ownership.
+package ulong a10NewConnId() nothrow @trusted
+{
+    return atomicOp!"+="(gAmqpConnGen, 1);
+}
+
+package void a10ClaimExclusive(scope const(char)[] q, ulong connId) nothrow @trusted
+{
+    try
+    {
+        char[24] idb = void;
+        size_t idl = 0;
+        ulong v = connId;
+        char[24] tmp = void;
+        size_t tn = 0;
+        do
+        {
+            tmp[tn++] = cast(char)('0' + v % 10);
+            v /= 10;
+        }
+        while (v);
+        while (tn)
+            idb[idl++] = tmp[--tn];
+        ctlBroadcast(10, q, idb[0 .. idl], "");
+    }
+    catch (Exception)
+    {
+    }
+}
+
+/// 0 = unowned; otherwise the owning conn id.
+package ulong a10ExclusiveOwner(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto po = (cast(string) q) in gQueueOwner)
+            return *po;
+    catch (Exception)
+    {
+    }
+    return 0;
+}
+
 /// Is the queue at (or beyond) its x-max-length bound?
 package bool a10QueueFull(scope const(char)[] q) nothrow @trusted
 {

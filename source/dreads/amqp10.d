@@ -576,6 +576,7 @@ private final class A10Conn
     uint peerIdleMs; // peer's open.idle-time-out: we SEND empties at half it
     long lastReadMs; // MonoTime ms (dead-peer, 0-9-1 lesson: never gClock)
     bool hbStarted;
+    ulong connId; // exclusivity token (shared generator with 0-9-1 conns)
     A10Session[ushort] sessions; // keyed by the CLIENT channel
     TaskMutex wlock; // two writers (read-loop replies + delivery fibers)
 
@@ -677,7 +678,10 @@ private bool a10SaslCheck(scope const(ubyte)[] mech, scope const(ubyte)[] resp) 
 /// The dispatching caller has ALREADY consumed the 8-byte header.
 public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
 {
+    import dreads.amqp : a10NewConnId;
+
     auto c = new A10Conn(tcp);
+    c.connId = a10NewConnId();
     scope (exit)
     {
         c.closing = true;
@@ -1917,13 +1921,29 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
                         annTbl.append(cast(const(char)[]) raw6);
                     }
                 }
+                // modified deliveries count: splice the reserved marker so
+                // the redelivery carries delivery-count=1 (released doesn't)
+                annTbl.appendByte(cast(char) 8);
+                annTbl.append("x-a10-dc");
+                annTbl.appendByte('t');
+                annTbl.appendByte(1);
                 a10RequeueAnn(po.queue, po.blob, cast(const(ubyte)[]) annTbl.data,
                         !modUndeliverable);
             }
             else if (modUndeliverable)
                 a10Reject(po.queue, po.blob); // undeliverable-here: dead-letter
             else
-                a10Requeue(po.queue, po.blob);
+            {
+                import dreads.amqp : a10RequeueAnn;
+
+                static ByteBuffer dcTbl; // TLS
+                dcTbl.clear();
+                dcTbl.appendByte(cast(char) 8);
+                dcTbl.append("x-a10-dc");
+                dcTbl.appendByte('t');
+                dcTbl.appendByte(1);
+                a10RequeueAnn(po.queue, po.blob, cast(const(ubyte)[]) dcTbl.data);
+            }
             break;
         case 0x26: // released
             a10Requeue(po.queue, po.blob);
@@ -2465,6 +2485,22 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                     }
                 }
             }
+            // exclusive queues belong to ONE connection: a second create of
+            // the same name from another conn is a 405 RESOURCE_LOCKED
+            if (a10QueueExists(qn))
+            {
+                import dreads.amqp : a10ExclusiveOwner;
+
+                immutable owner = a10ExclusiveOwner(qn);
+                if (owner != 0 && owner != c.connId)
+                {
+                    a10MgmtRespond(c, fchan, "405", corrRaw, 2, null,
+                            "cannot obtain exclusive access to locked queue - "
+                            ~ "the exclusive property value does not match that "
+                            ~ "of the original declaration");
+                    return;
+                }
+            }
             // redeclare with DIFFERENT flags/args is a 409 conflict (the
             // client-named retry flow depends on it)
             if (a10QueueExists(qn))
@@ -2505,6 +2541,12 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
             immutable created = a10DeclareQueue(qn, flags, ttlSet, ttlV,
                     expSet, expV, mlSet, mlV, dlx, dlxSet,
                     dlrk is null ? "" : dlrk);
+            if (created && (flags & 4))
+            {
+                import dreads.amqp : a10ClaimExclusive;
+
+                a10ClaimExclusive(qn, c.connId); // op-10, like 0-9-1 declares
+            }
             try
             {
                 auto qk9 = cast(string) qn.idup;
@@ -2845,8 +2887,24 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             replyTo = ss(props, i);
     }
 
-    // header section
+    // delivery-count rule: released requeues do NOT bump it; modified
+    // requeues (x-a10-dc marker) and dead-letter hops (deaths>0) do
+    int hdrDeliveryCount0 = 0;
     {
+        import dreads.amqp : splitRecord;
+
+        long pmh;
+        int dh;
+        const(char)[] rkh;
+        const(ubyte)[] ph, bh;
+        splitRecord(blob, pmh, dh, rkh, ph, bh);
+        if (dh > 0)
+            hdrDeliveryCount0 = 1; // ONLY dead-letter hops count in the header
+    }
+    // header section (delivery-count: the 1.0 client asserts it on the DLQ
+    // side and on modified redeliveries)
+    {
+        immutable hdrDeliveryCount = hdrDeliveryCount0;
         auto hl = a10OpenPerf(o, cast(ubyte) SEC_HEADER);
         a10Bool(o, deliveryMode == 2); // durable
         hl.n++;
@@ -2854,17 +2912,30 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
         {
             o.appendByte(0x50); // ubyte
             o.appendByte(cast(char) priority);
+        }
+        else
+            a10Null(o);
+        hl.n++;
+        if (hdrDeliveryCount)
+        {
+            a10Null(o); // ttl
+            hl.n++;
+            a10Null(o); // first-acquirer
+            hl.n++;
+            a10UInt(o, cast(uint) hdrDeliveryCount);
             hl.n++;
         }
         a10Close(o, hl);
     }
     // (x-delivery-count joins the single annotations section below — two
     // message-annotations sections are invalid and the client keeps the last)
+    // The ANNOTATION appears on ANY redelivery (released included); the
+    // header delivery-count above counts only modified requeues + DLX hops.
     bool redelivered;
     {
         import dreads.amqp : recordRedelivered;
 
-        redelivered = recordRedelivered(blob);
+        redelivered = recordRedelivered(blob) || hdrDeliveryCount0 > 0;
     }
     // properties section (message-id replayed RAW from the reserved header)
     const(ubyte)[] midRaw;
@@ -2958,7 +3029,7 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
                     scope const(ubyte)[] v) nothrow {
                 if (!(k.length >= 2 && k[0] == 'x' && k[1] == '-') || k == "x-death"
-                        || k == "x-a10-mid" || k == "x-a10-subj")
+                        || k == "x-a10-mid" || k == "x-a10-subj" || k == "x-a10-dc")
                     return true;
                 if (ty == 'S')
                 {
