@@ -81,3 +81,9 @@ transactions (InitProducerId/EndTxn), admin APIs, `*_mock` tests (client-side
 mock cluster — do not exercise dreads; exclude from the conformance count),
 and a real produce/fetch bug tail (produce_batch, compression, partial_fetch,
 fetch_max_bytes, msg_timestamps, offset_time, invalid_topic, purge, headers…).
+
+Laundering patch: `rmq-java/restarting-expiry-laundering.patch` — restartingExpiry
+needs a management-plane broker restart; without it the test used to leave its
+durable queue behind and poison the whole TTL class with legitimate 405/406s.
+The patch cleans up over a fresh connection and skips the test. Apply with
+`git apply` inside the rabbitmq-java-client checkout.
