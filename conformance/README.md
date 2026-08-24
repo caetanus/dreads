@@ -87,13 +87,29 @@ ISOLATED runner process (the stock runner aborts the batch on one timeout),
     ./configure --disable-gssapi --disable-ssl && make -j && (cd tests && make build -j)
     cp ../conformance/kafka-librdkafka/test.conf tests/ && bash ../conformance/kafka-librdkafka/driver.sh
 
-Baseline 2026-08-24 (dreads flexible/Kafka-2.5 dialect): **99 pass / 66 fail /
-1 skip**. Failure clusters: consumer groups (JoinGroup/SyncGroup/Heartbeat/
-OffsetCommit — a gated feature milestone, not a bug), idempotence +
-transactions (InitProducerId/EndTxn), admin APIs, `*_mock` tests (client-side
-mock cluster — do not exercise dreads; exclude from the conformance count),
-and a real produce/fetch bug tail (produce_batch, compression, partial_fetch,
-fetch_max_bytes, msg_timestamps, offset_time, invalid_topic, purge, headers…).
+Baseline 2026-08-24 (dreads flexible/Kafka-2.5 dialect): 99 pass / 66 fail /
+1 skip. **CONVERGED (non-gated) 2026-08-24: 127 pass / 38 fail / 1 skip.**
+Source-based classification of the failures (does the test call
+subscribe/rebalance APIs?): **37 of the 38 remaining failures are
+consumer-group/transaction tests** — a gated feature milestone awaiting user
+approval, not bugs. The 38th, 0115-producer_auth, shells out to an external
+`kafka-acls.sh` CLI and needs broker-side Kafka ACL enforcement (structural,
+same category as the rabbitmqctl exclusions in the java 0-9-1 suite).
+
+The real-bug tail fixed during convergence (all extend-only in kafka.d):
+Metadata cluster_id (was null; 0063), CreatePartitions API 37 (0044, 0112),
+ListOffsets by timestamp KIP-79 (0054), OffsetCommit metadata persisted in a
+sibling `<topic>/<part>#m` hash field + returned by OffsetFetch (0130, 0099),
+IncrementalAlterConfigs API 44 (SET/DELETE/APPEND/SUBTRACT on
+`kafka.tcfg.<topic>`) + DeleteTopics API 20 + compacted-topic produce gate
+(keyless record → INVALID_RECORD 87 with v8 record_errors; 0011), zstd frames
+without header content-size decompressed via bounded ZSTD_decompressStream
+(librdkafka's streaming writer; 0017), all-topics Metadata window 64→512
+topics (a full-suite run registers hundreds; 0114). Harness triage: 7 tests
+(0075 0088 0104 0121 0123 0131 0149) have built-in wall-clock phases that the
+speed multiplier 0.5 in test.conf falsely times out — driver.sh now runs that
+SLOW list serially at the end under multiplier 2; all of them pass at
+real-time pacing.
 
 Laundering patch: `rmq-java/restarting-expiry-laundering.patch` — restartingExpiry
 needs a management-plane broker restart; without it the test used to leave its
