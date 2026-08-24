@@ -464,8 +464,44 @@ package size_t a10FrameStart(ref ByteBuffer o, ubyte type, ushort channel) @nogc
     return at;
 }
 
+// message-section descriptors
+enum ulong SEC_HEADER = 0x70;
+enum ulong SEC_DELIVERY_ANN = 0x71;
+enum ulong SEC_MESSAGE_ANN = 0x72;
+enum ulong SEC_PROPERTIES = 0x73;
+enum ulong SEC_APP_PROPERTIES = 0x74;
+enum ulong SEC_DATA = 0x75;
+enum ulong SEC_AMQP_SEQUENCE = 0x76;
+enum ulong SEC_AMQP_VALUE = 0x77;
+enum ulong SEC_FOOTER = 0x78;
+enum ulong STATE_ACCEPTED = 0x24;
+enum ulong DESC_ERROR = 0x1D;
+
 // ---------------------------------------------------------------------------
-// Connection state (M1: no sessions/links yet)
+// Connection state
+
+private struct A10Link
+{
+    string name;
+    uint handle; // client's handle
+    bool clientSender; // role=false in the client's attach: it SENDS to us
+    string exchange; // resolved target ("" = default exchange)
+    string rkey; // resolved routing key (queue name for direct addresses)
+    ulong deliveryCount; // sender's count at attach + settled transfers
+    uint creditGranted;
+    ubyte[] pending; // more=true transfer fragments accumulate here (GC array)
+    bool pendingActive;
+    ulong pendingDeliveryId;
+    bool pendingSettled;
+}
+
+private struct A10Session
+{
+    ushort remoteCh; // the client's channel for this session
+    uint nextIncomingId; // next transfer-id we expect
+    uint incomingWindow = 2048;
+    A10Link[uint] links; // keyed by the client's handle
+}
 
 private final class A10Conn
 {
@@ -474,6 +510,7 @@ private final class A10Conn
     uint peerIdleMs; // peer's open.idle-time-out: we SEND empties at half it
     long lastReadMs; // MonoTime ms (dead-peer, 0-9-1 lesson: never gClock)
     bool hbStarted;
+    A10Session[ushort] sessions; // keyed by the CLIENT channel
 
     this(TCPConnection c) nothrow
     {
@@ -715,20 +752,104 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
                 a10Send(c, cast(const(ubyte)[]) outb.data);
                 return;
             }
+        case PERF_BEGIN:
+            {
+                if (!opened)
+                    return;
+                A10Session sess;
+                sess.remoteCh = fchan;
+                if (nf >= 2)
+                {
+                    fields.skipValue(); // remote-channel (null from initiator)
+                    auto noid = fields.readValue(); // next-outgoing-id
+                    if (noid.kind == A10Val.Kind.u64)
+                        sess.nextIncomingId = cast(uint) noid.u;
+                }
+                try
+                    c.sessions[fchan] = sess;
+                catch (Exception)
+                {
+                }
+                outb.clear();
+                {
+                    auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+                    auto l = a10OpenPerf(outb, cast(ubyte) PERF_BEGIN);
+                    a10UShort(outb, fchan); // remote-channel = theirs
+                    l.n++;
+                    a10UInt(outb, 0); // next-outgoing-id
+                    l.n++;
+                    a10UInt(outb, 2048); // incoming-window
+                    l.n++;
+                    a10UInt(outb, 2048); // outgoing-window
+                    l.n++;
+                    a10Close(outb, l);
+                    a10FrameFinish(outb, f);
+                }
+                a10Send(c, cast(const(ubyte)[]) outb.data);
+                break;
+            }
+        case PERF_END:
+            {
+                try
+                    c.sessions.remove(fchan);
+                catch (Exception)
+                {
+                }
+                outb.clear();
+                {
+                    auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+                    auto l = a10OpenPerf(outb, cast(ubyte) PERF_END);
+                    a10Close(outb, l);
+                    a10FrameFinish(outb, f);
+                }
+                a10Send(c, cast(const(ubyte)[]) outb.data);
+                break;
+            }
+        case PERF_ATTACH:
+            a10HandleAttach(c, fchan, fields, nf, outb);
+            break;
+        case PERF_TRANSFER:
+            a10HandleTransfer(c, fchan, fields, nf, body_, outb);
+            break;
+        case PERF_FLOW:
+        case PERF_DISPOSITION:
+            break; // M2: we grant credit and settle first; nothing to do yet
+        case PERF_DETACH:
+            {
+                uint handle;
+                if (nf >= 1)
+                {
+                    auto h2 = fields.readValue();
+                    if (h2.kind == A10Val.Kind.u64)
+                        handle = cast(uint) h2.u;
+                }
+                if (auto ps = fchan in c.sessions)
+                    ps.links.remove(handle);
+                outb.clear();
+                {
+                    auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+                    auto l = a10OpenPerf(outb, cast(ubyte) PERF_DETACH);
+                    a10UInt(outb, handle);
+                    l.n++;
+                    a10Bool(outb, true); // closed
+                    l.n++;
+                    a10Close(outb, l);
+                    a10FrameFinish(outb, f);
+                }
+                a10Send(c, cast(const(ubyte)[]) outb.data);
+                break;
+            }
         default:
-            // M1: begin/attach/... land in M2. An unknown performative before
-            // open is a violation; after open we close cleanly with close.
             if (!opened)
                 return;
             outb.clear();
             {
                 auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, 0);
                 auto l = a10OpenPerf(outb, cast(ubyte) PERF_CLOSE);
-                // error: condition symbol amqp:not-implemented
-                auto el = a10OpenPerf(outb, 0x1D); // error list
+                auto el = a10OpenPerf(outb, cast(ubyte) DESC_ERROR);
                 a10Sym(outb, "amqp:not-implemented");
                 el.n++;
-                a10Str(outb, "M1 speaks open/close only");
+                a10Str(outb, "M2 speaks open/begin/attach/transfer/detach/end/close");
                 el.n++;
                 a10Close(outb, el);
                 l.n++;
@@ -738,6 +859,478 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
             a10Send(c, cast(const(ubyte)[]) outb.data);
             return;
         }
+    }
+}
+
+/// attach: the client-sender case (role=false) — resolve the target address,
+/// ensure the queue, echo the attach with our (receiver) role, grant credit.
+private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
+        uint nf, ref ByteBuffer outb) nothrow
+{
+    import dreads.amqp : a10EnsureQueue;
+
+    auto ps = fchan in c.sessions;
+    if (ps is null)
+        return;
+    A10Link lk;
+    // fields: name(0) handle(1) role(2) snd-settle(3) rcv-settle(4)
+    //         source(5) target(6) unsettled(7) ... initial-delivery-count(9)
+    if (nf >= 1)
+    {
+        auto nm = fields.readValue();
+        if (nm.kind == A10Val.Kind.str)
+            try
+                lk.name = (cast(const(char)[]) nm.bytes).idup;
+            catch (Exception)
+            {
+            }
+    }
+    if (nf >= 2)
+    {
+        auto h = fields.readValue();
+        if (h.kind == A10Val.Kind.u64)
+            lk.handle = cast(uint) h.u;
+    }
+    if (nf >= 3)
+    {
+        auto role = fields.readValue();
+        lk.clientSender = role.kind == A10Val.Kind.boolean && !role.b;
+    }
+    if (nf >= 4)
+        fields.skipValue(); // snd-settle-mode
+    if (nf >= 5)
+        fields.skipValue(); // rcv-settle-mode
+    const(char)[] address;
+    char[512] addrBuf = void;
+    size_t addrLen = 0;
+    if (nf >= 6)
+        fields.skipValue(); // source (we only need the client-sender TARGET)
+    if (nf >= 7)
+    {
+        // target: described list whose field 0 is the address string
+        auto tgt = fields.readValue();
+        if (tgt.kind == A10Val.Kind.described)
+        {
+            auto inner = fields.readValue();
+            if (inner.kind == A10Val.Kind.list && inner.count >= 1)
+            {
+                auto td = A10Dec(inner.bytes);
+                auto av = td.readValue();
+                if (av.kind == A10Val.Kind.str && av.bytes.length <= addrBuf.length)
+                {
+                    addrBuf[0 .. av.bytes.length] = cast(const(char)[]) av.bytes;
+                    addrLen = av.bytes.length;
+                    address = addrBuf[0 .. addrLen];
+                }
+            }
+        }
+    }
+    // resolve address -> (exchange, rkey): "/exchanges/X/RK" or "/exchange/X/RK"
+    // routes through X; a plain name is a queue on the default exchange
+    const(char)[] exch = "";
+    const(char)[] rk = address;
+    foreach (pfx; ["/exchanges/", "/exchange/"])
+        if (address.length > pfx.length && address[0 .. pfx.length] == pfx)
+        {
+            auto rest = address[pfx.length .. $];
+            size_t slash = rest.length;
+            foreach (k, ch3; rest)
+                if (ch3 == '/')
+                {
+                    slash = k;
+                    break;
+                }
+            exch = rest[0 .. slash];
+            rk = slash < rest.length ? rest[slash + 1 .. $] : "";
+            break;
+        }
+    try
+    {
+        lk.exchange = exch.idup;
+        lk.rkey = rk.idup;
+    }
+    catch (Exception)
+    {
+    }
+    if (lk.exchange.length == 0 && lk.rkey.length)
+        a10EnsureQueue(lk.rkey); // queue address: attach declares it
+    try
+        ps.links[lk.handle] = lk;
+    catch (Exception)
+    {
+    }
+    // reply attach (our role = receiver=true for a client sender)
+    outb.clear();
+    {
+        auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+        auto l = a10OpenPerf(outb, cast(ubyte) PERF_ATTACH);
+        a10Str(outb, lk.name);
+        l.n++;
+        a10UInt(outb, lk.handle);
+        l.n++;
+        a10Bool(outb, lk.clientSender); // our role: receiver when client sends
+        l.n++;
+        a10Null(outb); // snd-settle-mode
+        l.n++;
+        a10Null(outb); // rcv-settle-mode
+        l.n++;
+        a10Null(outb); // source
+        l.n++;
+        {
+            auto tl = a10OpenPerf(outb, 0x29); // target
+            a10Str(outb, address);
+            tl.n++;
+            a10Close(outb, tl);
+        }
+        l.n++;
+        a10Close(outb, l);
+        a10FrameFinish(outb, f);
+    }
+    // grant link-credit to the client sender via flow
+    if (lk.clientSender)
+    {
+        auto ps2 = fchan in c.sessions;
+        auto f2 = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+        auto l2 = a10OpenPerf(outb, cast(ubyte) PERF_FLOW);
+        a10UInt(outb, ps2 !is null ? ps2.nextIncomingId : 0); // next-incoming-id
+        l2.n++;
+        a10UInt(outb, 2048); // incoming-window
+        l2.n++;
+        a10UInt(outb, 0); // next-outgoing-id
+        l2.n++;
+        a10UInt(outb, 2048); // outgoing-window
+        l2.n++;
+        a10UInt(outb, lk.handle); // handle
+        l2.n++;
+        a10UInt(outb, lk.deliveryCount); // delivery-count
+        l2.n++;
+        a10UInt(outb, 1000); // link-credit
+        l2.n++;
+        a10Close(outb, l2);
+        a10FrameFinish(outb, f2);
+        if (auto plk = lk.handle in ps.links)
+            plk.creditGranted = 1000;
+    }
+    a10Send(c, cast(const(ubyte)[]) outb.data);
+}
+
+/// transfer: decode the bare message, map to a 0-9-1 record, route, settle.
+private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
+        uint nf, scope const(ubyte)[] body_, ref ByteBuffer outb) nothrow
+{
+    import dreads.amqp : a10Publish;
+
+    auto ps = fchan in c.sessions;
+    if (ps is null)
+        return;
+    uint handle;
+    ulong deliveryId;
+    bool settled = false;
+    bool more = false;
+    if (nf >= 1)
+    {
+        auto h = fields.readValue();
+        if (h.kind == A10Val.Kind.u64)
+            handle = cast(uint) h.u;
+    }
+    if (nf >= 2)
+    {
+        auto d2 = fields.readValue();
+        if (d2.kind == A10Val.Kind.u64)
+            deliveryId = d2.u;
+    }
+    if (nf >= 3)
+        fields.skipValue(); // delivery-tag
+    if (nf >= 4)
+        fields.skipValue(); // message-format
+    if (nf >= 5)
+    {
+        auto st = fields.readValue();
+        settled = st.kind == A10Val.Kind.boolean && st.b;
+    }
+    if (nf >= 6)
+    {
+        auto mo = fields.readValue();
+        more = mo.kind == A10Val.Kind.boolean && mo.b;
+    }
+    auto plk = handle in ps.links;
+    if (plk is null)
+        return;
+    // the message payload = frame body AFTER the performative's list (the
+    // fields decoder is a window over the list CONTENTS; its end marks where
+    // the bare message begins)
+    immutable msgOff = cast(size_t)(fields.p.ptr - body_.ptr) + fields.p.length;
+    if (msgOff > body_.length)
+        return;
+    auto msg = body_[msgOff .. $];
+    ps.nextIncomingId++;
+    if (more || plk.pendingActive)
+    {
+        // accumulate fragments until more=false
+        if (!plk.pendingActive)
+        {
+            plk.pendingActive = true;
+            plk.pending = null;
+            plk.pendingDeliveryId = deliveryId;
+            plk.pendingSettled = settled;
+        }
+        try
+            plk.pending ~= msg;
+        catch (Exception)
+        {
+            plk.pendingActive = false;
+            return;
+        }
+        if (more)
+            return;
+        msg = plk.pending;
+        deliveryId = plk.pendingDeliveryId;
+        settled = settled || plk.pendingSettled;
+        plk.pendingActive = false;
+    }
+    plk.deliveryCount++;
+    // decode sections -> 0-9-1 props + body
+    static ByteBuffer props; // TLS: consumed by a10Publish before any yield
+    static ByteBuffer bodyBuf; // TLS
+    a10MapMessage(msg, props, bodyBuf);
+    cast(void) a10Publish(plk.exchange, plk.rkey,
+            cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
+    // settle back (rcv-settle-mode first): disposition accepted+settled
+    if (!settled)
+    {
+        outb.clear();
+        auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+        auto l = a10OpenPerf(outb, cast(ubyte) PERF_DISPOSITION);
+        a10Bool(outb, true); // role: receiver
+        l.n++;
+        a10UInt(outb, deliveryId); // first
+        l.n++;
+        a10UInt(outb, deliveryId); // last
+        l.n++;
+        a10Bool(outb, true); // settled
+        l.n++;
+        {
+            auto st2 = a10OpenPerf(outb, cast(ubyte) STATE_ACCEPTED);
+            a10Close(outb, st2);
+        }
+        l.n++;
+        a10Close(outb, l);
+        a10FrameFinish(outb, f);
+        a10Send(c, cast(const(ubyte)[]) outb.data);
+    }
+    // replenish credit when half-consumed
+    if (plk.creditGranted && plk.deliveryCount % 500 == 0)
+    {
+        outb.clear();
+        auto f2 = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
+        auto l2 = a10OpenPerf(outb, cast(ubyte) PERF_FLOW);
+        a10UInt(outb, ps.nextIncomingId);
+        l2.n++;
+        a10UInt(outb, 2048);
+        l2.n++;
+        a10UInt(outb, 0);
+        l2.n++;
+        a10UInt(outb, 2048);
+        l2.n++;
+        a10UInt(outb, handle);
+        l2.n++;
+        a10UInt(outb, plk.deliveryCount);
+        l2.n++;
+        a10UInt(outb, 1000);
+        l2.n++;
+        a10Close(outb, l2);
+        a10FrameFinish(outb, f2);
+        a10Send(c, cast(const(ubyte)[]) outb.data);
+    }
+}
+
+/// Map a 1.0 bare message onto 0-9-1 (props table + body): header.durable ->
+/// delivery-mode, header.priority/ttl, properties -> content-type/
+/// correlation-id/reply-to, application-properties -> headers table,
+/// data/amqp-value -> body. Sections we don't map are skipped whole.
+private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
+        ref ByteBuffer bodyBuf) nothrow @trusted
+{
+    props.clear();
+    bodyBuf.clear();
+    ushort flags = 0;
+    // staging for the fixed-order 0-9-1 property list
+    const(char)[] contentType, correlationId, replyTo;
+    char[24] expBuf = void;
+    const(char)[] expiration;
+    ubyte deliveryMode = 0, priority = 0;
+    static ByteBuffer hdrTbl; // TLS: application-properties -> headers table
+    hdrTbl.clear();
+
+    auto d = A10Dec(msg);
+    while (d.ok && d.i < d.p.length)
+    {
+        auto sec = d.readValue();
+        if (!d.ok || sec.kind != A10Val.Kind.described)
+            break;
+        immutable code = sec.u;
+        auto val = d.readValue();
+        if (!d.ok)
+            break;
+        switch (code)
+        {
+        case SEC_HEADER:
+            if (val.kind == A10Val.Kind.list)
+            {
+                auto hd = A10Dec(val.bytes);
+                if (val.count >= 1)
+                {
+                    auto durable = hd.readValue();
+                    if (durable.kind == A10Val.Kind.boolean && durable.b)
+                        deliveryMode = 2;
+                }
+                if (val.count >= 2)
+                {
+                    auto prio = hd.readValue();
+                    if (prio.kind == A10Val.Kind.u64)
+                        priority = cast(ubyte) prio.u;
+                }
+                if (val.count >= 3)
+                {
+                    auto ttl = hd.readValue();
+                    if (ttl.kind == A10Val.Kind.u64 && ttl.u > 0)
+                    {
+                        // decimal ms, 0-9-1 expiration-property style
+                        size_t ep = expBuf.length;
+                        ulong ev = ttl.u;
+                        do
+                        {
+                            expBuf[--ep] = cast(char)('0' + ev % 10);
+                            ev /= 10;
+                        }
+                        while (ev);
+                        expiration = expBuf[ep .. $];
+                    }
+                }
+            }
+            break;
+        case SEC_PROPERTIES:
+            if (val.kind == A10Val.Kind.list)
+            {
+                auto pd = A10Dec(val.bytes);
+                // message-id(0) user-id(1) to(2) subject(3) reply-to(4)
+                // correlation-id(5) content-type(6) ...
+                foreach (fi; 0 .. val.count)
+                {
+                    auto v2 = pd.readValue();
+                    if (!pd.ok)
+                        break;
+                    if (fi == 4 && v2.kind == A10Val.Kind.str)
+                        replyTo = cast(const(char)[]) v2.bytes;
+                    else if (fi == 5 && v2.kind == A10Val.Kind.str)
+                        correlationId = cast(const(char)[]) v2.bytes;
+                    else if (fi == 6 && v2.kind == A10Val.Kind.str)
+                        contentType = cast(const(char)[]) v2.bytes;
+                }
+            }
+            break;
+        case SEC_APP_PROPERTIES:
+            if (val.kind == A10Val.Kind.map)
+            {
+                auto md = A10Dec(val.bytes);
+                foreach (mi; 0 .. val.count / 2)
+                {
+                    auto k2 = md.readValue();
+                    auto v2 = md.readValue();
+                    if (!md.ok || k2.kind != A10Val.Kind.str || k2.bytes.length > 127)
+                        break;
+                    hdrTbl.appendByte(cast(char) k2.bytes.length);
+                    hdrTbl.append(cast(const(char)[]) k2.bytes);
+                    final switch (v2.kind)
+                    {
+                    case A10Val.Kind.str:
+                        hdrTbl.appendByte('S');
+                        a10PutU32(hdrTbl, cast(uint) v2.bytes.length);
+                        hdrTbl.append(cast(const(char)[]) v2.bytes);
+                        break;
+                    case A10Val.Kind.u64:
+                    case A10Val.Kind.i64:
+                        hdrTbl.appendByte('l');
+                        immutable lv = v2.kind == A10Val.Kind.u64
+                            ? cast(long) v2.u : v2.i;
+                        foreach (k3; 0 .. 8)
+                            hdrTbl.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+                        break;
+                    case A10Val.Kind.boolean:
+                        hdrTbl.appendByte('t');
+                        hdrTbl.appendByte(v2.b ? 1 : 0);
+                        break;
+                    case A10Val.Kind.null_:
+                        hdrTbl.appendByte('V');
+                        break;
+                    case A10Val.Kind.f64:
+                    case A10Val.Kind.list:
+                    case A10Val.Kind.map:
+                    case A10Val.Kind.array:
+                    case A10Val.Kind.described:
+                        hdrTbl.appendByte('V'); // unmapped value kinds -> void
+                        break;
+                    }
+                }
+            }
+            break;
+        case SEC_DATA:
+            if (val.kind == A10Val.Kind.str) // vbin slice
+                bodyBuf.append(cast(const(char)[]) val.bytes);
+            break;
+        case SEC_AMQP_VALUE:
+            if (val.kind == A10Val.Kind.str)
+                bodyBuf.append(cast(const(char)[]) val.bytes);
+            break;
+        default:
+            break; // delivery/message annotations, footer, sequence: skipped
+        }
+    }
+
+    if (contentType.length)
+        flags |= 0x8000;
+    if (hdrTbl.length)
+        flags |= 0x2000;
+    if (deliveryMode)
+        flags |= 0x1000;
+    if (priority)
+        flags |= 0x0800;
+    if (correlationId.length)
+        flags |= 0x0400;
+    if (replyTo.length)
+        flags |= 0x0200;
+    if (expiration.length)
+        flags |= 0x0100;
+    props.appendByte(cast(char)(flags >> 8));
+    props.appendByte(cast(char)(flags & 0xFF));
+    if (flags & 0x8000)
+    {
+        props.appendByte(cast(char) contentType.length);
+        props.append(contentType);
+    }
+    if (flags & 0x2000)
+    {
+        a10PutU32(props, cast(uint) hdrTbl.length);
+        props.append(cast(const(char)[]) hdrTbl.data);
+    }
+    if (flags & 0x1000)
+        props.appendByte(cast(char) deliveryMode);
+    if (flags & 0x0800)
+        props.appendByte(cast(char) priority);
+    if (flags & 0x0400)
+    {
+        props.appendByte(cast(char) correlationId.length);
+        props.append(correlationId);
+    }
+    if (flags & 0x0200)
+    {
+        props.appendByte(cast(char) replyTo.length);
+        props.append(replyTo);
+    }
+    if (flags & 0x0100)
+    {
+        props.appendByte(cast(char) expiration.length);
+        props.append(expiration);
     }
 }
 

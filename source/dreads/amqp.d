@@ -5022,6 +5022,62 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     });
 }
 
+// ---------------------------------------------------------------------------
+// AMQP 1.0 skin shims (dreads.amqp10): the 1.0 module maps onto the SAME
+// queue keyspace and routing walk — these package helpers expose exactly the
+// two operations it needs without opening the module's internals.
+
+/// Ensure `q` exists in the replicated existence set (1.0 attach-time
+/// declare, equivalent to a 0-9-1 non-exclusive non-auto-delete declare).
+package void a10EnsureQueue(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (q.length && !queueExists(q))
+        {
+            char[1] fb = [cast(char) 0];
+            ctlBroadcast(8, q, fb[], "");
+        }
+    catch (Exception)
+    {
+    }
+}
+
+/// Publish one already-encoded (0-9-1 props + body) message through the
+/// routing walk. Returns the number of queues routed to.
+package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
+        scope const(ubyte)[] props, scope const(ubyte)[] body_) nothrow @trusted
+{
+    static ByteBuffer rec; // TLS: consumed by the push sink in-walk
+    rec.clear();
+    buildRecord(rec, cast(long) nowMs(), 0, rkey, props, body_, exchange);
+    auto payload = rec.data.asChars;
+    atomicOp!"+="(gAmqpMessages, 1);
+    int routed = 0;
+    string[16] seen;
+    size_t ns = 0;
+    scope void delegate(string) nothrow sink = (string q) nothrow {
+        foreach (d; seen[0 .. ns])
+            if (d == q)
+                return;
+        if (ns < seen.length)
+            try
+                seen[ns++] = q.idup;
+            catch (Exception)
+            {
+            }
+        if (!queueExists(q))
+            return;
+        static ByteBuffer kb10; // TLS
+        queueKey(q, kb10);
+        if (gAmqpPush !is null)
+            gAmqpPush(kb10.data.asChars, payload);
+        routed++;
+        enforceMaxLen(q);
+    };
+    routeTo(exchange, rkey, propsHeaders(props), sink);
+    return routed;
+}
+
 /// ACTIVE x-message-ttl expiry (called ~1/s per shard from the maintenance
 /// tick). Lazy expiry only fires when a queue is READ; a message that outlives
 /// its TTL while sitting in an unconsumed queue would linger forever and never
