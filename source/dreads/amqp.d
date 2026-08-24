@@ -1557,9 +1557,15 @@ private final class AmqpConn
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
+    uint hbSecs; // NEGOTIATED heartbeat (seconds): reads stalling past 2x this close the conn
+    long lastReadMs; // MONOTONIC ms of the last bytes read (MonoTime — the
+    // frozen per-command gClock behind nowMs() would leave stale stamps)
     bool hbStarted;  // the sender fiber is spawned exactly once
     const(void)* aclAuth; // authenticated ACL user (AclUser*); null = legacy accept-any
-    uint frameMax = AMQP_FRAME_MAX; // NEGOTIATED max frame size (from tune-ok): we
+    // NEGOTIATED max frame size. Starts at the spec's frame-min-size (4096):
+    // until tune-ok lands, a peer frame beyond that is a negotiation-phase
+    // frame error (rejectLargeFramesDuringConnectionNegotiation pins it).
+    uint frameMax = 4096; // (from tune-ok): we
     // MUST NOT emit a frame larger than this, so a client that negotiated a smaller
     // frame-max doesn't see an over-size body frame (a fatal framing error to a
     // spec-strict receiver). Chunk size for bodies = frameMax - 8.
@@ -1715,8 +1721,18 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             catch (Exception)
                 return;
         }
-        if (hdr[0 .. 4] != "AMQP")
+        if (hdr[0 .. 4] != "AMQP" || hdr[4] != 0 || hdr[5] != 0 || hdr[6] != 9 || hdr[7] != 1)
+        {
+            // bad/unsupported protocol header: reply with the header we DO
+            // support, then close (the 0-9-1 spec's negotiation-failure path —
+            // the java suite's crazyProtocolHeader reads it back)
+            try
+                tcp.write(cast(const(ubyte)[]) "AMQP\x00\x00\x09\x01");
+            catch (Exception)
+            {
+            }
             return;
+        }
         // Connection.Start — the server-properties table must ANNOUNCE the
         // capabilities we implement (pika refuses confirm.select client-side
         // unless `publisher_confirms` is advertised here).
@@ -1768,7 +1784,7 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             d[tblAt + 1] = cast(ubyte)(tblLen >> 16);
             d[tblAt + 2] = cast(ubyte)(tblLen >> 8);
             d[tblAt + 3] = cast(ubyte)(tblLen & 0xFF);
-            putLongStr(o, "PLAIN");
+            putLongStr(o, "PLAIN AMQPLAIN");
             putLongStr(o, "en_US");
         });
         sendTo(c, outb.data);
@@ -1798,6 +1814,7 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             tcp.read(space[0 .. cast(size_t) avail]);
         catch (Exception)
             return;
+        c.lastReadMs = monoMs(); // heartbeat dead-peer clock
         inb.grow(cast(size_t) avail);
 
         size_t pos = 0;
@@ -1810,8 +1827,20 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             immutable chan = cast(ushort)((d[pos + 1] << 8) | d[pos + 2]);
             immutable fsize = (cast(uint) d[pos + 3] << 24) | (cast(uint) d[pos + 4] << 16)
                 | (cast(uint) d[pos + 5] << 8) | d[pos + 6];
-            if (fsize > AMQP_FRAME_MAX)
-                return; // exceeds advertised frame-max: framing error, close
+            if (fsize + 8 > c.frameMax)
+            {
+                // exceeds the NEGOTIATED frame-max (frame-max counts header +
+                // payload + end octet): connection-level 501 FRAME_ERROR, like
+                // RabbitMQ (rejectExceedingFrameMax pins the close code)
+                connectionClose(outb, 501, "FRAME_ERROR - frame too large", 0, 0);
+                sendTo(c, outb.data);
+                try
+                    sleep(100.msecs); // let the peer READ the close before the RST
+                catch (Exception)
+                {
+                }
+                return;
+            }
             if (d.length - pos < 7 + cast(size_t) fsize + 1) // size_t: no u32 wrap
                 break;
             auto payload = d[pos + 7 .. pos + 7 + fsize];
@@ -1919,8 +1948,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         switch (mth)
         {
         case 11: // start-ok
-            r.skipTable();
-            cast(void) r.shortStr(); // mechanism (PLAIN is all we advertise)
+            auto clientProps = r.tableRaw(); // client-properties (capabilities live here)
+            auto saslMech = r.shortStr(); // PLAIN or AMQPLAIN
             auto saslResp = r.longStr(); // PLAIN: authzid NUL authcid NUL password
             cast(void) r.shortStr();
             {
@@ -1932,6 +1961,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 import dreads.acl : aclUser, aclCheckPassword, aclUserCount;
 
                 const(char)[] auser, apass;
+                if (saslMech == "AMQPLAIN")
+                {
+                    // AMQPLAIN: the response is a field TABLE (no length
+                    // prefix) with LOGIN and PASSWORD longstrs
+                    cast(void) tableWalk(cast(const(ubyte)[]) saslResp, (scope const(char)[] k, char ty,
+                            scope const(ubyte)[] v) @nogc nothrow {
+                        if (ty == 'S' && k == "LOGIN")
+                            auser = cast(const(char)[]) v;
+                        else if (ty == 'S' && k == "PASSWORD")
+                            apass = cast(const(char)[]) v;
+                        return true;
+                    });
+                }
+                else
                 {
                     auto sr = cast(const(char)[]) saslResp;
                     size_t z1 = sr.length, z2 = sr.length;
@@ -1960,6 +2003,25 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable aclOff = aclUserCount() <= 1;
                 if (!aclOff && (au is null || !au.enabled || !aclCheckPassword(au, apass)))
                 {
+                    // the polite 403-in-handshake is OPT-IN: only clients
+                    // advertising the authentication_failure_close capability
+                    // get it (RabbitMQ). Everyone else gets the historical
+                    // abrupt hangup (the java suite pins BOTH behaviors).
+                    bool authFailClose = false;
+                    cast(void) tableWalk(cast(const(ubyte)[]) clientProps,
+                            (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+                        if (k == "capabilities" && ty == 'F')
+                            cast(void) tableWalk(v, (scope const(char)[] k2, char t2,
+                                    scope const(ubyte)[] v2) @nogc nothrow {
+                                if (k2 == "authentication_failure_close"
+                                        && t2 == 't' && v2.length && v2[0])
+                                    authFailClose = true;
+                                return true;
+                            });
+                        return true;
+                    });
+                    if (!authFailClose)
+                        return false; // abrupt close: no capability, no close-method
                     connectionClose(o, 403,
                             "ACCESS_REFUSED - Login was refused using authentication mechanism PLAIN. For details see the broker logfile.",
                             0, 0);
@@ -1977,15 +2039,24 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 cast(void) r.u16(); // channel-max (we accept the client's)
                 immutable fm = r.u32(); // frame-max (u32): the client's negotiated max
+                // a frame-max below the spec's frame-min-size (4096) is a
+                // negotiation failure: RabbitMQ hangs up (the java suite's
+                // frameMaxLessThanFrameMinSize pins the close)
+                if (fm != 0 && fm < 4096)
+                    return false;
                 // honor it (bounded to [4096, our proposal]); 0 = "no limit" per
                 // spec, so fall back to our own max. Prevents emitting a body frame
                 // larger than a down-negotiating client's frame-max.
                 c.frameMax = fm == 0 ? AMQP_FRAME_MAX
-                    : (fm < 4096 ? 4096 : (fm > AMQP_FRAME_MAX ? AMQP_FRAME_MAX : fm));
+                    : (fm > AMQP_FRAME_MAX ? AMQP_FRAME_MAX : fm);
+                if (c.frameMax < 4096)
+                    c.frameMax = 4096;
                 immutable hb = r.u16(); // NEGOTIATED heartbeat interval, seconds
                 // Send at half the negotiated interval so the client always
                 // sees a frame within its dead-peer window (2× interval).
                 // 0 = heartbeats disabled: don't start the sender at all.
+                c.hbSecs = hb;
+                c.lastReadMs = monoMs();
                 c.hbSendSecs = hb == 0 ? 0 : (hb + 1) / 2;
                 if (c.hbSendSecs != 0)
                     startHeartbeat(c);
@@ -4722,6 +4793,17 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
 // Heartbeat sender: a fiber emitting a heartbeat frame every 15s while the
 // connection lives (half the negotiated 30s interval). Read-side liveness
 // stays TCP-level in v1 (the serve loop notices the close).
+/// Monotonic milliseconds (never the frozen per-command gClock).
+private long monoMs() nothrow @trusted
+{
+    import core.time : MonoTime;
+
+    try
+        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+    catch (Exception)
+        return 0;
+}
+
 private void startHeartbeat(AmqpConn c) nothrow
 {
     if (c.hbStarted || c.hbSendSecs == 0)
@@ -4739,6 +4821,20 @@ private void startHeartbeat(AmqpConn c) nothrow
                     return;
                 if (cc.closing)
                     return;
+                // dead-peer detection, RabbitMQ-style: no bytes read for 2x
+                // the negotiated interval means the peer is gone — close the
+                // socket (the java Heartbeat test mutes its side and expects
+                // the server to hang up).
+                if (cc.hbSecs != 0 && cc.lastReadMs != 0
+                        && monoMs() - cc.lastReadMs > cast(long) cc.hbSecs * 2000)
+                {
+                    try
+                        cc.tcp.close();
+                    catch (Exception)
+                    {
+                    }
+                    return;
+                }
                 sendTo(cc, hb[]);
             }
         }, c);

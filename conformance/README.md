@@ -48,6 +48,10 @@ UserIDHeader. Drop the file into a rabbitmq-java-client checkout (v5.x branch)
 at `src/test/java/com/rabbitmq/client/test/functional/` and run:
 
     ./bin/dreads --port=16399 --amqp-port=5672 &
+    # the SaslMechanisms auth tests need the ACL configured (auth stays legacy
+    # accept-any while only the seeded `default` user exists):
+    redis-cli -p 16399 ACL SETUSER default on nopass '~*' '&*' +@all
+    redis-cli -p 16399 ACL SETUSER guest on '>guest' '~*' '&*' +@all
     ./mvnw verify -Dit.test=DreadsFunctionalTestSuite -Drabbitmqctl.bin=/bin/false \
       -Dtest=zzz -Dsurefire.failIfNoSpecifiedTests=false -Dspotless.check.skip=true
 
