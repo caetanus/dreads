@@ -1310,6 +1310,9 @@ private struct Unacked
     const(ubyte)[] blob; // stored record (rk+props+body), for requeue/dead-letter
     ushort chan; // owning channel: channel.close requeues just this channel's
     int deaths; // reserved for a future x-death header hop count (loop bound)
+    bool fromGet; // basic.get delivery: OUTSIDE the consumer qos window
+    // (RabbitMQ: qos governs consumers only), so its settle must not
+    // decrement the channel's consumer-window counter.
 }
 
 private final class AmqpConn
@@ -2245,13 +2248,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
                 // a no-ack=false get also consumes prefetch: don't let millions
                 // of un-acked gets pin RAM (the consumer path already caps this)
-                auto getCh = chan in c.chans;
-                immutable getLimit = getCh !is null && getCh.prefetch
-                    ? getCh.prefetch : (c.prefetch ? c.prefetch : AMQP_DEFAULT_PREFETCH);
+                // basic.qos does NOT govern basic.get (RabbitMQ: prefetch is a
+                // consumer contract — the java suite gets WITH the consumer
+                // window deliberately full). Only the RAM backstop applies.
                 bool getFull = false;
                 try
-                    getFull = !getNoAck && ((getCh !is null ? getCh.unackedN
-                            : cast(uint) c.unacked.length) >= getLimit
+                    getFull = !getNoAck && (c.unacked.length >= AMQP_DEFAULT_PREFETCH
                             || c.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
                 catch (Exception)
                 {
@@ -2300,12 +2302,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     if (!getNoAck)
                         try
                         {
-                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0);
+                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0, true);
                             c.unackedBytes += pay.data.length;
-                            // REFETCH: the pop's cross-shard hop yielded, and a
-                            // c.chans mutation may have moved the AA slots.
-                            if (auto ich = chan in c.chans)
-                                ich.unackedN++;
+                            // NOT counted in the channel's consumer window:
+                            // qos is a consumer contract (fromGet above).
                         }
                         catch (Exception)
                         {
@@ -3262,7 +3262,8 @@ private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
         {
             immutable n = p.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
-            chanUnackedDec(c, p.chan);
+            if (!p.fromGet)
+                chanUnackedDec(c, p.chan);
             c.unacked.remove(tag);
         }
     catch (Exception)
@@ -3284,7 +3285,8 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             found = true;
             immutable n = u.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
-            chanUnackedDec(c, u.chan);
+            if (!u.fromGet)
+                chanUnackedDec(c, u.chan);
             c.unacked.remove(tag);
         }
     }
