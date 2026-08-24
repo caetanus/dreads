@@ -822,7 +822,19 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
                     l.n++;
                     a10Null(outb); // incoming-locales
                     l.n++;
-                    a10Null(outb); // offered-capabilities
+                    {
+                        // offered-capabilities: the java client refuses to
+                        // build anonymous publishers without ANONYMOUS-RELAY
+                        outb.appendByte(0xE0); // array8
+                        immutable szC = outb.length;
+                        outb.appendByte(0);
+                        outb.appendByte(1); // count
+                        outb.appendByte(0xA3); // element ctor: sym8
+                        outb.appendByte(15);
+                        outb.append("ANONYMOUS-RELAY");
+                        auto dc = cast(ubyte[]) outb.data;
+                        dc[szC] = cast(ubyte)(outb.length - szC - 1);
+                    }
                     l.n++;
                     a10Null(outb); // desired-capabilities
                     l.n++;
@@ -1289,6 +1301,17 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
             plk.pendingDeliveryId = deliveryId;
             plk.pendingSettled = settled;
         }
+        if (plk.pending.length + msg.length > 16 * 1024 * 1024)
+        {
+            // RabbitMQ's default max message size: refuse with the 1.0
+            // link error the client maps to a size exception
+            plk.pendingActive = false;
+            plk.pending = null;
+            a10SendDetachError(c, fchan, handle,
+                    "amqp:link:message-size-exceeded", plk.rkey);
+            plk.detached = true;
+            return;
+        }
         try
             plk.pending ~= msg;
         catch (Exception)
@@ -1317,6 +1340,18 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
             {
                 a10SendDetachError(c, fchan, handle, "amqp:resource-deleted",
                         plk.rkey);
+                plk.detached = true;
+                return;
+            }
+        }
+        else if (plk.exchange.length)
+        {
+            import dreads.amqp : a10ExchangeExists;
+
+            if (!a10ExchangeExists(plk.exchange))
+            {
+                a10SendDetachError(c, fchan, handle, "amqp:resource-deleted",
+                        plk.exchange);
                 plk.detached = true;
                 return;
             }
@@ -1513,10 +1548,17 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                         hdrTbl.appendByte('t');
                         hdrTbl.appendByte(v2.b ? 1 : 0);
                         break;
+                    case A10Val.Kind.f64:
+                        hdrTbl.appendByte('d'); // 0-9-1 double
+                        {
+                            ulong raw8 = *cast(ulong*)&v2.f;
+                            foreach (k3; 0 .. 8)
+                                hdrTbl.appendByte(cast(char)(raw8 >> ((7 - k3) * 8)));
+                        }
+                        break;
                     case A10Val.Kind.null_:
                         hdrTbl.appendByte('V');
                         break;
-                    case A10Val.Kind.f64:
                     case A10Val.Kind.list:
                     case A10Val.Kind.map:
                     case A10Val.Kind.array:
@@ -1768,6 +1810,25 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
 // subject=GET|PUT|POST|DELETE} + an amqp-value map body; responses echo the
 // message-id as correlation-id with subject = the HTTP status code.
 
+/// Declared-arguments fingerprint + queue type per queue (shard-local: the
+/// managing connection's shard sees its own declares; cross-shard redeclare
+/// equivalence rides the replicated meta for the KNOWN args).
+private ulong[string] gA10ArgsHash; // TLS
+private string[string] gA10QueueType; // TLS
+private immutable(ubyte)[][string] gA10ArgsRaw; // TLS: declared args map CONTENTS
+private uint[string] gA10ArgsCount; // TLS: element count of that map
+
+private ulong a10Fnv(scope const(ubyte)[] b) @nogc nothrow
+{
+    ulong h = 0xCBF29CE484222325;
+    foreach (x; b)
+    {
+        h ^= x;
+        h *= 0x100000001B3;
+    }
+    return h;
+}
+
 /// %XX-decode one path segment into `buf`; returns the decoded slice.
 private const(char)[] a10UriDecode(scope const(char)[] src, return scope char[] buf) @nogc nothrow
 {
@@ -1913,12 +1974,45 @@ private void a10QueueInfoMap(ref ByteBuffer o, scope const(char)[] name,
     a10Bool(o, (flags & 4) != 0);
     n2 += 2;
     a10Str(o, "type");
-    a10Str(o, "classic");
+    {
+        const(char)[] qt = "classic";
+        try
+            if (auto pt2 = (cast(string) name) in gA10QueueType)
+                qt = *pt2;
+        catch (Exception)
+        {
+        }
+        a10Str(o, qt);
+    }
     n2 += 2;
     a10Str(o, "arguments");
-    o.appendByte(0xC1); // empty map8
-    o.appendByte(1);
-    o.appendByte(0);
+    {
+        const(ubyte)[] raw9;
+        uint cnt9;
+        try
+        {
+            if (auto pr9 = (cast(string) name) in gA10ArgsRaw)
+                raw9 = *pr9;
+            if (auto pc9 = (cast(string) name) in gA10ArgsCount)
+                cnt9 = *pc9;
+        }
+        catch (Exception)
+        {
+        }
+        if (raw9.length)
+        {
+            o.appendByte(0xD1); // map32: declared args echoed verbatim
+            a10PutU32(o, cast(uint)(raw9.length + 4));
+            a10PutU32(o, cnt9);
+            o.append(cast(const(char)[]) raw9);
+        }
+        else
+        {
+            o.appendByte(0xC1); // empty map8
+            o.appendByte(1);
+            o.appendByte(0);
+        }
+    }
     n2 += 2;
     a10Str(o, "leader");
     a10Str(o, "dreads-0");
@@ -2062,10 +2156,68 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                             "x-dead-letter-routing-key"));
                 }
             }
+            // argument validation: unknown x-* argument names are refused
+            // (RabbitMQ 4 validates them)
+            ulong argsHash = 0;
+            const(char)[] qType = "classic";
+            {
+                auto args = a10MapGet(bodyMapBytes, bodyMapCount, "arguments");
+                if (args.kind == A10Val.Kind.map)
+                {
+                    argsHash = a10Fnv(args.bytes);
+                    const(char)[] badArg;
+                    auto ad2 = A10Dec(args.bytes);
+                    foreach (mi; 0 .. args.count / 2)
+                    {
+                        auto k8 = ad2.readValue();
+                        auto v8 = ad2.readValue();
+                        if (!ad2.ok || k8.kind != A10Val.Kind.str)
+                            break;
+                        auto kn8 = cast(const(char)[]) k8.bytes;
+                        if (kn8 == "x-queue-type")
+                        {
+                            auto tv = cast(const(char)[]) v8.bytes;
+                            if (v8.kind == A10Val.Kind.str && tv.length)
+                                qType = tv;
+                        }
+                        else if (kn8 != "x-message-ttl" && kn8 != "x-expires"
+                                && kn8 != "x-max-length"
+                                && kn8 != "x-dead-letter-exchange"
+                                && kn8 != "x-dead-letter-routing-key"
+                                && kn8.length >= 2 && kn8[0] == 'x' && kn8[1] == '-')
+                            badArg = kn8;
+                    }
+                    if (badArg.length)
+                    {
+                        char[300] bb2 = void;
+                        import core.stdc.stdio : snprintf;
+
+                        immutable bn2 = snprintf(bb2.ptr, bb2.length,
+                                "invalid argument '%.*s' for queue",
+                                cast(int) badArg.length, badArg.ptr);
+                        a10MgmtRespond(c, fchan, "400", corrRaw, 2, null,
+                                bb2[0 .. bn2]);
+                        return;
+                    }
+                }
+            }
             // redeclare with DIFFERENT flags/args is a 409 conflict (the
             // client-named retry flow depends on it)
             if (a10QueueExists(qn))
             {
+                ulong prevHash = 0;
+                try
+                    if (auto ph = (cast(string) qn) in gA10ArgsHash)
+                        prevHash = *ph;
+                catch (Exception)
+                {
+                }
+                if (prevHash != argsHash)
+                {
+                    a10MgmtRespond(c, fchan, "409", corrRaw, 2, null,
+                            "inequivalent arguments");
+                    return;
+                }
                 import dreads.amqp : a10QueueMetaGet;
 
                 bool sTtl, sExp, sDlx;
@@ -2089,6 +2241,21 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
             immutable created = a10DeclareQueue(qn, flags, ttlSet, ttlV,
                     expSet, expV, mlSet, mlV, dlx, dlxSet,
                     dlrk is null ? "" : dlrk);
+            try
+            {
+                auto qk9 = cast(string) qn.idup;
+                gA10ArgsHash[qk9] = argsHash;
+                gA10QueueType[qk9] = cast(string) qType.idup;
+                auto args9 = a10MapGet(bodyMapBytes, bodyMapCount, "arguments");
+                if (args9.kind == A10Val.Kind.map)
+                {
+                    gA10ArgsRaw[qk9] = args9.bytes.idup;
+                    gA10ArgsCount[qk9] = args9.count;
+                }
+            }
+            catch (Exception)
+            {
+            }
             bodyOut.clear();
             a10QueueInfoMap(bodyOut, qn, flags, a10QueueLen(qn));
             a10MgmtRespond(c, fchan, created ? "201" : "200", corrRaw, 1,
@@ -2464,6 +2631,14 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             {
                 a10Str(o, k);
                 a10Str(o, cast(const(char)[]) v);
+                n2 += 2;
+            }
+            else if (ty == 'd' && v.length == 8)
+            {
+                a10Str(o, k);
+                o.appendByte(0x82); // double
+                foreach (k3; 0 .. 8)
+                    o.appendByte(cast(char) v[k3]);
                 n2 += 2;
             }
             else if ((ty == 'l' || ty == 'T') && v.length == 8)
