@@ -1230,6 +1230,7 @@ private final class AmqpConn
     size_t consumerCount; // live basic.consume fibers (per-conn cap)
     uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
     bool hbStarted;  // the sender fiber is spawned exactly once
+    const(void)* aclAuth; // authenticated ACL user (AclUser*); null = legacy accept-any
     uint frameMax = AMQP_FRAME_MAX; // NEGOTIATED max frame size (from tune-ok): we
     // MUST NOT emit a frame larger than this, so a client that negotiated a smaller
     // frame-max doesn't see an over-size body frame (a fatal framing error to a
@@ -1534,9 +1535,53 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         {
         case 11: // start-ok
             r.skipTable();
+            cast(void) r.shortStr(); // mechanism (PLAIN is all we advertise)
+            auto saslResp = r.longStr(); // PLAIN: authzid NUL authcid NUL password
             cast(void) r.shortStr();
-            cast(void) r.longStr();
-            cast(void) r.shortStr();
+            {
+                // Validate against the ACL exactly like the MQTT skin: an
+                // EMPTY registry (no `default` user defined) keeps the legacy
+                // accept-any behavior; once ACL users exist, an unknown user,
+                // a disabled one, or a wrong password is a 403 ACCESS_REFUSED
+                // connection close (RabbitMQ's authentication_failure_close).
+                import dreads.acl : aclUser, aclCheckPassword, aclUserCount;
+
+                const(char)[] auser, apass;
+                {
+                    auto sr = cast(const(char)[]) saslResp;
+                    size_t z1 = sr.length, z2 = sr.length;
+                    foreach (i, ch2; sr)
+                        if (ch2 == '\0')
+                        {
+                            if (z1 == sr.length)
+                                z1 = i;
+                            else
+                            {
+                                z2 = i;
+                                break;
+                            }
+                        }
+                    if (z1 < sr.length && z2 < sr.length)
+                    {
+                        auser = sr[z1 + 1 .. z2];
+                        apass = sr[z2 + 1 .. $];
+                    }
+                }
+                auto au = aclUser(auser.length ? auser : "default");
+                // Legacy accept-any until the operator actually CONFIGURES
+                // users: a fresh dreads seeds only the nopass `default` user,
+                // and virtually every AMQP client sends guest/guest — refusing
+                // them on an unconfigured broker would break existing deploys.
+                immutable aclOff = aclUserCount() <= 1;
+                if (!aclOff && (au is null || !au.enabled || !aclCheckPassword(au, apass)))
+                {
+                    connectionClose(o, 403,
+                            "ACCESS_REFUSED - Login was refused using authentication mechanism PLAIN. For details see the broker logfile.",
+                            0, 0);
+                    return true; // stay open for the client's close-ok
+                }
+                c.aclAuth = au; // null under legacy accept-any
+            }
             method(o, 0, 10, 30, (ref ByteBuffer b) @nogc nothrow {
                 putU16(b, 2047); // channel-max
                 putU32(b, 131072); // frame-max
@@ -1562,10 +1607,34 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 return true;
             }
         case 40: // open
-            method(o, 0, 10, 41, (ref ByteBuffer b) @nogc nothrow {
-                putShortStr(b, "");
-            });
-            return true;
+            {
+                auto vhost = r.shortStr();
+                // dreads has exactly ONE vhost, "/": opening any other is a 530
+                // NOT_ALLOWED connection close, like RabbitMQ's vhost-not-found.
+                if (vhost.length && vhost != "/")
+                {
+                    connectionClose(o, 530, "NOT_ALLOWED - vhost not found", 10, 40);
+                    return true; // stay open for close-ok
+                }
+                // vhost ACCESS: an authenticated user with no key grant and no
+                // channel grant at all can touch nothing — RabbitMQ's
+                // no-vhost-permission maps to a 530 at open.
+                {
+                    import dreads.acl : AclUser;
+
+                    auto aup = cast(const(AclUser)*) c.aclAuth;
+                    if (aup !is null && !aup.root.allKeys && aup.root.keyPats.length == 0
+                            && !aup.root.allChannels && aup.root.chanPats.length == 0)
+                    {
+                        connectionClose(o, 530, "NOT_ALLOWED - access to vhost '/' refused", 10, 40);
+                        return true;
+                    }
+                }
+                method(o, 0, 10, 41, (ref ByteBuffer b) @nogc nothrow {
+                    putShortStr(b, "");
+                });
+                return true;
+            }
         case 50: // close
             method(o, 0, 10, 51);
             return false;

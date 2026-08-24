@@ -23,7 +23,15 @@ Run (no local Erlang needed):
     docker run --rm --network host -v $PWD/conformance/rmq-erlang-ct:/w -w /w \
       erlang:26 rebar3 ct --suite test/dreads_system_SUITE
 
-Baseline 2026-08-24: 41 unique cases pass / 11 fail. 200 of the 209 counted
+**CONVERGED 2026-08-24: all 344 tests pass.** The auth cases need the ACL
+configured BEFORE the run (auth stays legacy accept-any while only the seeded
+`default` user exists):
+
+    redis-cli -p 16399 ACL SETUSER default on nopass '~*' '&*' +@all
+    redis-cli -p 16399 ACL SETUSER guest on '>guest' '~*' '&*' +@all
+    redis-cli -p 16399 ACL SETUSER test_user_no_perms on '>test_user_no_perms'
+
+Earlier baseline for reference: 41 unique cases pass / 11 fail. 200 of the 209 counted
 failures are just TWO cases repeated 100× by the upstream loop groups
 (`bogus_rpc`, `hard_error` — dreads does not yet answer bogus/hard-error
 methods with the exact close codes). Remaining: the auth cluster
