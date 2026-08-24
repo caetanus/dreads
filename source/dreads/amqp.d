@@ -324,8 +324,19 @@ package bool amqpTopicMatches(scope const(char)[] pattern, scope const(char)[] k
 // Apply a control op locally. Wire: [op u8][len u16][exchange][len u16][a][len u16][b]
 //   op 1 = exchange.declare (a = type name)
 //   op 2 = queue.bind       (a = queue, b = routing key)
+/// Topology epoch: bumped on EVERY applied ctl op. The publish hot path
+/// memoizes its per-queue lookups (existence + max-length) against it, so a
+/// run of publishes to the same queue pays ONE relaxed atomic load instead of
+/// two AA probes per message.
+package shared ulong gAmqpTopoEpoch;
+
 public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
 {
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"+="(gAmqpTopoEpoch, 1);
+    }
     try
     {
         size_t i = 0;
@@ -704,6 +715,13 @@ private bool exclusiveDenied(AmqpConn c, ushort chan, ref ByteBuffer o,
         }
     return false;
 }
+
+// publish-path memo (see gAmqpTopoEpoch)
+private char[256] tPubMemoQBuf = void;
+private size_t tPubMemoQLen;
+private bool tPubMemoExists;
+private long tPubMemoMaxLen; // gQueueMeta.maxLen (bound+1 encoding; 0 = unset)
+private ulong tPubMemoEpoch = ulong.max;
 
 /// True iff `q` names a queue that is currently declared (op 8, not yet op 9)
 /// on this shard. The registry is broadcast-replicated with LWW seq ordering,
@@ -4140,29 +4158,74 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     // Erlang serialization cases — reverted in b743fa9); CC/BCC dedup happens
     // inside the sink via `seen`, whose entries are COPIES (the walk's names
     // live in reused TLS a reentrant routeTo refills during our push yields).
-    string[64] seen;
+    // dedup names are copied into a STACK arena (not GC idup — that was one
+    // allocation PER MESSAGE on the hot path; the copies must still be real
+    // because the walk's names live in reused TLS that a reentrant routeTo
+    // refills during our push yields)
+    char[2048] seenArena = void;
+    size_t seenUsed = 0;
+    uint[64] seenOff = void;
+    uint[64] seenLen = void;
     size_t ns = 0;
     scope void delegate(string) nothrow pushSink = (string q) nothrow {
-        foreach (d; seen[0 .. ns])
-            if (d == q)
+        foreach (di; 0 .. ns)
+            if (seenArena[seenOff[di] .. seenOff[di] + seenLen[di]] == q)
                 return; // already delivered for this publish (noDuplicates)
-        if (ns < seen.length)
-            try
-                seen[ns++] = q.idup;
-            catch (Exception)
-            {
-            }
+        if (ns < seenOff.length && seenUsed + q.length <= seenArena.length)
+        {
+            seenArena[seenUsed .. seenUsed + q.length] = q[];
+            seenOff[ns] = cast(uint) seenUsed;
+            seenLen[ns] = cast(uint) q.length;
+            seenUsed += q.length;
+            ns++;
+        }
         // route only to queues that EXIST (RabbitMQ): the default exchange
         // routes by name, and a push to an undeclared name would create a
-        // ghost list — and defeat the mandatory basic.return (312 NO_ROUTE)
-        if (!queueExists(q))
+        // ghost list — and defeat the mandatory basic.return (312 NO_ROUTE).
+        // Existence + max-length come from the epoch-gated memo: a run of
+        // publishes to the same queue skips the AA probes entirely.
+        bool exists;
+        long mlP1;
+        {
+            import core.atomic : MemoryOrder, atomicLoad;
+
+            immutable ep = atomicLoad!(MemoryOrder.raw)(gAmqpTopoEpoch);
+            if (ep == tPubMemoEpoch && q.length == tPubMemoQLen
+                    && tPubMemoQBuf[0 .. tPubMemoQLen] == q)
+            {
+                exists = tPubMemoExists;
+                mlP1 = tPubMemoMaxLen;
+            }
+            else
+            {
+                exists = queueExists(q);
+                mlP1 = 0;
+                if (exists)
+                    try
+                        if (auto m = q in gQueueMeta)
+                            mlP1 = m.maxLen;
+                    catch (Exception)
+                    {
+                    }
+                if (q.length <= tPubMemoQBuf.length)
+                {
+                    tPubMemoQBuf[0 .. q.length] = q[];
+                    tPubMemoQLen = q.length;
+                    tPubMemoExists = exists;
+                    tPubMemoMaxLen = mlP1;
+                    tPubMemoEpoch = ep;
+                }
+            }
+        }
+        if (!exists)
             return;
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
         if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;
-        enforceMaxLen(q);
+        if (mlP1 > 0)
+            enforceMaxLen(q);
     };
     if (!drDirect)
         routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink, ccKeys[0 .. nCc]);
