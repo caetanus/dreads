@@ -1899,15 +1899,18 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
             char[1] xfb = [cast(char)(flags & 0x0E)];
             ctlBroadcast(1, ex, typ, xfb[]);
-            method(o, chan, 40, 11);
+            if (!(flags & 16)) // nowait: the client forbade declare-ok — an
+                method(o, chan, 40, 11); // extra reply desyncs its RPC stream
             return true;
         }
         if (mth == 20) // delete
         {
             cast(void) r.u16();
             auto ex = r.shortStr();
+            immutable dbits = r.ok && r.i < p.length ? p[r.i] : 0; // if-unused|nowait
             ctlBroadcast(5, ex, "", ""); // op 5: drop the exchange + its bindings
-            method(o, chan, 40, 21); // delete-ok
+            if (!(dbits & 2))
+                method(o, chan, 40, 21); // delete-ok (suppressed by nowait)
             return true;
         }
         if (mth == 30) // bind (exchange-to-exchange): dest, source, rk, args
@@ -1916,10 +1919,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             auto dest = r.shortStr();
             auto source = r.shortStr();
             auto rk = r.shortStr();
-            cast(void) r.u8(); // no-wait
+            immutable ebnw = r.u8() & 1; // no-wait
             auto bindArgs = r.tableRaw();
             ctlBroadcast(6, source, dest, rk, bindArgs); // op 6: source -> dest exch
-            method(o, chan, 40, 31); // bind-ok
+            if (!ebnw)
+                method(o, chan, 40, 31); // bind-ok (suppressed by nowait)
             return true;
         }
         if (mth == 40) // unbind (exchange-to-exchange)
@@ -1928,10 +1932,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             auto dest = r.shortStr();
             auto source = r.shortStr();
             auto rk = r.shortStr();
-            cast(void) r.u8(); // no-wait
+            immutable eunw = r.u8() & 1; // no-wait
             cast(void) r.tableRaw();
             ctlBroadcast(7, source, dest, rk); // op 7: drop the e2e binding
-            method(o, chan, 40, 51); // unbind-ok
+            if (!eunw)
+                method(o, chan, 40, 51); // unbind-ok (suppressed by nowait)
             return true;
         }
         return true;
@@ -2106,11 +2111,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
                 immutable ccnt = (cast(string) qq in gQueueConsumers)
                     ? gQueueConsumers[cast(string) qq] : 0u;
-                method(o, chan, 50, 11, (ref ByteBuffer b) @nogc nothrow {
-                    putShortStr(b, qq);
-                    putU32(b, cast(uint)(cnt < 0 ? 0 : cnt));
-                    putU32(b, ccnt); // live consumers on this queue (shard-local)
-                });
+                if (!(qflags & 16)) // nowait: no declare-ok
+                    method(o, chan, 50, 11, (ref ByteBuffer b) @nogc nothrow {
+                        putShortStr(b, qq);
+                        putU32(b, cast(uint)(cnt < 0 ? 0 : cnt));
+                        putU32(b, ccnt); // live consumers on this queue (shard-local)
+                    });
                 return true;
             }
         case 20: // bind
@@ -2119,7 +2125,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto q = r.shortStr();
                 auto ex = r.shortStr();
                 auto rk = r.shortStr();
-                cast(void) r.u8(); // no-wait
+                immutable bnw = r.u8() & 1; // no-wait
                 auto bindArgs = r.tableRaw();
                 // Binding an unknown queue — or a named unknown exchange — is a
                 // channel 404 NOT_FOUND, like RabbitMQ: bindings must reference
@@ -2140,7 +2146,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 if (exclusiveDenied(c, chan, o, q, 50, 20))
                     return true;
                 ctlBroadcast(2, ex, q, rk, bindArgs);
-                method(o, chan, 50, 21);
+                if (!bnw)
+                    method(o, chan, 50, 21); // bind-ok (suppressed by nowait)
                 return true;
             }
         case 50: // unbind
@@ -2179,7 +2186,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 cast(void) r.u16();
                 auto q = r.shortStr();
-                cast(void) r.u8(); // if-unused/if-empty/no-wait bits
+                immutable qdel = r.u8(); // if-unused(1)/if-empty(2)/no-wait(4)
                 if (exclusiveDenied(c, chan, o, q, 50, 40))
                     return true;
                 static ByteBuffer dk; // TLS
@@ -2196,9 +2203,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     gAmqpDelKey(delKey); // DEL the backing list
                 if (queueExists(q)) // dedupe: only stream a delete for a known queue
                     ctlBroadcast(9, q, "", ""); // tombstone in the existence set
-                method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
-                    putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
-                });
+                if (!(qdel & 4))
+                    method(o, chan, 50, 41, (ref ByteBuffer b) @nogc nothrow {
+                        putU32(b, cast(uint)(n < 0 ? 0 : n)); // message_count
+                    });
                 return true;
             }
         default:
