@@ -1416,6 +1416,7 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     plk.deliveryCount++;
     // decode sections -> 0-9-1 props + body
+    int transferRouted = plk.isMgmt ? 1 : 0; // mgmt "routes" by definition
     if (plk.isMgmt)
         a10HandleMgmt(c, fchan, msg);
     else
@@ -1481,10 +1482,11 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
         char[512] exB = void, rkB = void;
         if (plk.anonymous && msgTo.length)
             a10ResolveAddress(msgTo, exB, rkB, exch, rkey); // anonymous relay
-        cast(void) a10Publish(exch, rkey,
+        transferRouted = a10Publish(exch, rkey,
                 cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
     }
-    // settle back (rcv-settle-mode first): disposition accepted+settled
+    // settle back (rcv-settle-mode first): ACCEPTED when routed, RELEASED
+    // when the message matched no queue (RabbitMQ's unroutable signal)
     if (!settled)
     {
         outb.clear();
@@ -1499,7 +1501,8 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
         a10Bool(outb, true); // settled
         l.n++;
         {
-            auto st2 = a10OpenPerf(outb, cast(ubyte) STATE_ACCEPTED);
+            auto st2 = a10OpenPerf(outb,
+                    transferRouted > 0 ? cast(ubyte) STATE_ACCEPTED : 0x26);
             a10Close(outb, st2);
         }
         l.n++;
