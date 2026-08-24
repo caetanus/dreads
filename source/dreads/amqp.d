@@ -1683,9 +1683,11 @@ private struct Channel
     TxSettle[] txSettles;
     bool prefetchGlobal; // basic.qos global bit: true = the prefetch window is
     // per-CHANNEL (shared); false (the default) = per-CONSUMER
-    string lastServed; // consumer tag of the LAST delivery under a global
-    // window — the freed slot is offered to the OTHER consumers first (the
-    // QosTests fairness pair pins round-robin-ish dispatch)
+    string lastServed; // (kept for context) tag of the last global-window delivery
+    string[] rrOrder; // live consumer tags in consume order: under a GLOBAL
+    // window the designated (rrNext) consumer gets first crack at each freed
+    // slot; others wait a bounded grace (the QosTests fairness pair)
+    size_t rrNext;
     string lastQueue; // "current queue": last queue DECLARED on this channel —
     // the spec default for an empty queue field in queue.bind/unbind/purge/
     // delete and basic.consume/get
@@ -1738,6 +1740,9 @@ private final class AmqpConn
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
     uint[string] consumerUnacked; // live unacked per consumer tag (qos global=false)
+    ulong flushSeq; // bumps after each serve-loop reply flush: a consumer's
+    // FIRST delivery must wait for the flush carrying its consume-ok (a long
+    // pipelined batch outlives the old fixed 1ms park -> "Unsolicited delivery")
     uint hbSendMs; // heartbeat SEND interval in MS (0 = disabled): the
     // negotiated interval HALVED, like RabbitMQ — a full-interval cadence sits
     // exactly on the client's reader-idle boundary and gets dropped (hb=1)
@@ -2055,6 +2060,7 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             sendTo(c, outb.data);
             outb.clear();
         }
+        c.flushSeq++; // parked first-delivery fibers may proceed
         inb.consume(pos);
     }
 }
@@ -4310,6 +4316,23 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
 /// never during it. Underflow-guarded.
 /// Decrement the owning channel's live-unacked counter (no-op if the channel
 /// is already gone — its counter died with it).
+/// Drop `tag` from the channel's global-window round-robin order (nothrow-safe
+/// for scope(exit) use — array concat can allocate).
+private void rrOrderRemove(AmqpConn c, ushort chan, string tag) nothrow @trusted
+{
+    try
+        if (auto rchx = chan in c.chans)
+            foreach (i3, v3; rchx.rrOrder)
+                if (v3 == tag)
+                {
+                    rchx.rrOrder = rchx.rrOrder[0 .. i3] ~ rchx.rrOrder[i3 + 1 .. $];
+                    break;
+                }
+    catch (Exception)
+    {
+    }
+}
+
 private void chanUnackedDec(AmqpConn c, ushort chan) nothrow @trusted
 {
     if (auto ch = chan in c.chans)
@@ -5169,6 +5192,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     qConsumerInc(qs); // live consumer_count for queue.declare-ok
     qPrioAdd(qs, prio); // x-priority dispatch preference
     try
+        if (auto rch0 = chan in c.chans)
+            rch0.rrOrder ~= ts; // global-window round-robin order
+    catch (Exception)
+    {
+    }
+    try
     {
         immutable ck0 = (cast(ulong) chan) << 32 | myGen;
         c.chanConsumers[ck0] = (ck0 in c.chanConsumers ? c.chanConsumers[ck0] : 0u) + 1;
@@ -5199,6 +5228,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     else
                         cc.chanConsumers.remove(ckx);
                 }
+                rrOrderRemove(cc, chn, tt);
             }
             ByteBuffer kb;
             kb.append("amq.q.");
@@ -5209,13 +5239,23 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             // same-shard pop + sendTo here would put the first delivery on the
             // wire BEFORE the consume-ok still staged in the handler's reply
             // buffer ("Unsolicited delivery": the client kills the connection
-            // on a delivery for a tag it hasn't confirmed). Park once so the
-            // serve fiber returns and flushes consume-ok first.
-            try
-                sleep(1.msecs);
-            catch (Exception)
-                return;
-            bool yieldedTurn = false; // one-shot fairness deferral (global qos)
+            // on a delivery for a tag it hasn't confirmed). Park until the
+            // serve loop FLUSHES the batch that staged our consume-ok — a
+            // fixed 1ms was outlived by long pipelined batches (multi-threaded
+            // clients + cross-shard publishes). Bounded: a nowait consume may
+            // never flush, so give up parking after ~50 ticks.
+            {
+                immutable wantFlush = cc.flushSeq + 1;
+                int parked = 0;
+                while (cc.flushSeq < wantFlush && parked++ < 50)
+                {
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                }
+            }
+            int graceTicks = 0; // bounded fairness deferral (global qos)
             while (!cc.closing)
             {
                 try
@@ -5280,19 +5320,19 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     immutable gatesNoAck = wch !is null && wch.prefetch && wch.prefetchGlobal;
                     windowFull = (!na || gatesNoAck) && (chanN >= limit
                             || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES);
-                    // fairness: after WE were served under a global window,
-                    // offer the freed slot to the channel's other consumers
-                    // first (one 1ms deferral, then proceed regardless)
-                    if (!windowFull && gatesNoAck && !yieldedTurn
-                            && wch.lastServed == tt)
+                    // fairness: under a global window the DESIGNATED consumer
+                    // (round-robin over the channel's live consumers) gets
+                    // first crack at each freed slot; everyone else waits a
+                    // bounded grace so an empty designated queue can't stall
+                    // the channel.
+                    if (!windowFull && gatesNoAck && wch.rrOrder.length > 1)
                     {
-                        immutable ckk = (cast(ulong) chn) << 32 | mg;
-                        if (auto pcn2 = ckk in cc.chanConsumers)
-                            if (*pcn2 > 1)
-                            {
-                                yieldedTurn = true;
-                                windowFull = true; // treat as one back-off tick
-                            }
+                        auto designated = wch.rrOrder[wch.rrNext % wch.rrOrder.length];
+                        if (designated != tt && graceTicks < 2)
+                        {
+                            graceTicks++;
+                            windowFull = true; // one 1ms back-off tick
+                        }
                     }
                 }
                 catch (Exception)
@@ -5415,8 +5455,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (auto sch = chn in cc.chans)
                         if (sch.prefetch && sch.prefetchGlobal)
                         {
-                            sch.lastServed = tt; // fairness rotation marker
-                            yieldedTurn = false;
+                            sch.lastServed = tt;
+                            // WE delivered: if we were the designated consumer,
+                            // pass the turn on; either way our grace resets
+                            if (sch.rrOrder.length
+                                    && sch.rrOrder[sch.rrNext % sch.rrOrder.length] == tt)
+                                sch.rrNext++;
+                            graceTicks = 0;
                         }
                 catch (Exception)
                 {
