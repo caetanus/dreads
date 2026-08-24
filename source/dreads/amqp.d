@@ -128,6 +128,7 @@ private struct QueueMeta
     string dlx; // x-dead-letter-exchange ("" = none)
     string dlrk; // x-dead-letter-routing-key ("" = original queue name)
     long ttlMs; // x-message-ttl (0 = no expiry); lazily dead-lettered/dropped
+    long maxLen; // x-max-length ENCODED +1 (0 = unset, N+1 = bound N); overflow drops the HEAD
 }
 
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
@@ -344,14 +345,18 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             }
             gBindings[ex] ~= Binding(a, b, exb, seq, true);
         }
-        else if (op == 3) // queue metadata: ex=queue, a=dlx, b=dlrk, ttl(i64 BE)
+        else if (op == 3) // queue metadata: ex=queue, a=dlx, b=dlrk, ttl+maxlen(i64 BE each)
         {
             auto b = rd().idup;
-            auto tb = rd(); // 8-byte big-endian x-message-ttl (may be empty)
+            auto tb = rd(); // 8B ttl [+ 8B x-max-length] big-endian (may be empty)
             long ttl = 0;
-            if (tb.length == 8)
+            long mxl = 0;
+            if (tb.length >= 8)
                 foreach (k; 0 .. 8)
                     ttl = (ttl << 8) | tb[k];
+            if (tb.length >= 16)
+                foreach (k; 8 .. 16)
+                    mxl = (mxl << 8) | tb[k];
             if ((cast(string) ex) !in gQueueMeta && gQueueMeta.length >= AMQP_MAX_QUEUEMETA)
             {
                 atomicOp!"+="(gAmqpCtlDrops, 1);
@@ -359,7 +364,7 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             }
             // merge, don't clobber: a redeclare that sets only ttl must not
             // erase a previously-configured DLX (and vice-versa)
-            QueueMeta qm = QueueMeta(a, b, ttl);
+            QueueMeta qm = QueueMeta(a, b, ttl, mxl);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (a.length == 0)
@@ -368,6 +373,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     qm.dlrk = ex0.dlrk;
                 if (ttl == 0)
                     qm.ttlMs = ex0.ttlMs;
+                if (mxl == 0)
+                    qm.maxLen = ex0.maxLen;
             }
             gQueueMeta[ex] = qm;
         }
@@ -1912,7 +1919,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // all inequivalent-arg 406s, like RabbitMQ.
                     immutable dk = tableStrKind(argsTbl, "x-dead-letter-exchange");
                     immutable rk2 = tableStrKind(argsTbl, "x-dead-letter-routing-key");
+                    long mlV;
+                    immutable mk = tableIntKind(argsTbl, "x-max-length", mlV);
                     if (tk < 0 || (tk > 0 && ttlV < 0) || ek < 0 || (ek > 0 && expV <= 0)
+                            || mk < 0 || (mk > 0 && mlV < 0)
                             || dk < 0 || rk2 < 0 || (rk2 > 0 && dk == 0))
                     {
                         channelClose(o, chan, 406,
@@ -1937,7 +1947,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                             auto rdlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                             auto rdrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
                             immutable rttl = tk > 0 ? ttlV : 0;
+                            immutable rml = mk > 0 ? mlV + 1 : 0; // +1-encoded like the meta
                             immutable mm = (m0.ttlMs != rttl)
+                                || (m0.maxLen != rml)
                                 || (m0.dlx != (rdlx is null ? "" : rdlx))
                                 || (m0.dlrk != (rdrk is null ? "" : rdrk));
                             if (mm)
@@ -1952,11 +1964,19 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     auto dlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                     auto dlrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
                     immutable ttl = tableGetInt(argsTbl, "x-message-ttl");
-                    if (dlx !is null || ttl > 0)
+                    long mxl2;
+                    immutable mlPresent = tableIntKind(argsTbl, "x-max-length", mxl2) > 0;
+                    // ENCODED as value+1 on the wire and in the meta: maxlen 0
+                    // is a VALID bound (the queue holds nothing) and must be
+                    // distinguishable from unset.
+                    immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
+                    if (dlx !is null || ttl > 0 || mlEnc > 0)
                     {
-                        ubyte[8] tb = void;
+                        ubyte[16] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
+                        foreach (k; 0 .. 8)
+                            tb[8 + k] = cast(ubyte)(mlEnc >> ((7 - k) * 8));
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -2566,7 +2586,8 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
             if (gAmqpPush !is null)
                 gAmqpPush(kbT.data.asChars, payload);
             routed++;
-        });
+                    enforceMaxLen(q);
+});
         atomicOp!"+="(gAmqpMessages, 1);
         if (tp.mandatory && routed == 0)
         {
@@ -2841,6 +2862,41 @@ private void requeueAndDropChannel(AmqpConn c, ushort chan) nothrow @trusted
     }
 }
 
+/// x-max-length: after a push, evict heads beyond the bound — dead-lettered
+/// (reason "maxlen") when the queue has a DLX, dropped otherwise. Runs inside
+/// the publish sink: every buffer here is stack-local because both the LLEN
+/// and the pops can hop cross-shard and YIELD (the delKeyStore hazard).
+private void enforceMaxLen(string q) nothrow @trusted
+{
+    long ml = 0;
+    try
+        if (auto m = q in gQueueMeta)
+            ml = m.maxLen;
+    catch (Exception)
+    {
+    }
+    if (ml <= 0 || gAmqpLen is null || gAmqpPop is null)
+        return;
+    ml -= 1; // decode: stored as bound+1 so a 0 bound stays distinct from unset
+    static ByteBuffer mkq; // consumed into the stack copy before any yield
+    queueKey(q, mkq);
+    char[8 + 256 + 4] ks = void;
+    immutable kl = mkq.length <= ks.length ? mkq.length : ks.length;
+    ks[0 .. kl] = cast(const(char)[]) mkq.data[0 .. kl];
+    auto key = cast(const(char)[]) ks[0 .. kl];
+    int guard = 0;
+    while (guard++ < 1024)
+    {
+        immutable n = gAmqpLen(key);
+        if (n <= ml)
+            break; // ml may be 0: a zero bound evicts everything
+        ByteBuffer pay; // local: the pop yields
+        if (!gAmqpPop(key, pay))
+            break;
+        deadLetter(q, cast(const(ubyte)[]) pay.data, "maxlen"); // drops if no DLX
+    }
+}
+
 private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
 {
     ch.pub.active = false;
@@ -2912,7 +2968,8 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;
-    });
+            enforceMaxLen(q);
+});
     // [basic.return] a mandatory publish that matched no queue must come BACK
     // to the publisher (312 NO_ROUTE) instead of vanishing while confirmed
     if (mandatory && routed == 0)
