@@ -5245,6 +5245,33 @@ package void a10ConsumerDec(scope const(char)[] q) nothrow @trusted
     }
 }
 
+/// 1.0 consumer x-priority registration (shared registry with 0-9-1).
+package void a10PrioAdd(scope const(char)[] q, int prio) nothrow @trusted
+{
+    try
+        qPrioAdd(cast(string) q.idup, prio);
+    catch (Exception)
+    {
+    }
+}
+
+package void a10PrioRemove(scope const(char)[] q, int prio) nothrow @trusted
+{
+    try
+        qPrioRemove(cast(string) q.idup, prio);
+    catch (Exception)
+    {
+    }
+}
+
+package int a10PrioMax(scope const(char)[] q) nothrow @trusted
+{
+    try
+        return qPrioMax(cast(string) q.idup);
+    catch (Exception)
+        return int.min;
+}
+
 package bool a10ExchangeExists(scope const(char)[] x) nothrow @trusted
 {
     try

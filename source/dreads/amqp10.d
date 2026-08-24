@@ -515,6 +515,7 @@ private struct A10Link
     bool anonymous; // empty sender target: per-message properties.to routing
     bool v2Queue; // "/queues/..." address: existence is ENFORCED (the v2
     // client declares via $management; attach/deliver must 404 when gone)
+    int prio; // attach properties "rabbitmq:priority" (consumer preference)
 }
 
 /// Address grammar shared by attach targets/sources and per-message `to`.
@@ -1110,6 +1111,22 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
         if (grabAddr(fields, addrBuf, addrLen))
             address = addrBuf[0 .. addrLen];
     }
+    // fields 7..12 skipped; field 13 = link properties (rabbitmq:priority)
+    foreach (fi2; 7 .. 13)
+        if (nf > fi2)
+            fields.skipValue();
+    if (nf >= 14)
+    {
+        auto lp = fields.readValue();
+        if (lp.kind == A10Val.Kind.map)
+        {
+            auto pv2 = a10MapGet(lp.bytes, lp.count, "rabbitmq:priority");
+            if (pv2.kind == A10Val.Kind.u64)
+                lk.prio = cast(int) pv2.u;
+            else if (pv2.kind == A10Val.Kind.i64)
+                lk.prio = cast(int) pv2.i;
+        }
+    }
     // resolve address -> (exchange, rkey): "/queues/N" is a queue,
     // "/exchanges/X[/RK]" routes through X, a plain name is a queue on the
     // default exchange, and an EMPTY sender target is the anonymous relay
@@ -1213,9 +1230,10 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     if (!lk.clientSender && !lk.isMgmt)
     {
-        import dreads.amqp : a10ConsumerInc;
+        import dreads.amqp : a10ConsumerInc, a10PrioAdd;
 
         a10ConsumerInc(lk.rkey); // replicated count: queue-info + x-expires
+        a10PrioAdd(lk.rkey, lk.prio);
         a10StartDelivery(c, fchan, lk.handle);
     }
     // grant link-credit to the client sender via flow
@@ -1355,7 +1373,7 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
 
             if (!a10ExchangeExists(plk.exchange))
             {
-                a10SendDetachError(c, fchan, handle, "amqp:resource-deleted",
+                a10SendDetachError(c, fchan, handle, "amqp:not-found",
                         plk.exchange);
                 plk.detached = true;
                 return;
@@ -2323,7 +2341,7 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                         immutable bn2 = snprintf(bb2.ptr, bb2.length,
                                 "invalid argument '%.*s' for queue",
                                 cast(int) badArg.length, badArg.ptr);
-                        a10MgmtRespond(c, fchan, "400", corrRaw, 2, null,
+                        a10MgmtRespond(c, fchan, "409", corrRaw, 2, null,
                                 bb2[0 .. bn2]);
                         return;
                     }
@@ -2955,6 +2973,17 @@ private void a10RefuseAttach(A10Conn c, ushort fchan, ref A10Link lk,
         l.n++;
         a10Null(o); // target
         l.n++;
+        if (!lk.clientSender)
+        {
+            // we'd be the SENDER: proton-j drops an attach missing the
+            // initial-delivery-count and then calls our detach uncorrelated
+            a10Null(o); // unsettled
+            l.n++;
+            a10Null(o); // incomplete-unsettled
+            l.n++;
+            a10UInt(o, 0); // initial-delivery-count
+            l.n++;
+        }
         a10Close(o, l);
         a10FrameFinish(o, f);
     }
@@ -3016,12 +3045,15 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 return;
             scope (exit)
             {
-                import dreads.amqp : a10ConsumerDec;
+                import dreads.amqp : a10ConsumerDec, a10PrioRemove;
 
                 auto psx = ch5 in cc.sessions;
                 if (psx !is null)
                     if (auto plx = h5 in psx.links)
+                    {
                         a10ConsumerDec(plx.rkey);
+                        a10PrioRemove(plx.rkey, plx.prio);
+                    }
             }
             while (!cc.closing)
             {
@@ -3056,6 +3088,20 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                     catch (Exception)
                         return;
                     continue;
+                }
+                {
+                    // consumer priority: defer while a HIGHER-priority
+                    // consumer is live on this queue (shared 0-9-1 registry)
+                    import dreads.amqp : a10PrioMax;
+
+                    if (pl5.prio < a10PrioMax(pl5.rkey))
+                    {
+                        try
+                            sleep(1.msecs);
+                        catch (Exception)
+                            return;
+                        continue;
+                    }
                 }
                 pay.clear();
                 if (!a10Pop(pl5.rkey, pay))
