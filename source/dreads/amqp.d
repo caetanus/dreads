@@ -5078,6 +5078,62 @@ package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
     return routed;
 }
 
+/// Pop one deliverable record from `q` (expired heads are dead-lettered and
+/// skipped, bounded). False = empty.
+package bool a10Pop(scope const(char)[] q, ref ByteBuffer outPayload) nothrow @trusted
+{
+    if (gAmqpPop is null)
+        return false;
+    static ByteBuffer kbp; // TLS
+    queueKey(q, kbp);
+    char[8 + 256 + 4] ks = void;
+    immutable kl = kbp.length <= ks.length ? kbp.length : ks.length;
+    ks[0 .. kl] = cast(const(char)[]) kbp.data[0 .. kl];
+    auto key = cast(const(char)[]) ks[0 .. kl];
+    int guard = 0;
+    while (guard++ < 64)
+    {
+        outPayload.clear();
+        if (!gAmqpPop(key, outPayload))
+            return false;
+        immutable qttl = queueTtl(q);
+        if (isExpired(outPayload.data, qttl)
+                && !(effectiveTtl(outPayload.data, qttl) == 0
+                    && !recordRedelivered(outPayload.data)))
+        {
+            deadLetter(q, outPayload.data, "expired");
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Requeue a popped record to the queue FRONT (marked redelivered); dropped
+/// when the queue no longer exists. x-max-length holds.
+package void a10Requeue(scope const(char)[] q, scope const(ubyte)[] blob) nothrow @trusted
+{
+    if (!queueExists(q))
+        return;
+    static ByteBuffer kbr; // TLS
+    queueKey(q, kbr);
+    static ByteBuffer rqr; // TLS
+    markRedelivered(rqr, blob);
+    if (gAmqpPushFront !is null)
+        gAmqpPushFront(kbr.data.asChars, rqr.data.asChars);
+    try
+        enforceMaxLen(q.idup);
+    catch (Exception)
+    {
+    }
+}
+
+/// Dead-letter (or drop) a client-rejected record.
+package void a10Reject(scope const(char)[] q, scope const(ubyte)[] blob) nothrow @trusted
+{
+    deadLetter(q, blob, "rejected");
+}
+
 /// ACTIVE x-message-ttl expiry (called ~1/s per shard from the maintenance
 /// tick). Lazy expiry only fires when a queue is READ; a message that outlives
 /// its TTL while sitting in an unconsumed queue would linger forever and never

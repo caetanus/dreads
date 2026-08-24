@@ -11,6 +11,7 @@ module dreads.amqp10;
 
 import vibe.core.net : TCPConnection;
 import vibe.core.core : runTask, sleep;
+import vibe.core.sync : TaskMutex;
 import core.time : msecs;
 import dreads.mem : ByteBuffer;
 
@@ -493,6 +494,19 @@ private struct A10Link
     bool pendingActive;
     ulong pendingDeliveryId;
     bool pendingSettled;
+    // --- client-RECEIVER links (we send): ---
+    uint outCredit; // link-credit the client granted us via flow
+    bool drain;
+    bool detached; // stops the delivery fiber
+    bool fiberLive;
+}
+
+/// One in-flight (unsettled) delivery we sent on a receiver link.
+private struct A10Out
+{
+    string queue;
+    immutable(ubyte)[] blob;
+    uint handle;
 }
 
 private struct A10Session
@@ -500,7 +514,9 @@ private struct A10Session
     ushort remoteCh; // the client's channel for this session
     uint nextIncomingId; // next transfer-id we expect
     uint incomingWindow = 2048;
+    uint nextOutgoingId; // delivery-id source for OUR transfers
     A10Link[uint] links; // keyed by the client's handle
+    A10Out[ulong] unsettled; // delivery-id -> in-flight delivery (we sent)
 }
 
 private final class A10Conn
@@ -511,10 +527,25 @@ private final class A10Conn
     long lastReadMs; // MonoTime ms (dead-peer, 0-9-1 lesson: never gClock)
     bool hbStarted;
     A10Session[ushort] sessions; // keyed by the CLIENT channel
+    TaskMutex wlock; // two writers (read-loop replies + delivery fibers)
 
     this(TCPConnection c) nothrow
     {
         tcp = c;
+        try
+            wlock = new TaskMutex;
+        catch (Exception)
+            assert(false);
+    }
+}
+
+private void a10TeardownRequeue(A10Conn c) nothrow
+{
+    try
+        foreach (ch6, ref sess; c.sessions)
+            a10RequeueUnsettled(c, ch6, uint.max);
+    catch (Exception)
+    {
     }
 }
 
@@ -543,7 +574,12 @@ private long monoMs10() nothrow @trusted
 private void a10Send(A10Conn c, scope const(ubyte)[] bytes) nothrow
 {
     try
+    {
+        c.wlock.lock();
+        scope (exit)
+            c.wlock.unlock();
         c.tcp.write(bytes);
+    }
     catch (Exception)
         c.closing = true;
 }
@@ -595,6 +631,7 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
     scope (exit)
     {
         c.closing = true;
+        a10TeardownRequeue(c);
         closeQuiet(tcp);
     }
 
@@ -790,6 +827,7 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
             }
         case PERF_END:
             {
+                a10RequeueUnsettled(c, fchan, uint.max);
                 try
                     c.sessions.remove(fchan);
                 catch (Exception)
@@ -812,8 +850,51 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
             a10HandleTransfer(c, fchan, fields, nf, body_, outb);
             break;
         case PERF_FLOW:
+            {
+                // fields: next-incoming-id(0) incoming-window(1)
+                // next-outgoing-id(2) outgoing-window(3) handle(4)
+                // delivery-count(5) link-credit(6) ... drain(9)
+                if (auto psf = fchan in c.sessions)
+                {
+                    foreach (k4; 0 .. 4)
+                        if (nf > k4)
+                            fields.skipValue();
+                    uint handle = uint.max;
+                    if (nf >= 5)
+                    {
+                        auto h4 = fields.readValue();
+                        if (h4.kind == A10Val.Kind.u64)
+                            handle = cast(uint) h4.u;
+                    }
+                    if (nf >= 6)
+                        fields.skipValue(); // delivery-count (their view)
+                    uint credit = 0;
+                    if (nf >= 7)
+                    {
+                        auto cr = fields.readValue();
+                        if (cr.kind == A10Val.Kind.u64)
+                            credit = cast(uint) cr.u;
+                    }
+                    if (nf >= 8)
+                        fields.skipValue(); // available
+                    bool drain = false;
+                    if (nf >= 9)
+                    {
+                        auto dr = fields.readValue();
+                        drain = dr.kind == A10Val.Kind.boolean && dr.b;
+                    }
+                    if (handle != uint.max)
+                        if (auto plf = handle in psf.links)
+                        {
+                            plf.outCredit = credit;
+                            plf.drain = drain;
+                        }
+                }
+                break;
+            }
         case PERF_DISPOSITION:
-            break; // M2: we grant credit and settle first; nothing to do yet
+            a10HandleDisposition(c, fchan, fields, nf);
+            break;
         case PERF_DETACH:
             {
                 uint handle;
@@ -824,7 +905,12 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
                         handle = cast(uint) h2.u;
                 }
                 if (auto ps = fchan in c.sessions)
+                {
+                    if (auto pl4 = handle in ps.links)
+                        pl4.detached = true; // delivery fiber exits on its next pass
+                    a10RequeueUnsettled(c, fchan, handle);
                     ps.links.remove(handle);
+                }
                 outb.clear();
                 {
                     auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
@@ -903,27 +989,37 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     const(char)[] address;
     char[512] addrBuf = void;
     size_t addrLen = 0;
-    if (nf >= 6)
-        fields.skipValue(); // source (we only need the client-sender TARGET)
-    if (nf >= 7)
+    // client-sender: the address is the TARGET (field 6); client-receiver:
+    // it is the SOURCE (field 5). Both are described lists with the address
+    // string at field 0.
+    static bool grabAddr(ref A10Dec fs, ref char[512] buf, ref size_t blen) nothrow
     {
-        // target: described list whose field 0 is the address string
-        auto tgt = fields.readValue();
-        if (tgt.kind == A10Val.Kind.described)
-        {
-            auto inner = fields.readValue();
-            if (inner.kind == A10Val.Kind.list && inner.count >= 1)
-            {
-                auto td = A10Dec(inner.bytes);
-                auto av = td.readValue();
-                if (av.kind == A10Val.Kind.str && av.bytes.length <= addrBuf.length)
-                {
-                    addrBuf[0 .. av.bytes.length] = cast(const(char)[]) av.bytes;
-                    addrLen = av.bytes.length;
-                    address = addrBuf[0 .. addrLen];
-                }
-            }
-        }
+        auto tgt = fs.readValue();
+        if (tgt.kind != A10Val.Kind.described)
+            return false;
+        auto inner = fs.readValue();
+        if (inner.kind != A10Val.Kind.list || inner.count < 1)
+            return false;
+        auto td = A10Dec(inner.bytes);
+        auto av = td.readValue();
+        if (av.kind != A10Val.Kind.str || av.bytes.length > buf.length)
+            return false;
+        buf[0 .. av.bytes.length] = cast(const(char)[]) av.bytes;
+        blen = av.bytes.length;
+        return true;
+    }
+
+    if (nf >= 6)
+    {
+        if (!lk.clientSender && grabAddr(fields, addrBuf, addrLen))
+            address = addrBuf[0 .. addrLen];
+        else if (lk.clientSender)
+            fields.skipValue(); // source unused for a client sender
+    }
+    if (nf >= 7 && lk.clientSender)
+    {
+        if (grabAddr(fields, addrBuf, addrLen))
+            address = addrBuf[0 .. addrLen];
     }
     // resolve address -> (exchange, rkey): "/exchanges/X/RK" or "/exchange/X/RK"
     // routes through X; a plain name is a queue on the default exchange
@@ -959,7 +1055,8 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     catch (Exception)
     {
     }
-    // reply attach (our role = receiver=true for a client sender)
+    // reply attach (our role: receiver=true for a client sender, sender=false
+    // for a client receiver — always the flip of theirs)
     outb.clear();
     {
         auto f = a10FrameStart(outb, FRAME_TYPE_AMQP, fchan);
@@ -968,24 +1065,46 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
         l.n++;
         a10UInt(outb, lk.handle);
         l.n++;
-        a10Bool(outb, lk.clientSender); // our role: receiver when client sends
+        a10Bool(outb, lk.clientSender); // true=receiver iff the client sends
         l.n++;
         a10Null(outb); // snd-settle-mode
         l.n++;
         a10Null(outb); // rcv-settle-mode
         l.n++;
-        a10Null(outb); // source
+        if (lk.clientSender)
+            a10Null(outb); // source
+        else
+        {
+            auto sl = a10OpenPerf(outb, 0x28); // source (we deliver FROM it)
+            a10Str(outb, address);
+            sl.n++;
+            a10Close(outb, sl);
+        }
         l.n++;
         {
             auto tl = a10OpenPerf(outb, 0x29); // target
-            a10Str(outb, address);
-            tl.n++;
+            if (lk.clientSender)
+            {
+                a10Str(outb, address);
+                tl.n++;
+            }
             a10Close(outb, tl);
         }
         l.n++;
+        if (!lk.clientSender)
+        {
+            a10Null(outb); // unsettled
+            l.n++;
+            a10Null(outb); // incomplete-unsettled
+            l.n++;
+            a10UInt(outb, 0); // initial-delivery-count (we are the sender)
+            l.n++;
+        }
         a10Close(outb, l);
         a10FrameFinish(outb, f);
     }
+    if (!lk.clientSender)
+        a10StartDelivery(c, fchan, lk.handle);
     // grant link-credit to the client sender via flow
     if (lk.clientSender)
     {
@@ -1331,6 +1450,377 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
     {
         props.appendByte(cast(char) expiration.length);
         props.append(expiration);
+    }
+}
+
+/// Requeue every unsettled delivery of `handle` (uint.max = all handles) on
+/// session `fchan` — link detach, session end, connection teardown.
+private void a10RequeueUnsettled(A10Conn c, ushort fchan, uint handle) nothrow
+{
+    import dreads.amqp : a10Requeue;
+
+    auto ps = fchan in c.sessions;
+    if (ps is null)
+        return;
+    try
+    {
+        ulong[] drop;
+        foreach (id, ref o; ps.unsettled)
+            if (handle == uint.max || o.handle == handle)
+                drop ~= id;
+        foreach (id; drop)
+        {
+            if (auto po = id in ps.unsettled)
+                a10Requeue(po.queue, po.blob);
+            ps.unsettled.remove(id);
+        }
+    }
+    catch (Exception)
+    {
+    }
+}
+
+/// Client disposition over OUR deliveries: accepted settles, released
+/// requeues, rejected dead-letters, modified requeues.
+private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
+        uint nf) nothrow
+{
+    import dreads.amqp : a10Requeue, a10Reject;
+
+    auto ps = fchan in c.sessions;
+    if (ps is null)
+        return;
+    // fields: role(0) first(1) last(2) settled(3) state(4)
+    bool role;
+    if (nf >= 1)
+    {
+        auto r = fields.readValue();
+        role = r.kind == A10Val.Kind.boolean && r.b;
+    }
+    if (!role)
+        return; // only receiver dispositions settle OUR sends
+    ulong first, last;
+    if (nf >= 2)
+    {
+        auto f2 = fields.readValue();
+        if (f2.kind == A10Val.Kind.u64)
+            first = f2.u;
+    }
+    last = first;
+    if (nf >= 3)
+    {
+        auto l2 = fields.readValue();
+        if (l2.kind == A10Val.Kind.u64)
+            last = l2.u;
+        // null last = just `first`
+    }
+    if (nf >= 4)
+        fields.skipValue(); // settled
+    ulong state = STATE_ACCEPTED;
+    if (nf >= 5)
+    {
+        auto st = fields.readValue();
+        if (st.kind == A10Val.Kind.described && st.u != ulong.max)
+        {
+            state = st.u;
+            fields.skipValue(); // the state's (empty) list
+        }
+    }
+    foreach (id; first .. last + 1)
+    {
+        auto po = id in ps.unsettled;
+        if (po is null)
+            continue;
+        switch (state)
+        {
+        case 0x26: // released
+        case 0x27: // modified
+            a10Requeue(po.queue, po.blob);
+            break;
+        case 0x25: // rejected
+            a10Reject(po.queue, po.blob);
+            break;
+        default: // accepted (0x24)
+            break;
+        }
+        try
+            ps.unsettled.remove(id);
+        catch (Exception)
+        {
+        }
+    }
+}
+
+/// Map a stored 0-9-1 record back onto a 1.0 bare message: header (durable/
+/// priority/ttl), properties (reply-to/correlation-id/content-type),
+/// application-properties from the headers table, one data section.
+private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothrow @trusted
+{
+    import dreads.amqp : splitRecord, propsHeaders, propsReplyTo, tableWalk;
+
+    long pm;
+    int deaths;
+    const(char)[] rk;
+    const(ubyte)[] props, body_;
+    splitRecord(blob, pm, deaths, rk, props, body_);
+
+    // fixed props walk (flags order)
+    ushort flags = 0;
+    size_t i = 2;
+    const(char)[] contentType, correlationId, replyTo;
+    ubyte deliveryMode = 0, priority = 0;
+    if (props.length >= 2)
+    {
+        flags = cast(ushort)((props[0] << 8) | props[1]);
+        static const(char)[] ss(scope const(ubyte)[] pp, ref size_t j) @nogc nothrow
+        {
+            if (j >= pp.length || j + 1 + pp[j] > pp.length)
+                return null;
+            auto s2 = cast(const(char)[]) pp[j + 1 .. j + 1 + pp[j]];
+            j += 1 + pp[j];
+            return s2;
+        }
+
+        if (flags & 0x8000)
+            contentType = ss(props, i);
+        if (flags & 0x4000)
+            cast(void) ss(props, i);
+        if (flags & 0x2000)
+        {
+            if (i + 4 <= props.length)
+            {
+                immutable n = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+                    | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+                i += 4 + n;
+            }
+        }
+        if ((flags & 0x1000) && i < props.length)
+            deliveryMode = props[i++];
+        if ((flags & 0x0800) && i < props.length)
+            priority = props[i++];
+        if (flags & 0x0400)
+            correlationId = ss(props, i);
+        if (flags & 0x0200)
+            replyTo = ss(props, i);
+    }
+
+    // header section
+    {
+        auto hl = a10OpenPerf(o, cast(ubyte) SEC_HEADER);
+        a10Bool(o, deliveryMode == 2); // durable
+        hl.n++;
+        if (priority)
+        {
+            o.appendByte(0x50); // ubyte
+            o.appendByte(cast(char) priority);
+            hl.n++;
+        }
+        a10Close(o, hl);
+    }
+    // properties section
+    if (contentType.length || correlationId.length || replyTo.length)
+    {
+        auto pl = a10OpenPerf(o, cast(ubyte) SEC_PROPERTIES);
+        a10Null(o); // message-id
+        pl.n++;
+        a10Null(o); // user-id
+        pl.n++;
+        a10Null(o); // to
+        pl.n++;
+        a10Null(o); // subject
+        pl.n++;
+        if (replyTo.length)
+            a10Str(o, replyTo);
+        else
+            a10Null(o);
+        pl.n++;
+        if (correlationId.length)
+            a10Str(o, correlationId);
+        else
+            a10Null(o);
+        pl.n++;
+        if (contentType.length)
+            a10Sym(o, contentType);
+        else
+            a10Null(o);
+        pl.n++;
+        a10Close(o, pl);
+    }
+    // application-properties from the 0-9-1 headers table
+    auto hdrs = propsHeaders(props);
+    if (hdrs !is null && hdrs.length)
+    {
+        o.appendByte(0x00);
+        a10SmallUlong(o, cast(ubyte) SEC_APP_PROPERTIES);
+        o.appendByte(0xD1); // map32
+        immutable szAt = o.length;
+        a10PutU32(o, 0);
+        immutable cntAt = o.length;
+        a10PutU32(o, 0);
+        uint n2 = 0;
+        cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
+                scope const(ubyte)[] v) nothrow {
+            if (ty == 'S')
+            {
+                a10Str(o, k);
+                a10Str(o, cast(const(char)[]) v);
+                n2 += 2;
+            }
+            else if ((ty == 'l' || ty == 'T') && v.length == 8)
+            {
+                long lv = 0;
+                foreach (b3; v)
+                    lv = (lv << 8) | b3;
+                a10Str(o, k);
+                o.appendByte(0x81);
+                foreach (k3; 0 .. 8)
+                    o.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+                n2 += 2;
+            }
+            else if (ty == 'I' && v.length == 4)
+            {
+                a10Str(o, k);
+                o.appendByte(0x71);
+                foreach (k3; 0 .. 4)
+                    o.appendByte(cast(char) v[k3]);
+                n2 += 2;
+            }
+            else if (ty == 't' && v.length == 1)
+            {
+                a10Str(o, k);
+                a10Bool(o, v[0] != 0);
+                n2 += 2;
+            }
+            return true;
+        });
+        a10PatchU32(o, szAt, cast(uint)(o.length - cntAt));
+        a10PatchU32(o, cntAt, n2);
+    }
+    // data section
+    {
+        o.appendByte(0x00);
+        a10SmallUlong(o, cast(ubyte) SEC_DATA);
+        a10Bin(o, body_);
+    }
+}
+
+/// Delivery fiber for one client-receiver link: pops from the source queue
+/// while the client has granted credit, sends transfers, tracks unsettled.
+private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
+{
+    try
+        cast(void) runTask((A10Conn cc, ushort ch5, uint h5) nothrow {
+            import dreads.amqp : a10Pop;
+
+            ByteBuffer pay;
+            ByteBuffer outd;
+            ByteBuffer msg;
+            // park until the attach reply flush (0-9-1 flushSeq lesson: the
+            // attach echo must hit the wire before the first transfer)
+            try
+                sleep(2.msecs);
+            catch (Exception)
+                return;
+            while (!cc.closing)
+            {
+                auto ps5 = ch5 in cc.sessions;
+                if (ps5 is null)
+                    return;
+                auto pl5 = h5 in ps5.links;
+                if (pl5 is null || pl5.detached)
+                    return;
+                if (pl5.outCredit == 0)
+                {
+                    if (pl5.drain)
+                    {
+                        // drain with nothing to send: burn the credit and echo
+                        pl5.drain = false;
+                    }
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                    continue;
+                }
+                pay.clear();
+                if (!a10Pop(pl5.rkey, pay))
+                {
+                    if (pl5.drain)
+                    {
+                        // drain: advance delivery-count by remaining credit,
+                        // zero the credit, echo a flow so the client unblocks
+                        pl5.deliveryCount += pl5.outCredit;
+                        pl5.outCredit = 0;
+                        pl5.drain = false;
+                        outd.clear();
+                        auto fD = a10FrameStart(outd, FRAME_TYPE_AMQP, ch5);
+                        auto lD = a10OpenPerf(outd, cast(ubyte) PERF_FLOW);
+                        a10UInt(outd, ps5.nextIncomingId);
+                        lD.n++;
+                        a10UInt(outd, 2048);
+                        lD.n++;
+                        a10UInt(outd, ps5.nextOutgoingId);
+                        lD.n++;
+                        a10UInt(outd, 2048);
+                        lD.n++;
+                        a10UInt(outd, h5);
+                        lD.n++;
+                        a10UInt(outd, pl5.deliveryCount);
+                        lD.n++;
+                        a10UInt(outd, 0); // link-credit exhausted
+                        lD.n++;
+                        a10Close(outd, lD);
+                        a10FrameFinish(outd, fD);
+                        a10Send(cc, cast(const(ubyte)[]) outd.data);
+                    }
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                    continue;
+                }
+                // build transfer + message
+                immutable did = ps5.nextOutgoingId++;
+                pl5.deliveryCount++;
+                pl5.outCredit--;
+                try
+                    ps5.unsettled[did] = A10Out(pl5.rkey,
+                            (cast(const(ubyte)[]) pay.data).idup, h5);
+                catch (Exception)
+                {
+                }
+                outd.clear();
+                auto fT = a10FrameStart(outd, FRAME_TYPE_AMQP, ch5);
+                auto lT = a10OpenPerf(outd, cast(ubyte) PERF_TRANSFER);
+                a10UInt(outd, h5); // handle
+                lT.n++;
+                a10UInt(outd, did); // delivery-id
+                lT.n++;
+                {
+                    ubyte[4] dt = void;
+                    dt[0] = cast(ubyte)(did >> 24);
+                    dt[1] = cast(ubyte)(did >> 16);
+                    dt[2] = cast(ubyte)(did >> 8);
+                    dt[3] = cast(ubyte)(did & 0xFF);
+                    a10Bin(outd, dt[]);
+                }
+                lT.n++;
+                a10UInt(outd, 0); // message-format
+                lT.n++;
+                a10Bool(outd, false); // settled: client dispositions decide
+                lT.n++;
+                a10Bool(outd, false); // more
+                lT.n++;
+                a10Close(outd, lT);
+                msg.clear();
+                a10BuildMessage(cast(const(ubyte)[]) pay.data, msg);
+                outd.append(cast(const(char)[]) msg.data);
+                a10FrameFinish(outd, fT);
+                a10Send(cc, cast(const(ubyte)[]) outd.data);
+            }
+        }, c, fchan, handle);
+    catch (Exception)
+    {
     }
 }
 
