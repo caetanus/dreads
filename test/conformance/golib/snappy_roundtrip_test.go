@@ -11,6 +11,7 @@ func TestSnappyRoundTrip(t *testing.T) {
 	topic := "snappy_rt"
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers("127.0.0.1:19092"),
+		kgo.AllowAutoTopicCreation(),
 		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	)

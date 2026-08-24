@@ -13,6 +13,7 @@ func TestGzipRoundTrip(t *testing.T) {
 	topic := "gzip_rt"
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers("127.0.0.1:19092"),
+		kgo.AllowAutoTopicCreation(),
 		kgo.ProducerBatchCompression(kgo.GzipCompression()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	)

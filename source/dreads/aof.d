@@ -43,11 +43,61 @@ private void emitSelect(ref ByteBuffer buf, int db) @nogc nothrow
 import dreads.resp;
 import dreads.scripting : evalCommand;
 
+// ---------------------------------------------------------------------------
+// AOF v2 — the RESP-IR format ("o AOF em RESP-IR"). The file opens with an
+// 8-byte magic + the build's command-table hash; every entry is a framed
+// record `[u32 len][u8 kind][u16 db]` where len counts the bytes AFTER the
+// len field. kind 0 = RAW (one or more whole RESP commands — dumps, synthetic
+// DELs, script effects; replay parses them exactly like the legacy stream,
+// SELECT frames included). kind 1 = IR: `[u16 opcode][u16 argc]
+// [(u32 off,u32 len) x argc][raw resp]` — the hop descriptor's layout, so
+// replay rebuilds the RVal from offsets with NO RESP scan and dispatches by
+// opcode with NO name resolution. Opcodes are only trusted when the file's
+// command-table hash matches this build (indices shift when the table
+// changes); on mismatch replay falls back to resolving arg0 — still
+// parse-free. A pre-existing legacy file keeps its format until the next
+// rewrite (sticky per file; a mid-file format flip would corrupt replay).
+public enum ubyte[8] AOF_IR_MAGIC = cast(ubyte[8]) "#AOFIR2\n";
+
+/// FNV-1a over the command table's names in order: opcode validity fingerprint.
+public enum ulong aofCmdTableHash = ()
+{
+    import dreads.aclcat : gCmdCats;
+
+    ulong h = 1469598103934665603UL;
+    foreach (c; gCmdCats)
+    {
+        foreach (ch; c.name)
+        {
+            h ^= cast(ubyte) ch;
+            h *= 1099511628211UL;
+        }
+        h ^= 0xFF; // name separator
+        h *= 1099511628211UL;
+    }
+    return h;
+}();
+
+private void aofPutU32(ref ByteBuffer b, uint v) @nogc nothrow
+{
+    b.appendByte(cast(char)(v >> 24));
+    b.appendByte(cast(char)(v >> 16));
+    b.appendByte(cast(char)(v >> 8));
+    b.appendByte(cast(char)(v & 0xFF));
+}
+
+private uint aofGetU32(scope const(ubyte)[] d, size_t i) @nogc nothrow
+{
+    return (cast(uint) d[i] << 24) | (cast(uint) d[i + 1] << 16)
+        | (cast(uint) d[i + 2] << 8) | d[i + 3];
+}
+
 public struct Aof
 {
     private FILE* f;
     private ByteBuffer pending;
     private bool dirty;
+    private bool irMode; // v2 framing (fresh files + rewrites); legacy files stay raw
     // The db the log stream is currently positioned on (-1 = unknown, force a
     // SELECT on the next append). A write on a different db emits `SELECT <db>`
     // first, so replay routes each command to the right database.
@@ -78,6 +128,35 @@ public struct Aof
         zpath[0 .. path.length] = path;
         zpath[path.length] = 0;
         f = fopen(zpath.ptr, "ab");
+        irMode = false;
+        if (f !is null)
+        {
+            import core.stdc.stdio : ftell;
+
+            immutable long sz = ftell(f); // "ab" opens positioned at EOF
+            if (sz == 0)
+            {
+                // fresh file: v2 header (magic + this build's table hash)
+                ubyte[16] hdr = void;
+                hdr[0 .. 8] = AOF_IR_MAGIC[];
+                foreach (k; 0 .. 8)
+                    hdr[8 + k] = cast(ubyte)(aofCmdTableHash >> ((7 - k) * 8));
+                if (fwrite(hdr.ptr, 1, 16, f) == 16)
+                    irMode = true;
+            }
+            else
+            {
+                // existing file: the format is whatever it opens with (sticky)
+                auto probe = fopen(zpath.ptr, "rb");
+                if (probe !is null)
+                {
+                    ubyte[8] m = void;
+                    if (fread(m.ptr, 1, 8, probe) == 8 && m == AOF_IR_MAGIC)
+                        irMode = true;
+                    fclose(probe);
+                }
+            }
+        }
         if (f !is null)
         {
             // UNBUFFERED: the AOF already batches in its own `pending` buffer, so
@@ -104,13 +183,72 @@ public struct Aof
         f = null;
     }
 
-    /// Stages one command's raw RESP bytes; cheap, no I/O.
+    /// Stages one command's raw RESP bytes; cheap, no I/O. Under the v2
+    /// format the bytes travel as ONE RAW record stamped with the ambient db.
     void append(scope const(ubyte)[] bytes) @nogc nothrow
     {
         if (f is null)
             return;
-        maybeSelect();
+        if (!irMode)
+        {
+            maybeSelect();
+            pending.append(bytes);
+            return;
+        }
+        import dreads.notify : gNotifyDb;
+
+        aofPutU32(pending, cast(uint)(3 + bytes.length));
+        pending.appendByte(0); // kind RAW
+        immutable ushort db = cast(ushort)(gNotifyDb < 0 ? 0 : gNotifyDb);
+        pending.appendByte(cast(char)(db >> 8));
+        pending.appendByte(cast(char)(db & 0xFF));
         pending.append(bytes);
+    }
+
+    /// Stages one command as an IR record: opcode + per-arg offsets + the raw
+    /// RESP — replay rebuilds the args with no scan and dispatches by opcode.
+    /// Falls back to append() when the file is legacy or the shape is odd.
+    void appendIR(const ref RVal cmd, int opcode, scope const(ubyte)[] raw) @nogc nothrow
+    {
+        if (f is null)
+            return;
+        if (!irMode || opcode < 0 || cmd.type != RType.Array
+                || cmd.arr.length == 0 || cmd.arr.length > 0xFFFF)
+        {
+            append(raw);
+            return;
+        }
+        // every arg must be a slice INTO raw (the parse is zero-copy, so this
+        // holds for wire commands; synthesized ones go through append())
+        auto base = cast(const(char)*) raw.ptr;
+        foreach (ref a; cmd.arr)
+        {
+            if (a.type != RType.BulkString || a.str.ptr < base
+                    || a.str.ptr + a.str.length > base + raw.length)
+            {
+                append(raw);
+                return;
+            }
+        }
+        import dreads.notify : gNotifyDb;
+
+        immutable uint plen = cast(uint)(3 + 2 + 2 + cmd.arr.length * 8 + raw.length);
+        aofPutU32(pending, plen);
+        pending.appendByte(1); // kind IR
+        immutable ushort db = cast(ushort)(gNotifyDb < 0 ? 0 : gNotifyDb);
+        pending.appendByte(cast(char)(db >> 8));
+        pending.appendByte(cast(char)(db & 0xFF));
+        pending.appendByte(cast(char)(opcode >> 8));
+        pending.appendByte(cast(char)(opcode & 0xFF));
+        immutable ushort argc = cast(ushort) cmd.arr.length;
+        pending.appendByte(cast(char)(argc >> 8));
+        pending.appendByte(cast(char)(argc & 0xFF));
+        foreach (ref a; cmd.arr)
+        {
+            aofPutU32(pending, cast(uint)(a.str.ptr - base));
+            aofPutU32(pending, cast(uint) a.str.length);
+        }
+        pending.append(raw);
     }
 
     /// Re-encodes EVALSHA as EVAL so replay does not depend on the script cache.
@@ -119,12 +257,15 @@ public struct Aof
     {
         if (f is null)
             return;
-        maybeSelect();
-        repArrayHeader(pending, rest.length + 2);
-        repBulk(pending, "EVAL");
-        repBulk(pending, body_);
+        // built in a scratch so the v2 path can frame it as one RAW record
+        static ByteBuffer eb; // TLS: consumed synchronously below
+        eb.clear();
+        repArrayHeader(eb, rest.length + 2);
+        repBulk(eb, "EVAL");
+        repBulk(eb, body_);
         foreach (ref a; rest)
-            repBulk(pending, a.str);
+            repBulk(eb, a.str);
+        append(cast(const(ubyte)[]) eb.data);
     }
 
     /// Hands staged bytes to the OS (survives a process crash).
@@ -418,7 +559,30 @@ public bool aofRewrite(ref Aof live, scope const(char)[] path,
 
         aclDumpUsers(buf);
     }
-    bool ioOk = buf.empty || fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
+    // the rewrite is the format-upgrade point: always v2 — header + ONE RAW
+    // record wrapping the SELECT-framed dump (it already sits fully in buf)
+    bool ioOk;
+    {
+        ubyte[16] hdr = void;
+        hdr[0 .. 8] = AOF_IR_MAGIC[];
+        foreach (k; 0 .. 8)
+            hdr[8 + k] = cast(ubyte)(aofCmdTableHash >> ((7 - k) * 8));
+        ioOk = fwrite(hdr.ptr, 1, 16, f) == 16;
+        if (ioOk && !buf.empty)
+        {
+            if (buf.length > uint.max - 3)
+                ioOk = false; // cannot frame a >4GB dump in one record
+            else
+            {
+                immutable uint plen = cast(uint)(3 + buf.length);
+                ubyte[7] rh = [cast(ubyte)(plen >> 24), cast(ubyte)(plen >> 16),
+                    cast(ubyte)(plen >> 8), cast(ubyte)(plen & 0xFF),
+                    0 /* kind RAW */ , 0, 0 /* db 0; inner SELECTs route */ ];
+                ioOk = fwrite(rh.ptr, 1, 7, f) == 7
+                    && fwrite(buf.data.ptr, 1, buf.length, f) == buf.length;
+            }
+        }
+    }
     fflush(f);
     version (Posix)
         fsync(fileno(f));
@@ -489,7 +653,8 @@ public void logAfterDispatch(ref Aof aof, scope const(ubyte)[] rawCmd,
 
 /// Replays one logged command. EVAL goes to the scripting engine; everything
 /// else through the regular dispatch.
-private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer sink, ref Arena arena) nothrow
+private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer sink,
+        ref Arena arena, int knownIdx = -1) nothrow
 {
     if (cmd.type == RType.Array && cmd.arr.length > 0 && cmd.arr[0].type == RType.BulkString)
     {
@@ -506,7 +671,7 @@ private void replayCommand(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer s
             }
         }
     }
-    dispatch(cmd, ks, sink, arena);
+    dispatch(cmd, ks, sink, arena, 0, knownIdx);
 }
 
 /// Recognise a replay-stream `SELECT <n>` (0 <= n < NUM_DBS) and return its db.
@@ -535,6 +700,127 @@ public bool aofIsSelect(ref const RVal cmd, out int db) @nogc nothrow
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// v2 replay plumbing (shared by aofLoad and aofLoadSharded)
+// ---------------------------------------------------------------------------
+
+/// Streams v2 records off an open file. Payload slices stay valid until the
+/// next next() call. A partial trailing record sets truncated (tolerated, like
+/// the legacy truncated-tail case); an impossible frame sets corrupt.
+private struct AofRecReader
+{
+    FILE* f;
+    ByteBuffer inb;
+    size_t pos;
+    bool truncated;
+    bool corrupt;
+
+    private bool fill(size_t need) nothrow
+    {
+        if (inb.length - pos >= need)
+            return true;
+        // compact ONCE per refill — a per-record consume() would memmove the
+        // whole buffered tail for every ~80-byte record (quadratic replay)
+        if (pos > 0)
+        {
+            inb.consume(pos);
+            pos = 0;
+        }
+        while (inb.length < need)
+        {
+            auto space = inb.freeSpace(64 * 1024);
+            auto n = fread(space.ptr, 1, space.length, f);
+            if (n == 0)
+                return false;
+            inb.grow(n);
+        }
+        return true;
+    }
+
+    bool next(out ubyte kind, out ushort db, out const(ubyte)[] payload) nothrow
+    {
+        if (!fill(4))
+        {
+            truncated = inb.length - pos > 0;
+            return false;
+        }
+        auto d = cast(const(ubyte)[]) inb.data;
+        immutable uint len = aofGetU32(d, pos);
+        if (len < 3)
+        {
+            corrupt = true;
+            return false;
+        }
+        if (!fill(4 + cast(size_t) len))
+        {
+            truncated = true;
+            return false;
+        }
+        d = cast(const(ubyte)[]) inb.data; // fill() may have reallocated
+        kind = d[pos + 4];
+        db = cast(ushort)((d[pos + 5] << 8) | d[pos + 6]);
+        payload = d[pos + 7 .. pos + 4 + len];
+        pos += 4 + len;
+        return true;
+    }
+}
+
+/// Sniffs the 16-byte v2 header off a just-opened file. On a legacy file the
+/// consumed bytes are pushed into `spill` so the legacy parse loop starts from
+/// byte 0. trustOps = the stored command-table hash matches this build, so IR
+/// opcodes index gCmdCats directly; otherwise replay re-resolves from arg0.
+private bool aofSniffV2(FILE* f, ref ByteBuffer spill, out bool trustOps) nothrow
+{
+    ubyte[16] hdr = void;
+    auto hn = fread(hdr.ptr, 1, 16, f);
+    if (hn >= 8 && hdr[0 .. 8] == AOF_IR_MAGIC)
+    {
+        ulong h = 0;
+        if (hn == 16)
+            foreach (k; 0 .. 8)
+                h = (h << 8) | hdr[8 + k];
+        trustOps = hn == 16 && h == aofCmdTableHash;
+        return true;
+    }
+    trustOps = false;
+    spill.append(hdr[0 .. hn]);
+    return false;
+}
+
+/// Decodes one IR record payload: `[u16 opcode][u16 argc][(u32,u32) x argc]
+/// [raw resp]` into an arena-backed BulkString array. opcode comes out -1
+/// unless trustOps (indices are only meaningful under a matching table hash).
+private bool aofDecodeIR(const(ubyte)[] payload, ref Arena arena, bool trustOps,
+        out RVal cmd, out int opcode) nothrow
+{
+    import dreads.aclcat : gCmdCats;
+
+    opcode = -1;
+    if (payload.length < 4)
+        return false;
+    immutable int op = (payload[0] << 8) | payload[1];
+    immutable size_t argc = (payload[2] << 8) | payload[3];
+    immutable size_t tbl = 4 + argc * 8;
+    if (argc == 0 || payload.length < tbl)
+        return false;
+    auto raw = payload[tbl .. $];
+    auto items = arena.allocArray!RVal(argc);
+    foreach (i; 0 .. argc)
+    {
+        immutable size_t off = aofGetU32(payload, 4 + i * 8);
+        immutable size_t len = aofGetU32(payload, 4 + i * 8 + 4);
+        if (off > raw.length || len > raw.length - off)
+            return false;
+        items[i].type = RType.BulkString;
+        items[i].str = cast(const(char)[]) raw[off .. off + len];
+    }
+    cmd.type = RType.Array;
+    cmd.arr = items;
+    if (trustOps && op >= 0 && op < gCmdCats.length)
+        opcode = op;
+    return true;
+}
+
 /// Loads an AOF into ks (the db-0 keyspace). A `SELECT <n>` in the stream routes
 /// subsequent commands into `gDbs[n]`. Returns the number of commands replayed,
 /// or -1 when the file exists but is unreadable. A truncated tail is tolerated.
@@ -556,13 +842,101 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
     bool corrupt = false;
     Keyspace* curKs = &ks; // a `SELECT <n>` re-points this into gDbs
 
+    bool trustOps;
+    if (aofSniffV2(f, inb, trustOps))
+    {
+        AofRecReader rd;
+        rd.f = f;
+        ubyte kind;
+        ushort rdb;
+        const(ubyte)[] payload;
+        while (rd.next(kind, rdb, payload))
+        {
+            if (rdb >= NUM_DBS)
+            {
+                corrupt = true;
+                break;
+            }
+            auto recKs = rdb == 0 ? &ks : &gDbs[rdb];
+            if (kind == 1)
+            {
+                RVal cmd;
+                int op;
+                if (!aofDecodeIR(payload, arena, trustOps, cmd, op))
+                {
+                    corrupt = true;
+                    break;
+                }
+                replayCommand(cmd, *recKs, sink, arena, op);
+                sink.clear();
+                arena.reset();
+                {
+                    import dreads.commands : propagationOverride;
+
+                    propagationOverride.clear();
+                }
+                count++;
+            }
+            else if (kind == 0)
+            {
+                // whole RESP commands; inner SELECT frames re-route (dumps)
+                size_t pp = 0;
+                auto cur = recKs;
+                for (;;)
+                {
+                    RVal cmd;
+                    auto st = parseValue(payload, pp, arena, cmd);
+                    if (st == ParseStatus.incomplete)
+                    {
+                        if (pp != payload.length)
+                            corrupt = true; // a delivered record holds whole commands
+                        break;
+                    }
+                    if (st == ParseStatus.protocolError)
+                    {
+                        corrupt = true;
+                        break;
+                    }
+                    int selDb;
+                    if (aofIsSelect(cmd, selDb))
+                    {
+                        cur = selDb == 0 ? &ks : &gDbs[selDb];
+                        continue;
+                    }
+                    replayCommand(cmd, *cur, sink, arena);
+                    sink.clear();
+                    {
+                        import dreads.commands : propagationOverride;
+
+                        propagationOverride.clear();
+                    }
+                    count++;
+                }
+                arena.reset();
+                if (corrupt)
+                    break;
+            }
+            else
+            {
+                corrupt = true; // unknown record kind
+                break;
+            }
+        }
+        if (rd.corrupt)
+            corrupt = true;
+        fclose(f);
+        if (corrupt)
+            fprintf(stderr, "dreads: AOF corrupt after %lld commands; stopped replay\n", count);
+        else if (rd.truncated)
+            fprintf(stderr, "dreads: AOF has a truncated trailing record (ignored)\n");
+        return count;
+    }
+
     for (;;)
     {
         auto space = inb.freeSpace(64 * 1024);
         auto n = fread(space.ptr, 1, space.length, f);
-        if (n == 0)
-            break;
-        inb.grow(n);
+        inb.grow(n); // n == 0 still parses what the v2 sniff spilled into inb
 
         size_t pos = 0;
         for (;;)
@@ -597,7 +971,7 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
             count++;
         }
         inb.consume(pos);
-        if (corrupt)
+        if (corrupt || n == 0)
             break;
     }
     fclose(f);
@@ -625,6 +999,23 @@ public long aofLoad(scope const(char)[] path, ref Keyspace ks) nothrow
 /// that shard's allocator, or the owning shard thread later frees a foreign
 /// block (the cross-allocator SIGSEGV class). The scratch buffers here are
 /// created and destroyed inside the call, under the same slot.
+/// First-key ownership routing shared by the legacy and v2 sharded replays.
+private bool aofRouteApplies(const ref RVal cmd, int ci, scope const(char)[] lname,
+        uint ownerShard, bool applyGlobals) nothrow
+{
+    import dreads.acl : commandRouteKeyIx;
+    import dreads.slots : keyToSlot;
+    import dreads.shard : shardOfSlot;
+    import dreads.aclcat : cmdIx;
+
+    auto k = commandRouteKeyIx(ci, cast(string) lname, cmd.arr);
+    if (k !is null)
+        return shardOfSlot(keyToSlot(k)) == ownerShard;
+    if (ci == cmdIx!"flushdb" || ci == cmdIx!"flushall")
+        return true; // db-wide: every shard clears its own slice
+    return applyGlobals;
+}
+
 public long aofLoadSharded(scope const(char)[] path, Keyspace[] dbs,
         uint ownerShard, uint shardCount, bool applyGlobals = true) nothrow
 {
@@ -649,13 +1040,123 @@ public long aofLoadSharded(scope const(char)[] path, Keyspace[] dbs,
     bool corrupt = false;
     size_t curDb = 0;
 
+    bool trustOps;
+    if (aofSniffV2(f, inb, trustOps))
+    {
+        import dreads.aclcat : gCmdCats;
+
+        AofRecReader rd;
+        rd.f = f;
+        ubyte kind;
+        ushort rdb;
+        const(ubyte)[] payload;
+
+        // one command: route by first key, then replay if it lands here
+        void routeReplay(const ref RVal cmd, int op, size_t db) nothrow
+        {
+            bool apply = true;
+            int ki = op;
+            if (shardCount > 1 && cmd.type == RType.Array && cmd.arr.length > 0)
+            {
+                if (op >= 0)
+                    apply = aofRouteApplies(cmd, op, gCmdCats[op].name,
+                            ownerShard, applyGlobals);
+                else
+                {
+                    auto name = cmd.arr[0].str;
+                    char[16] lb = void;
+                    if (name.length <= lb.length)
+                    {
+                        foreach (i, ch; name)
+                            lb[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+                        auto lname = cast(const(char)[]) lb[0 .. name.length];
+                        immutable ci = aclCmdIndex(lname);
+                        if (ci >= 0)
+                            ki = ci; // resolved once — replay stays integer-dispatched
+                        apply = aofRouteApplies(cmd, ci, lname, ownerShard, applyGlobals);
+                    }
+                    else
+                        apply = applyGlobals;
+                }
+            }
+            if (apply && db < dbs.length)
+            {
+                replayCommand(cmd, dbs[db], sink, arena, ki);
+                sink.clear();
+                count++;
+            }
+            {
+                import dreads.commands : propagationOverride;
+
+                propagationOverride.clear();
+            }
+        }
+
+        while (rd.next(kind, rdb, payload))
+        {
+            if (kind == 1)
+            {
+                RVal cmd;
+                int op;
+                if (!aofDecodeIR(payload, arena, trustOps, cmd, op))
+                {
+                    corrupt = true;
+                    break;
+                }
+                routeReplay(cmd, op, rdb);
+                arena.reset();
+            }
+            else if (kind == 0)
+            {
+                size_t pp = 0;
+                size_t cur = rdb;
+                for (;;)
+                {
+                    RVal cmd;
+                    auto st = parseValue(payload, pp, arena, cmd);
+                    if (st == ParseStatus.incomplete)
+                    {
+                        if (pp != payload.length)
+                            corrupt = true;
+                        break;
+                    }
+                    if (st == ParseStatus.protocolError)
+                    {
+                        corrupt = true;
+                        break;
+                    }
+                    int selDb;
+                    if (aofIsSelect(cmd, selDb))
+                    {
+                        cur = cast(size_t) selDb;
+                        continue;
+                    }
+                    routeReplay(cmd, -1, cur);
+                }
+                arena.reset();
+                if (corrupt)
+                    break;
+            }
+            else
+            {
+                corrupt = true;
+                break;
+            }
+        }
+        if (rd.corrupt)
+            corrupt = true;
+        fclose(f);
+        if (corrupt)
+            fprintf(stderr, "dreads: AOF %s corrupt after %lld commands; stopped replay\n",
+                    zpath.ptr, count);
+        return count;
+    }
+
     for (;;)
     {
         auto space = inb.freeSpace(64 * 1024);
         auto n = fread(space.ptr, 1, space.length, f);
-        if (n == 0)
-            break;
-        inb.grow(n);
+        inb.grow(n); // n == 0 still parses what the v2 sniff spilled into inb
 
         size_t pos = 0;
         for (;;)
@@ -712,7 +1213,7 @@ public long aofLoadSharded(scope const(char)[] path, Keyspace[] dbs,
             }
         }
         inb.consume(pos);
-        if (corrupt)
+        if (corrupt || n == 0)
             break;
     }
     fclose(f);
@@ -877,4 +1378,124 @@ unittest // appendEval writes an EVAL the loader accepts
         ks.d.free();
     assert(aofLoad(path, ks) == 1);
     assert(runOne(ks, "GET", "k3") == "$6\r\nvalue!\r\n");
+}
+
+unittest // v2: IR records replay by opcode; offsets rebuild the args exactly
+{
+    import dreads.acl : aclCmdIndex;
+
+    enum path = "/tmp/dreads_aof_test_ir.aof";
+    rmPath(path);
+    scope (exit)
+        rmPath(path);
+
+    Aof aof;
+    assert(aof.open(path));
+    Arena pa;
+    auto enc = respCmd("SET", "irk", "irv");
+    RVal cmd;
+    size_t pos = 0;
+    assert(parseValue(cast(const(ubyte)[]) enc, pos, pa, cmd) == ParseStatus.ok);
+    aof.appendIR(cmd, aclCmdIndex("set"), cast(const(ubyte)[]) enc);
+    aof.append(cast(const(ubyte)[]) respCmd("RPUSH", "irl", "x")); // RAW record
+    aof.close();
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    assert(aofLoad(path, ks) == 2);
+    assert(runOne(ks, "GET", "irk") == "$3\r\nirv\r\n");
+    assert(runOne(ks, "LRANGE", "irl", "0", "-1") == "*1\r\n$1\r\nx\r\n");
+}
+
+unittest // v2: a foreign table hash demotes opcodes — replay resolves by name
+{
+    enum path = "/tmp/dreads_aof_test_irhash.aof";
+    rmPath(path);
+    scope (exit)
+        rmPath(path);
+
+    Aof aof;
+    assert(aof.open(path));
+    Arena pa;
+    auto enc = respCmd("SET", "hk", "hv");
+    RVal cmd;
+    size_t pos = 0;
+    assert(parseValue(cast(const(ubyte)[]) enc, pos, pa, cmd) == ParseStatus.ok);
+    // a WRONG opcode on purpose: it must be ignored once the hash mismatches
+    aof.appendIR(cmd, 1, cast(const(ubyte)[]) enc);
+    aof.close();
+
+    { // flip one byte of the stored table hash
+        import core.stdc.stdio : fseek, SEEK_SET;
+
+        auto fh = fopen(path.ptr, "r+b");
+        assert(fh !is null);
+        ubyte b;
+        fseek(fh, 15, SEEK_SET);
+        assert(fread(&b, 1, 1, fh) == 1);
+        b ^= 0xFF;
+        fseek(fh, 15, SEEK_SET);
+        assert(fwrite(&b, 1, 1, fh) == 1);
+        fclose(fh);
+    }
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    assert(aofLoad(path, ks) == 1);
+    assert(runOne(ks, "GET", "hk") == "$2\r\nhv\r\n");
+}
+
+unittest // v2: legacy files smaller than the 16-byte sniff still replay fully
+{
+    enum path = "/tmp/dreads_aof_test_tiny.aof";
+    rmPath(path);
+    scope (exit)
+        rmPath(path);
+
+    { // hand-written legacy file, 14 bytes < the sniff window
+        auto fh = fopen(path.ptr, "wb");
+        assert(fh !is null);
+        auto raw = respCmd("SET", "t", ""); // *3..$1 t $0 — still < 32B? build exact
+        fwrite(raw.ptr, 1, raw.length, fh);
+        fclose(fh);
+    }
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    assert(aofLoad(path, ks) == 1);
+    assert(runOne(ks, "EXISTS", "t") == ":1\r\n");
+}
+
+unittest // v2: kill-9 mid-record — the partial trailing record is tolerated
+{
+    enum path = "/tmp/dreads_aof_test_irtrunc.aof";
+    rmPath(path);
+    scope (exit)
+        rmPath(path);
+
+    Aof aof;
+    assert(aof.open(path));
+    aof.append(cast(const(ubyte)[]) respCmd("SET", "whole", "1"));
+    aof.append(cast(const(ubyte)[]) respCmd("SET", "cut", "2"));
+    aof.close();
+
+    { // truncate inside the LAST record's payload
+        import core.stdc.stdio : fseek, ftell, SEEK_END;
+        import core.sys.posix.unistd : truncate;
+
+        auto fh = fopen(path.ptr, "rb");
+        fseek(fh, 0, SEEK_END);
+        immutable long sz = ftell(fh);
+        fclose(fh);
+        assert(truncate(path.ptr, sz - 5) == 0);
+    }
+
+    Keyspace ks;
+    scope (exit)
+        ks.d.free();
+    assert(aofLoad(path, ks) == 1);
+    assert(runOne(ks, "GET", "whole") == "$1\r\n1\r\n");
+    assert(runOne(ks, "EXISTS", "cut") == ":0\r\n");
 }

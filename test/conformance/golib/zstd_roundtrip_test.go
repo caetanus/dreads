@@ -11,6 +11,7 @@ func TestZstdRoundTrip(t *testing.T) {
 	topic := "zstd_rt"
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers("127.0.0.1:19092"),
+		kgo.AllowAutoTopicCreation(),
 		kgo.ProducerBatchCompression(kgo.ZstdCompression()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	)

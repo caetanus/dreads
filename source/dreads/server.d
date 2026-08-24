@@ -2039,7 +2039,7 @@ private void shardDrainLoop() nothrow
                             if (!propagationOverride.empty)
                                 myAof().append(propagationOverride.data);
                             else
-                                myAof().append(rawSect);
+                                myAof().appendIR(cmd, opcode, rawSect);
                         }
                     }
                     // A hopped command's propagation override must NEVER leak
@@ -2190,7 +2190,7 @@ private void shardDrainLoop() nothrow
                         if (!propagationOverride.empty)
                             myAof().append(propagationOverride.data);
                         else
-                            myAof().append(rawSect);
+                            myAof().appendIR(cmd, opcode, rawSect);
                     }
                 }
                 propagationOverride.clear();
@@ -2560,7 +2560,7 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply,
                 if (!propagationOverride.empty)
                     myAof().append(propagationOverride.data);
                 else
-                    myAof().append(raw.data);
+                    myAof().appendIR(cmd, opcode, raw.data);
             }
         }
         {
@@ -6714,7 +6714,7 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
             if (!propagationOverride.empty)
                 myAof().append(propagationOverride.data);
             else if (pureWrite)
-                myAof().append(rawCmd);
+                myAof().appendIR(cmd, opcode, rawCmd);
         }
         // CLIENT TRACKING: a write invalidates the cached copies of its keys; a
         // read by a tracking client records its keys. Gated by gTrackCount so a
