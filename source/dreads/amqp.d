@@ -1388,6 +1388,33 @@ private struct TxSettle
     bool requeue;
 }
 
+/// [bug 21846] ack/nack/reject with an unknown delivery-tag is an IMMEDIATE
+/// channel 406 PRECONDITION_FAILED — even on a transacted channel. "Known" =
+/// an outstanding unacked entry of THIS channel that the open tx hasn't
+/// already settled; the multiple form (tag = upper bound, 0 = all) is only
+/// checked for "was this tag ever issued" (tags are conn-monotonic).
+private bool settleTagUnknown(AmqpConn c, ushort chan, ulong tag, bool multiple) nothrow @trusted
+{
+    try
+    {
+        if (multiple)
+            return tag != 0 && tag >= c.nextTag;
+        auto u = tag in c.unacked;
+        if (u is null || u.chan != chan)
+            return true;
+        if (auto tch = chan in c.chans)
+            if (tch.txMode)
+                foreach (ref tsx; tch.txSettles)
+                    if (tsx.tag == tag && !tsx.multiple)
+                        return true; // second settle of the same tag inside the tx
+        return false;
+    }
+    catch (Exception)
+    {
+        return false;
+    }
+}
+
 /// Cap the buffered work of one open transaction (unbounded would be a RAM DoS:
 /// a client that tx.selects and never commits). The BYTE cap is the real bound —
 /// a message body reaches AMQP_MAX_BODY (128MB), so 100k of them would be
@@ -1993,7 +2020,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
         if (mth == 10) // declare
         {
             cast(void) r.u16();
-            auto ex = r.shortStr();
+            auto exRaw = r.shortStr();
+            // RabbitMQ strips CR/LF from declared exchange names (the java
+            // suite pins it): "e\nxc\rhange" declares "exchange"
+            char[256] exbuf = void;
+            size_t exn = 0;
+            foreach (xc; exRaw)
+                if (xc != '\n' && xc != '\r' && exn < exbuf.length)
+                    exbuf[exn++] = xc;
+            auto ex = cast(const(char)[]) exbuf[0 .. exn];
             auto typ = r.shortStr();
             immutable flags = r.u8(); // passive/durable/auto-delete/internal/no-wait
             immutable passive = (flags & 0x01) != 0;
@@ -2132,8 +2167,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 else
                 {
-                    immutable qn = q.length <= qbuf.length ? q.length : qbuf.length;
-                    qbuf[0 .. qn] = q[0 .. qn];
+                    // RabbitMQ strips CR/LF from declared queue names (bug
+                    // 21846-era behavior the java suite pins): "a\nb\r" = "ab"
+                    size_t qn = 0;
+                    foreach (qc; q)
+                        if (qc != '\n' && qc != '\r' && qn < qbuf.length)
+                            qbuf[qn++] = qc;
                     qq = cast(const(char)[]) qbuf[0 .. qn];
                 }
                 if (argsTbl !is null && argsTbl.length)
@@ -2231,8 +2270,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     if (auto pf = (cast(string) qq) in gQueueFlags)
                         if (*pf != (qflags & 0x0E))
                         {
-                            channelClose(o, chan, 406,
-                                    "PRECONDITION_FAILED - inequivalent flags", 50, 10);
+                            // redeclaring an EXISTING non-exclusive queue as
+                            // exclusive is a 405 RESOURCE_LOCKED (RabbitMQ);
+                            // every other flag mismatch stays a 406
+                            if ((qflags & 0x04) && !(*pf & 0x04))
+                                channelClose(o, chan, 405,
+                                        "RESOURCE_LOCKED - not exclusive", 50, 10);
+                            else
+                                channelClose(o, chan, 406,
+                                        "PRECONDITION_FAILED - inequivalent flags", 50, 10);
                             c.chans.remove(chan);
                             return true;
                         }
@@ -2584,6 +2630,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 immutable tag = r.u64();
                 immutable multiple = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                if (settleTagUnknown(c, chan, tag, multiple))
+                {
+                    channelClose(o, chan, 406,
+                            "PRECONDITION_FAILED - unknown delivery tag", 60, 80);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 if (auto tch = chan in c.chans)
                     if (tch.txMode)
                     {
@@ -2628,6 +2681,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 immutable tag = r.u64();
                 immutable requeue = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                if (settleTagUnknown(c, chan, tag, false))
+                {
+                    channelClose(o, chan, 406,
+                            "PRECONDITION_FAILED - unknown delivery tag", 60, 90);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 if (auto tch = chan in c.chans)
                     if (tch.txMode)
                     {
@@ -2648,6 +2708,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable bits2 = r.ok && r.i < p.length ? p[r.i] : 0;
                 immutable multiple = (bits2 & 1) != 0;
                 immutable requeue = (bits2 & 2) != 0;
+                if (settleTagUnknown(c, chan, tag, multiple))
+                {
+                    channelClose(o, chan, 406,
+                            "PRECONDITION_FAILED - unknown delivery tag", 60, 120);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 if (auto tch = chan in c.chans)
                     if (tch.txMode)
                     {
@@ -2704,9 +2771,23 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // client stuck without recover-ok used to hang forever.
                     import std.algorithm.sorting : sort;
 
+                    // [bug 21845] a tag with a PENDING (uncommitted) tx ack is
+                    // NOT redelivered by recover — the ack stands unless the tx
+                    // rolls back.
+                    bool txAcked(ulong t) nothrow
+                    {
+                        if (auto rch = chan in c.chans)
+                            if (rch.txMode)
+                                foreach (ref tsx; rch.txSettles)
+                                    if (tsx.kind == 0 && (tsx.multiple
+                                            ? (tsx.tag == 0 || t <= tsx.tag) : tsx.tag == t))
+                                        return true;
+                        return false;
+                    }
+
                     ulong[] all;
                     foreach (t, ref u; c.unacked)
-                        if (u.chan == chan)
+                        if (u.chan == chan && !txAcked(t))
                             all ~= t;
                     sort!"a > b"(all);
                     foreach (t; all)
@@ -2814,11 +2895,26 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             }
             else if (mth == 20) // commit: apply buffered pubs + settles atomically
             {
+                if (!ch.txMode)
+                {
+                    // commit without tx.select: channel 406 (RabbitMQ)
+                    channelClose(o, chan, 406,
+                            "PRECONDITION_FAILED - channel is not transactional", 90, 20);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 commitTx(c, chan, *ch, o);
                 method(o, chan, 90, 21); // commit-ok
             }
             else if (mth == 30) // rollback: drop the buffers (acks stay un-applied
             {                    //  -> messages remain unacked / redeliverable)
+                if (!ch.txMode)
+                {
+                    channelClose(o, chan, 406,
+                            "PRECONDITION_FAILED - channel is not transactional", 90, 30);
+                    c.chans.remove(chan);
+                    return true;
+                }
                 ch.txPubs = null;
                 ch.txSettles = null;
                 ch.txBytes = 0;
