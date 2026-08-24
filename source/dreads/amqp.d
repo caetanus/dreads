@@ -1056,6 +1056,34 @@ package long tableGetInt(scope const(ubyte)[] t, scope const(char)[] key) @nogc 
     return found;
 }
 
+/// Presence+type check for an integer table arg: 0 = absent, 1 = an integer
+/// field type, -1 = present with a NON-integer type (string "foobar",
+/// "10000foobar", bool, ...) — the inequivalent-arg 406 case.
+package int tableIntKind(scope const(ubyte)[] t, scope const(char)[] key,
+        out long val) @nogc nothrow
+{
+    int kind = 0;
+    long got = 0;
+    cast(void) tableWalk(t, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+        if (k != key)
+            return true;
+        switch (ty)
+        {
+        case 'b', 'B', 'U', 'u', 'I', 'i', 'l', 'L':
+            kind = 1;
+            break;
+        default:
+            kind = -1;
+            break;
+        }
+        return false;
+    });
+    if (kind == 1)
+        got = tableGetInt(t, key);
+    val = got;
+    return kind;
+}
+
 package const(char)[] tableGetStr(return scope const(ubyte)[] t, scope const(char)[] key) @nogc nothrow
 {
     const(char)[] found = null;
@@ -1110,10 +1138,13 @@ package const(ubyte)[] propsHeaders(return scope const(ubyte)[] props) @nogc not
 /// property-flags bit 8). 0 = absent/invalid. Walks the properties that precede
 /// it in the flags order: content-type, content-encoding, headers (field
 /// table), delivery-mode + priority (one octet each), correlation-id, reply-to.
+/// The expiration BasicProperty, ms: -1 = absent, -2 = present but INVALID
+/// (non-numeric — "foobar", "10000foobar", "-1"), >= 0 = the value ("0" means
+/// expire immediately).
 package long propsExpiration(scope const(ubyte)[] props) @nogc nothrow
 {
     if (props.length < 2)
-        return 0;
+        return -1;
     immutable flags = (cast(ushort) props[0] << 8) | props[1];
     size_t i = 2;
     static bool skipShort(scope const(ubyte)[] p, ref size_t j) @nogc nothrow
@@ -1126,19 +1157,19 @@ package long propsExpiration(scope const(ubyte)[] props) @nogc nothrow
 
     if (flags & 0x8000) // content-type
         if (!skipShort(props, i))
-            return 0;
+            return -1;
     if (flags & 0x4000) // content-encoding
         if (!skipShort(props, i))
-            return 0;
+            return -1;
     if (flags & 0x2000) // headers: u32 length + table
     {
         if (i + 4 > props.length)
-            return 0;
+            return -1;
         immutable n = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
             | (cast(size_t) props[i + 2] << 8) | props[i + 3];
         i += 4 + n;
         if (i > props.length)
-            return 0;
+            return -1;
     }
     if (flags & 0x1000) // delivery-mode: octet
         i += 1;
@@ -1146,24 +1177,24 @@ package long propsExpiration(scope const(ubyte)[] props) @nogc nothrow
         i += 1;
     if (flags & 0x0400) // correlation-id
         if (!skipShort(props, i))
-            return 0;
+            return -1;
     if (flags & 0x0200) // reply-to
         if (!skipShort(props, i))
-            return 0;
+            return -1;
     if (!(flags & 0x0100)) // no expiration property
-        return 0;
+        return -1;
     if (i + 1 > props.length)
-        return 0;
+        return -1;
     immutable len = props[i];
     i += 1;
     if (i + len > props.length)
-        return 0;
+        return -1;
     long v = 0;
     foreach (k; 0 .. len)
     {
         immutable ch = props[i + k];
         if (ch < '0' || ch > '9')
-            return 0; // non-numeric expiration -> treat as unset
+            return -2; // present but non-numeric: the publish-time 406 case
         v = v * 10 + (ch - '0');
     }
     return v;
@@ -1855,6 +1886,19 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (argsTbl !is null && argsTbl.length)
                 {
+                    // arg validation (RabbitMQ equivalence rules): x-message-ttl
+                    // must be an integer >= 0; x-expires an integer > 0. A wrong
+                    // type or range is a channel 406 PRECONDITION_FAILED.
+                    long ttlV, expV;
+                    immutable tk = tableIntKind(argsTbl, "x-message-ttl", ttlV);
+                    immutable ek = tableIntKind(argsTbl, "x-expires", expV);
+                    if (tk < 0 || (tk > 0 && ttlV < 0) || ek < 0 || (ek > 0 && expV <= 0))
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - invalid arg", 50, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
                     auto dlx = tableGetStr(argsTbl, "x-dead-letter-exchange");
                     auto dlrk = tableGetStr(argsTbl, "x-dead-letter-routing-key");
                     immutable ttl = tableGetInt(argsTbl, "x-message-ttl");
@@ -2761,6 +2805,14 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         requeueAndDropChannel(c, chan);
         return;
     }
+    // expiration property must be a decimal-ms string: anything else is a 406
+    // PRECONDITION_FAILED at publish (RabbitMQ), never stored.
+    if (propsExpiration(ch.pub.props.data) == -2)
+    {
+        channelClose(o, chan, 406, "PRECONDITION_FAILED - invalid expiration", 60, 40);
+        requeueAndDropChannel(c, chan);
+        return;
+    }
     immutable mandatory = ch.pub.mandatory;
     // route to queues and RPUSH the framed record through the data plane. rec
     // is normally a reused TLS static, but the sink's cross-shard RPUSH YIELDS
@@ -3020,11 +3072,13 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
     // x-message-ttl (lazily at delivery; the active reaper only sweeps queues
     // that have a queue-level TTL).
     immutable msgTtl = propsExpiration(props);
+    if (msgTtl == 0)
+        return pm > 0; // expiration "0": expired the moment it was stored
     long ttl;
     if (ttlMs > 0 && msgTtl > 0)
         ttl = ttlMs < msgTtl ? ttlMs : msgTtl;
     else
-        ttl = ttlMs > 0 ? ttlMs : msgTtl;
+        ttl = ttlMs > 0 ? ttlMs : (msgTtl > 0 ? msgTtl : 0);
     if (ttl <= 0)
         return false;
     // compare as `published <= now - ttl` (NOT `now > published + ttl`): the
