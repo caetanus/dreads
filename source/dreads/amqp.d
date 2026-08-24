@@ -3266,6 +3266,16 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             kb.append(qq);
             ByteBuffer pay;
             ByteBuffer ob;
+            // runTask runs this fiber SYNCHRONOUSLY up to its first yield — a
+            // same-shard pop + sendTo here would put the first delivery on the
+            // wire BEFORE the consume-ok still staged in the handler's reply
+            // buffer ("Unsolicited delivery": the client kills the connection
+            // on a delivery for a tag it hasn't confirmed). Park once so the
+            // serve fiber returns and flushes consume-ok first.
+            try
+                sleep(1.msecs);
+            catch (Exception)
+                return;
             while (!cc.closing)
             {
                 try
