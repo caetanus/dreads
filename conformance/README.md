@@ -55,7 +55,16 @@ at `src/test/java/com/rabbitmq/client/test/functional/` and run:
     ./mvnw verify -Dit.test=DreadsFunctionalTestSuite -Drabbitmqctl.bin=/bin/false \
       -Dtest=zzz -Dsurefire.failIfNoSpecifiedTests=false -Dspotless.check.skip=true
 
-Baseline 2026-08-24: 298 tests, 135 pass / 117 fail / 46 error / 6 skip.
+**CONVERGED 2026-08-24: 330 tests, 325 pass / 0 fail / 5 error / 7 skip.**
+The 5 remaining errors are all tests that drive the broker through
+`rabbitmqctl close_all_connections` (mapped to /bin/false in this harness):
+checkAcksWithAutomaticRecovery, checkListenersWithAutoRecoveryConnection,
+topologyRecoveryBindingFailure, topologyRecoveryConsumerFailure,
+topologyRecoveryRetry — the same management-plane dependency that excluded
+five whole classes from the suite. The 7 skips are justified in-file
+(restartingExpiry x3 laundering + upstream version gates).
+
+Original baseline for reference: 298 tests, 135 pass / 117 fail / 46 error / 6 skip.
 Biggest fail clusters (all real conformance targets): DeadLetterExchange,
 QueueExclusivity, Per*TTL, CcRoutes, QueueSizeLimit (x-max-length),
 UnexpectedFrames, QosTests, QueueLease (x-expires), PerConsumerPrefetch,
