@@ -42,6 +42,12 @@ public enum ubyte KGOP_DESCRIBE = 6;
 public enum ubyte KGOP_COMMIT_CHECK = 7; // OffsetCommit generation fencing
 public enum ubyte KGOP_DROP = 8; // DeleteGroups: drop an EMPTY group's state
 public enum ubyte KGOP_SUBSCRIBED = 9; // OffsetDelete: is any member subscribed?
+// Transaction-coordinator ops (KAFKA-TXN-PLAN.md T2) — same transport, the
+// "group" field carries the transactional.id, state in a separate TLS AA.
+public enum ubyte KGOP_TXN_INIT = 10; // -> [i16 err][i64 pid][i16 epoch]
+public enum ubyte KGOP_TXN_ADD = 11; // register partitions in the open txn
+public enum ubyte KGOP_TXN_END = 12; // -> the txn's partitions (and clears them)
+public enum ubyte KGOP_TXN_OFFSETS = 13; // buffer TxnOffsetCommit until EndTxn
 
 private enum ubyte ST_EMPTY = 0, ST_PREPARING = 1, ST_COMPLETING = 2, ST_STABLE = 3;
 
@@ -77,6 +83,28 @@ private struct KgGroup
 }
 
 private KgGroup*[string] tGroups; // TLS: groups owned by THIS shard
+
+private struct KgTxnOff
+{
+    string topic;
+    int part;
+    long off;
+    bool hasMeta;
+    string meta;
+}
+
+private struct KgTxn
+{
+    long pid;
+    short epoch;
+    string[] tps; // "topic\x1fpartition" touched by the OPEN transaction
+    string offGroup; // consumer group of the buffered TxnOffsetCommit
+    KgTxnOff[] offs; // offsets applied on COMMIT, dropped on abort
+}
+
+private KgTxn*[string] tTxns; // TLS: transactional ids owned by THIS shard
+private shared long gKgPidCtr = 5000; // producer-id source for transactional ids
+private enum int TXN_MAX_TIMEOUT_MS = 900_000; // transaction.max.timeout.ms
 
 /// Monotonic milliseconds (never the per-command frozen wall clock).
 public long kgNowMs() @nogc nothrow @trusted
@@ -760,6 +788,182 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                     }
                 }
             wU8(o, sub);
+            return;
+        }
+
+    case KGOP_TXN_INIT:
+        {
+            immutable txnTimeout = r.i32();
+            if (txnTimeout > TXN_MAX_TIMEOUT_MS)
+            {
+                wI16(o, 50); // INVALID_TRANSACTION_TIMEOUT (0103 misuse)
+                return;
+            }
+            auto tp = groupName in tTxns;
+            KgTxn* t = tp !is null ? *tp : null;
+            if (t is null)
+            {
+                import core.atomic : atomicOp;
+
+                t = new KgTxn;
+                t.pid = atomicOp!"+="(gKgPidCtr, 1);
+                t.epoch = -1;
+                tTxns[groupName.idup] = t;
+            }
+            t.epoch++; // re-init fences the previous epoch (zombie producer)
+            t.tps = null;
+            t.offs = null;
+            t.offGroup = null;
+            wI16(o, KG_NONE);
+            immutable long pv = t.pid;
+            foreach_reverse (k; 0 .. 8)
+                o.appendByte(cast(char)((pv >> (k * 8)) & 0xFF));
+            wI16(o, t.epoch);
+            return;
+        }
+
+    case KGOP_TXN_ADD:
+        {
+            long pid = 0;
+            foreach (_; 0 .. 8)
+                pid = (pid << 8) | r.u8();
+            immutable epoch = cast(short) r.i32();
+            immutable n2 = r.i32();
+            auto tp = groupName in tTxns;
+            if (tp is null || (*tp).pid != pid)
+            {
+                wI16(o, 51); // INVALID_PRODUCER_ID_MAPPING
+                return;
+            }
+            auto t = *tp;
+            if (epoch != t.epoch)
+            {
+                wI16(o, 47); // INVALID_PRODUCER_EPOCH: fenced
+                return;
+            }
+            foreach (_; 0 .. (n2 < 0 || n2 > 1024 ? 0 : n2))
+            {
+                if (!r.ok)
+                    break;
+                auto topic = r.str16();
+                immutable part = r.i32();
+                if (!r.ok)
+                    break;
+                char[300] tb = void;
+                size_t tl = topic.length <= 280 ? topic.length : 280;
+                tb[0 .. tl] = topic[0 .. tl];
+                tb[tl] = '\x1f';
+                import core.stdc.stdio : snprintf;
+
+                immutable pl = snprintf(tb.ptr + tl + 1, tb.length - tl - 1, "%d", part);
+                auto tps = (cast(const(char)[]) tb[0 .. tl + 1 + pl]).idup;
+                bool have = false;
+                foreach (x; t.tps)
+                    if (x == tps)
+                    {
+                        have = true;
+                        break;
+                    }
+                if (!have)
+                    t.tps ~= tps;
+            }
+            wI16(o, KG_NONE);
+            return;
+        }
+
+    case KGOP_TXN_OFFSETS:
+        {
+            long pid = 0;
+            foreach (_; 0 .. 8)
+                pid = (pid << 8) | r.u8();
+            immutable epoch = cast(short) r.i32();
+            auto grp = r.str16();
+            immutable n2 = r.i32();
+            auto tp = groupName in tTxns;
+            if (tp is null || (*tp).pid != pid)
+            {
+                wI16(o, 51); // INVALID_PRODUCER_ID_MAPPING
+                return;
+            }
+            auto t = *tp;
+            if (epoch != t.epoch)
+            {
+                wI16(o, 47); // fenced
+                return;
+            }
+            t.offGroup = grp.idup;
+            foreach (_; 0 .. (n2 < 0 || n2 > 4096 ? 0 : n2))
+            {
+                if (!r.ok)
+                    break;
+                KgTxnOff e;
+                e.topic = r.str16().idup;
+                e.part = r.i32();
+                e.off = 0;
+                foreach (_2; 0 .. 8)
+                    e.off = (e.off << 8) | r.u8();
+                e.hasMeta = r.u8() != 0;
+                e.meta = r.str16().idup;
+                if (r.ok)
+                    t.offs ~= e;
+            }
+            wI16(o, KG_NONE);
+            return;
+        }
+
+    case KGOP_TXN_END:
+        {
+            long pid = 0;
+            foreach (_; 0 .. 8)
+                pid = (pid << 8) | r.u8();
+            immutable epoch = cast(short) r.i32();
+            cast(void) r.u8(); // committed flag (markers written by the caller)
+            auto tp = groupName in tTxns;
+            if (tp is null || (*tp).pid != pid)
+            {
+                wI16(o, 51); // INVALID_PRODUCER_ID_MAPPING
+                return;
+            }
+            auto t = *tp;
+            if (epoch != t.epoch)
+            {
+                wI16(o, 47); // fenced
+                return;
+            }
+            wI16(o, KG_NONE);
+            wI32(o, cast(int) t.tps.length);
+            foreach (x; t.tps)
+            {
+                // split "topic\x1fpart"
+                size_t sep = x.length;
+                foreach (k, ch; x)
+                    if (ch == '\x1f')
+                    {
+                        sep = k;
+                        break;
+                    }
+                wStr16(o, x[0 .. sep]);
+                int part = 0;
+                if (sep < x.length)
+                    foreach (c; x[sep + 1 .. $])
+                        if (c >= '0' && c <= '9')
+                            part = part * 10 + (c - '0');
+                wI32(o, part);
+            }
+            wStr16(o, t.offGroup);
+            wI32(o, cast(int) t.offs.length);
+            foreach (e; t.offs)
+            {
+                wStr16(o, e.topic);
+                wI32(o, e.part);
+                foreach_reverse (k; 0 .. 8)
+                    o.appendByte(cast(char)((e.off >> (k * 8)) & 0xFF));
+                wU8(o, e.hasMeta ? 1 : 0);
+                wStr16(o, e.meta);
+            }
+            t.tps = null; // txn closed
+            t.offs = null;
+            t.offGroup = null;
             return;
         }
 

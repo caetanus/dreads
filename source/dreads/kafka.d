@@ -31,7 +31,8 @@ import dreads.mem : ByteBuffer, tByteBufferOom;
 import dreads.kafkagroup : KGOP_JOIN, KGOP_JOIN_POLL, KGOP_SYNC, KGOP_HEARTBEAT,
     KGOP_LEAVE, KGOP_DESCRIBE, KGOP_COMMIT_CHECK, KG_NONE, KG_WAIT,
     KG_ILLEGAL_GENERATION, KG_INCONSISTENT_PROTOCOL, KG_UNKNOWN_MEMBER,
-    KG_REBALANCE_IN_PROGRESS, KG_MEMBER_ID_REQUIRED, KGOP_DROP, KGOP_SUBSCRIBED;
+    KG_REBALANCE_IN_PROGRESS, KG_MEMBER_ID_REQUIRED, KGOP_DROP, KGOP_SUBSCRIBED,
+    KGOP_TXN_INIT, KGOP_TXN_ADD, KGOP_TXN_END, KGOP_TXN_OFFSETS;
 import std.digest.crc : crc32Of;
 
 /// Data-plane hook installed by server.d: execute a synthesized RESP command
@@ -65,7 +66,7 @@ private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_INVALID_TOPIC = 17, E_UNSUPPORTED_VERSION = 35,
-        E_INVALID_RECORD = 87;
+        E_INVALID_RECORD = 87, E_OUT_OF_ORDER_SEQ = 45, E_INVALID_PRODUCER_EPOCH = 47;
 
 /// Hard bound on any wire array count (topics/partitions/records). Kafka
 /// counts are SIGNED i32; a hostile 0x7FFFFFFF made the response-building
@@ -1924,63 +1925,118 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 // producer fencing (the seam's "callback fencing" is enforced client-side).
 private shared long gNextProducerId = 1000; // monotonic id source (atomic)
 
-/// InitProducerID (v0-v1): hand a transactional/idempotent producer a fresh
-/// producer_id and epoch 0.
+/// Global "a transaction has ever run" gate: 0 keeps every fetch/produce hot
+/// path at zero extra cost; set on the first transactional produce/EndTxn.
+public shared ubyte gKafkaTxnSeen;
+
+/// Resolve (pid, epoch) for a TRANSACTIONAL id via the coordinator (stable
+/// pid; epoch++ per init = zombie fencing; timeout validated). Returns the
+/// error code.
+private short txnInit(scope const(char)[] tid, int txnTimeoutMs, out long pid,
+        out short epoch) nothrow @trusted
+{
+    pid = -1;
+    epoch = -1;
+    static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+    req.clear();
+    req.appendByte(cast(char) KGOP_TXN_INIT);
+    putStr(req, tid);
+    putI32(req, txnTimeoutMs);
+    if (!kgOp(tid, cast(const(ubyte)[]) req.data, rep))
+        return E_UNSUPPORTED_VERSION; // transport failure: retryable-ish
+    Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+    immutable e = rr.i16();
+    if (e != E_NONE)
+        return e;
+    pid = rr.i64();
+    epoch = rr.i16();
+    return E_NONE;
+}
+
+/// InitProducerID (v0-v3): transactional ids go through the coordinator
+/// (stable pid + fencing epochs + timeout validation); bare idempotent
+/// producers keep the historic fresh-pid counter.
 private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     import core.atomic : atomicOp;
 
-    if (isFlexible(API_INIT_PRODUCER_ID, ver)) // v2/v3 flexible
+    const(char)[] tid;
+    int txnTimeout;
+    immutable flex = isFlexible(API_INIT_PRODUCER_ID, ver); // v2/v3 flexible
+    if (flex)
     {
-        cast(void) r.cstr(); // transactional_id (nullable compact)
-        cast(void) r.i32(); // transaction_timeout_ms
+        tid = r.cstr(); // transactional_id (nullable compact)
+        txnTimeout = r.i32();
         if (ver >= 3)
         {
             cast(void) r.i64(); // producer_id (v3+, for resume/fence)
             cast(void) r.i16(); // producer_epoch (v3+)
         }
-        immutable pidf = atomicOp!"+="(gNextProducerId, 1);
+    }
+    else
+    {
+        tid = r.str(); // transactional_id (nullable)
+        txnTimeout = r.i32();
+    }
+    short err = E_NONE;
+    long pid;
+    short epoch = 0;
+    if (tid !is null && tid.length)
+        err = txnInit(tid, txnTimeout, pid, epoch);
+    else
+        pid = atomicOp!"+="(gNextProducerId, 1);
+    if (flex)
+    {
         putI32(o, 0); // throttle_time_ms
-        putI16(o, E_NONE); // error_code
-        putI64(o, pidf); // producer_id
-        putI16(o, 0); // producer_epoch
+        putI16(o, err);
+        putI64(o, err == E_NONE ? pid : -1);
+        putI16(o, err == E_NONE ? epoch : -1);
         putTaggedFields(o);
         return;
     }
-    cast(void) r.str(); // transactional_id (nullable)
-    cast(void) r.i32(); // transaction_timeout_ms
-    immutable pid = atomicOp!"+="(gNextProducerId, 1);
     putI32(o, 0); // throttle_time_ms (v0+)
-    putI16(o, E_NONE); // error_code
-    putI64(o, pid); // producer_id
-    putI16(o, 0); // producer_epoch
+    putI16(o, err);
+    putI64(o, err == E_NONE ? pid : -1);
+    putI16(o, err == E_NONE ? epoch : -1);
 }
 
-/// AddPartitionsToTxn (v0-v2): accept every partition into the txn (echo E_NONE).
-/// Pure echo, no cross-shard hop.
+/// AddPartitionsToTxn (v0-v2): register the partitions with the coordinator
+/// (fencing validated); the response echoes one error for all partitions.
 private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.str(); // transactional_id
-    cast(void) r.i64(); // producer_id
-    cast(void) r.i16(); // producer_epoch
+    auto tid = r.str();
+    immutable pid = r.i64();
+    immutable epoch = r.i16();
     immutable ntopics = safeCount(r.i32());
-    putI32(o, 0); // throttle_time_ms
-    immutable tOff = o.length;
-    putI32(o, ntopics);
-    int et = 0;
+    // stage the coordinator op while parsing (slices = stable request buffer)
+    static ByteBuffer req, rep; // TLS: consumed synchronously by the hop
+    req.clear();
+    req.appendByte(cast(char) KGOP_TXN_ADD);
+    putStr(req, tid);
+    foreach_reverse (k; 0 .. 8)
+        req.appendByte(cast(char)((pid >> (k * 8)) & 0xFF));
+    putI32(req, epoch);
+    immutable nOff = req.length;
+    putI32(req, 0);
+    int nAll = 0;
+    // remember the topic/partition layout for the response echo
+    const(char)[][32] tnames;
+    size_t[32] tnparts;
+    int[512] tparts;
+    size_t nt, npAll;
     foreach (_; 0 .. ntopics)
     {
-        if (!r.ok || o.length > KAFKA_MAX_RESP)
+        if (!r.ok)
             break;
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         if (!r.ok)
             break;
-        putStr(o, topic);
-        immutable pOff = o.length;
-        putI32(o, nparts);
-        et++;
-        int ep = 0;
+        if (nt < tnames.length)
+        {
+            tnames[nt] = topic;
+            tnparts[nt] = 0;
+        }
         foreach (_2; 0 .. nparts)
         {
             if (!r.ok)
@@ -1988,16 +2044,41 @@ private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) not
             immutable part = r.i32();
             if (!r.ok)
                 break;
-            putI32(o, part);
-            putI16(o, E_NONE); // error_code
-            ep++;
+            if (nt < tnames.length && npAll < tparts.length)
+            {
+                tparts[npAll++] = part;
+                tnparts[nt]++;
+            }
+            putStr(req, topic);
+            putI32(req, part);
+            nAll++;
         }
-        patchI32(o, pOff, ep);
+        if (nt < tnames.length)
+            nt++;
     }
-    patchI32(o, tOff, et);
+    patchI32(req, nOff, nAll);
+    short err = E_NONE;
+    if (tid.length && kgOp(tid, cast(const(ubyte)[]) req.data, rep))
+    {
+        Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+        err = rr.i16();
+    }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nt);
+    size_t pi;
+    foreach (i; 0 .. nt)
+    {
+        putStr(o, tnames[i]);
+        putI32(o, cast(int) tnparts[i]);
+        foreach (_; 0 .. tnparts[i])
+        {
+            putI32(o, tparts[pi++]);
+            putI16(o, err);
+        }
+    }
 }
 
-/// AddOffsetsToTxn (v0-v2): register the consumer group with the txn — ack only
+/// AddOffsetsToTxn/// AddOffsetsToTxn (v0-v2): register the consumer group with the txn — ack only
 /// (the offsets themselves arrive via TxnOffsetCommit).
 private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
@@ -2009,16 +2090,185 @@ private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothro
     putI16(o, E_NONE); // error_code
 }
 
-/// EndTxn (v0-v2): commit or abort. Both just ack — records are already stored
-/// (read-uncommitted), so there is nothing to flush or roll back.
+/// EndTxn (v0-v2): close the transaction at the coordinator, then write a
+/// CONTROL MARKER record into every partition the txn touched (markers occupy
+/// offsets, like the real broker). Aborts also record the aborted range in
+/// `kafka.txa.<t>.<p>` for Fetch's aborted_transactions.
 private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.str(); // transactional_id
-    cast(void) r.i64(); // producer_id
-    cast(void) r.i16(); // producer_epoch
-    cast(void) r.i8(); // committed (commit vs abort)
+    import core.atomic : atomicStore;
+    import core.stdc.stdio : snprintf;
+
+    auto tid = r.str();
+    immutable pid = r.i64();
+    immutable epoch = r.i16();
+    immutable committed = r.i8() != 0;
+    short err = E_NONE;
+    static ByteBuffer req, rep; // TLS: rep parsed into stack copies below
+    req.clear();
+    req.appendByte(cast(char) KGOP_TXN_END);
+    putStr(req, tid);
+    foreach_reverse (k; 0 .. 8)
+        req.appendByte(cast(char)((pid >> (k * 8)) & 0xFF));
+    putI32(req, epoch);
+    req.appendByte(committed ? 1 : 0);
+    // partitions copied to STACK before the marker writes below hop
+    char[256][64] tbuf = void;
+    size_t[64] tlen;
+    int[64] parts;
+    size_t np;
+    if (tid.length && kgOp(tid, cast(const(ubyte)[]) req.data, rep))
+    {
+        Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+        err = rr.i16();
+        if (err == E_NONE)
+        {
+            immutable n2 = rr.i32();
+            foreach (_; 0 .. (n2 < 0 ? 0 : n2))
+            {
+                auto topic = rr.str();
+                immutable part = rr.i32();
+                if (!rr.ok)
+                    break;
+                if (np < parts.length)
+                {
+                    immutable tl = topic.length <= 256 ? topic.length : 256;
+                    tbuf[np][0 .. tl] = topic[0 .. tl];
+                    tlen[np] = tl;
+                    parts[np] = part;
+                    np++;
+                }
+            }
+            // buffered TxnOffsetCommit offsets: applied ONLY on commit.
+            // Copies go to STACK buffers first — the stores below hop and
+            // rep is a shared TLS buffer.
+            auto ogrp = rr.str();
+            immutable nOffs = rr.i32();
+            char[256] gbuf = void;
+            immutable ogl = ogrp.length <= 256 ? ogrp.length : 256;
+            gbuf[0 .. ogl] = ogrp[0 .. ogl];
+            char[256][64] otb = void;
+            size_t[64] otl;
+            int[64] oparts;
+            long[64] ooffs;
+            bool[64] ometaHas;
+            char[128][64] ometab = void;
+            size_t[64] ometal;
+            size_t nol;
+            foreach (_; 0 .. (nOffs < 0 ? 0 : nOffs))
+            {
+                auto t2 = rr.str();
+                immutable p2 = rr.i32();
+                immutable o2 = rr.i64();
+                immutable hasM = rr.i8() != 0;
+                auto m2 = rr.str();
+                if (!rr.ok)
+                    break;
+                if (committed && nol < oparts.length)
+                {
+                    immutable tl2 = t2.length <= 256 ? t2.length : 256;
+                    otb[nol][0 .. tl2] = t2[0 .. tl2];
+                    otl[nol] = tl2;
+                    oparts[nol] = p2;
+                    ooffs[nol] = o2;
+                    ometaHas[nol] = hasM;
+                    immutable ml2 = m2.length <= 128 ? m2.length : 128;
+                    ometab[nol][0 .. ml2] = m2[0 .. ml2];
+                    ometal[nol] = ml2;
+                    nol++;
+                }
+            }
+            foreach (i2; 0 .. nol)
+            {
+                auto g2 = cast(const(char)[]) gbuf[0 .. ogl];
+                auto t3 = cast(const(char)[]) otb[i2][0 .. otl[i2]];
+                storeGroupOffset(g2, t3, oparts[i2], ooffs[i2]);
+                if (ometaHas[i2])
+                    storeGroupMeta(g2, t3, oparts[i2],
+                            cast(const(char)[]) ometab[i2][0 .. ometal[i2]]);
+            }
+        }
+    }
+    if (err == E_NONE && np > 0)
+    {
+        atomicStore(gKafkaTxnSeen, cast(ubyte) 1);
+        foreach (i; 0 .. np)
+        {
+            auto topic = cast(const(char)[]) tbuf[i][0 .. tlen[i]];
+            immutable part = parts[i];
+            if (!validTopic(topic) || part < 0)
+                continue;
+            immutable base = partBase(topic, part);
+            // the open txn's first offset (recorded at first transactional
+            // produce); absent = the txn produced nothing here
+            static ByteBuffer pk9, rb9;
+            pidKey(topic, part, pk9);
+            char[12 + KAFKA_MAX_TOPIC + 16] pst = void;
+            immutable pl = pk9.length <= pst.length ? pk9.length : pst.length;
+            pst[0 .. pl] = cast(const(char)[]) pk9.data[0 .. pl];
+            auto pkey = cast(const(char)[]) pst[0 .. pl];
+            char[32] fb = void;
+            immutable fl = snprintf(fb.ptr, fb.length, "txn:%lld", pid);
+            auto tf = cast(const(char)[]) fb[0 .. (fl > 0 ? fl : 0)];
+            long firstOff = -1;
+            {
+                const(char)[][3] a = ["hget", pkey, tf];
+                gKafkaExec(a[], rb9);
+                auto d = rb9.data;
+                if (d.length >= 4 && d[0] == '$' && d[1] != '-')
+                {
+                    size_t i2 = 1;
+                    long blen = 0;
+                    while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9')
+                        blen = blen * 10 + (d[i2++] - '0');
+                    i2 += 2;
+                    long v = 0;
+                    long got = 0;
+                    while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9' && got < blen)
+                    {
+                        v = v * 10 + (d[i2++] - '0');
+                        got++;
+                    }
+                    if (got)
+                        firstOff = v;
+                }
+            }
+            {
+                const(char)[][3] a = ["hdel", pkey, tf];
+                gKafkaExec(a[], rb9);
+            }
+            // control marker record: [0xFE][pid 8B][type i16] (1=commit 0=abort)
+            char[11] ctl = void;
+            ctl[0] = cast(char) 0xFE;
+            foreach (k; 0 .. 8)
+                ctl[1 + k] = cast(char)((pid >> ((7 - k) * 8)) & 0xFF);
+            ctl[9] = 0;
+            ctl[10] = committed ? 1 : 0;
+            static ByteBuffer kb9;
+            partKey(topic, part, kb9);
+            char[8 + KAFKA_MAX_TOPIC + 16] kst = void;
+            immutable kl = kb9.length <= kst.length ? kb9.length : kst.length;
+            kst[0 .. kl] = cast(const(char)[]) kb9.data[0 .. kl];
+            const(char)[][1] one = [cast(const(char)[]) ctl[0 .. 11]];
+            immutable newLen = pushRecords(cast(const(char)[]) kst[0 .. kl], one[]);
+            if (!committed && firstOff >= 0 && newLen >= 0)
+            {
+                // aborted range for Fetch: "pid:firstOffset"
+                char[64] ab = void;
+                immutable al = snprintf(ab.ptr, ab.length, "%lld:%lld", pid, firstOff);
+                char[12 + KAFKA_MAX_TOPIC + 16] xst = void;
+                immutable xn = snprintf(xst.ptr, xst.length, "kafka.txa.%.*s.%d",
+                        cast(int) topic.length, topic.ptr, part);
+                const(char)[][3] a = ["rpush",
+                    cast(const(char)[]) xst[0 .. (xn > 0 ? xn : 0)],
+                    cast(const(char)[]) ab[0 .. (al > 0 ? al : 0)]];
+                gKafkaExec(a[], rb9);
+            }
+            cast(void) base;
+        }
+    }
     putI32(o, 0); // throttle_time_ms
-    putI16(o, E_NONE); // error_code
+    putI16(o, err); // error_code
 }
 
 /// TxnOffsetCommit (v0-v2): persist consumer offsets as part of the txn. Same
@@ -2032,15 +2282,27 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
 /// classic path (hop-safe interleave; see handleOffsetCommit).
 private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.cstr(); // transactional_id
+    auto tid = r.cstr(); // transactional_id
     auto group = r.cstr();
-    cast(void) r.i64(); // producer_id
-    cast(void) r.i16(); // producer_epoch
+    immutable pid = r.i64();
+    immutable epoch = r.i16();
     cast(void) r.i32(); // generation_id (v3+)
     cast(void) r.cstr(); // member_id (v3+)
     cast(void) r.cstr(); // group_instance_id (nullable, v3+)
     immutable rawn = r.carrlen();
     immutable ntopics = rawn < 0 ? 0 : safeCount(rawn);
+    // buffer the offsets at the coordinator: they apply on COMMIT only
+    static ByteBuffer req, rep; // TLS: consumed synchronously by the hop
+    req.clear();
+    req.appendByte(cast(char) KGOP_TXN_OFFSETS);
+    putStr(req, tid);
+    foreach_reverse (k; 0 .. 8)
+        req.appendByte(cast(char)((pid >> (k * 8)) & 0xFF));
+    putI32(req, epoch);
+    putStr(req, group);
+    immutable nOff2 = req.length;
+    putI32(req, 0);
+    int nAll = 0;
     immutable respStart = o.length;
     putI32(o, 0); // throttle_time_ms
     immutable tOff = reserveCArrLen(o);
@@ -2064,10 +2326,18 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
             immutable part = r.i32();
             immutable off = r.i64();
             cast(void) r.i32(); // committed_leader_epoch (v2+)
-            cast(void) r.cstr(); // metadata (nullable compact)
+            auto meta = r.cstr(); // metadata (nullable compact)
             r.skipTaggedFields(); // partition tagged fields
             if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
-                storeGroupOffset(group, topic, part, off);
+            {
+                putStr(req, topic);
+                putI32(req, part);
+                foreach_reverse (k; 0 .. 8)
+                    req.appendByte(cast(char)((off >> (k * 8)) & 0xFF));
+                req.appendByte(meta !is null ? 1 : 0);
+                putStr(req, meta is null ? "" : meta);
+                nAll++;
+            }
             putI32(o, part);
             putI16(o, E_NONE); // error_code
             putTaggedFields(o); // partition tagged fields
@@ -2080,6 +2350,9 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
     }
     patchCArrLen(o, tOff, et);
     putTaggedFields(o); // response tagged fields
+    patchI32(req, nOff2, nAll);
+    if (tid !is null && tid.length && nAll > 0)
+        cast(void) kgOp(tid, cast(const(ubyte)[]) req.data, rep);
 }
 
 private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
@@ -2089,11 +2362,22 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
         handleTxnOffsetCommitFlex(r, ver, o);
         return;
     }
-    cast(void) r.str(); // transactional_id
+    auto tid = r.str(); // transactional_id
     auto group = r.str();
-    cast(void) r.i64(); // producer_id
-    cast(void) r.i16(); // producer_epoch
+    immutable pid = r.i64();
+    immutable epoch = r.i16();
     immutable ntopics = safeCount(r.i32());
+    static ByteBuffer req, rep; // TLS: consumed synchronously by the hop
+    req.clear();
+    req.appendByte(cast(char) KGOP_TXN_OFFSETS);
+    putStr(req, tid);
+    foreach_reverse (k; 0 .. 8)
+        req.appendByte(cast(char)((pid >> (k * 8)) & 0xFF));
+    putI32(req, epoch);
+    putStr(req, group);
+    immutable nOff2 = req.length;
+    putI32(req, 0);
+    int nAll = 0;
     immutable respStart = o.length;
     putI32(o, 0); // throttle_time_ms
     immutable tOff = o.length;
@@ -2102,7 +2386,7 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
-            break; // response ceiling: also bounds the HSET hop count
+            break;
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
         if (!r.ok)
@@ -2120,9 +2404,17 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
             immutable off = r.i64();
             if (ver >= 2)
                 cast(void) r.i32(); // committed_leader_epoch (v2+)
-            cast(void) r.str(); // metadata (nullable)
+            auto meta = r.str(); // metadata (nullable)
             if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
-                storeGroupOffset(group, topic, part, off);
+            {
+                putStr(req, topic);
+                putI32(req, part);
+                foreach_reverse (k; 0 .. 8)
+                    req.appendByte(cast(char)((off >> (k * 8)) & 0xFF));
+                req.appendByte(meta !is null ? 1 : 0);
+                putStr(req, meta is null ? "" : meta);
+                nAll++;
+            }
             putI32(o, part);
             putI16(o, E_NONE); // error_code
             ep++;
@@ -2130,6 +2422,9 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
         patchI32(o, pOff, ep);
     }
     patchI32(o, tOff, et);
+    patchI32(req, nOff2, nAll);
+    if (tid !is null && tid.length && nAll > 0)
+        cast(void) kgOp(tid, cast(const(ubyte)[]) req.data, rep);
 }
 
 /// Read one RESP bulk string `$<len>\r\n<bytes>\r\n` from d at i; advances i.
@@ -4442,6 +4737,117 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     }
 }
 
+// --- idempotent-producer state (KIP-98 T1; see KAFKA-TXN-PLAN.md) ----------
+// Per-partition producer state: hash `kafka.pid.<topic>.<p>`, field = pid,
+// value = "<epoch>:<lastBaseSeq>:<lastCount>:<lastBaseOffset>". Producers
+// without a producer id (pid -1 in the v2 batch header) never touch it.
+private void pidKey(scope const(char)[] topic, int part, ref ByteBuffer o) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    o.clear();
+    o.append("kafka.pid.");
+    o.append(topic);
+    char[16] nb = void;
+    immutable n = snprintf(nb.ptr, nb.length, ".%d", part);
+    o.append(nb[0 .. n]);
+}
+
+/// Sequence/epoch admission for one idempotent batch. NONE = accept;
+/// dupBase >= 0 = exact retry of the last acked batch (ack its offset, store
+/// nothing); 45/47 otherwise.
+private short pidCheck(scope const(char)[] topic, int part, long pid, short epoch,
+        int seq, int cnt, out long dupBase) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    dupBase = -1;
+    if (gKafkaExec is null)
+        return E_NONE;
+    static ByteBuffer kb7, rb;
+    pidKey(topic, part, kb7);
+    char[24] fb = void;
+    immutable fl = snprintf(fb.ptr, fb.length, "%lld", pid);
+    const(char)[][3] a = ["hget", cast(const(char)[]) kb7.data,
+        cast(const(char)[]) fb[0 .. (fl > 0 ? fl : 0)]];
+    gKafkaExec(a[], rb);
+    auto d = rb.data;
+    if (d.length < 4 || d[0] != '$' || d[1] == '-')
+        return E_NONE; // first batch from this pid
+    size_t i2 = 1;
+    long blen = 0;
+    while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9')
+        blen = blen * 10 + (d[i2++] - '0');
+    if (i2 + 2 + blen > d.length)
+        return E_NONE;
+    i2 += 2;
+    auto v = cast(const(char)[]) d[i2 .. i2 + cast(size_t) blen];
+    long[4] parts2;
+    size_t np2, st2;
+    foreach (k, ch; v)
+        if (ch == ':')
+        {
+            if (np2 < 3)
+            {
+                long x = 0;
+                bool neg = st2 < k && v[st2] == '-';
+                foreach (c; v[(neg ? st2 + 1 : st2) .. k])
+                    if (c >= '0' && c <= '9')
+                        x = x * 10 + (c - '0');
+                parts2[np2++] = neg ? -x : x;
+            }
+            st2 = k + 1;
+        }
+    {
+        long x = 0;
+        bool neg = st2 < v.length && v[st2] == '-';
+        foreach (c; v[(neg ? st2 + 1 : st2) .. $])
+            if (c >= '0' && c <= '9')
+                x = x * 10 + (c - '0');
+        parts2[np2++] = neg ? -x : x;
+    }
+    if (np2 != 4)
+        return E_NONE; // malformed state: accept rather than wedge the producer
+    immutable sEpoch = cast(short) parts2[0];
+    immutable lastSeq = cast(int) parts2[1];
+    immutable lastCnt = cast(int) parts2[2];
+    immutable lastBase = parts2[3];
+    if (epoch < sEpoch)
+        return E_INVALID_PRODUCER_EPOCH; // fenced zombie
+    if (epoch > sEpoch)
+        return E_NONE; // new epoch resets the sequence
+    immutable int expected = cast(int)(cast(uint) lastSeq + cast(uint) lastCnt);
+    if (seq == expected)
+        return E_NONE;
+    if (seq == lastSeq && cnt == lastCnt)
+    {
+        dupBase = lastBase; // exact retry of the last acked batch
+        return E_NONE;
+    }
+    return E_OUT_OF_ORDER_SEQ;
+}
+
+/// Record the last accepted batch for the pid (after a successful append).
+private void pidUpdate(scope const(char)[] topic, int part, long pid, short epoch,
+        int seq, int cnt, long baseOff) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer kb8, rb;
+    pidKey(topic, part, kb8);
+    char[24] fb = void;
+    immutable fl = snprintf(fb.ptr, fb.length, "%lld", pid);
+    char[80] vb = void;
+    immutable vl = snprintf(vb.ptr, vb.length, "%d:%d:%d:%lld", cast(int) epoch,
+            seq, cnt, baseOff);
+    const(char)[][4] a = ["hset", cast(const(char)[]) kb8.data,
+        cast(const(char)[]) fb[0 .. (fl > 0 ? fl : 0)],
+        cast(const(char)[]) vb[0 .. (vl > 0 ? vl : 0)]];
+    gKafkaExec(a[], rb);
+}
+
 // MessageSet v1 entry on the wire:
 //   [offset i64][size i32][crc u32][magic i8][attrs i8][timestamp i64][key][value]
 // We store [size i32][crc..value] (WITHOUT the offset) as the list record;
@@ -4501,6 +4907,36 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
             // until a DeleteRecords ever ran) — hops BEFORE the TLS staging
             immutable pbase = err == E_NONE && validTopic(topic) && part >= 0
                 ? partBase(topic, part) : 0;
+            // Idempotent producer (KIP-98): the fixed v2 header carries
+            // attributes@21, producerId@43, producerEpoch@51, baseSequence@53,
+            // recordCount@57. pid -1 (the default) skips ALL of this — and
+            // the admission HGET hops HERE, before the TLS staging below.
+            long bPid = -1;
+            short bEpoch = -1;
+            short bAttrs = 0;
+            int bSeq = -1, bCount = 0;
+            if (records.length >= 61 && records[16] == 2)
+            {
+                bAttrs = cast(short)((cast(ushort) records[21] << 8) | records[22]);
+                bPid = 0;
+                foreach (k2; 43 .. 51)
+                    bPid = (bPid << 8) | records[k2];
+                bEpoch = cast(short)((cast(ushort) records[51] << 8) | records[52]);
+                bSeq = (cast(int) records[53] << 24) | (cast(int) records[54] << 16)
+                    | (cast(int) records[55] << 8) | records[56];
+                bCount = (cast(int) records[57] << 24) | (cast(int) records[58] << 16)
+                    | (cast(int) records[59] << 8) | records[60];
+            }
+            long dupBase = -1;
+            bool skipStore = false;
+            if (err == E_NONE && bPid >= 0 && validTopic(topic) && part >= 0)
+            {
+                immutable ie = pidCheck(topic, part, bPid, bEpoch, bSeq, bCount, dupBase);
+                if (ie != E_NONE)
+                    err = ie;
+                else if (dupBase >= 0)
+                    skipStore = true; // exact retry: ack the original offset
+            }
             int[1024] invIdx = void; // batch indices of keyless records
             size_t ninv = 0;
             // topic registration happens in Metadata (the auto-create moment):
@@ -4533,7 +4969,11 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                     if (offs.length < (nrec + 1) * 2)
                         offs.length = (nrec + 1) * 2;
                     offs[nrec * 2] = blobArena.length;
-                    putInternalRec(blobArena, ts, k, kn, v, vn, hdr);
+                    if (bPid >= 0)
+                        putInternalRecPid(blobArena, bPid, (bAttrs & 0x10) != 0,
+                                ts, k, kn, v, vn, hdr);
+                    else
+                        putInternalRec(blobArena, ts, k, kn, v, vn, hdr);
                     offs[nrec * 2 + 1] = blobArena.length - offs[nrec * 2];
                     nrec++;
                 });
@@ -4619,6 +5059,8 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 err = E_INVALID_RECORD; // whole batch rejected, nothing stored
                 nrec = 0;
             }
+            if (skipStore)
+                nrec = 0; // duplicate: nothing stored, offset answered below
             if (err == E_NONE && nrec > 0 && validTopic(topic) && part >= 0)
             {
                 if (slices.length < nrec)
@@ -4640,8 +5082,22 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                     baseOffset = pbase + newLen - cast(long) nrec;
                     import core.atomic : atomicOp;
                     atomicOp!"+="(gKafkaProduced, nrec);
+                    // idempotence bookkeeping (post-push: blobArena consumed)
+                    if (bPid >= 0)
+                    {
+                        pidUpdate(topic, part, bPid, bEpoch, bSeq, bCount, baseOffset);
+                        if ((bAttrs & 0x10) != 0) // transactional batch
+                        {
+                            import core.atomic : atomicStore;
+
+                            atomicStore(gKafkaTxnSeen, cast(ubyte) 1);
+                            txnNoteStart(topic, part, bPid, baseOffset);
+                        }
+                    }
                 }
             }
+            if (skipStore)
+                baseOffset = dupBase; // duplicate retry acks the ORIGINAL offset
             if (o.length - respStart > KAFKA_MAX_RESP)
                 continue; // response ceiling: skip this entry (count is backpatched)
             putI32(o, part);
@@ -4689,8 +5145,9 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     cast(void) r.i32(); // min_bytes
     if (ver >= 3)
         cast(void) r.i32(); // max_bytes (whole request)
+    byte isolation = 0;
     if (ver >= 4)
-        cast(void) r.i8(); // isolation_level (read_uncommitted assumed)
+        isolation = r.i8(); // isolation_level (1 = read_committed)
     if (ver >= 7)
     {
         cast(void) r.i32(); // session_id
@@ -4764,15 +5221,40 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable fetchIdx = fetchOff - base; // list index of the offset
             immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
             immutable bad = fetchOff < base || fetchOff > hw || !validTopic(topic) || part < 0;
+            // transactions: zero-cost while gKafkaTxnSeen is 0 (one atomic
+            // load); afterwards LSO + aborted ranges hop BEFORE emission
+            long lso = hw;
+            long[64] abPids = void;
+            long[64] abOffs = void;
+            size_t nab;
+            bool txnActive;
+            {
+                import core.atomic : atomicLoad;
+
+                txnActive = atomicLoad(gKafkaTxnSeen) != 0;
+            }
+            if (txnActive && !bad && ver >= 4)
+            {
+                lso = computeLso(topic, part, hw);
+                nab = loadAborted(topic, part, abPids, abOffs);
+            }
+            // read_committed: records are served only BELOW the LSO — data of
+            // an OPEN transaction stays invisible until its marker lands
+            immutable long servEnd = (isolation == 1 && txnActive && lso < hw) ? lso : hw;
             putI32(o, part);
             putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
             putI64(o, hw); // high watermark
             if (ver >= 4)
             {
-                putI64(o, hw); // last_stable_offset (no transactions => == hw)
+                putI64(o, lso); // last_stable_offset
                 if (ver >= 5)
                     putI64(o, base); // log_start_offset (v5+)
-                putI32(o, 0); // aborted_transactions: empty array
+                putI32(o, cast(int) nab); // aborted_transactions
+                foreach (k2; 0 .. nab)
+                {
+                    putI64(o, abPids[k2]); // producer_id
+                    putI64(o, abOffs[k2]); // first_offset
+                }
                 if (ver >= 11)
                     putI32(o, -1); // preferred_read_replica (v11+): none
             }
@@ -4781,9 +5263,11 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             // v4+ as ONE RecordBatch v2 (carrying headers).
             immutable recAt = o.length;
             putI32(o, 0); // records byte size, patched below
-            if (!bad && !overCap && fetchOff < hw)
+            if (!bad && !overCap && fetchOff < servEnd)
             {
-                immutable int maxN = 16384; // deep batches: fewer walks per fetch
+                int maxN = 16384; // deep batches: fewer walks per fetch
+                if (servEnd - fetchOff < maxN)
+                    maxN = cast(int)(servEnd - fetchOff); // LSO cap (read_committed)
                 // Clamp the client's partition_max_bytes to the response ceiling.
                 // An unclamped ~int.max budget both defeats KAFKA_MAX_RESP within a
                 // single partition (a large-allocation broker-death vector) and can
@@ -4829,7 +5313,55 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     }
                     if (nb > 0)
                     {
-                        encodeV2BatchFromInternal(o, fetchOff, fblobs[0 .. nb]);
+                        if (txnActive)
+                        {
+                            // control markers get their OWN batches, and data
+                            // runs split whenever producer provenance changes
+                            // (one batch = one pid, so read_committed clients
+                            // can match aborted_transactions)
+                            size_t st2 = 0;
+                            long runPid = long.min; // unset
+                            foreach (bi; 0 .. nb)
+                            {
+                                auto bl = fblobs[bi];
+                                if (bl.length == 11 && bl[0] == 0xFE)
+                                {
+                                    if (bi > st2)
+                                        encodeV2BatchFromInternal(o,
+                                                fetchOff + st2, fblobs[st2 .. bi]);
+                                    long cpid = 0;
+                                    foreach (k3; 1 .. 9)
+                                        cpid = (cpid << 8) | bl[k3];
+                                    immutable short ctype =
+                                        cast(short)((cast(short) bl[9] << 8) | bl[10]);
+                                    encodeControlBatch(o, fetchOff + bi, cpid, ctype);
+                                    st2 = bi + 1;
+                                    runPid = long.min;
+                                    continue;
+                                }
+                                long thisPid = -1;
+                                if (bl.length >= 10 && bl[0] == 0xFD)
+                                {
+                                    thisPid = 0;
+                                    foreach (k3; 1 .. 9)
+                                        thisPid = (thisPid << 8) | bl[k3];
+                                }
+                                if (runPid == long.min)
+                                    runPid = thisPid;
+                                else if (thisPid != runPid)
+                                {
+                                    encodeV2BatchFromInternal(o, fetchOff + st2,
+                                            fblobs[st2 .. bi]);
+                                    st2 = bi;
+                                    runPid = thisPid;
+                                }
+                            }
+                            if (st2 < nb)
+                                encodeV2BatchFromInternal(o, fetchOff + st2,
+                                        fblobs[st2 .. nb]);
+                        }
+                        else
+                            encodeV2BatchFromInternal(o, fetchOff, fblobs[0 .. nb]);
                         atomicOp!"+="(gKafkaFetched, cast(ulong) nb);
                     }
                 }
@@ -4879,8 +5411,9 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     cast(void) r.i32(); // replica_id
+    byte isolation = 0;
     if (ver >= 2)
-        cast(void) r.i8(); // isolation_level (v2+)
+        isolation = r.i8(); // isolation_level (v2+; 1 = read_committed)
     tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 2)
@@ -4931,10 +5464,19 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 llen = partLen(k3);
             }
             long off;
+            long lend = base + llen; // latest
+            if (isolation == 1)
+            {
+                import core.atomic : atomicLoad;
+
+                // read_committed: "latest" is the last STABLE offset
+                if (atomicLoad(gKafkaTxnSeen) != 0 && validTopic(topic) && part >= 0)
+                    lend = computeLso(topic, part, lend);
+            }
             if (ts == -2)
                 off = base; // earliest = log start offset
             else if (ts < 0)
-                off = base + llen; // -1 = latest (high watermark)
+                off = lend; // -1 = latest (LSO under read_committed)
             else
             {
                 off = offsetForTime(k3, llen, ts); // KIP-79; -1 = no match
@@ -5108,9 +5650,16 @@ unittest // varint / zigzag round-trip, including boundaries and negatives
 //   ([svarint count]([svarint kLen][k][svarint vLen][v])*), verbatim-copyable
 //   into a re-encoded batch because header key/value lengths are absolute.
 private enum ubyte KREC_TAG = 0xFF;
+/// v2 internal record WITH producer provenance: [0xFD][pid i64][u8 txnFlag]
+/// then the same tail as KREC_TAG. Only idempotent/transactional producers
+/// write it; read_committed clients need the pid on the data batches to match
+/// the aborted-transactions list.
+private enum ubyte KREC_TAG_PID = 0xFD;
 
 private struct KRec2
 {
+    long pid = -1; // producer id (KREC_TAG_PID records; -1 otherwise)
+    bool txn; // transactional-batch provenance
     long ts;
     const(ubyte)[] key;
     bool keyNull;
@@ -5142,12 +5691,77 @@ private void putInternalRec(ref ByteBuffer o, long ts, scope const(ubyte)[] key,
     o.append(hdrSection);
 }
 
+private void putInternalRecPid(ref ByteBuffer o, long pid, bool txn, long ts,
+        scope const(ubyte)[] key, bool keyNull, scope const(ubyte)[] val,
+        bool valNull, scope const(ubyte)[] hdrSection) @nogc nothrow
+{
+    o.appendByte(cast(char) KREC_TAG_PID);
+    putI64(o, pid);
+    o.appendByte(txn ? 1 : 0);
+    putI64(o, ts);
+    putBytesI32(o, key, keyNull);
+    putBytesI32(o, val, valNull);
+    putI32(o, cast(int) hdrSection.length);
+    o.append(hdrSection);
+}
+
 /// Parse a stored list element into common fields, handling BOTH the internal
 /// v2 blob (0xFF tag) and a legacy v1 message blob `[i32 size][crc magic attrs
 /// ts key val]`. A partition may hold a mix (v1 produce + v2 produce).
 private KRec2 parseStoredRec(scope const(ubyte)[] b) @nogc nothrow
 {
     KRec2 r;
+    if (b.length >= 10 && b[0] == KREC_TAG_PID)
+    {
+        Rd rd0 = Rd(b);
+        rd0.i = 1;
+        r.pid = rd0.i64();
+        r.txn = rd0.i8() != 0;
+        Rd rd = rd0; // continue with the shared tail
+        r.ts = rd.i64();
+        immutable kl0 = rd.i32();
+        if (!rd.ok)
+        {
+            r.ok = false;
+            return r;
+        }
+        if (kl0 < 0)
+            r.keyNull = true;
+        else if (rd.i + kl0 <= b.length)
+        {
+            r.key = b[rd.i .. rd.i + kl0];
+            rd.i += kl0;
+        }
+        else
+        {
+            r.ok = false;
+            return r;
+        }
+        immutable vl0 = rd.i32();
+        if (!rd.ok)
+        {
+            r.ok = false;
+            return r;
+        }
+        if (vl0 < 0)
+            r.valNull = true;
+        else if (rd.i + vl0 <= b.length)
+        {
+            r.val = b[rd.i .. rd.i + vl0];
+            rd.i += vl0;
+        }
+        else
+        {
+            r.ok = false;
+            return r;
+        }
+        immutable hl0 = rd.i32();
+        if (rd.ok && hl0 >= 0 && rd.i + hl0 <= b.length)
+            r.hdrSection = b[rd.i .. rd.i + hl0];
+        else if (!rd.ok || hl0 > 0)
+            r.ok = false;
+        return r;
+    }
     if (b.length >= 1 && b[0] == KREC_TAG)
     {
         Rd rd = Rd(b);
@@ -5594,6 +6208,194 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
 
 /// Encode stored records (internal or v1 blobs) as ONE RecordBatch v2 at
 /// baseOffset — the Fetch v4+ emit path.
+/// ZigZag varint writer (the record-level varint encoding).
+private void putZig(ref ByteBuffer o, long v) @nogc nothrow
+{
+    ulong u = (cast(ulong)(v) << 1) ^ cast(ulong)(v >> 63);
+    while (u >= 0x80)
+    {
+        o.appendByte(cast(char)((u & 0x7F) | 0x80));
+        u >>= 7;
+    }
+    o.appendByte(cast(char)(u & 0x7F));
+}
+
+/// One CONTROL batch (attrs isControl|isTransactional, count 1) for a stored
+/// marker record. Clients skip it and learn the txn outcome from its key.
+private void encodeControlBatch(ref ByteBuffer o, long offset, long pid,
+        short ctype) @nogc nothrow
+{
+    static ByteBuffer bodyB, rbuf; // TLS: yield-free build
+    rbuf.clear();
+    rbuf.appendByte(0); // record attributes
+    putZig(rbuf, 0); // timestampDelta
+    putZig(rbuf, 0); // offsetDelta
+    putZig(rbuf, 4); // key length
+    putI16(rbuf, 0); // key: version
+    putI16(rbuf, ctype); // key: type (0 abort, 1 commit)
+    putZig(rbuf, 6); // value length
+    putI16(rbuf, 0); // value: version
+    putI32(rbuf, 0); // value: coordinator epoch
+    putZig(rbuf, 0); // headers count
+    bodyB.clear();
+    putI16(bodyB, 0x0030); // attributes: isTransactional | isControl
+    putI32(bodyB, 0); // lastOffsetDelta
+    putI64(bodyB, 0); // firstTimestamp
+    putI64(bodyB, 0); // maxTimestamp
+    putI64(bodyB, pid); // producerId
+    putI16(bodyB, 0); // producerEpoch
+    putI32(bodyB, -1); // baseSequence
+    putI32(bodyB, 1); // record count
+    putZig(bodyB, cast(long) rbuf.length); // record length prefix
+    bodyB.append(cast(const(char)[]) rbuf.data);
+    putI64(o, offset); // baseOffset
+    putI32(o, cast(int)(4 + 1 + 4 + bodyB.length)); // batchLength after this field
+    putI32(o, 0); // partitionLeaderEpoch
+    o.appendByte(2); // magic
+    putI32(o, cast(int) crc32c(cast(const(ubyte)[]) bodyB.data)); // crc32c
+    o.append(cast(const(char)[]) bodyB.data);
+}
+
+/// First transactional produce of a (pid, txn) on a partition records the
+/// txn's first offset (HSETNX: later batches don't move it).
+private void txnNoteStart(scope const(char)[] topic, int part, long pid,
+        long firstOff) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer kb10, rb;
+    pidKey(topic, part, kb10);
+    char[32] fb = void;
+    immutable fl = snprintf(fb.ptr, fb.length, "txn:%lld", pid);
+    char[24] vb = void;
+    immutable vl = snprintf(vb.ptr, vb.length, "%lld", firstOff);
+    const(char)[][4] a = ["hsetnx", cast(const(char)[]) kb10.data,
+        cast(const(char)[]) fb[0 .. (fl > 0 ? fl : 0)],
+        cast(const(char)[]) vb[0 .. (vl > 0 ? vl : 0)]];
+    gKafkaExec(a[], rb);
+}
+
+/// Last stable offset: the smallest first-offset among OPEN transactions on
+/// the partition (fields `txn:<pid>` of the kafka.pid hash), else hw.
+private long computeLso(scope const(char)[] topic, int part, long hw) nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return hw;
+    static ByteBuffer kb11, rb;
+    pidKey(topic, part, kb11);
+    const(char)[][2] a = ["hgetall", cast(const(char)[]) kb11.data];
+    gKafkaExec(a[], rb);
+    auto d = cast(const(char)[]) rb.data;
+    long lso = hw;
+    if (d.length < 4 || d[0] != '*')
+        return lso;
+    size_t i2 = 1;
+    long cnt = 0;
+    while (i2 < d.length && d[i2] != '\r')
+        cnt = cnt * 10 + (d[i2++] - '0');
+    i2 += 2;
+    for (long e = 0; e + 1 < cnt; e += 2)
+    {
+        // field bulk
+        if (i2 >= d.length || d[i2] != '$')
+            break;
+        i2++;
+        long fl = 0;
+        while (i2 < d.length && d[i2] != '\r')
+            fl = fl * 10 + (d[i2++] - '0');
+        i2 += 2;
+        if (i2 + fl + 2 > d.length)
+            break;
+        auto f = d[i2 .. i2 + cast(size_t) fl];
+        i2 += cast(size_t) fl + 2;
+        // value bulk
+        if (i2 >= d.length || d[i2] != '$')
+            break;
+        i2++;
+        long vl = 0;
+        while (i2 < d.length && d[i2] != '\r')
+            vl = vl * 10 + (d[i2++] - '0');
+        i2 += 2;
+        if (i2 + vl + 2 > d.length)
+            break;
+        auto v = d[i2 .. i2 + cast(size_t) vl];
+        i2 += cast(size_t) vl + 2;
+        if (f.length > 4 && f[0 .. 4] == "txn:")
+        {
+            long x = 0;
+            foreach (c; v)
+                if (c >= '0' && c <= '9')
+                    x = x * 10 + (c - '0');
+            if (x < lso)
+                lso = x;
+        }
+    }
+    return lso;
+}
+
+/// Aborted ranges for the partition into stack arrays; returns the count.
+private size_t loadAborted(scope const(char)[] topic, int part,
+        ref long[64] pids, ref long[64] offs) nothrow @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    if (gKafkaExec is null)
+        return 0;
+    static ByteBuffer rb;
+    char[12 + KAFKA_MAX_TOPIC + 16] xst = void;
+    immutable xn = snprintf(xst.ptr, xst.length, "kafka.txa.%.*s.%d",
+            cast(int) topic.length, topic.ptr, part);
+    const(char)[][4] a = ["lrange", cast(const(char)[]) xst[0 .. (xn > 0 ? xn : 0)],
+        "0", "-1"];
+    gKafkaExec(a[], rb);
+    auto d = cast(const(char)[]) rb.data;
+    size_t n;
+    if (d.length < 4 || d[0] != '*')
+        return 0;
+    size_t i2 = 1;
+    long cnt = 0;
+    while (i2 < d.length && d[i2] != '\r')
+        cnt = cnt * 10 + (d[i2++] - '0');
+    i2 += 2;
+    foreach (_; 0 .. cnt)
+    {
+        if (n >= pids.length || i2 >= d.length || d[i2] != '$')
+            break;
+        i2++;
+        long bl = 0;
+        while (i2 < d.length && d[i2] != '\r')
+            bl = bl * 10 + (d[i2++] - '0');
+        i2 += 2;
+        if (i2 + bl + 2 > d.length)
+            break;
+        auto v = d[i2 .. i2 + cast(size_t) bl];
+        i2 += cast(size_t) bl + 2;
+        long pv = 0, ov = 0;
+        bool sec = false;
+        foreach (c; v)
+        {
+            if (c == ':')
+            {
+                sec = true;
+                continue;
+            }
+            if (c >= '0' && c <= '9')
+            {
+                if (sec)
+                    ov = ov * 10 + (c - '0');
+                else
+                    pv = pv * 10 + (c - '0');
+            }
+        }
+        pids[n] = pv;
+        offs[n] = ov;
+        n++;
+    }
+    return n;
+}
+
 private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
         scope const(ubyte)[][] blobs) @nogc nothrow
 {
@@ -5622,12 +6424,26 @@ private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
         }
     }
     immutable int count = cast(int) blobs.length;
-    putI16(bodyB, 0); // attributes
+    // producer provenance from the first record (the fetch assembler groups
+    // runs by pid/txn, so one batch is homogeneous): read_committed clients
+    // match batch.producerId against aborted_transactions
+    long bpid = -1;
+    bool btxn = false;
+    if (blobs.length)
+    {
+        auto r0 = parseStoredRec(blobs[0]);
+        if (r0.ok)
+        {
+            bpid = r0.pid;
+            btxn = r0.txn;
+        }
+    }
+    putI16(bodyB, btxn ? 0x0010 : 0); // attributes (isTransactional)
     putI32(bodyB, count > 0 ? count - 1 : 0); // lastOffsetDelta
     putI64(bodyB, firstTs);
     putI64(bodyB, maxTs);
-    putI64(bodyB, -1); // producerId
-    putI16(bodyB, -1); // producerEpoch
+    putI64(bodyB, bpid); // producerId
+    putI16(bodyB, bpid >= 0 ? 0 : -1); // producerEpoch
     putI32(bodyB, -1); // baseSequence
     putI32(bodyB, count); // record count
     foreach (idx, bl; blobs)
@@ -5675,7 +6491,7 @@ private void encodeV2BatchFromInternal(ref ByteBuffer o, long baseOffset,
 /// no header field — the standard broker down-conversion for old clients).
 private void emitV1Record(ref ByteBuffer o, long offset, scope const(ubyte)[] blob) @nogc nothrow
 {
-    if (blob.length >= 1 && blob[0] == KREC_TAG)
+    if (blob.length >= 1 && (blob[0] == KREC_TAG || blob[0] == KREC_TAG_PID))
     {
         auto rr = parseStoredRec(blob);
         static ByteBuffer m; // TLS: message body magic..value (for CRC)
