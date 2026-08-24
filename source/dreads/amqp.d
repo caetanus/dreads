@@ -143,6 +143,11 @@ private ulong[string] gExchangeSeq; // TLS
 // RabbitMQ clients rely on to probe existence.
 private bool[string] gQueues; // TLS: present => queue currently exists
 private ulong[string] gQueueSeq; // TLS: per-name LWW seq (tombstones survive delete)
+// Live consumer count per queue, shard-local (a consumer and the queue.declare
+// that reports it share a connection, hence a shard, in the common case). Feeds
+// the consumer_count field of queue.declare-ok. Cross-shard consumers are not
+// summed here — an accepted best-effort, matching how RabbitMQ treats the field.
+private uint[string] gQueueConsumers; // TLS
 private Binding[][string] gBindings; // TLS: exchange -> bindings
 
 /// The AMQP 0-9-1 default exchanges exist on every vhost with NO explicit
@@ -1361,6 +1366,12 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             putShortStr(o, "basic.nack"); // pika gates confirms on BOTH caps
             o.appendByte('t');
             o.appendByte(1);
+            putShortStr(o, "consumer_cancel_notify"); // we push basic.cancel on queue delete
+            o.appendByte('t');
+            o.appendByte(1);
+            putShortStr(o, "exchange_exchange_bindings"); // op 6/7 e2e bindings
+            o.appendByte('t');
+            o.appendByte(1);
             // patch inner then outer lengths
             auto d = cast(ubyte[]) o.data;
             immutable capLen = o.length - capAt - 4;
@@ -1554,33 +1565,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             });
             return true;
         case 40: // close
-            // requeue this channel's in-flight (unacked) records to the queue
-            // front and stop its consumer fibers before dropping the channel —
-            // otherwise those messages were destructively popped and lost
-            try
-            {
-                // removing chans[chan] (below) makes this channel's consumer
-                // fibers observe a gen/existence mismatch and exit — no per-number
-                // closed-flag needed (that flag mis-killed fresh consumers on a
-                // reopened, reused channel number).
-                ulong[] mine;
-                foreach (t, ref u; c.unacked)
-                    if (u.chan == chan)
-                        mine ~= t;
-                // FIFO-preserving requeue + redelivered mark (settleNegative):
-                // descending tag -> pushFront leaves ascending at the head. The
-                // old inline pushFront scrambled order (AA hash order) and never
-                // set the redelivered flag.
-                import std.algorithm.sorting : sort;
-
-                sort!"a > b"(mine);
-                foreach (t; mine)
-                    settleNegative(c, t, true);
-                c.chans.remove(chan);
-            }
-            catch (Exception)
-            {
-            }
+            // requeue this channel's in-flight (unacked) records and stop its
+            // consumer fibers (they observe the gen/existence mismatch and exit)
+            // before dropping the channel — else those popped messages are lost.
+            requeueAndDropChannel(c, chan);
             method(o, chan, 20, 41);
             return true;
         case 20: // flow: we never throttle -> acknowledge, echoing the state
@@ -1732,10 +1720,12 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 static ByteBuffer kb; // TLS
                 queueKey(qq, kb);
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
+                immutable ccnt = (cast(string) qq in gQueueConsumers)
+                    ? gQueueConsumers[cast(string) qq] : 0u;
                 method(o, chan, 50, 11, (ref ByteBuffer b) @nogc nothrow {
                     putShortStr(b, qq);
                     putU32(b, cast(uint)(cnt < 0 ? 0 : cnt));
-                    putU32(b, 0);
+                    putU32(b, ccnt); // live consumers on this queue (shard-local)
                 });
                 return true;
             }
@@ -1903,10 +1893,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         }
                     immutable redlv = recordRedelivered(pay.data);
                     auto grk = recordRoutingKey(pay.data);
+                    auto gex = recordExchange(pay.data);
                     method(o, chan, 60, 71, (ref ByteBuffer b) @nogc nothrow {
                         putU64(b, gtag);
                         b.appendByte(redlv ? 1 : 0); // redelivered
-                        putShortStr(b, ""); // exchange (not stored in the record)
+                        putShortStr(b, gex); // original exchange
                         putShortStr(b, grk); // original routing key
                         putU32(b, cast(uint)(remaining < 0 ? 0 : remaining));
                     });
@@ -2307,11 +2298,20 @@ private auto asChars(const(ubyte)[] b) @nogc nothrow
 // recover from the stored bytes. splitRecord still reads legacy v1
 // ("\x01AMQ", no rk) and bare (magic-less) records.
 private void buildRecord(ref ByteBuffer o, long publishMs, int deaths,
-        scope const(char)[] rkey, scope const(ubyte)[] props, scope const(ubyte)[] body_) @nogc nothrow
+        scope const(char)[] rkey, scope const(ubyte)[] props, scope const(ubyte)[] body_,
+        scope const(char)[] exchange = "") @nogc nothrow
 {
-    o.append("\x03AMQ");
+    // v4 record: bytes 0..12 are byte-identical to v3 (magic, publishMs, deaths
+    // with the redelivered flag in bit 7), then the ORIGINAL exchange (u16 len)
+    // ahead of the routing key. basic.deliver/basic.get-ok must carry the real
+    // exchange the message was published to (recordExchange reads it back).
+    o.append("\x04AMQ");
     putU64(o, cast(ulong) publishMs); // wall-clock ms at publish (0 = unknown)
     o.appendByte(cast(char)(deaths > 255 ? 255 : (deaths < 0 ? 0 : deaths))); // x-death hop count
+    immutable el = exchange.length > 0xFFFF ? 0xFFFF : exchange.length;
+    o.appendByte(cast(char)(el >> 8));
+    o.appendByte(cast(char)(el & 0xFF));
+    o.append(exchange[0 .. el]);
     immutable rl = rkey.length > 0xFFFF ? 0xFFFF : rkey.length;
     o.appendByte(cast(char)(rl >> 8));
     o.appendByte(cast(char)(rl & 0xFF));
@@ -2325,6 +2325,34 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
         out int deaths, out const(char)[] rkey, out const(ubyte)[] props,
         out const(ubyte)[] body_) @nogc nothrow
 {
+    if (blob.length >= 17 && blob[0] == 0x04 && blob[1] == 'A' && blob[2] == 'M'
+            && blob[3] == 'Q')
+    {
+        long pm = 0;
+        foreach (k; 0 .. 8)
+            pm = (pm << 8) | blob[4 + k];
+        publishMs = pm;
+        deaths = blob[12] & 0x7F; // bit 7 is the redelivered flag, not a death
+        immutable el = (cast(size_t) blob[13] << 8) | blob[14]; // exchange, skipped here
+        immutable ro = 15 + el; // routing-key length offset
+        if (ro + 2 <= blob.length)
+        {
+            immutable rl = (cast(size_t) blob[ro] << 8) | blob[ro + 1];
+            immutable po = ro + 2 + rl;
+            if (po + 4 <= blob.length)
+            {
+                rkey = cast(const(char)[]) blob[ro + 2 .. po];
+                immutable pl = (cast(size_t) blob[po] << 24) | (cast(size_t) blob[po + 1] << 16)
+                    | (cast(size_t) blob[po + 2] << 8) | blob[po + 3];
+                if (po + 4 + pl <= blob.length)
+                {
+                    props = blob[po + 4 .. po + 4 + pl];
+                    body_ = blob[po + 4 + pl .. $];
+                    return;
+                }
+            }
+        }
+    }
     if (blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A' && blob[2] == 'M'
             && blob[3] == 'Q')
     {
@@ -2389,8 +2417,24 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
 /// both read false, matching RabbitMQ (dead-letter starts a fresh delivery).
 private bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
 {
-    return blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A'
+    return blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04) && blob[1] == 'A'
         && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
+}
+
+/// The ORIGINAL exchange a message was published to ([basic.deliver]/
+/// [basic.get-ok] carry it). Only the v4 record stores it; earlier records (and
+/// bare RESP-side values) predate the field and yield "" — which is also the
+/// correct value for a default-exchange publish.
+private const(char)[] recordExchange(return scope const(ubyte)[] blob) @nogc nothrow
+{
+    if (blob.length >= 17 && blob[0] == 0x04 && blob[1] == 'A' && blob[2] == 'M'
+            && blob[3] == 'Q')
+    {
+        immutable el = (cast(size_t) blob[13] << 8) | blob[14];
+        if (15 + el <= blob.length)
+            return cast(const(char)[]) blob[15 .. 15 + el];
+    }
+    return "";
 }
 
 /// The ORIGINAL routing key a message was published with ([basic.deliver] /
@@ -2413,7 +2457,7 @@ private void markRedelivered(ref ByteBuffer dst, scope const(ubyte)[] blob) @nog
 {
     dst.clear();
     dst.append(cast(const(char)[]) blob);
-    if (blob.length >= 15 && blob[0] == 0x03 && blob[1] == 'A'
+    if (blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04) && blob[1] == 'A'
             && blob[2] == 'M' && blob[3] == 'Q')
     {
         auto d = cast(ubyte[]) dst.data;
@@ -2421,9 +2465,46 @@ private void markRedelivered(ref ByteBuffer dst, scope const(ubyte)[] blob) @nog
     }
 }
 
+/// Requeue a channel's in-flight (unacked) records to their queue fronts, then
+/// drop the channel so its consumer fibers observe the gen/existence mismatch
+/// and exit. Shared by channel.close and the publish-to-unknown-exchange 404.
+private void requeueAndDropChannel(AmqpConn c, ushort chan) nothrow @trusted
+{
+    try
+    {
+        // collect first, settle after — settleNegative mutates c.unacked, so it
+        // must not run inside the foreach over it. Descending tag + pushFront
+        // leaves the queue head in ascending (FIFO) order.
+        ulong[] mine;
+        foreach (t, ref u; c.unacked)
+            if (u.chan == chan)
+                mine ~= t;
+        import std.algorithm.sorting : sort;
+
+        sort!"a > b"(mine);
+        foreach (t; mine)
+            settleNegative(c, t, true);
+        c.chans.remove(chan);
+    }
+    catch (Exception)
+    {
+    }
+}
+
 private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
 {
     ch.pub.active = false;
+    // basic.publish to a non-existent exchange is a channel 404 NOT_FOUND, like
+    // RabbitMQ ("no exchange 'x'"). The default exchange ("") and the seeded
+    // amq.* always exist; a named exchange must have been declared. Validate
+    // before routing; requeueAndDropChannel removes chans[chan], so `ch` must
+    // not be touched afterwards (the callers return immediately — safe).
+    if (ch.pub.exchange.length && (cast(string) ch.pub.exchange !in gExchanges))
+    {
+        channelClose(o, chan, 404, "NOT_FOUND - no exchange", 60, 40);
+        requeueAndDropChannel(c, chan);
+        return;
+    }
     immutable mandatory = ch.pub.mandatory;
     // route to queues and RPUSH the framed record through the data plane. rec
     // is normally a reused TLS static, but the sink's cross-shard RPUSH YIELDS
@@ -2443,7 +2524,8 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         if (rec is &recStatic)
             recBusy = false;
     rec.clear();
-    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data, ch.pub.payload.data);
+    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data,
+            ch.pub.payload.data, ch.pub.exchange);
     if (ch.txMode)
     {
         // transaction: buffer the framed publish; it routes on tx.commit and is
@@ -2933,7 +3015,7 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     buildXDeathEntry(xbuf, deaths + 1, reason, queue, origRk);
     mergeXDeath(paug, props, xbuf.data);
     dlrec.clear();
-    buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_);
+    buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_, meta.dlx);
     auto blobc = dlrec.data.asChars;
     routeTo(meta.dlx, rk, propsHeaders(paug.data), (string q) nothrow {
         static ByteBuffer kb5; // TLS
@@ -3027,6 +3109,28 @@ public void amqpTtlSweep() nothrow @trusted
 // Consumer: a fiber that drains the queue to this connection. v1 POLLS the
 // data plane (1ms backoff when empty) — under load it never sleeps; a parked
 // wake integration (the BLPOP machinery) is the v2 upgrade.
+/// Per-queue live-consumer count (shard-local TLS), used only by the
+/// queue.declare-ok consumer_count field. Both run on the shard thread.
+private void qConsumerInc(string q) nothrow @trusted
+{
+    try
+        gQueueConsumers[q] = (q in gQueueConsumers ? gQueueConsumers[q] : 0u) + 1;
+    catch (Exception)
+    {
+    }
+}
+
+private void qConsumerDec(string q) nothrow @trusted
+{
+    if (auto p = q in gQueueConsumers)
+    {
+        if (*p > 0)
+            --*p;
+        if (*p == 0)
+            gQueueConsumers.remove(q);
+    }
+}
+
 private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
         scope const(char)[] tag, bool noAck) nothrow
 {
@@ -3043,6 +3147,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
         myGen = pch.openGen;
     atomicOp!"+="(gAmqpConsumers, 1);
     c.consumerCount++;
+    qConsumerInc(qs); // live consumer_count for queue.declare-ok
     try
         cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg) nothrow {
             scope (exit)
@@ -3050,6 +3155,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 atomicOp!"-="(gAmqpConsumers, 1);
                 if (cc.consumerCount > 0)
                     cc.consumerCount--;
+                qConsumerDec(qq);
                 // drop our own cancel marker so a healthy connection's
                 // cancelledTags doesn't accumulate one dead entry per
                 // consume/cancel cycle (it's only needed until we've seen it).
@@ -3074,6 +3180,22 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     auto pch = chn in cc.chans;
                     if (pch is null || pch.openGen != mg)
                         return;
+                    // Consumer Cancel Notification: our queue was deleted (the
+                    // op-9 tombstone dropped it from the existence set on every
+                    // shard). Tell the client its consumer is gone (server-sent
+                    // basic.cancel) and exit, exactly like RabbitMQ. The queue
+                    // was present when the consumer started (basic.consume 404s
+                    // an unknown queue), so this fires only on a real delete.
+                    if (!queueExists(qq))
+                    {
+                        ByteBuffer cbuf;
+                        method(cbuf, chn, 60, 30, (ref ByteBuffer b) @nogc nothrow {
+                            putShortStr(b, tt);
+                            b.appendByte(0); // no-wait = 0
+                        });
+                        sendTo(cc, cbuf.data);
+                        return;
+                    }
                 }
                 catch (Exception)
                 {
@@ -3149,11 +3271,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         }
                     immutable redlv = recordRedelivered(pay.data);
                     auto drk = recordRoutingKey(pay.data);
+                    auto dex = recordExchange(pay.data);
                     method(ob, chn, 60, 60, (ref ByteBuffer b) @nogc nothrow {
                         putShortStr(b, tt);
                         putU64(b, tg);
                         b.appendByte(redlv ? 1 : 0); // redelivered
-                        putShortStr(b, ""); // exchange (not stored in the record)
+                        putShortStr(b, dex); // original exchange
                         putShortStr(b, drk); // original routing key, not the queue name
                     });
                     emitContent(ob, chn, pay.data, cc.frameMax);
@@ -3175,6 +3298,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
         atomicOp!"-="(gAmqpConsumers, 1);
         if (c.consumerCount > 0)
             c.consumerCount--;
+        qConsumerDec(qs); // the fiber never ran; undo the pre-increment
     }
 }
 
