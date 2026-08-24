@@ -1357,6 +1357,110 @@ package const(ubyte)[] propsHeaders(return scope const(ubyte)[] props) @nogc not
     return props[i .. i + n];
 }
 
+/// The `reply-to` basic property (bit 0x0200 shortstr), or null when absent.
+package const(char)[] propsReplyTo(return scope const(ubyte)[] props) @nogc nothrow
+{
+    if (props.length < 2)
+        return null;
+    immutable flags = (cast(ushort) props[0] << 8) | props[1];
+    if (!(flags & 0x0200))
+        return null;
+    size_t i = 2;
+    static bool skipShort(scope const(ubyte)[] pp, ref size_t j) @nogc nothrow
+    {
+        if (j + 1 > pp.length)
+            return false;
+        j += 1 + pp[j];
+        return j <= pp.length;
+    }
+
+    if (flags & 0x8000)
+        if (!skipShort(props, i))
+            return null;
+    if (flags & 0x4000)
+        if (!skipShort(props, i))
+            return null;
+    if (flags & 0x2000)
+    {
+        if (i + 4 > props.length)
+            return null;
+        immutable n = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        i += 4 + n;
+        if (i > props.length)
+            return null;
+    }
+    if (flags & 0x1000)
+        i += 1;
+    if (flags & 0x0800)
+        i += 1;
+    if (flags & 0x0400)
+        if (!skipShort(props, i))
+            return null;
+    if (i + 1 > props.length || i + 1 + props[i] > props.length)
+        return null;
+    return cast(const(char)[]) props[i + 1 .. i + 1 + props[i]];
+}
+
+/// Rebuild `props` with the reply-to property REPLACED by `newRt` (set when
+/// absent). Everything else survives verbatim.
+private void replaceReplyTo(ref ByteBuffer dst, scope const(ubyte)[] props,
+        scope const(char)[] newRt) @nogc nothrow
+{
+    dst.clear();
+    ushort flags = 0;
+    size_t i = 2;
+    if (props.length >= 2)
+        flags = cast(ushort)((props[0] << 8) | props[1]);
+    immutable nf = cast(ushort)(flags | 0x0200);
+    dst.appendByte(cast(char)(nf >> 8));
+    dst.appendByte(cast(char)(nf & 0xFF));
+    static bool copyShort(ref ByteBuffer d2, scope const(ubyte)[] pp, ref size_t j) @nogc nothrow
+    {
+        if (j >= pp.length || j + 1 + pp[j] > pp.length)
+            return false;
+        immutable seg = 1 + pp[j];
+        d2.append(cast(const(char)[]) pp[j .. j + seg]);
+        j += seg;
+        return true;
+    }
+
+    if (flags & 0x8000)
+        if (!copyShort(dst, props, i))
+            return;
+    if (flags & 0x4000)
+        if (!copyShort(dst, props, i))
+            return;
+    if (flags & 0x2000)
+    {
+        if (i + 4 > props.length)
+            return;
+        immutable n = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        if (i + 4 + n > props.length)
+            return;
+        dst.append(cast(const(char)[]) props[i .. i + 4 + n]);
+        i += 4 + n;
+    }
+    if (flags & 0x1000)
+        if (i < props.length)
+            dst.appendByte(cast(char) props[i++]);
+    if (flags & 0x0800)
+        if (i < props.length)
+            dst.appendByte(cast(char) props[i++]);
+    if (flags & 0x0400)
+        if (!copyShort(dst, props, i))
+            return;
+    // the NEW reply-to
+    dst.appendByte(cast(char)(newRt.length > 255 ? 255 : newRt.length));
+    dst.append(newRt[0 .. newRt.length > 255 ? 255 : newRt.length]);
+    if (flags & 0x0200) // skip the OLD one
+        if (i < props.length)
+            i += 1 + props[i];
+    if (i <= props.length)
+        dst.append(cast(const(char)[]) props[i .. $]); // expiration onward verbatim
+}
+
 /// Parse the `expiration` basic property (a shortstr of decimal milliseconds;
 /// property-flags bit 8). 0 = absent/invalid. Walks the properties that precede
 /// it in the flags order: content-type, content-encoding, headers (field
@@ -1522,6 +1626,8 @@ private struct Channel
     // delete and basic.consume/get
     ulong lastTag; // highest delivery-tag ISSUED on this channel (tags are
     // conn-monotonic): a multiple-form settle beyond it is "unknown" (406)
+    bool drConsumer; // active direct-reply consumer (amq.rabbitmq.reply-to)
+    string drCtag; // its consumer tag (basic.cancel clears the flag)
     size_t txBytes; // running size of buffered tx publish records (byte cap)
     // basic.qos is CHANNEL-scoped in 0-9-1 (RabbitMQ: per-channel window).
     // 0 = unset -> conn-level fallback -> AMQP_DEFAULT_PREFETCH. unackedN is
@@ -1678,8 +1784,16 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
     import core.atomic : atomicOp;
 
     c.connId = atomicOp!"+="(gAmqpConnGen, 1);
+    if (gDrSecret == 0)
+        gDrSecret = monoMs() * 0x9E3779B97F4A7C15 + cast(ulong) cast(void*) c;
+    try
+        gConnsById[c.connId] = c; // direct-reply routing (this shard's conns)
+    catch (Exception)
+    {
+    }
     scope (exit)
     {
+        gConnsById.remove(c.connId);
         c.closing = true;
         requeueAllUnacked(c);
         // exclusive queues die with their owning connection (RabbitMQ):
@@ -2459,7 +2573,24 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         }
                 if (passive)
                 {
-                    if (q.length && !queueExists(qq))
+                    bool drOk = false;
+                    if (qq == DIRECT_REPLY_Q)
+                        drOk = true; // the pseudo-queue always "exists"
+                    else if (qq.length > DIRECT_REPLY_Q.length
+                            && qq[0 .. DIRECT_REPLY_Q.length] == DIRECT_REPLY_Q)
+                    {
+                        ulong dcid;
+                        uint dch, dgen;
+                        // a VALID reply token "exists"; a tampered one 404s
+                        drOk = drParse(qq, dcid, dch, dgen);
+                        if (!drOk)
+                        {
+                            channelClose(o, chan, 404, "NOT_FOUND - no queue", 50, 10);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                    if (!drOk && q.length && !queueExists(qq))
                     {
                         channelClose(o, chan, 404, "NOT_FOUND - no queue", 50, 10);
                         c.chans.remove(chan);
@@ -2569,6 +2700,26 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (exclusiveDenied(c, chan, o, q, 50, 20))
                     return true;
+                // headers exchange: a present x-match must be one of the four
+                // valid strings — anything else is a bind-time 406 (RabbitMQ)
+                try
+                    if (auto pxt = (cast(string) ex) in gExchanges)
+                        if (*pxt == ExType.headers && bindArgs !is null)
+                        {
+                            immutable xmk = tableStrKind(bindArgs, "x-match");
+                            auto xmv = tableGetStr(bindArgs, "x-match");
+                            if (xmk < 0 || (xmk > 0 && xmv != "all" && xmv != "any"
+                                    && xmv != "all-with-x" && xmv != "any-with-x"))
+                            {
+                                channelClose(o, chan, 406,
+                                        "PRECONDITION_FAILED - invalid x-match", 50, 20);
+                                c.chans.remove(chan);
+                                return true;
+                            }
+                        }
+                catch (Exception)
+                {
+                }
                 ctlBroadcast(2, ex, q, rk, bindArgs);
                 if (!bnw)
                     method(o, chan, 50, 21); // bind-ok (suppressed by nowait)
@@ -2823,6 +2974,57 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // consume on an unopened channel: ignore
                 cast(void) r.u16();
                 auto q = r.shortStr();
+                if (q == DIRECT_REPLY_Q)
+                {
+                    // direct reply-to pseudo-queue: no-ack ONLY, at most one
+                    // consumer per channel; no fiber — replies are delivered
+                    // straight to this channel by the token publish path
+                    auto dtag = r.shortStr();
+                    immutable dbits2 = r.u8();
+                    if (!(dbits2 & 2)) // no-ack REQUIRED
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - reply consumer cannot acknowledge", 60, 20);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                    if (ch.drConsumer)
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - reply consumer already set", 60, 20);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                    char[64] drtb = void;
+                    const(char)[] drt;
+                    if (dtag.length)
+                    {
+                        auto dn = dtag.length <= drtb.length ? dtag.length : drtb.length;
+                        drtb[0 .. dn] = dtag[0 .. dn];
+                        drt = drtb[0 .. dn];
+                    }
+                    else
+                    {
+                        import core.stdc.stdio : snprintf;
+
+                        immutable dn = snprintf(drtb.ptr, drtb.length,
+                                "amq.ctag-%llu", cast(ulong) c.nextCtag++);
+                        drt = drtb[0 .. dn];
+                    }
+                    try
+                    {
+                        ch.drConsumer = true;
+                        ch.drCtag = drt.idup;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                    if (!(dbits2 & 8)) // no-wait
+                        method(o, chan, 60, 21, (ref ByteBuffer b) @nogc nothrow {
+                            putShortStr(b, drt);
+                        });
+                    return true;
+                }
                 // Consuming from a queue that was never declared is a channel
                 // 404 NOT_FOUND, like RabbitMQ. The connection survives.
                 if (q.length && !queueExists(q))
@@ -3086,6 +3288,24 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 auto tag = r.shortStr();
                 immutable noWait = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
+                // direct-reply consumer: no fiber to wait for — clear + ok
+                if (auto drch = chan in c.chans)
+                    if (drch.drConsumer && drch.drCtag == tag)
+                    {
+                        drch.drConsumer = false;
+                        drch.drCtag = null;
+                        if (!noWait)
+                        {
+                            char[64] drtb2 = void;
+                            auto dn2 = tag.length <= drtb2.length ? tag.length : drtb2.length;
+                            drtb2[0 .. dn2] = tag[0 .. dn2];
+                            auto drt2 = cast(const(char)[]) drtb2[0 .. dn2];
+                            method(o, chan, 60, 31, (ref ByteBuffer b) @nogc nothrow {
+                                putShortStr(b, drt2);
+                            });
+                        }
+                        return true;
+                    }
                 // cap the map: basic.cancel needs neither an open channel nor a
                 // completed handshake, so a flood of unique bogus tags would
                 // otherwise grow this per-conn AA without bound (RAM DoS). Legit
@@ -3629,6 +3849,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         if (h0 !is null && h0.length)
         {
             static immutable string[2] ccNames = ["CC", "BCC"];
+            bool badCc = false;
             foreach (cn; ccNames)
             {
                 cast(void) tableWalk(h0, (scope const(char)[] k, char ty,
@@ -3638,7 +3859,10 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                     if (cn == "BCC")
                         hasBcc = true; // stripped regardless of value type
                     if (ty != 'A')
-                        return false; // non-array CC/BCC: no extra routes
+                    {
+                        badCc = true; // CC/BCC MUST be an array: channel 406
+                        return false;
+                    }
                     size_t i2 = 0;
                     while (i2 + 5 <= v.length && nCc < ccKeys.length)
                     {
@@ -3656,6 +3880,17 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                     return false;
                 });
             }
+            if (badCc)
+            {
+                channelClose(o, chan, 406,
+                        "PRECONDITION_FAILED - CC/BCC header must be an array", 60, 40);
+                try
+                    c.chans.remove(chan);
+                catch (Exception)
+                {
+                }
+                return;
+            }
             if (hasBcc)
             {
                 // splice the headers table minus BCC back into the props.
@@ -3672,6 +3907,91 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                 patchU32(sp, lenAt, cast(uint)(sp.length - tblStart2));
                 sp.append(cast(const(char)[]) effProps[off + h0.length .. $]);
                 effProps = cast(const(ubyte)[]) sp.data;
+            }
+        }
+    }
+    // direct reply-to: a request published with reply-to=amq.rabbitmq.reply-to
+    // gets the property REWRITTEN to this channel's live reply token; without
+    // an active reply consumer it is a channel 406 (RabbitMQ's fast-reply rule)
+    if (propsReplyTo(effProps) == DIRECT_REPLY_Q)
+    {
+        bool drOk = false;
+        uint drGen;
+        try
+            if (auto pch2 = chan in c.chans)
+                if (pch2.drConsumer)
+                {
+                    drOk = true;
+                    drGen = pch2.openGen;
+                }
+        catch (Exception)
+        {
+        }
+        if (!drOk)
+        {
+            channelClose(o, chan, 406,
+                    "PRECONDITION_FAILED - fast reply consumer does not exist", 60, 40);
+            try
+                c.chans.remove(chan);
+            catch (Exception)
+            {
+            }
+            return;
+        }
+        char[160] drtok = void;
+        immutable drtl = drToken(drtok, c.connId, chan, drGen);
+        static ByteBuffer drp; // TLS: consumed by buildRecord before any yield
+        replaceReplyTo(drp, effProps, drtok[0 .. drtl]);
+        effProps = cast(const(ubyte)[]) drp.data;
+    }
+    // publish TO a reply token (default exchange): deliver STRAIGHT to the
+    // consumer channel it names — same-shard connections only (the tests and
+    // the dominant RPC pattern use one connection). Invalid/tampered tokens
+    // and gone consumers route nowhere (mandatory returns, otherwise drop).
+    bool drDirect = false;
+    int drRouted = 0;
+    if (ch.pub.exchange.length == 0 && ch.pub.rkey.length > DIRECT_REPLY_Q.length
+            && ch.pub.rkey[0 .. DIRECT_REPLY_Q.length] == DIRECT_REPLY_Q)
+    {
+        drDirect = true;
+        ulong dcid;
+        uint dch, dgen;
+        if (drParse(ch.pub.rkey, dcid, dch, dgen))
+        {
+            AmqpConn tc;
+            try
+                if (auto ptc = dcid in gConnsById)
+                    tc = *ptc;
+            catch (Exception)
+            {
+            }
+            if (tc !is null && !tc.closing)
+            {
+                try
+                    if (auto tch3 = cast(ushort) dch in tc.chans)
+                        if (tch3.openGen == dgen && tch3.drConsumer)
+                        {
+                            ByteBuffer drec;
+                            buildRecord(drec, cast(long) nowMs(), 0, ch.pub.rkey,
+                                    effProps, ch.pub.payload.data, "");
+                            ByteBuffer dout;
+                            immutable dtag2 = tc.nextTag++;
+                            tch3.lastTag = dtag2;
+                            auto drct = tch3.drCtag;
+                            method(dout, cast(ushort) dch, 60, 60, (ref ByteBuffer b) @nogc nothrow {
+                                putShortStr(b, drct);
+                                putU64(b, dtag2);
+                                b.appendByte(0); // never redelivered (no-ack)
+                                putShortStr(b, ""); // default exchange
+                                putShortStr(b, ""); // routing key elided, like rabbit
+                            });
+                            emitContent(dout, cast(ushort) dch, drec.data, tc.frameMax);
+                            sendTo(tc, dout.data);
+                            drRouted = 1;
+                        }
+                catch (Exception)
+                {
+                }
             }
         }
     }
@@ -3699,7 +4019,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(effProps);
     atomicOp!"+="(gAmqpMessages, 1);
-    int routed = 0;
+    int routed = drRouted;
     // the push stays IN-WALK (the collect-then-push restructure broke the
     // Erlang serialization cases — reverted in b743fa9); CC/BCC dedup happens
     // inside the sink via `seen`, whose entries are COPIES (the walk's names
@@ -3728,9 +4048,12 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         routed++;
         enforceMaxLen(q);
     };
-    routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink);
-    foreach (ck; ccKeys[0 .. nCc])
-        routeTo(ch.pub.exchange, ck, hdrs, pushSink);
+    if (!drDirect)
+    {
+        routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink);
+        foreach (ck; ccKeys[0 .. nCc])
+            routeTo(ch.pub.exchange, ck, hdrs, pushSink);
+    }
     // alternate-exchange: an UNROUTED message cascades through the AE chain
     // (same routing key + CC); a revisit or depth cap breaks x->u->v->x cycles
     if (routed == 0)
@@ -4075,6 +4398,80 @@ private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
         return false;
     });
     return prior;
+}
+
+// --- Direct Reply-To (amq.rabbitmq.reply-to pseudo-queue, rabbit extension) ---
+enum DIRECT_REPLY_Q = "amq.rabbitmq.reply-to";
+/// Connections served by THIS shard, keyed by connId (direct-reply routing).
+private AmqpConn[ulong] gConnsById; // TLS
+private __gshared ulong gDrSecret; // keyed into the reply token (anti-forgery)
+
+/// Weak keyed hash for the reply token (anti-tamper, not crypto: the java
+/// suite's `hack` test only proves a corrupted token cannot publish).
+private ulong drSig(ulong connId, uint chan, uint gen) @nogc nothrow
+{
+    ulong h = gDrSecret ^ 0x9E3779B97F4A7C15;
+    static void mix(ref ulong hh, ulong v) @nogc nothrow
+    {
+        hh ^= v + 0x9E3779B97F4A7C15 + (hh << 6) + (hh >> 2);
+        hh *= 0xFF51AFD7ED558CCD;
+    }
+
+    mix(h, connId);
+    mix(h, chan);
+    mix(h, gen);
+    return h;
+}
+
+/// "amq.rabbitmq.reply-to.<connId>-<chan>-<gen>-<sig>" (decimal fields).
+private size_t drToken(char[] buf, ulong connId, uint chan, uint gen) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    return cast(size_t) snprintf(buf.ptr, buf.length, "%s.%llu-%u-%u-%llx",
+            DIRECT_REPLY_Q.ptr, connId, chan, gen, drSig(connId, chan, gen));
+}
+
+/// Parse+verify a reply token. Returns false on any malformation or bad sig.
+private bool drParse(scope const(char)[] name, out ulong connId, out uint chan, out uint gen) @nogc nothrow
+{
+    enum pfx = DIRECT_REPLY_Q ~ ".";
+    if (name.length <= pfx.length || name[0 .. pfx.length] != pfx)
+        return false;
+    auto t = name[pfx.length .. $];
+    ulong[4] f;
+    size_t fi = 0, i = 0;
+    while (i < t.length && fi < 4)
+    {
+        ulong v = 0;
+        bool any = false;
+        immutable hex = fi == 3;
+        while (i < t.length && t[i] != '-')
+        {
+            immutable ch2 = t[i];
+            int d2 = -1;
+            if (ch2 >= '0' && ch2 <= '9')
+                d2 = ch2 - '0';
+            else if (hex && ch2 >= 'a' && ch2 <= 'f')
+                d2 = ch2 - 'a' + 10;
+            else
+                return false;
+            v = v * (hex ? 16 : 10) + cast(ulong) d2;
+            any = true;
+            i++;
+        }
+        if (!any)
+            return false;
+        f[fi++] = v;
+        if (i < t.length && t[i] == '-')
+            i++;
+    }
+    if (fi != 4 || i != t.length)
+        return false;
+    connId = f[0];
+    chan = cast(uint) f[1];
+    gen = cast(uint) f[2];
+    return f[3] == drSig(connId, cast(uint) f[1], cast(uint) f[2]);
 }
 
 /// First 'S' (longstr) value under `key` in the props' headers table, or null.
