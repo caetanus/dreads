@@ -177,6 +177,49 @@ private ulong[string] gQueueSeq; // TLS: per-name LWW seq (tombstones survive de
 // the consumer_count field of queue.declare-ok. Cross-shard consumers are not
 // summed here — an accepted best-effort, matching how RabbitMQ treats the field.
 private uint[string] gQueueConsumers; // TLS
+// x-priority per live consumer (shard-local): only consumers at the queue's
+// MAX live priority pop; lower ones idle until the higher cancel/exit.
+private int[][string] gQueuePrios; // TLS
+
+private void qPrioAdd(string q, int p) nothrow @trusted
+{
+    try
+        gQueuePrios[q] ~= p;
+    catch (Exception)
+    {
+    }
+}
+
+private void qPrioRemove(string q, int p) nothrow @trusted
+{
+    try
+        if (auto pl = q in gQueuePrios)
+            foreach (i2, v; *pl)
+                if (v == p)
+                {
+                    *pl = (*pl)[0 .. i2] ~ (*pl)[i2 + 1 .. $];
+                    if ((*pl).length == 0)
+                        gQueuePrios.remove(q);
+                    return;
+                }
+    catch (Exception)
+    {
+    }
+}
+
+private int qPrioMax(string q) nothrow @trusted
+{
+    int mx = int.min;
+    try
+        if (auto pl = q in gQueuePrios)
+            foreach (v; *pl)
+                if (v > mx)
+                    mx = v;
+    catch (Exception)
+    {
+    }
+    return mx;
+}
 private Binding[][string] gBindings; // TLS: exchange -> bindings
 
 /// The AMQP 0-9-1 default exchanges exist on every vhost with NO explicit
@@ -843,14 +886,17 @@ private bool headersMatch(scope const(ubyte)[] bindArgs,
 /// Route (exchange, routingKey) -> queue names, calling sink for each.
 private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         scope const(ubyte)[] msgHeaders,
-        scope void delegate(string q) nothrow sink) nothrow @trusted
+        scope void delegate(string q) nothrow sink,
+        scope const(const(char)[])[] altKeys = null) nothrow @trusted
 {
     try
     {
         if (ex.length == 0)
         {
-            // default exchange: routing key IS the queue name
+            // default exchange: routing key IS the queue name (CC/BCC keys too)
             sink(rkey.idup);
+            foreach (ak; altKeys)
+                sink(ak.idup);
             return;
         }
         auto t = (cast(string) ex) in gExchanges;
@@ -935,9 +981,23 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
                     break;
                 case ExType.direct:
                     m = bd.key == rkey;
+                    if (!m)
+                        foreach (ak; altKeys)
+                            if (bd.key == ak)
+                            {
+                                m = true;
+                                break;
+                            }
                     break;
                 case ExType.topic:
                     m = amqpTopicMatches(bd.key, rkey);
+                    if (!m)
+                        foreach (ak; altKeys)
+                            if (amqpTopicMatches(bd.key, ak))
+                            {
+                                m = true;
+                                break;
+                            }
                     break;
                 case ExType.headers:
                     m = headersMatch(bd.args, msgHeaders);
@@ -3039,6 +3099,26 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable bits = r.u8();
                 immutable noAck = (bits & 2) != 0;
                 immutable subNoWait = (bits & 8) != 0;
+                int consumerPrio = 0;
+                {
+                    // consume-arguments: a present x-priority must be an
+                    // INTEGER (ConsumerPriorities.validation pins the 406)
+                    auto cargs = r.tableRaw();
+                    if (cargs !is null && cargs.length)
+                    {
+                        long xprio;
+                        immutable xpk = tableIntKind(cargs, "x-priority", xprio);
+                        if (xpk < 0)
+                        {
+                            channelClose(o, chan, 406,
+                                    "PRECONDITION_FAILED - invalid x-priority", 60, 20);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                        if (xpk > 0)
+                            consumerPrio = cast(int) xprio;
+                    }
+                }
                 // STACK buffer, not TLS: the cancel-race wait below YIELDS, and
                 // a concurrent consume on this thread would clobber a shared
                 // static (the delKeyStore hazard all over this file).
@@ -3080,7 +3160,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     method(o, chan, 60, 21, (ref ByteBuffer b) @nogc nothrow {
                         putShortStr(b, tg);
                     });
-                startConsumer(c, chan, q, tg, noAck);
+                startConsumer(c, chan, q, tg, noAck, consumerPrio);
                 return true;
             }
         case 80: // ack: delivery-tag u64, multiple bit
@@ -4049,11 +4129,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         enforceMaxLen(q);
     };
     if (!drDirect)
-    {
-        routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink);
-        foreach (ck; ccKeys[0 .. nCc])
-            routeTo(ch.pub.exchange, ck, hdrs, pushSink);
-    }
+        routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink, ccKeys[0 .. nCc]);
     // alternate-exchange: an UNROUTED message cascades through the AE chain
     // (same routing key + CC); a revisit or depth cap breaks x->u->v->x cycles
     if (routed == 0)
@@ -4087,9 +4163,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             if (revisit)
                 break;
             seenAE[nAE++] = ae;
-            routeTo(ae, ch.pub.rkey, hdrs, pushSink);
-            foreach (ck; ccKeys[0 .. nCc])
-                routeTo(ae, ck, hdrs, pushSink);
+            routeTo(ae, ch.pub.rkey, hdrs, pushSink, ccKeys[0 .. nCc]);
             cur = ae;
         }
     }
@@ -5028,7 +5102,7 @@ private void qConsumerDec(string q) nothrow @trusted
 }
 
 private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
-        scope const(char)[] tag, bool noAck) nothrow
+        scope const(char)[] tag, bool noAck, int prio = 0) nothrow
 {
     string qs, ts;
     try
@@ -5044,6 +5118,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     atomicOp!"+="(gAmqpConsumers, 1);
     c.consumerCount++;
     qConsumerInc(qs); // live consumer_count for queue.declare-ok
+    qPrioAdd(qs, prio); // x-priority dispatch preference
     try
     {
         immutable ck0 = (cast(ulong) chan) << 32 | myGen;
@@ -5053,12 +5128,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     {
     }
     try
-        cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg) nothrow {
+        cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg, int myPrio) nothrow {
             scope (exit)
             {
                 atomicOp!"-="(gAmqpConsumers, 1);
                 if (cc.consumerCount > 0)
                     cc.consumerCount--;
+                qPrioRemove(qq, myPrio);
                 qConsumerDec(qq);
                 // drop our own cancel marker so a healthy connection's
                 // cancelledTags doesn't accumulate one dead entry per
@@ -5149,6 +5225,16 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 {
                 }
                 if (windowFull)
+                {
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                    continue;
+                }
+                // x-priority: while a HIGHER-priority consumer is live on this
+                // queue, lower ones idle (RabbitMQ dispatch preference)
+                if (myPrio < qPrioMax(qq))
                 {
                     try
                         sleep(1.msecs);
@@ -5251,7 +5337,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 }
                 sendTo(cc, ob.data);
             }
-        }, c, chan, qs, ts, noAck, myGen);
+        }, c, chan, qs, ts, noAck, myGen, prio);
     catch (Exception)
     {
         atomicOp!"-="(gAmqpConsumers, 1);
