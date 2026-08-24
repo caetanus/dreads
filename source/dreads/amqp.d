@@ -2973,8 +2973,65 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     scope (exit)
         if (rec is &recStatic)
             recBusy = false;
+    // --- CC/BCC sender-selected routing: extra routing keys from the "CC"/
+    // "BCC" header string-arrays; BCC is stripped from the delivered props.
+    const(ubyte)[] effProps = ch.pub.props.data;
+    const(char)[][32] ccKeys;
+    size_t nCc = 0;
+    {
+        auto h0 = propsHeaders(effProps);
+        bool hasBcc = false;
+        if (h0 !is null && h0.length)
+        {
+            static immutable string[2] ccNames = ["CC", "BCC"];
+            foreach (cn; ccNames)
+            {
+                cast(void) tableWalk(h0, (scope const(char)[] k, char ty,
+                        scope const(ubyte)[] v) @nogc nothrow {
+                    if (k != cn)
+                        return true;
+                    if (cn == "BCC")
+                        hasBcc = true; // stripped regardless of value type
+                    if (ty != 'A')
+                        return false; // non-array CC/BCC: no extra routes
+                    size_t i2 = 0;
+                    while (i2 + 5 <= v.length && nCc < ccKeys.length)
+                    {
+                        immutable et = v[i2];
+                        immutable ln = (cast(size_t) v[i2 + 1] << 24)
+                            | (cast(size_t) v[i2 + 2] << 16)
+                            | (cast(size_t) v[i2 + 3] << 8) | v[i2 + 4];
+                        i2 += 5;
+                        if (et != 'S' || i2 + ln > v.length)
+                            break; // only longstr members route
+                        if (ln > 0)
+                            ccKeys[nCc++] = cast(const(char)[]) v[i2 .. i2 + ln];
+                        i2 += ln;
+                    }
+                    return false;
+                });
+            }
+            if (hasBcc)
+            {
+                // splice the headers table minus BCC back into the props.
+                // STACK buffer (not TLS): consumed by buildRecord below, but a
+                // clean lifetime regardless of later yields.
+                immutable off = cast(size_t)(h0.ptr - effProps.ptr);
+                static ByteBuffer sp; // TLS: consumed by buildRecord before any yield
+                sp.clear();
+                sp.append(cast(const(char)[]) effProps[0 .. off - 4]);
+                immutable lenAt = sp.length;
+                putU32(sp, 0);
+                immutable tblStart2 = sp.length;
+                appendHeadersExcept(sp, h0, "BCC");
+                patchU32(sp, lenAt, cast(uint)(sp.length - tblStart2));
+                sp.append(cast(const(char)[]) effProps[off + h0.length .. $]);
+                effProps = cast(const(ubyte)[]) sp.data;
+            }
+        }
+    }
     rec.clear();
-    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, ch.pub.props.data,
+    buildRecord(*rec, cast(long) nowMs(), 0, ch.pub.rkey, effProps,
             ch.pub.payload.data, ch.pub.exchange);
     if (ch.txMode)
     {
@@ -2995,17 +3052,35 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         return;
     }
     auto payload = rec.data.asChars;
-    auto hdrs = propsHeaders(ch.pub.props.data);
+    auto hdrs = propsHeaders(effProps);
     atomicOp!"+="(gAmqpMessages, 1);
     int routed = 0;
-    routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, (string q) nothrow {
+    // the push stays IN-WALK (the collect-then-push restructure broke the
+    // Erlang serialization cases — reverted in b743fa9); CC/BCC dedup happens
+    // inside the sink via `seen`, whose entries are COPIES (the walk's names
+    // live in reused TLS a reentrant routeTo refills during our push yields).
+    string[64] seen;
+    size_t ns = 0;
+    scope void delegate(string) nothrow pushSink = (string q) nothrow {
+        foreach (d; seen[0 .. ns])
+            if (d == q)
+                return; // already delivered for this publish (noDuplicates)
+        if (ns < seen.length)
+            try
+                seen[ns++] = q.idup;
+            catch (Exception)
+            {
+            }
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
         if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;
-            enforceMaxLen(q);
-});
+        enforceMaxLen(q);
+    };
+    routeTo(ch.pub.exchange, ch.pub.rkey, hdrs, pushSink);
+    foreach (ck; ccKeys[0 .. nCc])
+        routeTo(ch.pub.exchange, ck, hdrs, pushSink);
     // [basic.return] a mandatory publish that matched no queue must come BACK
     // to the publisher (312 NO_ROUTE) instead of vanishing while confirmed
     if (mandatory && routed == 0)
