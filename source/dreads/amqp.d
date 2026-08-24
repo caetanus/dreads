@@ -135,7 +135,18 @@ private struct QueueMeta
     long maxLen; // x-max-length ENCODED +1 (0 = unset, N+1 = bound N); overflow drops the HEAD
     bool dlxSet; // x-dead-letter-exchange arg present ("" alone can't tell: it names the default exchange)
     bool ttlSet; // x-message-ttl arg present (0 is a VALID immediate-expiry TTL)
+    long expMs; // x-expires: the queue's unused-lease in ms (meaningful when expSet)
+    bool expSet;
 }
+
+/// x-expires lease deadlines (nowMs-based), shard-local. Stamped by the op-3
+/// meta apply, the op-11 touch (declares/gets), and a consumer count hitting
+/// zero; only the shard OWNING the queue's key acts on an expired lease.
+private long[string] gQueueLease; // TLS
+/// Replicated live-consumer counts (op 12 inc / op 13 dec): the x-expires
+/// sweep must see consumers on EVERY shard, unlike the shard-local
+/// gQueueConsumers that feeds declare-ok.
+private int[string] gQueueConsGlobal; // TLS
 
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
 
@@ -386,9 +397,14 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 fl = tb[16];
             else // legacy encode: infer presence from a non-empty/non-zero value
                 fl = cast(ubyte)((a.length ? 1 : 0) | (ttl > 0 ? 4 : 0));
+            long expw = 0;
+            if (tb.length >= 25)
+                foreach (k; 17 .. 25)
+                    expw = (expw << 8) | tb[k];
             // merge, don't clobber: a redeclare that sets only ttl must not
             // erase a previously-configured DLX (and vice-versa)
-            QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0);
+            QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0,
+                    expw, (fl & 8) != 0);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (!(fl & 1))
@@ -405,8 +421,15 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 }
                 if (mxl == 0)
                     qm.maxLen = ex0.maxLen;
+                if (!(fl & 8))
+                {
+                    qm.expMs = ex0.expMs;
+                    qm.expSet = ex0.expSet;
+                }
             }
             gQueueMeta[ex] = qm;
+            if (qm.expSet) // (re)declare re-arms the unused-lease on every shard
+                gQueueLease[ex] = cast(long) nowMs() + qm.expMs;
         }
         else if (op == 4) // queue.unbind: ex=exchange, a=queue, b=routing-key
         {
@@ -552,6 +575,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             gQueueOwner.remove(cast(string) ex); // exclusivity dies with the queue
             gQueueMeta.remove(cast(string) ex); // dlx/ttl die with the queue too
             gQueueFlags.remove(cast(string) ex);
+            gQueueLease.remove(cast(string) ex); // x-expires state dies too
+            gQueueConsGlobal.remove(cast(string) ex);
             // ... and so do its BINDINGS (RabbitMQ removes them with the queue).
             // A stale binding would keep routing dead-letters/publishes into a
             // ghost list under the deleted name — a queue redeclared later
@@ -575,6 +600,36 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     oid = oid * 10 + (ch3 - '0');
             if (oid != 0 && gQueueOwner.length < AMQP_MAX_QUEUEMETA)
                 gQueueOwner[ex] = oid;
+        }
+        else if (op == 11) // queue touch: re-arm the x-expires unused-lease
+        {
+            if (auto qm = (cast(string) ex) in gQueueMeta)
+                if (qm.expSet)
+                    gQueueLease[ex] = cast(long) nowMs() + qm.expMs;
+        }
+        else if (op == 12 || op == 13) // consumer count inc/dec (replicated sum)
+        {
+            auto pcg = (cast(string) ex) in gQueueConsGlobal;
+            if (op == 12)
+            {
+                if (pcg !is null)
+                    ++*pcg;
+                else if (gQueueConsGlobal.length < AMQP_MAX_QUEUEMETA)
+                    gQueueConsGlobal[ex] = 1;
+            }
+            else if (pcg !is null)
+            {
+                if (*pcg > 1)
+                    --*pcg;
+                else
+                {
+                    gQueueConsGlobal.remove(cast(string) ex);
+                    // the queue just became UNUSED: the x-expires clock starts now
+                    if (auto qm = (cast(string) ex) in gQueueMeta)
+                        if (qm.expSet)
+                            gQueueLease[ex] = cast(long) nowMs() + qm.expMs;
+                }
+            }
         }
     }
     catch (Exception)
@@ -1115,11 +1170,12 @@ package bool tableWalk(scope const(ubyte)[] t,
             i = voff + vlen;
             break;
         case 's':
-            if (i + 1 > t.length)
-                return false;
-            vlen = t[i];
-            voff = i + 1;
-            i = voff + vlen;
+            // RabbitMQ field-table dialect: 's' is a SIGNED 16-BIT SHORT (the
+            // java client writes Short this way), NOT the 0-9-1 shortstr —
+            // shortstr does not occur in rabbit tables.
+            vlen = 2;
+            voff = i;
+            i += 2;
             break;
         case 't', 'b', 'B':
             vlen = 1;
@@ -1173,7 +1229,7 @@ package long tableGetInt(scope const(ubyte)[] t, scope const(char)[] key) @nogc 
         case 'B': // unsigned octet
             if (v.length >= 1) found = cast(long) v[0];
             break;
-        case 'U': // signed short
+        case 'U', 's': // signed short ('s' = rabbit-dialect short, not shortstr)
             if (v.length >= 2) found = cast(short)((v[0] << 8) | v[1]);
             break;
         case 'u': // unsigned short
@@ -1215,7 +1271,7 @@ package int tableIntKind(scope const(ubyte)[] t, scope const(char)[] key,
             return true;
         switch (ty)
         {
-        case 'b', 'B', 'U', 'u', 'I', 'i', 'l', 'L':
+        case 'b', 'B', 's', 'U', 'u', 'I', 'i', 'l', 'L':
             kind = 1;
             break;
         default:
@@ -1248,7 +1304,7 @@ package const(char)[] tableGetStr(return scope const(ubyte)[] t, scope const(cha
 {
     const(char)[] found = null;
     cast(void) tableWalk(t, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
-        if (k == key && (ty == 'S' || ty == 's'))
+        if (k == key && ty == 'S') // 's' is a rabbit-dialect short, not a string
         {
             found = cast(const(char)[]) v;
             return false;
@@ -2242,6 +2298,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                             immutable rml = mk > 0 ? mlV + 1 : 0; // +1-encoded like the meta
                             immutable mm = (m0.ttlSet != (tk > 0))
                                 || (m0.ttlSet && m0.ttlMs != ttlV)
+                                || (m0.expSet != (ek > 0))
+                                || (m0.expSet && m0.expMs != expV)
                                 || (m0.maxLen != rml)
                                 || (m0.dlxSet != (rdlx !is null))
                                 || (m0.dlx != (rdlx is null ? "" : rdlx))
@@ -2264,9 +2322,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
-                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0)
+                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0)
                     {
-                        ubyte[17] tb = void;
+                        ubyte[25] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
@@ -2274,7 +2332,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         // presence flags: "" dlx (default exchange) and ttl 0
                         // (expire immediately) are real values, not absence
                         tb[16] = cast(ubyte)((dlx !is null ? 1 : 0)
-                                | (dlrk !is null ? 2 : 0) | (tk > 0 ? 4 : 0));
+                                | (dlrk !is null ? 2 : 0) | (tk > 0 ? 4 : 0)
+                                | (ek > 0 ? 8 : 0));
+                        foreach (k; 0 .. 8)
+                            tb[17 + k] = cast(ubyte)((ek > 0 ? expV : 0) >> ((7 - k) * 8));
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -2349,6 +2410,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 try
                     if (auto lch = chan in c.chans)
                         lch.lastQueue = qq.idup; // the channel's "current queue"
+                catch (Exception)
+                {
+                }
+                // ANY declare (active or passive) extends an x-expires lease
+                try
+                    if (auto qm0 = (cast(string) qq) in gQueueMeta)
+                        if (qm0.expSet)
+                            ctlBroadcast(11, qq, "", "");
                 catch (Exception)
                 {
                 }
@@ -2538,6 +2607,14 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
                 if (exclusiveDenied(c, chan, o, q, 60, 70))
                     return true; // another connection's exclusive queue: 405
+                // a basic.get counts as "use": extend an x-expires lease
+                try
+                    if (auto qm0 = (cast(string) q) in gQueueMeta)
+                        if (qm0.expSet)
+                            ctlBroadcast(11, q, "", "");
+                catch (Exception)
+                {
+                }
                 // a no-ack=false get also consumes prefetch: don't let millions
                 // of un-acked gets pin RAM (the consumer path already caps this)
                 // basic.qos does NOT govern basic.get (RabbitMQ: prefetch is a
@@ -3948,9 +4025,7 @@ private void appendHeadersExcept(ref ByteBuffer dst, scope const(ubyte)[] t,
             i += 4 + vlen;
             break;
         case 's':
-            if (i + 1 > t.length)
-                return;
-            i += 1 + t[i];
+            i += 2; // rabbit-dialect short, not shortstr
             break;
         case 't', 'b', 'B':
             i += 1;
@@ -4210,7 +4285,7 @@ public void amqpTtlSweep() nothrow @trusted
         size_t nq = 0;
         foreach (q, ref meta; gQueueMeta)
         {
-            if (!meta.ttlSet)
+            if (!meta.ttlSet && !meta.expSet)
                 continue;
             if (ttlQ.length <= nq)
                 ttlQ.length = nq + 8;
@@ -4222,9 +4297,12 @@ public void amqpTtlSweep() nothrow @trusted
             // re-read the meta (a declare during a prior queue's yield may have
             // changed it; a delete leaves it absent -> skip)
             auto mp = q in gQueueMeta;
-            if (mp is null || !mp.ttlSet)
+            if (mp is null || (!mp.ttlSet && !mp.expSet))
                 continue;
             immutable ttl = mp.ttlMs;
+            immutable hasTtl = mp.ttlSet;
+            immutable hasExp = mp.expSet;
+            immutable expLease = mp.expMs;
             // COPY the key to the stack: deadLetter() below yields (cross-shard
             // DLX push), and the TLS `kb` would be clobbered by a concurrent
             // fiber's queueKey during that park -> the next peek/pop would hit a
@@ -4236,6 +4314,28 @@ public void amqpTtlSweep() nothrow @trusted
             auto key = cast(const(char)[]) keyStore[0 .. klen];
             if (!gAmqpOwns(key))
                 continue; // only the list's owner reaps it
+            // x-expires: the owner deletes an UNUSED queue whose lease lapsed.
+            // "Used" = any live consumer anywhere (replicated op-12/13 counts);
+            // declares and basic.gets re-arm the lease via op-3/op-11.
+            if (hasExp)
+            {
+                long deadline;
+                if (auto pl = q in gQueueLease)
+                    deadline = *pl;
+                else
+                    gQueueLease[q] = deadline = cast(long) nowMs() + expLease;
+                if ((q in gQueueConsGlobal) is null && cast(long) nowMs() > deadline)
+                {
+                    auto adSeeds = bindingSourcesTo(q, false);
+                    ctlBroadcast(9, q, "", ""); // exactly like queue.delete
+                    if (gAmqpDelKey !is null)
+                        gAmqpDelKey(key);
+                    autoDeleteExchangeSweep(adSeeds);
+                    continue;
+                }
+            }
+            if (!hasTtl)
+                continue;
             int reaped = 0;
             while (reaped < 4096) // bound the work per queue per tick
             {
@@ -4274,7 +4374,10 @@ public void amqpTtlSweep() nothrow @trusted
 private void qConsumerInc(string q) nothrow @trusted
 {
     try
+    {
         gQueueConsumers[q] = (q in gQueueConsumers ? gQueueConsumers[q] : 0u) + 1;
+        ctlBroadcast(12, q, "", ""); // replicated count (x-expires "in use")
+    }
     catch (Exception)
     {
     }
@@ -4282,6 +4385,11 @@ private void qConsumerInc(string q) nothrow @trusted
 
 private void qConsumerDec(string q) nothrow @trusted
 {
+    try
+        ctlBroadcast(13, q, "", ""); // replicated count (a zero re-arms x-expires)
+    catch (Exception)
+    {
+    }
     bool last = false;
     if (auto p = q in gQueueConsumers)
     {
