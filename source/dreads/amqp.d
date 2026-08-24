@@ -142,6 +142,11 @@ private ulong[string] gExchangeSeq; // TLS
 // backs the passive-declare / basic.consume NOT_FOUND (404) checks that
 // RabbitMQ clients rely on to probe existence.
 private bool[string] gQueues; // TLS: present => queue currently exists
+// Exclusive-queue ownership: queue -> owning connection id (ctl op 10 claims,
+// op 9 clears with the queue). An access from any OTHER connection is a 405
+// RESOURCE_LOCKED channel error; the owner's teardown deletes the queue.
+private ulong[string] gQueueOwner; // TLS, broadcast-replicated
+private shared ulong gAmqpConnGen; // atomic source for AmqpConn.connId
 private ulong[string] gQueueSeq; // TLS: per-name LWW seq (tombstones survive delete)
 // Live consumer count per queue, shard-local (a consumer and the queue.declare
 // that reports it share a connection, hence a shard, in the common case). Feeds
@@ -487,13 +492,39 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 if (seq <= *sp)
                     return; // stale vs a newer declare/delete
             gQueues.remove(cast(string) ex);
+            gQueueOwner.remove(cast(string) ex); // exclusivity dies with the queue
             if ((cast(string) ex) in gQueueSeq || gQueueSeq.length < AMQP_MAX_QUEUEMETA)
                 gQueueSeq[ex] = seq; // tombstone: rejects a stale later declare
+        }
+        else if (op == 10) // exclusive claim: ex=queue, a=owner conn id (decimal)
+        {
+            ulong oid = 0;
+            foreach (ch3; a)
+                if (ch3 >= '0' && ch3 <= '9')
+                    oid = oid * 10 + (ch3 - '0');
+            if (oid != 0 && gQueueOwner.length < AMQP_MAX_QUEUEMETA)
+                gQueueOwner[ex] = oid;
         }
     }
     catch (Exception)
     {
     }
+}
+
+/// Exclusive-queue gate: true (and sends the 405) when `q` is another
+/// connection's exclusive queue. RabbitMQ answers RESOURCE_LOCKED for ANY
+/// access — declare, consume, bind, delete — from a non-owner.
+private bool exclusiveDenied(AmqpConn c, ushort chan, ref ByteBuffer o,
+        scope const(char)[] q, ushort cls, ushort mth) nothrow @trusted
+{
+    if (auto po = (cast(string) q) in gQueueOwner)
+        if (*po != c.connId)
+        {
+            channelClose(o, chan, 405, "RESOURCE_LOCKED - exclusive queue", cls, mth);
+            c.chans.remove(chan);
+            return true;
+        }
+    return false;
 }
 
 /// True iff `q` names a queue that is currently declared (op 8, not yet op 9)
@@ -1225,6 +1256,8 @@ private final class AmqpConn
     size_t unackedBytes; // running sum of unacked blob bytes (byte-cap the window)
     ulong nextTag = 1;
     ulong nextCtag = 1; // server-assigned consumer tags (unique per connection)
+    ulong connId; // process-unique id (exclusive-queue ownership token)
+    string[] exclQueues; // exclusive queues THIS connection declared (owns)
     size_t prefetch;    // basic.qos prefetch-count (0 = AMQP_DEFAULT_PREFETCH)
     uint chanGenCtr; // monotonic per-conn source for Channel.openGen (channel-reuse safe)
     size_t consumerCount; // live basic.consume fibers (per-conn cap)
@@ -1334,10 +1367,29 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         }
     }
 
+    import core.atomic : atomicOp;
+
+    c.connId = atomicOp!"+="(gAmqpConnGen, 1);
     scope (exit)
     {
         c.closing = true;
         requeueAllUnacked(c);
+        // exclusive queues die with their owning connection (RabbitMQ):
+        // tombstone the existence set (live consumers elsewhere get their
+        // Consumer Cancel Notification via the queueExists poll) and DEL the
+        // backing list.
+        foreach (q; c.exclQueues)
+        {
+            if (auto po = q in gQueueOwner)
+                if (*po == c.connId)
+                {
+                    ctlBroadcast(9, q, "", "");
+                    static ByteBuffer xk; // TLS: teardown runs serially per conn
+                    queueKey(q, xk);
+                    if (gAmqpDelKey !is null)
+                        gAmqpDelKey(xk.data.asChars);
+                }
+        }
         releaseChannels(c); // free malloc-plane bufs on THIS (owning) thread
         closeQuiet(c);
     }
@@ -1717,6 +1769,22 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 c.chans.remove(chan);
                 return true;
             }
+            // equivalence: redeclaring an EXISTING exchange with a different
+            // type is a 406 PRECONDITION_FAILED (RabbitMQ inequivalent-args)
+            if (typ.length)
+                if (auto pt = (cast(string) ex) in gExchanges)
+                {
+                    immutable ExType want = typ == "fanout" ? ExType.fanout
+                        : typ == "topic" ? ExType.topic
+                        : typ == "headers" ? ExType.headers : ExType.direct;
+                    if (*pt != want)
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - inequivalent arg 'type'", 40, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                }
             ctlBroadcast(1, ex, typ, "");
             method(o, chan, 40, 11);
             return true;
@@ -1805,6 +1873,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 // name is never passive-checked (it always names a fresh server
                 // queue). A non-passive declare records the name in the
                 // existence set so later passive/consume probes resolve it.
+                if (exclusiveDenied(c, chan, o, qq, 50, 10))
+                    return true; // another connection's exclusive queue: 405
                 if (passive)
                 {
                     if (q.length && !queueExists(qq))
@@ -1815,11 +1885,35 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     }
                 }
                 else if (!queueExists(qq))
+                {
                     // broadcast is a stream — clients redeclare a queue before
                     // every use, so announce only the FIRST time this shard sees
                     // a name (or the first after a tombstone). LWW seq still
                     // orders the genuine announce and a post-delete resurrection.
                     ctlBroadcast(8, qq, "", "");
+                    if (qflags & 4) // exclusive: claim it for THIS connection
+                    {
+                        char[24] idb = void;
+                        size_t idl = 0;
+                        ulong v = c.connId;
+                        char[24] tmp = void;
+                        size_t tn = 0;
+                        do
+                        {
+                            tmp[tn++] = cast(char)('0' + v % 10);
+                            v /= 10;
+                        }
+                        while (v);
+                        while (tn)
+                            idb[idl++] = tmp[--tn];
+                        ctlBroadcast(10, qq, idb[0 .. idl], "");
+                        try
+                            c.exclQueues ~= qq.idup;
+                        catch (Exception)
+                        {
+                        }
+                    }
+                }
                 static ByteBuffer kb; // TLS
                 queueKey(qq, kb);
                 immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
@@ -1856,6 +1950,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     c.chans.remove(chan);
                     return true;
                 }
+                if (exclusiveDenied(c, chan, o, q, 50, 20))
+                    return true;
                 ctlBroadcast(2, ex, q, rk, bindArgs);
                 method(o, chan, 50, 21);
                 return true;
@@ -1897,6 +1993,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u16();
                 auto q = r.shortStr();
                 cast(void) r.u8(); // if-unused/if-empty/no-wait bits
+                if (exclusiveDenied(c, chan, o, q, 50, 40))
+                    return true;
                 static ByteBuffer dk; // TLS
                 queueKey(q, dk);
                 // stack-copy: gAmqpLen's cross-shard hop YIELDS, and a
@@ -2050,6 +2148,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     c.chans.remove(chan);
                     return true;
                 }
+                if (exclusiveDenied(c, chan, o, q, 60, 20))
+                    return true;
                 auto tag = r.shortStr();
                 immutable bits = r.u8();
                 immutable noAck = (bits & 2) != 0;
