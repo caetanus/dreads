@@ -56,7 +56,7 @@ private enum short API_OFFSET_COMMIT = 8, API_OFFSET_FETCH = 9,
         API_CREATE_TOPICS = 19, API_DESCRIBE_GROUPS = 15;
 // Transaction coordinator APIs (single-node = own coordinator).
 private enum short API_CREATE_PARTITIONS = 37, API_DELETE_TOPICS = 20,
-        API_INCREMENTAL_ALTER_CONFIGS = 44;
+        API_INCREMENTAL_ALTER_CONFIGS = 44, API_ALTER_CONFIGS = 33;
 private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
         API_ADD_OFFSETS_TO_TXN = 25, API_END_TXN = 26, API_TXN_OFFSET_COMMIT = 28;
 
@@ -114,6 +114,7 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_CREATE_PARTITIONS: return 1; // v2+ flexible
     case API_DELETE_TOPICS: return 1; // v4+ flexible
     case API_INCREMENTAL_ALTER_CONFIGS: return 0; // v1+ flexible
+    case API_ALTER_CONFIGS: return 1; // v2+ flexible
     case API_DESCRIBE_GROUPS: return 4; // v5+ flexible
     case API_INIT_PRODUCER_ID: return 3; // v2+ flexible
     case API_ADD_PARTITIONS_TO_TXN: return 2; // v3+ flexible
@@ -802,7 +803,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 23); // array count
+        putI32(o, 24); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -827,6 +828,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_CREATE_PARTITIONS, 0, 1);
         row(o, API_DELETE_TOPICS, 0, 1);
         row(o, API_INCREMENTAL_ALTER_CONFIGS, 0, 0);
+        row(o, API_ALTER_CONFIGS, 0, 1);
         row(o, API_DESCRIBE_GROUPS, 0, 4);
         row(o, API_INIT_PRODUCER_ID, 0, 3);
         row(o, API_ADD_PARTITIONS_TO_TXN, 0, 2);
@@ -903,6 +905,10 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         handleIncrementalAlterConfigs(r, apiVer, o);
         break;
 
+    case API_ALTER_CONFIGS:
+        handleAlterConfigs(r, apiVer, o);
+        break;
+
     case API_DESCRIBE_GROUPS:
         handleDescribeGroups(r, apiVer, o);
         break;
@@ -962,6 +968,10 @@ public __gshared ushort gKafkaPort = 9092;
 /// only once created (CreateTopics) or produced-into, and Metadata returns
 /// UNKNOWN_TOPIC for the rest — which lets an inspector see a missing topic.
 public __gshared bool gKafkaAutoCreate = true;
+/// Per-request Metadata gate: the request's allow_auto_topic_creation flag
+/// (v4+; librdkafka consumers send FALSE — KIP-361/0109). ANDed with
+/// gKafkaAutoCreate wherever a missing topic would auto-exist.
+private bool tMetaAllowAuto = true;
 
 /// Emit a JoinGroup ERROR response (classic or flex). MEMBER_ID_REQUIRED
 /// carries the broker-assigned id the client must re-join with.
@@ -2598,6 +2608,36 @@ private int registeredTopicPartitions(scope const(char)[] topic) nothrow @truste
 
 /// CreateTopics (v0-v4): register each topic's partition count. Auto-create is
 /// off, so this is how a topic comes into existence.
+/// The broker's topic-config registry: names a client may set (CreateTopics
+/// configs, AlterConfigs, IncrementalAlterConfigs). An unknown name answers
+/// INVALID_CONFIG(40) — 0081 probes with "dummy.doesntexist".
+private bool knownTopicConfig(scope const(char)[] n) @nogc nothrow pure
+{
+    switch (n)
+    {
+    case "cleanup.policy": case "compression.type": case "delete.retention.ms":
+    case "file.delete.delay.ms": case "flush.messages": case "flush.ms":
+    case "follower.replication.throttled.replicas": case "index.interval.bytes":
+    case "leader.replication.throttled.replicas": case "local.retention.bytes":
+    case "local.retention.ms": case "max.compaction.lag.ms":
+    case "max.message.bytes": case "message.downconversion.enable":
+    case "message.format.version": case "message.timestamp.difference.max.ms":
+    case "message.timestamp.type": case "message.timestamp.after.max.ms":
+    case "message.timestamp.before.max.ms": case "min.cleanable.dirty.ratio":
+    case "min.compaction.lag.ms": case "min.insync.replicas": case "preallocate":
+    case "remote.storage.enable": case "remote.log.copy.disable":
+    case "remote.log.delete.on.disable": case "retention.bytes":
+    case "retention.ms": case "segment.bytes": case "segment.index.bytes":
+    case "segment.jitter.ms": case "segment.ms":
+    case "unclean.leader.election.enable":
+        return true;
+    default:
+        return false;
+    }
+}
+
+private enum short E_INVALID_CONFIG = 40;
+
 private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     immutable ntopics = safeCount(r.i32());
@@ -2606,13 +2646,21 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     // handleCreateTopics during the park, registering the wrong topic.
     const(char)[][64] names;
     int[64] nparts;
+    short[64] errs;
+    // per-topic configs, flattened (slices point into the stable request buf)
+    enum size_t MAXCFG = 256;
+    size_t[64] cfgFrom;
+    size_t[64] cfgCount;
+    const(char)[][MAXCFG] cfgNames;
+    const(char)[][MAXCFG] cfgVals;
+    size_t ncfgAll;
     size_t nt;
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok)
             break;
         auto name = r.str();
-        immutable np = r.i32(); // num_partitions
+        immutable np = r.i32(); // num_partitions (-1 = from assignments / default)
         cast(void) r.i16(); // replication_factor
         immutable nassign = safeCount(r.i32());
         foreach (_2; 0 .. nassign)
@@ -2624,34 +2672,153 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             foreach (_3; 0 .. nb)
                 cast(void) r.i32(); // broker id
         }
+        // manual replica assignment: num_partitions is -1 on the wire and the
+        // partition count is the assignment count (0081 creates 22 this way)
+        immutable effNp = np > 0 ? np : (nassign > 0 ? nassign : np);
+        short terr = E_NONE;
+        immutable cfrom = ncfgAll;
         immutable ncfg = safeCount(r.i32());
         foreach (_2; 0 .. ncfg)
         {
             if (!r.ok)
                 break;
-            cast(void) r.str(); // config name
-            cast(void) r.str(); // config value (nullable)
+            auto cname = r.str(); // config name
+            auto cval = r.str(); // config value (nullable)
+            if (!knownTopicConfig(cname))
+                terr = E_INVALID_CONFIG; // 0081: unknown name fails the topic
+            else if (ncfgAll < MAXCFG && cval !is null)
+            {
+                cfgNames[ncfgAll] = cname;
+                cfgVals[ncfgAll] = cval;
+                ncfgAll++;
+            }
         }
         if (nt < names.length && r.ok)
         {
             names[nt] = name;
-            immutable c = np > 0 ? np : cast(int) KAFKA_PARTITIONS;
+            errs[nt] = validTopic(name) ? terr : E_INVALID_TOPIC;
+            immutable c = effNp > 0 ? effNp : cast(int) KAFKA_PARTITIONS;
             nparts[nt] = c > KAFKA_MAX_PARTITIONS ? KAFKA_MAX_PARTITIONS : c; // cap
+            cfgFrom[nt] = cfrom;
+            cfgCount[nt] = ncfgAll - cfrom;
             nt++;
         }
     }
-    foreach (i; 0 .. nt)
-        if (validTopic(names[i]))
-            registerTopic(names[i], nparts[i]);
+    cast(void) r.i32(); // timeout_ms
+    immutable validateOnly = ver >= 1 && r.ok && r.i8() != 0;
+    if (!validateOnly)
+        foreach (i; 0 .. nt)
+            if (errs[i] == E_NONE)
+            {
+                registerTopic(names[i], nparts[i]);
+                // persist the topic's declared configs (kafka.tcfg.<topic>)
+                foreach (k; cfgFrom[i] .. cfgFrom[i] + cfgCount[i])
+                {
+                    if (gKafkaExec is null)
+                        break;
+                    static ByteBuffer ckey, crb;
+                    topicCfgKey(names[i], ckey);
+                    const(char)[][4] a = ["hset", cast(const(char)[]) ckey.data,
+                        cfgNames[k], cfgVals[k]];
+                    gKafkaExec(a[], crb);
+                }
+            }
     if (ver >= 2)
         putI32(o, 0); // throttle_time_ms
     putI32(o, cast(int) nt); // topics count
     foreach (i; 0 .. nt)
     {
         putStr(o, names[i]);
-        putI16(o, E_NONE); // error_code
+        putI16(o, errs[i]); // error_code
         if (ver >= 1)
             putI16(o, -1); // error_message = null
+    }
+}
+
+/// AlterConfigs (v0-v1, KIP-133 legacy full-set alter): apply SETs for the
+/// provided entries on kafka.tcfg.<topic>; unknown config name answers
+/// INVALID_CONFIG for the resource. Non-topic resources are acked untouched.
+private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
+{
+    immutable nres = safeCount(r.i32());
+    byte[16] rtypes;
+    const(char)[][16] rnames;
+    short[16] rerrs;
+    enum size_t MAXCFG = 128;
+    size_t[16] cfgFrom;
+    size_t[16] cfgCount;
+    const(char)[][MAXCFG] cfgNames;
+    const(char)[][MAXCFG] cfgVals;
+    bool[MAXCFG] cfgNull;
+    size_t ncfgAll;
+    size_t nr;
+    foreach (_; 0 .. nres)
+    {
+        if (!r.ok)
+            break;
+        immutable rtype = r.i8();
+        auto rname = r.str();
+        short rerr = E_NONE;
+        immutable cfrom = ncfgAll;
+        immutable ncfg = safeCount(r.i32());
+        foreach (_2; 0 .. ncfg)
+        {
+            if (!r.ok)
+                break;
+            auto cname = r.str();
+            auto cval = r.str(); // nullable
+            if (rtype == 2 && !knownTopicConfig(cname))
+                rerr = E_INVALID_CONFIG;
+            else if (ncfgAll < MAXCFG)
+            {
+                cfgNames[ncfgAll] = cname;
+                cfgVals[ncfgAll] = cval;
+                cfgNull[ncfgAll] = cval is null;
+                ncfgAll++;
+            }
+        }
+        if (nr < rnames.length && r.ok)
+        {
+            rtypes[nr] = rtype;
+            rnames[nr] = rname;
+            rerrs[nr] = rerr;
+            cfgFrom[nr] = cfrom;
+            cfgCount[nr] = ncfgAll - cfrom;
+            nr++;
+        }
+    }
+    immutable validateOnly = r.ok && r.i8() != 0;
+    if (!validateOnly && gKafkaExec !is null)
+        foreach (i; 0 .. nr)
+        {
+            if (rerrs[i] != E_NONE || rtypes[i] != 2 || !validTopic(rnames[i]))
+                continue;
+            foreach (k; cfgFrom[i] .. cfgFrom[i] + cfgCount[i])
+            {
+                static ByteBuffer ckey, crb;
+                topicCfgKey(rnames[i], ckey);
+                if (cfgNull[k])
+                {
+                    const(char)[][3] a = ["hdel", cast(const(char)[]) ckey.data,
+                        cfgNames[k]];
+                    gKafkaExec(a[], crb);
+                }
+                else
+                {
+                    const(char)[][4] a = ["hset", cast(const(char)[]) ckey.data,
+                        cfgNames[k], cfgVals[k]];
+                    gKafkaExec(a[], crb);
+                }
+            }
+        }
+    putI32(o, 0); // throttle_time_ms
+    putI32(o, cast(int) nr); // resources
+    foreach (i; 0 .. nr)
+    {
+        putI16(o, rerrs[i]);
+        putI16(o, -1); // error_message = null
+        o.appendByte(cast(char) rtypes[i]);
+        putStr(o, rnames[i]);
     }
 }
 
@@ -2939,11 +3106,20 @@ private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             names[nt++] = name;
     }
     cast(void) r.i32(); // timeout_ms
+    short[64] derrs = E_NONE;
     foreach (i; 0 .. nt)
     {
         if (gKafkaExec is null || !validTopic(names[i]))
+        {
+            derrs[i] = E_UNKNOWN_TOPIC;
             continue;
+        }
         immutable np = registeredTopicPartitions(names[i]);
+        if (np < 0)
+        {
+            derrs[i] = E_UNKNOWN_TOPIC; // deleting a topic nobody created (0081)
+            continue;
+        }
         immutable cnt = np > 0 ? (np > KAFKA_MAX_PARTITIONS ? KAFKA_MAX_PARTITIONS : np)
             : cast(int) KAFKA_PARTITIONS;
         static ByteBuffer kb2, rb;
@@ -2972,7 +3148,7 @@ private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     foreach (i; 0 .. nt)
     {
         putStr(o, names[i]);
-        putI16(o, E_NONE);
+        putI16(o, derrs[i]);
     }
 }
 
@@ -3032,7 +3208,7 @@ private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) n
         np = topicPartitionCount(t);
         if (np == 0)
         {
-            if (gKafkaAutoCreate)
+            if (gKafkaAutoCreate && tMetaAllowAuto)
                 np = cast(int) KAFKA_PARTITIONS;
             else
                 terr = E_UNKNOWN_TOPIC;
@@ -3106,12 +3282,25 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         }
     }
     tMetaProbes = 0;
+    // v4+ request flag: consumers with allow.auto.create.topics=false ask for
+    // metadata WITHOUT creating (KIP-361, test 0109). Default true when the
+    // read fails (truncated request) — the historic behavior.
+    tMetaAllowAuto = true;
+    if (r.ok)
+    {
+        immutable aat = r.i8();
+        if (r.ok)
+            tMetaAllowAuto = aat != 0;
+        else
+            r.ok = true; // flag absent: tolerate (header-only probes)
+    }
     // The explicit-topic Metadata request is Kafka's auto-create moment:
     // register each VALID requested topic so the all-topics form lists it —
-    // but ONLY in auto-create mode. Registry mode (DREADS_KAFKA_AUTOCREATE=
-    // false) must keep a merely-queried topic MISSING (golib Inspector).
+    // but ONLY when BOTH the broker mode and the request allow it. Registry
+    // mode (DREADS_KAFKA_AUTOCREATE=false) must keep a merely-queried topic
+    // MISSING (golib Inspector).
     // Safe to yield here — only fiber-local state (o) is staged.
-    if (gKafkaAutoCreate)
+    if (gKafkaAutoCreate && tMetaAllowAuto)
         foreach (t; topics[0 .. nt])
             if (validTopic(t))
                 registerTopic(t);
@@ -3204,6 +3393,15 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
         }
     }
     tMetaProbes = 0; // reset the per-request cross-shard LLEN-probe budget
+    tMetaAllowAuto = true;
+    if (ver >= 4 && r.ok)
+    {
+        immutable aat = r.i8(); // allow_auto_topic_creation (v4+)
+        if (r.ok)
+            tMetaAllowAuto = aat != 0;
+        else
+            r.ok = true; // tolerate a truncated tail
+    }
 
     // brokers: just us
     putI32(o, 1);
@@ -3235,10 +3433,10 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
             np = topicPartitionCount(t); // glob: 0 if empty
             if (np == 0)
             {
-                if (gKafkaAutoCreate)
+                if (gKafkaAutoCreate && tMetaAllowAuto)
                     np = cast(int) KAFKA_PARTITIONS; // auto-exist (compat default)
                 else
-                    terr = E_UNKNOWN_TOPIC; // registry mode: topic is missing
+                    terr = E_UNKNOWN_TOPIC; // registry mode / request said no
             }
         }
         if (np > KAFKA_MAX_PARTITIONS)
