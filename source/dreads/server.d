@@ -2746,7 +2746,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpOwns, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -2818,6 +2818,29 @@ private void amqpInstallHooks() nothrow
         if (i + n > d.length)
             return false;
         outHead.append(d[i .. i + n]);
+        return true;
+    };
+    gAmqpPeekAt = (scope const(char)[] key, long index, ref ByteBuffer outPayload) nothrow {
+        import core.stdc.stdio : snprintf;
+
+        static ByteBuffer rbk2; // TLS
+        char[24] ib = void;
+        immutable n2 = snprintf(ib.ptr, ib.length, "%lld", index);
+        const(char)[][3] a = ["lindex", key, cast(const(char)[]) ib[0 .. (n2 > 0 ? n2 : 0)]];
+        amqpDataExec(a[], rbk2);
+        auto d = rbk2.data;
+        if (d.length < 4 || d[0] != '$' || d[1] == '-')
+            return false;
+        size_t i = 1, n = 0;
+        while (i < d.length && d[i] != '\r')
+        {
+            n = n * 10 + (d[i] - '0');
+            i++;
+        }
+        i += 2;
+        if (i + n > d.length)
+            return false;
+        outPayload.append(d[i .. i + n]);
         return true;
     };
     gAmqpOwns = (scope const(char)[] key) nothrow {

@@ -518,6 +518,20 @@ private struct A10Link
     int prio; // attach properties "rabbitmq:priority" (consumer preference)
     immutable(ubyte)[] srcFilterRaw; // client source filter-set (echoed back:
     // stream consumers refuse an attach whose source drops their filters)
+    // --- STREAM consumption (v2): non-destructive positional reads ---
+    bool stream; // source queue is mgmt-declared type=stream
+    long streamPos; // next absolute offset to read
+    ubyte offKind; // 0 none, 1 first, 2 last, 3 next, 4 offset, 5 timestamp
+    long offVal;
+    string[] streamFilterVals; // rabbitmq:stream-filter (bloom values)
+    bool matchUnfiltered; // rabbitmq:stream-match-unfiltered
+    immutable(ubyte)[] propFilterRaw; // amqp:properties-filter map contents
+    uint propFilterCount;
+    immutable(ubyte)[] appFilterRaw; // amqp:application-properties-filter map
+    uint appFilterCount;
+    bool hasFilters; // any bloom/expression filter present
+    long bloomChunk = -1; // chunk index the cached bloom decision is for
+    bool bloomPass; // cached: does the current chunk pass the value filter?
 }
 
 /// Address grammar shared by attach targets/sources and per-message `to`.
@@ -556,6 +570,7 @@ private struct A10Out
     string queue;
     immutable(ubyte)[] blob;
     uint handle;
+    bool stream; // stream deliveries: dispositions never touch the log
 }
 
 private struct A10Session
@@ -1295,8 +1310,99 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     if (!lk.clientSender && !lk.isMgmt)
     {
-        import dreads.amqp : a10ConsumerInc, a10PrioAdd;
+        import dreads.amqp : a10ConsumerInc, a10PrioAdd, a10QueueLen;
 
+        // v2 STREAMS: a receiver on a mgmt-declared stream queue reads
+        // non-destructively by position; the source filter-set carries the
+        // offset spec + bloom/expression filters (parsed once here)
+        {
+            const(char)[] qt;
+            try
+                if (auto pt = (cast(string) lk.rkey) in gA10QueueType)
+                    qt = *pt;
+            catch (Exception)
+            {
+            }
+            if (qt == "stream")
+            {
+                auto plk = (){ auto ps9 = fchan in c.sessions; return ps9 !is null
+                        ? lk.handle in ps9.links : null; }();
+                if (plk !is null)
+                {
+                    a10ParseFilters(plk);
+                    plk.stream = true;
+                    immutable qlen = a10QueueLen(plk.rkey);
+                    switch (plk.offKind)
+                    {
+                    default:
+                    case 0: // RabbitMQ stream default: "next"
+                    case 3:
+                        plk.streamPos = qlen;
+                        break;
+                    case 1: // first
+                        plk.streamPos = 0;
+                        break;
+                    case 2: // last: the final existing message
+                        plk.streamPos = qlen > 0 ? qlen - 1 : 0;
+                        break;
+                    case 4: // absolute offset (clamped)
+                        plk.streamPos = plk.offVal < 0 ? 0 : plk.offVal;
+                        break;
+                    case 5: // absolute timestamp: first record at/after it
+                    case 6: // interval "<n><unit>": first record younger than Δ
+                        {
+                            import dreads.amqp : a10PeekAt, splitRecord;
+
+                            long target;
+                            if (plk.offKind == 6)
+                            {
+                                long nowWall = 0;
+                                try
+                                {
+                                    import std.datetime.systime : Clock;
+
+                                    nowWall = Clock.currTime.toUnixTime!long * 1000;
+                                }
+                                catch (Exception)
+                                {
+                                }
+                                target = nowWall - plk.offVal;
+                            }
+                            else
+                                target = plk.offVal;
+                            static ByteBuffer sb; // TLS: consumed per peek
+                            long pos = 0;
+                            while (pos < qlen)
+                            {
+                                sb.clear();
+                                if (!a10PeekAt(plk.rkey, pos, sb))
+                                    break;
+                                long pm;
+                                int dth;
+                                const(char)[] rk0;
+                                const(ubyte)[] pr0, bd0;
+                                splitRecord(cast(const(ubyte)[]) sb.data, pm, dth,
+                                        rk0, pr0, bd0);
+                                if (pm >= target)
+                                    break;
+                                pos++;
+                            }
+                            plk.streamPos = pos;
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // non-stream links still parse expression filters (harmless;
+                // evaluated per delivery)
+                auto plk2 = (){ auto ps9 = fchan in c.sessions; return ps9 !is null
+                        ? lk.handle in ps9.links : null; }();
+                if (plk2 !is null)
+                    a10ParseFilters(plk2);
+            }
+        }
         a10ConsumerInc(lk.rkey); // replicated count: queue-info + x-expires
         a10PrioAdd(lk.rkey, lk.prio);
         a10StartDelivery(c, fchan, lk.handle);
@@ -1659,9 +1765,11 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                         break;
                     hdrTbl.appendByte(cast(char) k2.bytes.length);
                     hdrTbl.append(cast(const(char)[]) k2.bytes);
-                    // FLOAT (0x72) must round-trip as float, not double:
-                    // preserve the RAW 1.0 encoding ('x') for lossless replay
-                    if (rawA.length && rawA[0] == 0x72)
+                    // FLOAT (0x72) must round-trip as float, not double, and
+                    // SYMBOL (0xA3/0xB3) as symbol, not string: preserve the
+                    // RAW 1.0 encoding ('x') for lossless replay
+                    if (rawA.length && (rawA[0] == 0x72 || rawA[0] == 0xA3
+                            || rawA[0] == 0xB3))
                     {
                         hdrTbl.appendByte('x');
                         a10PutU32(hdrTbl, cast(uint) rawA.length);
@@ -1677,9 +1785,19 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                         break;
                     case A10Val.Kind.u64:
                     case A10Val.Kind.i64:
-                        hdrTbl.appendByte('l');
                         immutable lv = v2.kind == A10Val.Kind.u64
                             ? cast(long) v2.u : v2.i;
+                        // INT-encoded (0x71/0x54): keep 32-bit identity so
+                        // the consumer gets an Integer back (filter tests)
+                        if (rawA.length && (rawA[0] == 0x71 || rawA[0] == 0x54)
+                                && lv >= int.min && lv <= int.max)
+                        {
+                            hdrTbl.appendByte('I');
+                            foreach (k3; 0 .. 4)
+                                hdrTbl.appendByte(cast(char)(lv >> ((3 - k3) * 8)));
+                            break;
+                        }
+                        hdrTbl.appendByte('l');
                         foreach (k3; 0 .. 8)
                             hdrTbl.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
                         break;
@@ -1877,6 +1995,17 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
         auto po = id in ps.unsettled;
         if (po is null)
             continue;
+        if (po.stream)
+        {
+            // stream consumers never mutate the log: accepted/released/
+            // rejected all just settle the delivery
+            try
+                ps.unsettled.remove(id);
+            catch (Exception)
+            {
+            }
+            continue;
+        }
         switch (state)
         {
         case 0x27: // modified: requeue, splicing any annotations into headers
@@ -2068,10 +2197,23 @@ private void a10MapToTable(scope const(ubyte)[] mapBytes, uint count,
         }
         else if (v2.kind == A10Val.Kind.u64 || v2.kind == A10Val.Kind.i64)
         {
-            tbl.appendByte('l');
             immutable lv = v2.kind == A10Val.Kind.u64 ? cast(long) v2.u : v2.i;
-            foreach (k3; 0 .. 8)
-                tbl.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+            // an INT-encoded value (0x71 int / 0x54 smallint) keeps 32-bit
+            // identity through the 0-9-1 'I' type, so a 1.0 consumer gets an
+            // Integer back, not a Long (filter-expression round-trip)
+            if (raw.length && (raw[0] == 0x71 || raw[0] == 0x54)
+                    && lv >= int.min && lv <= int.max)
+            {
+                tbl.appendByte('I');
+                foreach (k3; 0 .. 4)
+                    tbl.appendByte(cast(char)(lv >> ((3 - k3) * 8)));
+            }
+            else
+            {
+                tbl.appendByte('l');
+                foreach (k3; 0 .. 8)
+                    tbl.appendByte(cast(char)(lv >> ((7 - k3) * 8)));
+            }
         }
         else if (v2.kind == A10Val.Kind.boolean)
         {
@@ -2106,6 +2248,17 @@ private void a10TableToMap(scope const(ubyte)[] tbl, ref ByteBuffer o) nothrow @
             {
                 a10Str(o, k);
                 a10Str(o, cast(const(char)[]) v);
+                n2 += 2;
+            }
+            else if (ty == 'I' && v.length == 4)
+            {
+                int iv = 0;
+                foreach (b3; v)
+                    iv = (iv << 8) | b3;
+                a10Str(o, k);
+                o.appendByte(0x71); // int
+                foreach (k3; 0 .. 4)
+                    o.appendByte(cast(char)(iv >> ((3 - k3) * 8)));
                 n2 += 2;
             }
             else if ((ty == 'l' || ty == 'T') && v.length == 8)
@@ -2840,7 +2993,8 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
 /// Map a stored 0-9-1 record back onto a 1.0 bare message: header (durable/
 /// priority/ttl), properties (reply-to/correlation-id/content-type),
 /// application-properties from the headers table, one data section.
-private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothrow @trusted
+private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o,
+        long streamOff = -1) nothrow @trusted
 {
     import dreads.amqp : splitRecord, propsHeaders, propsReplyTo, tableWalk;
 
@@ -3011,7 +3165,7 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
                     anyX = true;
                 return true;
             });
-        if (anyX)
+        if (anyX || streamOff >= 0)
         {
             o.appendByte(0x00);
             a10SmallUlong(o, cast(ubyte) SEC_MESSAGE_ANN);
@@ -3021,6 +3175,14 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             immutable cntX = o.length;
             a10PutU32(o, 0);
             uint nx = 0;
+            if (streamOff >= 0)
+            {
+                a10Sym(o, "x-stream-offset");
+                o.appendByte(0x81); // long
+                foreach (k9b; 0 .. 8)
+                    o.appendByte(cast(char)(streamOff >> ((7 - k9b) * 8)));
+                nx += 2;
+            }
             if (redelivered)
             {
                 a10Sym(o, "x-delivery-count");
@@ -3220,6 +3382,322 @@ private void a10SendDetachError(A10Conn c, ushort fchan, uint handle,
 
 /// Delivery fiber for one client-receiver link: pops from the source queue
 /// while the client has granted credit, sends transfers, tracks unsettled.
+/// Parse the attach's source filter-set into the link's stream/filter fields.
+/// Layout: map { symbol -> described(symbol, value) }.
+private void a10ParseFilters(A10Link* lk) nothrow @trusted
+{
+    if (lk.srcFilterRaw.length == 0)
+        return;
+    auto dec = A10Dec(lk.srcFilterRaw);
+    auto m = dec.readValue();
+    if (!dec.ok || m.kind != A10Val.Kind.map)
+        return;
+    auto md = A10Dec(m.bytes);
+    foreach (_; 0 .. m.count / 2)
+    {
+        auto k = md.readValue();
+        auto v = md.readValue();
+        if (!md.ok || k.kind != A10Val.Kind.str)
+            break;
+        if (v.kind == A10Val.Kind.described)
+            v = md.readValue(); // the described VALUE follows
+        if (!md.ok)
+            break;
+        auto key = cast(const(char)[]) k.bytes;
+        if (key == "rabbitmq:stream-offset-spec")
+        {
+            if (v.kind == A10Val.Kind.str)
+            {
+                auto sv = cast(const(char)[]) v.bytes;
+                if (sv == "first")
+                    lk.offKind = 1;
+                else if (sv == "last")
+                    lk.offKind = 2;
+                else if (sv == "next")
+                    lk.offKind = 3;
+                else if (sv.length >= 2)
+                {
+                    // interval spec "<n><unit>": messages from the last n
+                    // units (RabbitMQ stream offset intervals)
+                    long n2 = 0;
+                    bool digits = true;
+                    foreach (ch; sv[0 .. $ - 1])
+                        if (ch >= '0' && ch <= '9')
+                            n2 = n2 * 10 + (ch - '0');
+                        else
+                            digits = false;
+                    long unitMs = 0;
+                    switch (sv[$ - 1])
+                    {
+                    case 's': unitMs = 1000; break;
+                    case 'm': unitMs = 60_000; break;
+                    case 'h': unitMs = 3_600_000; break;
+                    case 'D': unitMs = 86_400_000; break;
+                    case 'M': unitMs = 2_592_000_000L; break;
+                    case 'Y': unitMs = 31_536_000_000L; break;
+                    default: break;
+                    }
+                    if (digits && unitMs > 0)
+                    {
+                        lk.offKind = 6; // interval: now - n*unit
+                        lk.offVal = n2 * unitMs;
+                    }
+                }
+            }
+            else if (v.kind == A10Val.Kind.u64)
+            {
+                lk.offKind = 4;
+                lk.offVal = cast(long) v.u;
+            }
+            else if (v.kind == A10Val.Kind.i64)
+            {
+                // timestamps decode as i64 too; treat as offset only when
+                // small, else as a timestamp spec (start from first: streams
+                // here have no per-record retention clock)
+                lk.offKind = v.i > 4_000_000_000L ? 5 : 4;
+                lk.offVal = v.i;
+            }
+        }
+        else if (key == "rabbitmq:stream-filter")
+        {
+            if (v.kind == A10Val.Kind.list || v.kind == A10Val.Kind.array)
+            {
+                auto ld = A10Dec(v.bytes);
+                foreach (_2; 0 .. v.count)
+                {
+                    auto e = ld.readValue();
+                    if (!ld.ok)
+                        break;
+                    if (e.kind == A10Val.Kind.str)
+                        try
+                            lk.streamFilterVals ~= (cast(const(char)[]) e.bytes).idup;
+                        catch (Exception)
+                        {
+                        }
+                }
+            }
+            else if (v.kind == A10Val.Kind.str)
+                try
+                    lk.streamFilterVals ~= (cast(const(char)[]) v.bytes).idup;
+                catch (Exception)
+                {
+                }
+        }
+        else if (key == "rabbitmq:stream-match-unfiltered")
+        {
+            if (v.kind == A10Val.Kind.boolean)
+                lk.matchUnfiltered = v.b;
+        }
+        else if (key == "amqp:properties-filter")
+        {
+            if (v.kind == A10Val.Kind.map)
+            {
+                lk.propFilterRaw = v.bytes.idup;
+                lk.propFilterCount = v.count;
+            }
+        }
+        else if (key == "amqp:application-properties-filter")
+        {
+            if (v.kind == A10Val.Kind.map)
+            {
+                lk.appFilterRaw = v.bytes.idup;
+                lk.appFilterCount = v.count;
+            }
+        }
+    }
+    lk.hasFilters = lk.streamFilterVals.length > 0 || lk.propFilterCount > 0
+        || lk.appFilterCount > 0;
+}
+
+/// Locate one section of a built bare message by descriptor code.
+private bool a10FindSection(scope const(ubyte)[] msg, ulong code,
+        out A10Val val) nothrow @trusted
+{
+    auto dec = A10Dec(msg);
+    while (dec.ok && dec.i < msg.length)
+    {
+        auto d = dec.readValue();
+        if (!dec.ok || d.kind != A10Val.Kind.described)
+            return false;
+        // the descriptor itself was consumed into d (kind described exposes
+        // the descriptor's value in u for smallulong codes)
+        auto v = dec.readValue();
+        if (!dec.ok)
+            return false;
+        if (d.u == code)
+        {
+            val = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Compare a filter value against a message value (type-aware; string
+/// modifiers "&p:" prefix, "&s:" suffix, "&&" literal-escape).
+private bool a10FilterEq(const ref A10Val f, const ref A10Val v) nothrow @trusted
+{
+    final switch (f.kind)
+    {
+    case A10Val.Kind.str:
+        if (v.kind != A10Val.Kind.str)
+            return false;
+        auto fb = cast(const(char)[]) f.bytes;
+        auto vb = cast(const(char)[]) v.bytes;
+        if (fb.length >= 3 && fb[0 .. 3] == "&p:")
+            return vb.length >= fb.length - 3 && vb[0 .. fb.length - 3] == fb[3 .. $];
+        if (fb.length >= 3 && fb[0 .. 3] == "&s:")
+            return vb.length >= fb.length - 3
+                && vb[$ - (fb.length - 3) .. $] == fb[3 .. $];
+        if (fb.length >= 2 && fb[0 .. 2] == "&&")
+            return vb == fb[1 .. $];
+        return vb == fb;
+    case A10Val.Kind.u64:
+        if (v.kind == A10Val.Kind.u64)
+            return v.u == f.u;
+        if (v.kind == A10Val.Kind.i64)
+            return v.i >= 0 && cast(ulong) v.i == f.u;
+        return false;
+    case A10Val.Kind.i64:
+        if (v.kind == A10Val.Kind.i64)
+            return v.i == f.i;
+        if (v.kind == A10Val.Kind.u64)
+            return f.i >= 0 && v.u == cast(ulong) f.i;
+        return false;
+    case A10Val.Kind.boolean:
+        return v.kind == A10Val.Kind.boolean && v.b == f.b;
+    case A10Val.Kind.f64:
+        return v.kind == A10Val.Kind.f64 && v.f == f.f;
+    case A10Val.Kind.null_:
+        return true; // null filter value: field presence not enforced
+    case A10Val.Kind.list:
+    case A10Val.Kind.map:
+    case A10Val.Kind.array:
+    case A10Val.Kind.described:
+        return false;
+    }
+}
+
+/// Does the BUILT message pass the link's VALUE filter (bloom family)?
+private bool a10BloomHit(scope const(ubyte)[] msg, A10Link* lk) nothrow @trusted
+{
+    A10Val ann;
+    const(char)[] fv;
+    if (a10FindSection(msg, SEC_MESSAGE_ANN, ann) && ann.kind == A10Val.Kind.map)
+    {
+        auto ad = A10Dec(ann.bytes);
+        foreach (_; 0 .. ann.count / 2)
+        {
+            auto k = ad.readValue();
+            auto v = ad.readValue();
+            if (!ad.ok)
+                break;
+            if (k.kind == A10Val.Kind.str
+                    && cast(const(char)[]) k.bytes == "x-stream-filter-value"
+                    && v.kind == A10Val.Kind.str)
+            {
+                fv = cast(const(char)[]) v.bytes;
+                break;
+            }
+        }
+    }
+    if (fv is null || fv.length == 0)
+        return lk.matchUnfiltered;
+    foreach (want; lk.streamFilterVals)
+        if (want == fv)
+            return true;
+    return false;
+}
+
+/// Does the BUILT message pass the link's EXPRESSION filters (properties +
+/// application-properties, AND semantics)?
+private bool a10ExprMatch(scope const(ubyte)[] msg, A10Link* lk) nothrow @trusted
+{
+    // properties filter: field-by-name against the properties list
+    if (lk.propFilterCount)
+    {
+        A10Val props;
+        if (!a10FindSection(msg, SEC_PROPERTIES, props)
+                || props.kind != A10Val.Kind.list)
+            return false;
+        // extract the 13 property fields once
+        A10Val[13] fields;
+        {
+            auto pd = A10Dec(props.bytes);
+            foreach (fi; 0 .. (props.count < 13 ? props.count : 13))
+            {
+                fields[fi] = pd.readValue();
+                if (!pd.ok)
+                    break;
+            }
+        }
+        auto fd = A10Dec(lk.propFilterRaw);
+        foreach (_; 0 .. lk.propFilterCount / 2)
+        {
+            auto k = fd.readValue();
+            auto v = fd.readValue();
+            if (!fd.ok || k.kind != A10Val.Kind.str)
+                return false;
+            auto name = cast(const(char)[]) k.bytes;
+            int idx = -1;
+            switch (name)
+            {
+            case "message-id": idx = 0; break;
+            case "user-id": idx = 1; break;
+            case "to": idx = 2; break;
+            case "subject": idx = 3; break;
+            case "reply-to": idx = 4; break;
+            case "correlation-id": idx = 5; break;
+            case "content-type": idx = 6; break;
+            case "content-encoding": idx = 7; break;
+            case "absolute-expiry-time": idx = 8; break;
+            case "creation-time": idx = 9; break;
+            case "group-id": idx = 10; break;
+            case "group-sequence": idx = 11; break;
+            case "reply-to-group-id": idx = 12; break;
+            default: break;
+            }
+            if (idx < 0)
+                return false; // unknown property name: no match
+            if (!a10FilterEq(v, fields[idx]))
+                return false;
+        }
+    }
+    // application-properties filter: key lookup in the app-props map
+    if (lk.appFilterCount)
+    {
+        A10Val ap;
+        if (!a10FindSection(msg, SEC_APP_PROPERTIES, ap)
+                || ap.kind != A10Val.Kind.map)
+            return false;
+        auto fd = A10Dec(lk.appFilterRaw);
+        foreach (_; 0 .. lk.appFilterCount / 2)
+        {
+            auto k = fd.readValue();
+            auto v = fd.readValue();
+            if (!fd.ok || k.kind != A10Val.Kind.str)
+                return false;
+            bool matched = false;
+            auto ad = A10Dec(ap.bytes);
+            foreach (_2; 0 .. ap.count / 2)
+            {
+                auto mk = ad.readValue();
+                auto mv = ad.readValue();
+                if (!ad.ok)
+                    break;
+                if (mk.kind == A10Val.Kind.str && mk.bytes == k.bytes)
+                {
+                    matched = a10FilterEq(v, mv);
+                    break;
+                }
+            }
+            if (!matched)
+                return false;
+        }
+    }
+    return true;
+}
+
 private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
 {
     try
@@ -3295,8 +3773,81 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                         continue;
                     }
                 }
+                long streamOffThis = -1;
                 pay.clear();
-                if (!a10Pop(pl5.rkey, pay))
+                bool got;
+                if (pl5.stream)
+                {
+                    import dreads.amqp : a10PeekAt;
+
+                    got = a10PeekAt(pl5.rkey, pl5.streamPos, pay);
+                    if (got)
+                    {
+                        streamOffThis = pl5.streamPos;
+                        pl5.streamPos++;
+                        // bloom value filters run CHUNK-coarse (16 messages),
+                        // like real stream bloom filters: a chunk with any
+                        // hit ships whole (false positives by design — the
+                        // client-side-filtering test asserts they exist).
+                        // Partial tail chunks fall back to exact matching.
+                        if (pl5.streamFilterVals.length)
+                        {
+                            enum long CHUNK = 16;
+                            immutable chunk = streamOffThis / CHUNK;
+                            bool pass;
+                            if (chunk == pl5.bloomChunk)
+                                pass = pl5.bloomPass;
+                            else
+                            {
+                                ByteBuffer sb2, mb2;
+                                bool full = true;
+                                bool anyHit = false;
+                                foreach (k9c; 0 .. CHUNK)
+                                {
+                                    sb2.clear();
+                                    if (!a10PeekAt(pl5.rkey, chunk * CHUNK + k9c, sb2))
+                                    {
+                                        full = false;
+                                        break;
+                                    }
+                                    mb2.clear();
+                                    a10BuildMessage(cast(const(ubyte)[]) sb2.data, mb2);
+                                    if (a10BloomHit(cast(const(ubyte)[]) mb2.data, pl5))
+                                    {
+                                        anyHit = true;
+                                        break;
+                                    }
+                                }
+                                if (full || anyHit)
+                                {
+                                    pl5.bloomChunk = chunk;
+                                    pl5.bloomPass = anyHit;
+                                    pass = anyHit;
+                                }
+                                else
+                                {
+                                    // partial tail chunk: exact per-message
+                                    mb2.clear();
+                                    a10BuildMessage(cast(const(ubyte)[]) pay.data, mb2);
+                                    pass = a10BloomHit(cast(const(ubyte)[]) mb2.data, pl5);
+                                }
+                            }
+                            if (!pass)
+                                continue; // advance WITHOUT burning credit
+                        }
+                        if (pl5.propFilterCount || pl5.appFilterCount)
+                        {
+                            msg.clear();
+                            a10BuildMessage(cast(const(ubyte)[]) pay.data, msg,
+                                    streamOffThis);
+                            if (!a10ExprMatch(cast(const(ubyte)[]) msg.data, pl5))
+                                continue; // advance WITHOUT burning credit
+                        }
+                    }
+                }
+                else
+                    got = a10Pop(pl5.rkey, pay);
+                if (!got)
                 {
                     if (pl5.drain)
                     {
@@ -3338,7 +3889,7 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 pl5.outCredit--;
                 try
                     ps5.unsettled[did] = A10Out(pl5.rkey,
-                            (cast(const(ubyte)[]) pay.data).idup, h5);
+                            (cast(const(ubyte)[]) pay.data).idup, h5, pl5.stream);
                 catch (Exception)
                 {
                 }
@@ -3366,7 +3917,7 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 lT.n++;
                 a10Close(outd, lT);
                 msg.clear();
-                a10BuildMessage(cast(const(ubyte)[]) pay.data, msg);
+                a10BuildMessage(cast(const(ubyte)[]) pay.data, msg, streamOffThis);
                 outd.append(cast(const(char)[]) msg.data);
                 a10FrameFinish(outd, fT);
                 a10Send(cc, cast(const(ubyte)[]) outd.data);

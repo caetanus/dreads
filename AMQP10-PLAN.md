@@ -70,3 +70,35 @@ amqp.d (hoje ecoa e fecha); vira o ponto de entrada da skin.
 
 Transações 1.0 (txn-capability), dynamic nodes com lifetime policies além do
 básico, resume de link (unsettled map), multi-hop/link-routing, TLS.
+
+## v2 (gate aprovado 2026-08-24: "ampq1v2") — streams + filter expressions
+
+Alvo: SourceFiltersTest 4/16 → 16/16. Duas famílias:
+
+1. **Consumo de STREAM** (offset-specs): fila declarada type=stream consome
+   NÃO-destrutivamente por posição. A10Link ganha {stream, streamPos}; attach
+   parseia o filter-set (srcFilterRaw) — "rabbitmq:stream-offset-spec"
+   (first/last/next/long/timestamp), "rabbitmq:stream-filter" (lista de
+   filter-values bloom), "rabbitmq:stream-match-unfiltered" (bool). Fiber de
+   entrega: LINDEX na posição (shim a10PeekAt), avalia filtros, entrega
+   anotada com x-stream-offset (long), avança; NÃO-match avança SEM queimar
+   crédito (o teste de flow-control cobra isso). Disposições de stream são
+   no-op no log (A10Out.stream). Tipo da fila: registro TLS gA10QueueType
+   (single-shard, como o v1).
+
+2. **Filter expressions (RabbitMQ 4.1)**: entradas "amqp:properties-filter"
+   (map symbol→valor sobre os 13 campos de properties, type-aware:
+   ulong/uuid/binary/timestamp/symbol/str) e
+   "amqp:application-properties-filter" (map string→valor). Modificadores de
+   string: "&p:" prefixo, "&s:" sufixo, "&&" escapa literal. Avaliação no
+   BROKER sobre a mensagem RECONSTRUÍDA (a10BuildMessage já preserva tudo via
+   headers x-a10): parsear as seções 0x73/0x74 do bare message e comparar.
+   Valores bloom ("x-stream-filter-value") chegam como annotation no publish
+   → viram header x-* (mecanismo v1) → reaparecem na annotations da mensagem
+   reconstruída; match contra a lista do consumidor (+ match-unfiltered para
+   mensagens sem valor).
+
+O attach ECOA o filter-set aceito verbatim (v1 já faz).
+
+Fora de escopo v2 (pedir depois): transações 1.0, link resume, TLS, SQL
+filter (4.2), retenção/segmentação de stream.

@@ -44,6 +44,8 @@ public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
 /// Non-destructive head read (LINDEX key 0) for the active-TTL reaper; false =
 /// empty queue. Installed by server.d.
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outHead) nothrow gAmqpPeekHead;
+/// Positional LINDEX peek (AMQP 1.0 stream consumers read non-destructively).
+public __gshared bool delegate(scope const(char)[] key, long index, ref ByteBuffer outPayload) nothrow gAmqpPeekAt;
 /// Does THIS shard thread own `key`? Only the owner reaps a queue (so peek+pop
 /// stay self-shard and yield-free, and no queue is swept N times). Installed by
 /// server.d.
@@ -5094,6 +5096,20 @@ package long a10QueueLen(scope const(char)[] q) nothrow @trusted
     queueKey(q, kbl);
     immutable n = gAmqpLen(kbl.data.asChars);
     return n < 0 ? 0 : n;
+}
+
+/// Non-destructive positional read for STREAM consumers (1.0 skin).
+package bool a10PeekAt(scope const(char)[] q, long index, ref ByteBuffer outPayload) nothrow @trusted
+{
+    if (gAmqpPeekAt is null)
+        return false;
+    static ByteBuffer kbx; // TLS
+    queueKey(q, kbx);
+    char[8 + 256 + 4] ks = void;
+    immutable kl = kbx.length <= ks.length ? kbx.length : ks.length;
+    ks[0 .. kl] = cast(const(char)[]) kbx.data[0 .. kl];
+    outPayload.clear();
+    return gAmqpPeekAt(cast(const(char)[]) ks[0 .. kl], index, outPayload);
 }
 
 package ubyte a10QueueFlags(scope const(char)[] q) nothrow @trusted
