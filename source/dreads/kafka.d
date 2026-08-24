@@ -50,7 +50,7 @@ private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
         API_ADD_OFFSETS_TO_TXN = 25, API_END_TXN = 26, API_TXN_OFFSET_COMMIT = 28;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
-        E_OFFSET_OUT_OF_RANGE = 1, E_UNSUPPORTED_VERSION = 35;
+        E_OFFSET_OUT_OF_RANGE = 1, E_INVALID_TOPIC = 17, E_UNSUPPORTED_VERSION = 35;
 
 /// Hard bound on any wire array count (topics/partitions/records). Kafka
 /// counts are SIGNED i32; a hostile 0x7FFFFFFF made the response-building
@@ -449,12 +449,47 @@ private struct Rd
 /// (topic="a",p=5) collide on the same list key.
 private bool validTopic(scope const(char)[] t) @nogc nothrow pure
 {
-    if (t.length == 0 || t.length > KAFKA_MAX_TOPIC)
+    // Kafka's real rule: 1..249 chars from [a-zA-Z0-9._-], and not "." / "..".
+    // The old rule rejected legal DOTTED topics (my.topic.name) and accepted
+    // illegal specials ($#!) — librdkafka 0057 expects INVALID_TOPIC for those.
+    // Dots are safe in the flat key kafka.t.<topic>.<p>: keys are constructed,
+    // never split back.
+    if (t.length == 0 || t.length > 249 || t.length > KAFKA_MAX_TOPIC)
+        return false;
+    if (t == "." || t == "..")
         return false;
     foreach (ch; t)
-        if (ch == '.' || ch == ' ' || cast(ubyte) ch < 0x21)
+    {
+        immutable ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+            || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+        if (!ok)
             return false;
+    }
     return true;
+}
+
+/// Topic registry backing all-topics Metadata: topics auto-exist statelessly,
+/// but LISTING them needs state — a keyspace set (`kafka.topics`, in the
+/// kafka-db) written on the FIRST produce per shard (TLS-deduped, so the hot
+/// path pays one AA probe). Keyspace-backed = AOF-persisted + cross-shard via
+/// the data plane, no new broadcast op.
+private bool[string] tTopicsSeen; // TLS dedupe cache
+private void registerTopic(scope const(char)[] t) nothrow @trusted
+{
+    try
+    {
+        if ((cast(string) t in tTopicsSeen) !is null)
+            return;
+        if (gKafkaExec is null)
+            return;
+        static ByteBuffer rreg; // TLS
+        const(char)[][3] a = ["sadd", "kafka.topics", t];
+        gKafkaExec(a[], rreg);
+        tTopicsSeen[t.idup] = true;
+    }
+    catch (Exception)
+    {
+    }
 }
 
 // partition key: kafka.t.<topic>.<p>
@@ -2141,13 +2176,48 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     immutable ntopics = rawn < 0 ? 0 : safeCount(rawn);
     const(char)[][64] topics;
     size_t nt = 0;
+    static ByteBuffer allBuf; // TLS: SMEMBERS reply for the all-topics form
+    if (rawn < 0 && gKafkaExec !is null)
+    {
+        // all-topics request: list the produce-time registry (kafka.topics).
+        allBuf.clear();
+        const(char)[][2] aq = ["smembers", "kafka.topics"];
+        gKafkaExec(aq[], allBuf);
+        // parse *N\r\n($L\r\n<member>\r\n)* into the same topics[] window
+        auto d = cast(const(char)[]) allBuf.data;
+        size_t i = 0;
+        if (i < d.length && d[i] == '*')
+        {
+            i++;
+            long n2 = 0;
+            while (i < d.length && d[i] != '\r')
+                n2 = n2 * 10 + (d[i++] - '0');
+            i += 2;
+            foreach (_k; 0 .. n2)
+            {
+                if (i >= d.length || d[i] != '$')
+                    break;
+                i++;
+                long ln = 0;
+                while (i < d.length && d[i] != '\r')
+                    ln = ln * 10 + (d[i++] - '0');
+                i += 2;
+                if (ln < 0 || i + ln > d.length)
+                    break;
+                auto m = d[i .. i + cast(size_t) ln];
+                i += cast(size_t) ln + 2;
+                if (nt < topics.length && validTopic(m))
+                    topics[nt++] = m;
+            }
+        }
+    }
     foreach (_; 0 .. ntopics)
     {
         if (!r.ok)
             break;
         auto t = r.cstr();
         r.skipTaggedFields(); // per-topic tagged fields
-        if (nt < topics.length && t !is null && validTopic(t))
+        if (nt < topics.length && t !is null && t.length)
         {
             bool dup = false;
             foreach (k; 0 .. nt)
@@ -2157,10 +2227,16 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
                     break;
                 }
             if (!dup)
-                topics[nt++] = t;
+                topics[nt++] = t; // invalid names STAY: emitted with error 17
         }
     }
     tMetaProbes = 0;
+    // The explicit-topic Metadata request is Kafka's auto-create moment:
+    // register each VALID requested topic so the all-topics form lists it.
+    // Safe to yield here — only fiber-local state (o) is staged.
+    foreach (t; topics[0 .. nt])
+        if (validTopic(t))
+            registerTopic(t);
 
     putI32(o, 0); // throttle_time_ms
     // brokers: just us
@@ -2176,6 +2252,18 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     putCArrLen(o, cast(int) nt);
     foreach (t; topics[0 .. nt])
     {
+        if (!validTopic(t))
+        {
+            // requested-but-illegal name: report it WITH error 17 — filtering
+            // it out left producers retrying metadata forever (librdkafka 0057).
+            putI16(o, E_INVALID_TOPIC);
+            putCStr(o, t);
+            o.appendByte(0); // is_internal
+            putCArrLen(o, 0); // no partitions
+            putI32(o, -2147483648);
+            putTaggedFields(o);
+            continue;
+        }
         int np;
         short terr;
         metaTopicParts(t, np, terr);
@@ -2334,8 +2422,13 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 break; // truncated mid-partition: don't emit/store a phantom entry
             long baseOffset = -1;
             short err = E_NONE;
-            if (!validTopic(topic) || part < 0)
+            if (!validTopic(topic))
+                err = E_INVALID_TOPIC; // illegal NAME is 17, not unknown-topic
+            else if (part < 0)
                 err = E_UNKNOWN_TOPIC;
+            // topic registration happens in Metadata (the auto-create moment):
+            // a gKafkaExec here would YIELD mid-produce with kb/blobArena TLS
+            // statics staged — the exact clobber hazard documented above.
             static ByteBuffer kb; // TLS (consumed into `raw` before any hop yield)
             partKey(topic, part, kb);
             // collect the whole message set, ONE atomic variadic RPUSH
