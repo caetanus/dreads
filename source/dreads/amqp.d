@@ -1738,7 +1738,9 @@ private final class AmqpConn
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
     uint[string] consumerUnacked; // live unacked per consumer tag (qos global=false)
-    uint hbSendSecs; // heartbeat SEND interval (0 = disabled); set from tune-ok
+    uint hbSendMs; // heartbeat SEND interval in MS (0 = disabled): the
+    // negotiated interval HALVED, like RabbitMQ — a full-interval cadence sits
+    // exactly on the client's reader-idle boundary and gets dropped (hb=1)
     uint hbSecs; // NEGOTIATED heartbeat (seconds): reads stalling past 2x this close the conn
     long lastReadMs; // MONOTONIC ms of the last bytes read (MonoTime — the
     // frozen per-command gClock behind nowMs() would leave stale stamps)
@@ -2247,8 +2249,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 // 0 = heartbeats disabled: don't start the sender at all.
                 c.hbSecs = hb;
                 c.lastReadMs = monoMs();
-                c.hbSendSecs = hb == 0 ? 0 : (hb + 1) / 2;
-                if (c.hbSendSecs != 0)
+                c.hbSendMs = hb == 0 ? 0 : (cast(uint) hb * 1000) / 2;
+                if (c.hbSendMs != 0)
                     startHeartbeat(c);
                 return true;
             }
@@ -4283,12 +4285,15 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
         foreach (t; tags)
             if (auto u = t in c.unacked)
             {
+                if (!queueExists(u.queue))
+                    continue; // dead queue: no ghost list on teardown either
                 static ByteBuffer kb6; // TLS
                 queueKey(u.queue, kb6);
                 static ByteBuffer rq6; // TLS: redelivered-marked copy
                 markRedelivered(rq6, u.blob);
                 if (gAmqpPushFront !is null)
                     gAmqpPushFront(kb6.data.asChars, rq6.data.asChars);
+                enforceMaxLen(u.queue); // x-max-length holds across requeues
             }
         c.unacked.clear();
         c.consumerUnacked.clear();
@@ -4378,6 +4383,8 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
     static ByteBuffer kb4; // TLS
     if (requeue)
     {
+        if (!queueExists(u.queue))
+            return; // the queue died: its messages die with it (no ghost list)
         queueKey(u.queue, kb4);
         // mark the requeued copy redelivered so the next delivery sets the flag
         // (both TLS buffers are consumed by gAmqpPushFront before its yield)
@@ -4385,6 +4392,9 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
         markRedelivered(rq4, u.blob);
         if (gAmqpPushFront !is null)
             gAmqpPushFront(kb4.data.asChars, rq4.data.asChars);
+        // x-max-length holds across REQUEUES too (RabbitMQ): an over-cap
+        // queue head-drops (dead-lettering via DLX when configured)
+        enforceMaxLen(u.queue);
         return;
     }
     deadLetter(u.queue, u.blob, "rejected");
@@ -5453,13 +5463,13 @@ private long monoMs() nothrow @trusted
 
 private void startHeartbeat(AmqpConn c) nothrow
 {
-    if (c.hbStarted || c.hbSendSecs == 0)
+    if (c.hbStarted || c.hbSendMs == 0)
         return;
     c.hbStarted = true;
     try
         cast(void) runTask((AmqpConn cc) nothrow {
             static immutable ubyte[8] hb = [8, 0, 0, 0, 0, 0, 0, 0xCE];
-            immutable dur = cc.hbSendSecs * 1000;
+            immutable dur = cc.hbSendMs;
             while (!cc.closing)
             {
                 try
@@ -5473,7 +5483,7 @@ private void startHeartbeat(AmqpConn c) nothrow
                 // socket (the java Heartbeat test mutes its side and expects
                 // the server to hang up).
                 if (cc.hbSecs != 0 && cc.lastReadMs != 0
-                        && monoMs() - cc.lastReadMs > cast(long) cc.hbSecs * 2000)
+                        && monoMs() - cc.lastReadMs > cast(long) cc.hbSecs * 2000 + 500)
                 {
                     try
                         cc.tcp.close();
