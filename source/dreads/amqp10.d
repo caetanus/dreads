@@ -283,6 +283,13 @@ struct A10Dec
         }
     }
 
+    /// After a described SECTION's descriptor was consumed, skip its value.
+    void skipValue2(ulong code) @nogc nothrow
+    {
+        cast(void) code;
+        cast(void) readValue();
+    }
+
     /// Skip one COMPLETE value: a described constructor is TWO reads
     /// (descriptor + value) — rhea's attach taught us the hard way (its
     /// source/target fields are described lists; a one-read skip left the
@@ -504,6 +511,7 @@ private struct A10Link
     bool drain;
     bool detached; // stops the delivery fiber
     bool fiberLive;
+    bool isMgmt; // "/management" pseudo-node (HTTP-over-AMQP topology ops)
 }
 
 /// One in-flight (unsettled) delivery we sent on a receiver link.
@@ -520,6 +528,7 @@ private struct A10Session
     uint nextIncomingId; // next transfer-id we expect
     uint incomingWindow = 2048;
     uint nextOutgoingId; // delivery-id source for OUR transfers
+    uint mgmtRecvHandle = uint.max; // the client's management RECEIVER link
     A10Link[uint] links; // keyed by the client's handle
     A10Out[ulong] unsettled; // delivery-id -> in-flight delivery (we sent)
 }
@@ -698,7 +707,9 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
             {
                 auto f = a10FrameStart(outb, FRAME_TYPE_SASL, 0);
                 auto l = a10OpenPerf(outb, cast(ubyte) SASL_OUTCOME);
-                a10SmallUlong(outb, pass ? 0 : 1); // code: ok / auth failure
+                // sasl-code is a UBYTE (0x50): proton-j rejects smallulong here
+                outb.appendByte(0x50);
+                outb.appendByte(pass ? 0 : 1);
                 l.n = 1;
                 a10Close(outb, l);
                 a10FrameFinish(outb, f);
@@ -773,6 +784,31 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
                     l.n++;
                     outb.appendByte(0x70); // idle-time-out
                     a10PutU32(outb, A10_OUR_IDLE_MS);
+                    l.n++;
+                    a10Null(outb); // outgoing-locales
+                    l.n++;
+                    a10Null(outb); // incoming-locales
+                    l.n++;
+                    a10Null(outb); // offered-capabilities
+                    l.n++;
+                    a10Null(outb); // desired-capabilities
+                    l.n++;
+                    {
+                        // properties: the java 1.0 client version-gates its
+                        // tests on these (same trick as 0-9-1 server-properties)
+                        outb.appendByte(0xC1); // map8
+                        immutable szAt2 = outb.length;
+                        outb.appendByte(0);
+                        outb.appendByte(6); // count
+                        a10Sym(outb, "product");
+                        a10Str(outb, "RabbitMQ");
+                        a10Sym(outb, "version");
+                        a10Str(outb, "4.1.0");
+                        a10Sym(outb, "node");
+                        a10Str(outb, "rabbit@dreads");
+                        auto dd = cast(ubyte[]) outb.data;
+                        dd[szAt2] = cast(ubyte)(outb.length - szAt2 - 1);
+                    }
                     l.n++;
                     a10Close(outb, l);
                     a10FrameFinish(outb, f);
@@ -1056,7 +1092,13 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     catch (Exception)
     {
     }
-    if (lk.exchange.length == 0 && lk.rkey.length)
+    if (address == "/management")
+    {
+        lk.isMgmt = true;
+        if (!lk.clientSender)
+            ps.mgmtRecvHandle = lk.handle; // responses flow back on this link
+    }
+    else if (lk.exchange.length == 0 && lk.rkey.length)
         a10EnsureQueue(lk.rkey); // queue address: attach declares it
     try
         ps.links[lk.handle] = lk;
@@ -1111,7 +1153,7 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
         a10Close(outb, l);
         a10FrameFinish(outb, f);
     }
-    if (!lk.clientSender)
+    if (!lk.clientSender && !lk.isMgmt)
         a10StartDelivery(c, fchan, lk.handle);
     // grant link-credit to the client sender via flow
     if (lk.clientSender)
@@ -1217,11 +1259,16 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     plk.deliveryCount++;
     // decode sections -> 0-9-1 props + body
-    static ByteBuffer props; // TLS: consumed by a10Publish before any yield
-    static ByteBuffer bodyBuf; // TLS
-    a10MapMessage(msg, props, bodyBuf);
-    cast(void) a10Publish(plk.exchange, plk.rkey,
-            cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
+    if (plk.isMgmt)
+        a10HandleMgmt(c, fchan, msg);
+    else
+    {
+        static ByteBuffer props; // TLS: consumed by a10Publish before any yield
+        static ByteBuffer bodyBuf; // TLS
+        a10MapMessage(msg, props, bodyBuf);
+        cast(void) a10Publish(plk.exchange, plk.rkey,
+                cast(const(ubyte)[]) props.data, cast(const(ubyte)[]) bodyBuf.data);
+    }
     // settle back (rcv-settle-mode first): disposition accepted+settled
     if (!settled)
     {
@@ -1557,6 +1604,424 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
         {
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// $management node (HTTP-over-AMQP, RabbitMQ 4.x AMQP 1.0 management API):
+// requests arrive as messages with properties {message-id, to=/queues/...,
+// subject=GET|PUT|POST|DELETE} + an amqp-value map body; responses echo the
+// message-id as correlation-id with subject = the HTTP status code.
+
+/// %XX-decode one path segment into `buf`; returns the decoded slice.
+private const(char)[] a10UriDecode(scope const(char)[] src, return scope char[] buf) @nogc nothrow
+{
+    size_t o2 = 0;
+    size_t i2 = 0;
+    while (i2 < src.length && o2 < buf.length)
+    {
+        auto ch7 = src[i2];
+        if (ch7 == '%' && i2 + 2 < src.length)
+        {
+            static int hex1(char h) @nogc nothrow
+            {
+                if (h >= '0' && h <= '9')
+                    return h - '0';
+                if (h >= 'a' && h <= 'f')
+                    return h - 'a' + 10;
+                if (h >= 'A' && h <= 'F')
+                    return h - 'A' + 10;
+                return -1;
+            }
+
+            immutable hi = hex1(src[i2 + 1]);
+            immutable lo = hex1(src[i2 + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                buf[o2++] = cast(char)((hi << 4) | lo);
+                i2 += 3;
+                continue;
+            }
+        }
+        buf[o2++] = cast(char) ch7;
+        i2++;
+    }
+    return buf[0 .. o2];
+}
+
+/// Pull a value by key from an amqp-value MAP (str keys).
+private A10Val a10MapGet(scope const(ubyte)[] mapBytes, uint count,
+        scope const(char)[] key) @nogc nothrow
+{
+    A10Val none;
+    auto md = A10Dec(mapBytes);
+    foreach (mi; 0 .. count / 2)
+    {
+        auto k2 = md.readValue();
+        auto v2 = md.readValue();
+        if (!md.ok)
+            break;
+        if (k2.kind == A10Val.Kind.str && cast(const(char)[]) k2.bytes == key)
+            return v2;
+    }
+    return none;
+}
+
+/// Send a management RESPONSE on the session's mgmt receiver link.
+/// bodyKind: 0 = none, 1 = map (pre-encoded map WITH constructor), 2 = string.
+private void a10MgmtRespond(A10Conn c, ushort fchan, scope const(char)[] code,
+        scope const(ubyte)[] corrRaw, int bodyKind,
+        scope const(ubyte)[] bodyMap, scope const(char)[] bodyStr) nothrow
+{
+    auto ps = fchan in c.sessions;
+    if (ps is null || ps.mgmtRecvHandle == uint.max)
+        return;
+    ByteBuffer o;
+    immutable did = ps.nextOutgoingId++;
+    auto f = a10FrameStart(o, FRAME_TYPE_AMQP, fchan);
+    auto l = a10OpenPerf(o, cast(ubyte) PERF_TRANSFER);
+    a10UInt(o, ps.mgmtRecvHandle);
+    l.n++;
+    a10UInt(o, did);
+    l.n++;
+    {
+        ubyte[4] dt = void;
+        dt[0] = cast(ubyte)(did >> 24);
+        dt[1] = cast(ubyte)(did >> 16);
+        dt[2] = cast(ubyte)(did >> 8);
+        dt[3] = cast(ubyte)(did & 0xFF);
+        a10Bin(o, dt[]);
+    }
+    l.n++;
+    a10UInt(o, 0); // message-format
+    l.n++;
+    a10Bool(o, true); // settled (mgmt responses are presettled)
+    l.n++;
+    a10Close(o, l);
+    // properties: message-id(null) user-id(null) to(null) subject(code)
+    //             reply-to(null) correlation-id(echo)
+    {
+        auto pl = a10OpenPerf(o, cast(ubyte) SEC_PROPERTIES);
+        a10Null(o);
+        pl.n++;
+        a10Null(o);
+        pl.n++;
+        a10Null(o);
+        pl.n++;
+        a10Str(o, code);
+        pl.n++;
+        a10Null(o);
+        pl.n++;
+        if (corrRaw.length)
+            o.append(cast(const(char)[]) corrRaw); // raw re-emit (any id type)
+        else
+            a10Null(o);
+        pl.n++;
+        a10Close(o, pl);
+    }
+    if (bodyKind == 1)
+    {
+        o.appendByte(0x00);
+        a10SmallUlong(o, cast(ubyte) SEC_AMQP_VALUE);
+        o.append(cast(const(char)[]) bodyMap); // pre-encoded map value
+    }
+    else if (bodyKind == 2)
+    {
+        o.appendByte(0x00);
+        a10SmallUlong(o, cast(ubyte) SEC_AMQP_VALUE);
+        a10Str(o, bodyStr);
+    }
+    a10FrameFinish(o, f);
+    a10Send(c, cast(const(ubyte)[]) o.data);
+}
+
+/// Encode a queue-info map value (client's DefaultQueueInfo contract).
+private void a10QueueInfoMap(ref ByteBuffer o, scope const(char)[] name,
+        ubyte flags, long msgs) @nogc nothrow
+{
+    o.appendByte(0xD1); // map32
+    immutable szAt = o.length;
+    a10PutU32(o, 0);
+    immutable cntAt = o.length;
+    a10PutU32(o, 0);
+    uint n2 = 0;
+    a10Str(o, "name");
+    a10Str(o, name);
+    n2 += 2;
+    a10Str(o, "durable");
+    a10Bool(o, (flags & 2) != 0);
+    n2 += 2;
+    a10Str(o, "auto_delete");
+    a10Bool(o, (flags & 8) != 0);
+    n2 += 2;
+    a10Str(o, "exclusive");
+    a10Bool(o, (flags & 4) != 0);
+    n2 += 2;
+    a10Str(o, "type");
+    a10Str(o, "classic");
+    n2 += 2;
+    a10Str(o, "arguments");
+    o.appendByte(0xC1); // empty map8
+    o.appendByte(1);
+    o.appendByte(0);
+    n2 += 2;
+    a10Str(o, "leader");
+    a10Str(o, "dreads-0");
+    n2 += 2;
+    a10Str(o, "message_count");
+    o.appendByte(0x80);
+    foreach (k; 0 .. 8)
+        o.appendByte(cast(char)(cast(ulong) msgs >> ((7 - k) * 8)));
+    n2 += 2;
+    a10Str(o, "consumer_count");
+    a10UInt(o, 0);
+    n2 += 2;
+    a10PatchU32(o, szAt, cast(uint)(o.length - cntAt));
+    a10PatchU32(o, cntAt, n2);
+}
+
+/// One management request: parse, execute against the shared topology, reply.
+private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) nothrow
+{
+    import dreads.amqp : a10QueueExists, a10QueueLen, a10QueueFlags,
+        a10DeclareQueue, a10DeleteQueue, a10PurgeQueue, a10ExchangeExists,
+        a10DeclareExchange, a10DeleteExchange, a10Bind, a10Unbind;
+
+    // walk the sections: properties (to/subject/message-id) + amqp-value body
+    const(ubyte)[] corrRaw;
+    const(char)[] to, subject;
+    const(ubyte)[] bodyMapBytes;
+    uint bodyMapCount;
+    bool bodyIsMap = false;
+    auto d = A10Dec(msg);
+    while (d.ok && d.i < d.p.length)
+    {
+        auto sec = d.readValue();
+        if (!d.ok || sec.kind != A10Val.Kind.described)
+            break;
+        immutable code = sec.u;
+        if (code == SEC_PROPERTIES)
+        {
+            auto val = d.readValue();
+            if (val.kind != A10Val.Kind.list)
+                continue;
+            auto pd = A10Dec(val.bytes);
+            foreach (fi; 0 .. val.count)
+            {
+                immutable at0 = pd.i;
+                auto v2 = pd.readValue();
+                if (!pd.ok)
+                    break;
+                if (fi == 0) // message-id: keep the RAW encoding for the echo
+                    corrRaw = val.bytes[at0 .. pd.i];
+                else if (fi == 2 && v2.kind == A10Val.Kind.str)
+                    to = cast(const(char)[]) v2.bytes;
+                else if (fi == 3 && v2.kind == A10Val.Kind.str)
+                    subject = cast(const(char)[]) v2.bytes;
+            }
+        }
+        else if (code == SEC_AMQP_VALUE)
+        {
+            auto val = d.readValue();
+            if (val.kind == A10Val.Kind.map)
+            {
+                bodyIsMap = true;
+                bodyMapBytes = val.bytes;
+                bodyMapCount = val.count;
+            }
+        }
+        else
+            d.skipValue2(code);
+    }
+
+    char[512] nb = void;
+    ByteBuffer bodyOut;
+
+    static const(char)[] strOf(A10Val v) @nogc nothrow
+    {
+        return v.kind == A10Val.Kind.str ? cast(const(char)[]) v.bytes : null;
+    }
+
+    static bool boolOf(A10Val v) @nogc nothrow
+    {
+        return v.kind == A10Val.Kind.boolean && v.b;
+    }
+
+    // ---- /queues/{name} ----
+    enum QPFX = "/queues/";
+    enum XPFX = "/exchanges/";
+    if (to.length > QPFX.length && to[0 .. QPFX.length] == QPFX)
+    {
+        auto rest = to[QPFX.length .. $];
+        bool purge = false;
+        enum MSFX = "/messages";
+        if (rest.length > MSFX.length
+                && rest[$ - MSFX.length .. $] == MSFX)
+        {
+            purge = true;
+            rest = rest[0 .. $ - MSFX.length];
+        }
+        auto qn = a10UriDecode(rest, nb);
+        if (subject == "PUT" && !purge)
+        {
+            ubyte flags = 0;
+            if (bodyIsMap)
+            {
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "durable")))
+                    flags |= 2;
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "exclusive")))
+                    flags |= 4;
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "auto_delete")))
+                    flags |= 8;
+            }
+            immutable created = a10DeclareQueue(qn, flags, false, 0, false, 0,
+                    false, 0, "", false, "");
+            bodyOut.clear();
+            a10QueueInfoMap(bodyOut, qn, flags, a10QueueLen(qn));
+            a10MgmtRespond(c, fchan, created ? "201" : "200", corrRaw, 1,
+                    cast(const(ubyte)[]) bodyOut.data, "");
+            return;
+        }
+        if (subject == "DELETE")
+        {
+            immutable n3 = a10QueueLen(qn);
+            if (purge)
+                a10PurgeQueue(qn);
+            else
+                a10DeleteQueue(qn);
+            bodyOut.clear();
+            {
+                bodyOut.appendByte(0xD1);
+                immutable szAt = bodyOut.length;
+                a10PutU32(bodyOut, 0);
+                immutable cntAt = bodyOut.length;
+                a10PutU32(bodyOut, 0);
+                a10Str(bodyOut, "message_count");
+                bodyOut.appendByte(0x80);
+                foreach (k; 0 .. 8)
+                    bodyOut.appendByte(cast(char)(cast(ulong) n3 >> ((7 - k) * 8)));
+                a10PatchU32(bodyOut, szAt, cast(uint)(bodyOut.length - cntAt));
+                a10PatchU32(bodyOut, cntAt, 2);
+            }
+            a10MgmtRespond(c, fchan, "200", corrRaw, 1,
+                    cast(const(ubyte)[]) bodyOut.data, "");
+            return;
+        }
+        if (subject == "GET")
+        {
+            if (!a10QueueExists(qn))
+            {
+                // the client parses THIS phrasing for EntityDoesNotExist
+                char[600] eb = void;
+                import core.stdc.stdio : snprintf;
+
+                immutable en = snprintf(eb.ptr, eb.length,
+                        "no queue '%.*s' in vhost '/'", cast(int) qn.length, qn.ptr);
+                a10MgmtRespond(c, fchan, "404", corrRaw, 2, null,
+                        eb[0 .. en]);
+                return;
+            }
+            bodyOut.clear();
+            a10QueueInfoMap(bodyOut, qn, a10QueueFlags(qn), a10QueueLen(qn));
+            a10MgmtRespond(c, fchan, "200", corrRaw, 1,
+                    cast(const(ubyte)[]) bodyOut.data, "");
+            return;
+        }
+    }
+    // ---- /exchanges/{name} ----
+    else if (to.length > XPFX.length && to[0 .. XPFX.length] == XPFX)
+    {
+        auto xn = a10UriDecode(to[XPFX.length .. $], nb);
+        if (subject == "PUT")
+        {
+            const(char)[] typ = "direct";
+            ubyte flags = 0;
+            if (bodyIsMap)
+            {
+                auto t2 = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "type"));
+                if (t2.length)
+                    typ = t2;
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "durable")))
+                    flags |= 2;
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "auto_delete")))
+                    flags |= 4;
+                if (boolOf(a10MapGet(bodyMapBytes, bodyMapCount, "internal")))
+                    flags |= 8;
+            }
+            a10DeclareExchange(xn, typ, flags, "");
+            a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
+            return;
+        }
+        if (subject == "DELETE")
+        {
+            a10DeleteExchange(xn);
+            a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
+            return;
+        }
+    }
+    // ---- /bindings ----
+    else if (to == "/bindings" && subject == "POST" && bodyIsMap)
+    {
+        auto src = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "source"));
+        auto key = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "binding_key"));
+        auto dq = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "destination_queue"));
+        auto dx = strOf(a10MapGet(bodyMapBytes, bodyMapCount, "destination_exchange"));
+        if (src.length && (dq.length || dx.length))
+            a10Bind(src, dq.length ? dq : dx, key, dx.length != 0);
+        a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
+        return;
+    }
+    else if (to.length > 10 && to[0 .. 10] == "/bindings/" && subject == "DELETE")
+    {
+        // /bindings/src=S;dstq=D;key=K;args= (or dste=)
+        auto spec = to[10 .. $];
+        const(char)[] src, dst, key;
+        bool dstIsX = false;
+        size_t i3 = 0;
+        while (i3 < spec.length)
+        {
+            size_t semi = spec.length;
+            foreach (k5, ch8; spec[i3 .. $])
+                if (ch8 == ';')
+                {
+                    semi = i3 + k5;
+                    break;
+                }
+            auto part = spec[i3 .. semi];
+            i3 = semi < spec.length ? semi + 1 : spec.length;
+            size_t eq = part.length;
+            foreach (k5, ch8; part)
+                if (ch8 == '=')
+                {
+                    eq = k5;
+                    break;
+                }
+            if (eq == part.length)
+                continue;
+            auto pk = part[0 .. eq];
+            auto pv = part[eq + 1 .. $];
+            if (pk == "src")
+                src = pv;
+            else if (pk == "dstq")
+                dst = pv;
+            else if (pk == "dste")
+            {
+                dst = pv;
+                dstIsX = true;
+            }
+            else if (pk == "key")
+                key = pv;
+        }
+        char[256] sb2 = void, db2 = void, kb2 = void;
+        auto srcD = a10UriDecode(src, sb2);
+        auto dstD = a10UriDecode(dst, db2);
+        auto keyD = a10UriDecode(key, kb2);
+        if (srcD.length && dstD.length)
+            a10Unbind(srcD, dstD, keyD, dstIsX);
+        a10MgmtRespond(c, fchan, "204", corrRaw, 0, null, "");
+        return;
+    }
+    // unknown target/verb
+    a10MgmtRespond(c, fchan, "404", corrRaw, 2, null, "Not found");
 }
 
 /// Map a stored 0-9-1 record back onto a 1.0 bare message: header (durable/

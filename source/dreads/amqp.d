@@ -5078,6 +5078,159 @@ package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
     return routed;
 }
 
+/// 1.0 management shims: queue/exchange/binding topology ops for the
+/// $management node (dreads.amqp10). All replicate through the SAME ctl ops
+/// as 0-9-1 declares — one topology, two protocols.
+package bool a10QueueExists(scope const(char)[] q) nothrow @trusted
+{
+    return queueExists(q);
+}
+
+package long a10QueueLen(scope const(char)[] q) nothrow @trusted
+{
+    if (gAmqpLen is null)
+        return 0;
+    static ByteBuffer kbl; // TLS
+    queueKey(q, kbl);
+    immutable n = gAmqpLen(kbl.data.asChars);
+    return n < 0 ? 0 : n;
+}
+
+package ubyte a10QueueFlags(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto pf = (cast(string) q) in gQueueFlags)
+            return *pf;
+    catch (Exception)
+    {
+    }
+    return 0;
+}
+
+/// Declare with 0-9-1-style flags (durable=2|exclusive=4|auto-delete=8) and
+/// the known x-args. Returns false when the name already existed.
+package bool a10DeclareQueue(scope const(char)[] q, ubyte flags,
+        bool ttlSet, long ttlMs, bool expSet, long expMs,
+        bool mlSet, long maxLen, scope const(char)[] dlx, bool dlxSet,
+        scope const(char)[] dlrk) nothrow @trusted
+{
+    immutable existed = queueExists(q);
+    try
+    {
+        if (!existed)
+        {
+            char[1] fb = [cast(char)(flags & 0x0E)];
+            ctlBroadcast(8, q, fb[], "");
+        }
+        if (dlxSet || dlrk.length || ttlSet || mlSet || expSet)
+        {
+            ubyte[25] tb = void;
+            foreach (k; 0 .. 8)
+                tb[k] = cast(ubyte)(ttlMs >> ((7 - k) * 8));
+            immutable mlEnc = mlSet ? maxLen + 1 : 0;
+            foreach (k; 0 .. 8)
+                tb[8 + k] = cast(ubyte)(mlEnc >> ((7 - k) * 8));
+            tb[16] = cast(ubyte)((dlxSet ? 1 : 0) | (dlrk.length ? 2 : 0)
+                    | (ttlSet ? 4 : 0) | (expSet ? 8 : 0));
+            foreach (k; 0 .. 8)
+                tb[17 + k] = cast(ubyte)((expSet ? expMs : 0) >> ((7 - k) * 8));
+            ctlBroadcast(3, q, dlxSet ? dlx : "", dlrk, tb[]);
+        }
+    }
+    catch (Exception)
+    {
+    }
+    return !existed;
+}
+
+package void a10DeleteQueue(scope const(char)[] q) nothrow @trusted
+{
+    try
+    {
+        auto adSeeds = bindingSourcesTo(q, false);
+        ctlBroadcast(9, q, "", "");
+        static ByteBuffer kdd; // TLS
+        queueKey(q, kdd);
+        if (gAmqpDelKey !is null)
+            gAmqpDelKey(kdd.data.asChars);
+        autoDeleteExchangeSweep(adSeeds);
+    }
+    catch (Exception)
+    {
+    }
+}
+
+package void a10PurgeQueue(scope const(char)[] q) nothrow @trusted
+{
+    static ByteBuffer kpp; // TLS
+    queueKey(q, kpp);
+    if (gAmqpDelKey !is null)
+        gAmqpDelKey(kpp.data.asChars);
+}
+
+package bool a10ExchangeExists(scope const(char)[] x) nothrow @trusted
+{
+    try
+        return ((cast(string) x) in gExchanges) !is null;
+    catch (Exception)
+        return false;
+}
+
+package void a10DeclareExchange(scope const(char)[] x, scope const(char)[] typ,
+        ubyte flags, scope const(char)[] ae) nothrow @trusted
+{
+    try
+    {
+        char[1] xfb = [cast(char)(flags & 0x0E)];
+        ctlBroadcast(1, x, typ, xfb[], cast(const(ubyte)[]) ae);
+    }
+    catch (Exception)
+    {
+    }
+}
+
+package void a10DeleteExchange(scope const(char)[] x) nothrow @trusted
+{
+    try
+    {
+        auto adSeeds = bindingSourcesTo(x, true);
+        ctlBroadcast(5, x, "", "");
+        autoDeleteExchangeSweep(adSeeds);
+    }
+    catch (Exception)
+    {
+    }
+}
+
+package void a10Bind(scope const(char)[] source, scope const(char)[] dest,
+        scope const(char)[] key, bool destIsExchange) nothrow @trusted
+{
+    try
+        if (destIsExchange)
+            ctlBroadcast(6, source, dest, key, null);
+        else
+            ctlBroadcast(2, source, dest, key, null);
+    catch (Exception)
+    {
+    }
+}
+
+package void a10Unbind(scope const(char)[] source, scope const(char)[] dest,
+        scope const(char)[] key, bool destIsExchange) nothrow @trusted
+{
+    try
+    {
+        if (destIsExchange)
+            ctlBroadcast(7, source, dest, key);
+        else
+            ctlBroadcast(4, source, dest, key);
+        autoDeleteExchangeSweep([cast(string) source.idup]);
+    }
+    catch (Exception)
+    {
+    }
+}
+
 /// Pop one deliverable record from `q` (expired heads are dead-lettered and
 /// skipped, bounded). False = empty.
 package bool a10Pop(scope const(char)[] q, ref ByteBuffer outPayload) nothrow @trusted
