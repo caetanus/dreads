@@ -28,11 +28,20 @@ import vibe.core.net : TCPConnection;
 import vibe.core.sync : TaskMutex;
 
 import dreads.mem : ByteBuffer, tByteBufferOom;
+import dreads.kafkagroup : KGOP_JOIN, KGOP_JOIN_POLL, KGOP_SYNC, KGOP_HEARTBEAT,
+    KGOP_LEAVE, KGOP_DESCRIBE, KGOP_COMMIT_CHECK, KG_NONE, KG_WAIT,
+    KG_ILLEGAL_GENERATION, KG_INCONSISTENT_PROTOCOL, KG_UNKNOWN_MEMBER,
+    KG_REBALANCE_IN_PROGRESS, KG_MEMBER_ID_REQUIRED;
 import std.digest.crc : crc32Of;
 
 /// Data-plane hook installed by server.d: execute a synthesized RESP command
 /// (args[1] is the routing key) on the owner shard, reply RESP bytes.
 public __gshared void delegate(scope const(char)[][] args, ref ByteBuffer reply) nothrow gKafkaExec;
+
+/// Group-coordinator hook installed by server.d: run ONE FSM op (see
+/// dreads.kafkagroup) on the shard owning `key`, reply the op payload.
+public __gshared void delegate(scope const(char)[] key, scope const(ubyte)[] req,
+        ref ByteBuffer reply) nothrow gKafkaGroupHop;
 
 public enum uint KAFKA_PARTITIONS = 4; // partitions advertised per topic
 private enum int KAFKA_MAX_PARTITIONS = 1024; // cap a topic's partition count (DoS)
@@ -954,82 +963,217 @@ public __gshared ushort gKafkaPort = 9092;
 /// UNKNOWN_TOPIC for the rest — which lets an inspector see a missing topic.
 public __gshared bool gKafkaAutoCreate = true;
 
-private shared int gKafkaMemberCtr;
-
-/// Generate a broker-assigned member id into `buf`, returns the slice.
-private const(char)[] genMemberId(ref char[64] buf) nothrow @trusted
+/// Emit a JoinGroup ERROR response (classic or flex). MEMBER_ID_REQUIRED
+/// carries the broker-assigned id the client must re-join with.
+private void emitJoinErr(ref ByteBuffer o, short ver, bool flex, short err,
+        scope const(char)[] mid) nothrow @trusted
 {
-    import core.atomic : atomicOp;
-    import core.stdc.stdio : snprintf;
-
-    immutable n = atomicOp!"+="(gKafkaMemberCtr, 1);
-    immutable k = snprintf(buf.ptr, buf.length, "dreads-%d", n);
-    return cast(const(char)[]) buf[0 .. (k > 0 ? k : 0)];
+    if (flex)
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, err);
+        putI32(o, -1); // generation
+        if (ver >= 7)
+            putCStrNull(o, null, true); // protocol_type (v7+)
+        if (ver >= 7)
+            putCStrNull(o, null, true); // protocol_name nullable at v7
+        else
+            putCStr(o, ""); // v6: non-nullable compact string
+        putCStr(o, ""); // leader
+        putCStr(o, mid);
+        putCArrLen(o, 0); // members
+        putTaggedFields(o);
+        return;
+    }
+    if (ver >= 2)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, err);
+    putI32(o, -1); // generation
+    putStr(o, ""); // protocol_name
+    putStr(o, ""); // leader
+    putStr(o, mid);
+    putI32(o, 0); // members
 }
 
-/// JoinGroup (v0-v4): single-node coordinator. The joining member is always made
-/// the leader of a one-member group at generation 1; franz-go (as leader) then
-/// computes the assignment and ships it back in SyncGroup. We echo the member's
-/// own subscription metadata so the leader has the member list it needs.
+/// Drive the join barrier for a parsed JoinGroup request: send KGOP_JOIN once,
+/// then poll KGOP_JOIN_POLL every 15ms until the coordinator closes the
+/// barrier (or the cap passes), then emit the wire response. Holding the
+/// connection is spec-faithful: brokers process per-connection in order and a
+/// JoinGroup can legitimately take up to the rebalance timeout.
+private void joinLoop(ref ByteBuffer o, short ver, bool flex,
+        scope const(char)[] group, ref ByteBuffer req) nothrow @trusted
+{
+    static ByteBuffer rep; // TLS: parsed synchronously after each hop
+    char[128] midBuf = void;
+    size_t midLen;
+    immutable deadline = kMonoMs() + 70_000; // rebalance cap + slack
+    for (;;)
+    {
+        if (!kgOp(group, cast(const(ubyte)[]) req.data, rep))
+        {
+            emitJoinErr(o, ver, flex, KG_REBALANCE_IN_PROGRESS,
+                    cast(const(char)[]) midBuf[0 .. midLen]);
+            return;
+        }
+        Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+        immutable e = rr.i16();
+        if (e == KG_WAIT)
+        {
+            auto m = rr.str();
+            midLen = m.length <= midBuf.length ? m.length : midBuf.length;
+            midBuf[0 .. midLen] = m[0 .. midLen];
+            if (kMonoMs() >= deadline)
+            {
+                emitJoinErr(o, ver, flex, KG_REBALANCE_IN_PROGRESS,
+                        cast(const(char)[]) midBuf[0 .. midLen]);
+                return;
+            }
+            kSleepMs(15);
+            req.clear(); // TLS req may have been reused during the sleep: rebuild
+            req.appendByte(cast(char) KGOP_JOIN_POLL);
+            putStr(req, group);
+            putStr(req, cast(const(char)[]) midBuf[0 .. midLen]);
+            continue;
+        }
+        if (e == KG_MEMBER_ID_REQUIRED)
+        {
+            emitJoinErr(o, ver, flex, KG_MEMBER_ID_REQUIRED, rr.str());
+            return;
+        }
+        if (e != KG_NONE)
+        {
+            emitJoinErr(o, ver, flex, e, cast(const(char)[]) midBuf[0 .. midLen]);
+            return;
+        }
+        // ok: [str mid][i32 gen][u8 isLeader][str proto][str ptype][str leader]
+        //     [i32 n]{[str mid][u8 giiNull][str gii][bytes meta]}*
+        auto mid = rr.str();
+        immutable gen = rr.i32();
+        cast(void) rr.i8(); // isLeader (implied by leader field)
+        auto proto = rr.str();
+        auto ptype = rr.str();
+        auto leader = rr.str();
+        immutable nmembRaw = rr.i32();
+        immutable nmemb = nmembRaw < 0 ? 0 : nmembRaw;
+        if (flex)
+        {
+            putI32(o, 0); // throttle_time_ms
+            putI16(o, E_NONE);
+            putI32(o, gen);
+            if (ver >= 7)
+                putCStrNull(o, ptype, ptype is null); // protocol_type (v7+)
+            putCStr(o, proto);
+            putCStr(o, leader);
+            putCStr(o, mid);
+            putCArrLen(o, nmemb);
+            foreach (_; 0 .. nmemb)
+            {
+                auto m2 = rr.str();
+                immutable gN = rr.i8() != 0;
+                auto g2 = rr.str();
+                auto meta = rr.bytesI32();
+                putCStr(o, m2);
+                putCStrNull(o, g2, gN); // group_instance_id (v5+)
+                putCBytes(o, meta, false);
+                putTaggedFields(o); // member tagged fields
+            }
+            putTaggedFields(o); // response tagged fields
+            return;
+        }
+        if (ver >= 2)
+            putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE);
+        putI32(o, gen);
+        putStr(o, proto);
+        putStr(o, leader);
+        putStr(o, mid);
+        putI32(o, nmemb);
+        foreach (_; 0 .. nmemb)
+        {
+            auto m2 = rr.str();
+            immutable gN = rr.i8() != 0;
+            auto g2 = rr.str();
+            auto meta = rr.bytesI32();
+            putStr(o, m2);
+            if (ver >= 5)
+            {
+                if (gN)
+                    putI16(o, -1); // group_instance_id = null
+                else
+                    putStr(o, g2);
+            }
+            putBytesI32(o, meta, false);
+        }
+        return;
+    }
+}
+
+/// Stage the fixed head of a KGOP_JOIN request from parsed fields; the caller
+/// appends the [i32 nproto]{name,meta}* tail itself.
+private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
+        scope const(char)[] memberId, scope const(char)[] gii, bool giiNull,
+        int sessMs, int rebMs, bool v4plus, scope const(char)[] protocolType) nothrow @trusted
+{
+    req.clear();
+    req.appendByte(cast(char) KGOP_JOIN);
+    putStr(req, group);
+    putStr(req, memberId);
+    req.appendByte(giiNull ? 1 : 0);
+    putStr(req, giiNull ? "" : gii);
+    putI32(req, sessMs);
+    putI32(req, rebMs);
+    req.appendByte(v4plus ? 1 : 0);
+    putStr(req, protocolType);
+    return cast(int) req.length; // caller appends [i32 nproto]{...} itself
+}
+
+/// JoinGroup v6/v7 (flexible): real coordinator via dreads.kafkagroup.
 private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.cstr(); // group_id
-    cast(void) r.i32(); // session_timeout_ms
-    cast(void) r.i32(); // rebalance_timeout_ms (present from v1; v6+ is flexible)
+    auto group = r.cstr();
+    immutable sessMs = r.i32();
+    immutable rebMs = r.i32();
     auto memberId = r.cstr();
-    cast(void) r.cstr(); // group_instance_id (nullable, v5+)
+    auto gii = r.cstr(); // group_instance_id (nullable, v5+)
     auto protocolType = r.cstr();
-    immutable nproto = r.carrlen();
-    const(char)[] protoName;
-    const(ubyte)[] protoMeta;
-    bool haveProto;
-    foreach (i; 0 .. (nproto < 0 ? 0 : safeCount(nproto))) // clamp like siblings
+    immutable nprotoRaw = r.carrlen();
+    immutable nproto = nprotoRaw < 0 ? 0 : safeCount(nprotoRaw);
+    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    cast(void) buildJoinReq(req, group, memberId, gii, gii is null, sessMs,
+            rebMs, true, protocolType is null ? "consumer" : protocolType);
+    immutable npOff = req.length;
+    putI32(req, 0);
+    int np = 0;
+    foreach (_; 0 .. nproto)
     {
         if (!r.ok)
             break;
         auto name = r.cstr();
         auto meta = r.cbytes();
         r.skipTaggedFields(); // per-protocol tagged fields
-        if (!haveProto && r.ok)
+        if (!r.ok)
+            break;
+        if (np < 64)
         {
-            protoName = name;
-            protoMeta = meta;
-            haveProto = true;
+            putStr(req, name);
+            putI32(req, cast(int)(meta is null ? 0 : meta.length));
+            if (meta !is null)
+                req.append(cast(const(char)[]) meta);
+            np++;
         }
     }
-    static char[64] midBuf;
-    const(char)[] mid = memberId.length ? memberId : genMemberId(midBuf);
-    putI32(o, 0); // throttle_time_ms
-    if (!r.ok || !haveProto)
+    patchI32(req, npOff, np);
+    if (!r.ok || np == 0 || group is null || group.length == 0)
     {
-        putI16(o, 0x0010); // COORDINATOR_LOAD_IN_PROGRESS-ish: safe retryable
-        putI32(o, -1); // generation
-        putCStrNull(o, null, true); // protocol_type (v7+) = null
-        putCStrNull(o, null, true); // protocol_name = null
-        putCStr(o, ""); // leader
-        putCStr(o, mid); // member_id
-        putCArrLen(o, 0); // members
-        putTaggedFields(o);
+        emitJoinErr(o, ver, true, KG_INCONSISTENT_PROTOCOL, memberId);
         return;
     }
-    putI16(o, E_NONE); // error_code
-    putI32(o, 1); // generation_id
-    putCStrNull(o, protocolType, protocolType is null); // protocol_type (v7+)
-    putCStrNull(o, protoName, protoName is null); // protocol_name
-    putCStr(o, mid); // leader = this member
-    putCStr(o, mid); // member_id
-    putCArrLen(o, 1); // members: 1
-    putCStr(o, mid); // member_id
-    putCStrNull(o, null, true); // group_instance_id (v5+) = null
-    putCBytes(o, protoMeta, protoMeta is null); // subscription metadata (echoed)
-    putTaggedFields(o); // member tagged fields
-    putTaggedFields(o); // response tagged fields
+    joinLoop(o, ver, true, group, req);
 }
 
-/// JoinGroup (v0-v4): single-node coordinator. The joining member is always made
-/// the leader of a one-member group at generation 1; franz-go (as leader) then
-/// computes the assignment and ships it back in SyncGroup. We echo the member's
-/// own subscription metadata so the leader has the member list it needs.
+/// JoinGroup v0-v5 (classic): real coordinator via dreads.kafkagroup. v5 adds
+/// group_instance_id to BOTH the request and the response members (the old
+/// stub missed it — librdkafka v5 joins misparsed into a retry loop).
 private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     if (isFlexible(API_JOIN_GROUP, ver)) // v6/v7 flexible
@@ -1037,52 +1181,79 @@ private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         handleJoinGroupFlex(r, ver, o);
         return;
     }
-    cast(void) r.str(); // group_id
-    cast(void) r.i32(); // session_timeout_ms
-    if (ver >= 1)
-        cast(void) r.i32(); // rebalance_timeout_ms
+    auto group = r.str();
+    immutable sessMs = r.i32();
+    immutable rebMs = ver >= 1 ? r.i32() : 60_000;
     auto memberId = r.str();
-    cast(void) r.str(); // protocol_type
+    const(char)[] gii = null;
+    if (ver >= 5)
+        gii = r.str(); // group_instance_id (nullable) — v5 classic
+    auto protocolType = r.str();
     immutable nproto = safeCount(r.i32());
-    const(char)[] protoName;
-    const(ubyte)[] protoMeta;
-    bool haveProto;
-    foreach (i; 0 .. nproto)
+    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    cast(void) buildJoinReq(req, group, memberId, gii, gii is null, sessMs,
+            rebMs, ver >= 4, protocolType);
+    immutable npOff = req.length;
+    putI32(req, 0);
+    int np = 0;
+    foreach (_; 0 .. nproto)
     {
         if (!r.ok)
             break;
         auto name = r.str();
         auto meta = r.bytesI32();
-        if (!haveProto && r.ok)
+        if (!r.ok)
+            break;
+        if (np < 64)
         {
-            protoName = name;
-            protoMeta = meta;
-            haveProto = true;
+            putStr(req, name);
+            putI32(req, cast(int)(meta is null ? 0 : meta.length));
+            if (meta !is null)
+                req.append(cast(const(char)[]) meta);
+            np++;
         }
     }
-    static char[64] midBuf;
-    immutable(char)[] emptyName = "";
-    const(char)[] mid = memberId.length ? memberId : genMemberId(midBuf);
-    if (ver >= 2)
-        putI32(o, 0); // throttle_time_ms
-    if (!r.ok || !haveProto)
+    patchI32(req, npOff, np);
+    if (!r.ok || np == 0 || group.length == 0)
     {
-        putI16(o, 0x0010); // COORDINATOR_LOAD_IN_PROGRESS-ish: safe retryable
-        putI32(o, -1); // generation
-        putStr(o, emptyName);
-        putStr(o, emptyName);
-        putStr(o, mid);
-        putI32(o, 0); // members
+        emitJoinErr(o, ver, false, KG_INCONSISTENT_PROTOCOL, memberId);
         return;
     }
-    putI16(o, E_NONE); // error_code
-    putI32(o, 1); // generation_id
-    putStr(o, protoName); // protocol_name
-    putStr(o, mid); // leader = this member
-    putStr(o, mid); // member_id
-    putI32(o, 1); // members: 1
-    putStr(o, mid); // member_id
-    putBytesI32(o, protoMeta, protoMeta is null); // subscription metadata (echoed)
+    joinLoop(o, ver, false, group, req);
+}
+
+private void kSleepMs(long ms) nothrow @trusted
+{
+    import vibe.core.core : sleep;
+    import core.time : msecs;
+
+    try
+        sleep(msecs(ms));
+    catch (Exception)
+    {
+    }
+}
+
+private long kMonoMs() @nogc nothrow @trusted
+{
+    import core.time : MonoTime;
+
+    auto t = MonoTime.currTime;
+    return t.ticks / (MonoTime.ticksPerSecond / 1000);
+}
+
+/// One group-coordinator op on the owner shard (routing key = the group's
+/// offsets hash, so membership and offsets are co-owned). False = transport
+/// failure — callers treat it as retryable (REBALANCE_IN_PROGRESS).
+private bool kgOp(scope const(char)[] group, scope const(ubyte)[] req,
+        ref ByteBuffer rep) nothrow @trusted
+{
+    if (gKafkaGroupHop is null)
+        return false;
+    static ByteBuffer keyb; // TLS: consumed before the hop's first yield
+    groupOffKey(group, keyb);
+    gKafkaGroupHop(cast(const(char)[]) keyb.data, req, rep);
+    return rep.length >= 2;
 }
 
 // Consumer-group committed offsets live in a per-group hash `kafka.cg.<group>`,
@@ -1229,15 +1400,37 @@ private bool fetchGroupMeta(scope const(char)[] group, scope const(char)[] topic
 private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto group = r.str();
+    int genId = -1;
+    const(char)[] cMember = null;
     if (ver >= 1)
     {
-        cast(void) r.i32(); // generation_id
-        cast(void) r.str(); // member_id
+        genId = r.i32(); // generation_id
+        cMember = r.str(); // member_id
     }
     if (ver >= 7)
         cast(void) r.str(); // group_instance_id (nullable)
     if (ver >= 2 && ver <= 4)
         cast(void) r.i64(); // retention_time_ms (v2-v4 only)
+    // Generation fencing (real consumer groups): ONLY when the commit names a
+    // generation (>= 0). Simple/assign() consumers commit with generation -1
+    // and keep the historic unfenced path untouched.
+    short fenceErr = E_NONE;
+    if (ver >= 1 && genId >= 0 && r.ok && group.length)
+    {
+        static ByteBuffer fq, fr; // TLS: consumed synchronously per hop
+        fq.clear();
+        fq.appendByte(cast(char) KGOP_COMMIT_CHECK);
+        putStr(fq, group);
+        putStr(fq, cMember is null ? "" : cMember);
+        putI32(fq, genId);
+        if (kgOp(group, cast(const(ubyte)[]) fq.data, fr))
+        {
+            Rd fr2 = Rd(cast(const(ubyte)[]) fr.data);
+            fenceErr = fr2.i16();
+            if (fenceErr == KG_WAIT)
+                fenceErr = KG_REBALANCE_IN_PROGRESS;
+        }
+    }
     immutable ntopics = safeCount(r.i32());
     immutable respStart = o.length;
     if (ver >= 3)
@@ -1257,6 +1450,11 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         immutable pOff = o.length;
         putI32(o, nparts);
         et++;
+        // a commit against a topic nobody created/produced answers 3 per
+        // partition (0030); the registry is the existence source of truth
+        immutable texists = validTopic(topic) && registeredTopicPartitions(topic) >= 0;
+        immutable short topicErr = fenceErr != E_NONE ? fenceErr
+            : (texists ? E_NONE : E_UNKNOWN_TOPIC);
         int ep = 0;
         foreach (_2; 0 .. nparts)
         {
@@ -1269,13 +1467,13 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             if (ver >= 6)
                 cast(void) r.i32(); // committed_leader_epoch
             auto meta = r.str(); // committed_metadata (nullable)
-            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+            if (topicErr == E_NONE && r.ok && part >= 0 && off >= 0)
             {
                 storeGroupOffset(group, topic, part, off);
                 storeGroupMeta(group, topic, part, meta);
             }
             putI32(o, part);
-            putI16(o, E_NONE); // error_code
+            putI16(o, topicErr); // fence/unknown-topic: same error per partition
             ep++;
         }
         patchI32(o, pOff, ep);
@@ -1791,65 +1989,197 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
         putI16(o, E_NONE); // top-level error_code
 }
 
-/// Heartbeat (v0-v3): always OK (single-member group never rebalances).
+/// Heartbeat (v0-v4): real coordinator — validates member + generation,
+/// answers REBALANCE_IN_PROGRESS while a barrier is open (the client's cue to
+/// re-join).
 private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (isFlexible(API_HEARTBEAT, ver)) // v4 flexible
+    immutable flex = isFlexible(API_HEARTBEAT, ver); // v4 flexible
+    const(char)[] group, mid;
+    int gen;
+    if (flex)
     {
-        cast(void) r.cstr(); // group_id
-        cast(void) r.i32(); // generation_id
-        cast(void) r.cstr(); // member_id
+        group = r.cstr();
+        gen = r.i32();
+        mid = r.cstr();
         cast(void) r.cstr(); // group_instance_id (nullable, v3+)
+    }
+    else
+    {
+        group = r.str();
+        gen = r.i32();
+        mid = r.str();
+        if (ver >= 3)
+            cast(void) r.str(); // group_instance_id
+    }
+    short err = KG_REBALANCE_IN_PROGRESS; // transport failure: safe retryable
+    if (r.ok && group.length)
+    {
+        static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+        req.clear();
+        req.appendByte(cast(char) KGOP_HEARTBEAT);
+        putStr(req, group);
+        putStr(req, mid);
+        putI32(req, gen);
+        if (kgOp(group, cast(const(ubyte)[]) req.data, rep))
+        {
+            Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+            err = rr.i16();
+        }
+    }
+    if (flex)
+    {
         putI32(o, 0); // throttle_time_ms
-        putI16(o, E_NONE); // error_code
+        putI16(o, err);
         putTaggedFields(o);
         return;
     }
-    cast(void) r.str(); // group_id
-    cast(void) r.i32(); // generation_id
-    cast(void) r.str(); // member_id
-    if (ver >= 3)
-        cast(void) r.str(); // group_instance_id
     if (ver >= 1)
         putI32(o, 0); // throttle_time_ms
-    putI16(o, E_NONE); // error_code
+    putI16(o, err);
 }
 
 /// SyncGroup (v0-v3): the leader shipped the computed assignment; echo this
 /// member's assignment back. Single-member group, so we return the (only)
 /// assignment the leader provided.
+/// Emit a SyncGroup ERROR response (classic or flex).
+private void emitSyncErr(ref ByteBuffer o, short ver, bool flex, short err) nothrow @trusted
+{
+    if (flex)
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, err);
+        if (ver >= 5)
+        {
+            putCStrNull(o, null, true); // protocol_type
+            putCStrNull(o, null, true); // protocol_name
+        }
+        putCBytes(o, null, false); // assignment: empty
+        putTaggedFields(o);
+        return;
+    }
+    if (ver >= 1)
+        putI32(o, 0); // throttle_time_ms
+    putI16(o, err);
+    putBytesI32(o, null, false); // assignment: empty
+}
+
+/// Drive SyncGroup against the coordinator: the leader's first op carries the
+/// assignments; followers (and the leader once delivered) poll until the
+/// group turns Stable, then receive their own assignment.
+private void syncLoop(ref ByteBuffer o, short ver, bool flex, scope const(char)[] group,
+        scope const(char)[] memberId, int gen, ref ByteBuffer req,
+        scope const(char)[] ptype, bool ptypeNull, scope const(char)[] pname,
+        bool pnameNull) nothrow @trusted
+{
+    static ByteBuffer rep; // TLS: parsed synchronously after each hop
+    immutable deadline = kMonoMs() + 70_000;
+    for (;;)
+    {
+        if (!kgOp(group, cast(const(ubyte)[]) req.data, rep))
+        {
+            emitSyncErr(o, ver, flex, KG_REBALANCE_IN_PROGRESS);
+            return;
+        }
+        Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+        immutable e = rr.i16();
+        if (e == KG_WAIT)
+        {
+            if (kMonoMs() >= deadline)
+            {
+                emitSyncErr(o, ver, flex, KG_REBALANCE_IN_PROGRESS);
+                return;
+            }
+            kSleepMs(15);
+            req.clear(); // TLS req may have been reused during the sleep: rebuild
+            req.appendByte(cast(char) KGOP_SYNC);
+            putStr(req, group);
+            putStr(req, memberId);
+            putI32(req, gen);
+            putI32(req, 0); // polls never re-deliver assignments
+            continue;
+        }
+        if (e != KG_NONE)
+        {
+            emitSyncErr(o, ver, flex, e);
+            return;
+        }
+        auto assign = rr.bytesI32();
+        if (flex)
+        {
+            putI32(o, 0); // throttle_time_ms
+            putI16(o, E_NONE);
+            if (ver >= 5)
+            {
+                putCStrNull(o, ptype, ptypeNull); // echoed (v5+)
+                putCStrNull(o, pname, pnameNull);
+            }
+            putCBytes(o, assign, false);
+            putTaggedFields(o);
+            return;
+        }
+        if (ver >= 1)
+            putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE);
+        putBytesI32(o, assign, false);
+        return;
+    }
+}
+
+/// SyncGroup v4/v5 (flexible): real coordinator. v5 adds protocol_type/name
+/// (the old stub read them at v4 too — a misparse).
 private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.cstr(); // group_id
-    cast(void) r.i32(); // generation_id
-    auto memberId = r.cstr(); // this member
+    auto group = r.cstr();
+    immutable gen = r.i32();
+    auto memberId = r.cstr();
     cast(void) r.cstr(); // group_instance_id (nullable, v3+)
-    auto protocolType = r.cstr(); // v5+ nullable
-    auto protocolName = r.cstr(); // v5+ nullable
-    immutable nassign = r.carrlen();
-    const(ubyte)[] myAssignment;
-    bool found;
-    foreach (i; 0 .. (nassign < 0 ? 0 : safeCount(nassign))) // clamp like siblings
+    const(char)[] ptype = null, pname = null;
+    if (ver >= 5)
+    {
+        ptype = r.cstr(); // nullable (v5+)
+        pname = r.cstr();
+    }
+    immutable nassignRaw = r.carrlen();
+    immutable nassign = nassignRaw < 0 ? 0 : safeCount(nassignRaw);
+    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    req.clear();
+    req.appendByte(cast(char) KGOP_SYNC);
+    putStr(req, group);
+    putStr(req, memberId);
+    putI32(req, gen);
+    immutable naOff = req.length;
+    putI32(req, 0);
+    int na = 0;
+    foreach (_; 0 .. nassign)
     {
         if (!r.ok)
             break;
         auto mid = r.cstr();
         auto assign = r.cbytes();
-        r.skipTaggedFields();
-        if (r.ok && (!found || mid == memberId))
+        r.skipTaggedFields(); // per-assignment tagged fields
+        if (!r.ok)
+            break;
+        if (na < 512)
         {
-            myAssignment = assign;
-            found = true;
+            putStr(req, mid);
+            putI32(req, cast(int)(assign is null ? 0 : assign.length));
+            if (assign !is null)
+                req.append(cast(const(char)[]) assign);
+            na++;
         }
     }
-    putI32(o, 0); // throttle_time_ms
-    putI16(o, E_NONE); // error_code
-    putCStrNull(o, protocolType, protocolType is null); // v5+
-    putCStrNull(o, protocolName, protocolName is null); // v5+
-    putCBytes(o, myAssignment, myAssignment is null); // member assignment
-    putTaggedFields(o);
+    patchI32(req, naOff, na);
+    if (!r.ok || group is null || group.length == 0)
+    {
+        emitSyncErr(o, ver, true, KG_UNKNOWN_MEMBER);
+        return;
+    }
+    syncLoop(o, ver, true, group, memberId, gen, req, ptype, ptype is null,
+            pname, pname is null);
 }
 
+/// SyncGroup v0-v3 (classic): real coordinator.
 private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     if (isFlexible(API_SYNC_GROUP, ver)) // v4/v5 flexible
@@ -1857,42 +2187,60 @@ private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         handleSyncGroupFlex(r, ver, o);
         return;
     }
-    cast(void) r.str(); // group_id
-    cast(void) r.i32(); // generation_id
-    auto memberId = r.str(); // this member
+    auto group = r.str();
+    immutable gen = r.i32();
+    auto memberId = r.str();
     if (ver >= 3)
         cast(void) r.str(); // group_instance_id (nullable)
     immutable nassign = safeCount(r.i32());
-    const(ubyte)[] myAssignment;
-    bool found;
-    foreach (i; 0 .. nassign)
+    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    req.clear();
+    req.appendByte(cast(char) KGOP_SYNC);
+    putStr(req, group);
+    putStr(req, memberId);
+    putI32(req, gen);
+    immutable naOff = req.length;
+    putI32(req, 0);
+    int na = 0;
+    foreach (_; 0 .. nassign)
     {
         if (!r.ok)
             break;
         auto mid = r.str();
         auto assign = r.bytesI32();
-        if (r.ok && (!found || mid == memberId))
+        if (!r.ok)
+            break;
+        if (na < 512)
         {
-            myAssignment = assign;
-            found = true;
+            putStr(req, mid);
+            putI32(req, cast(int)(assign is null ? 0 : assign.length));
+            if (assign !is null)
+                req.append(cast(const(char)[]) assign);
+            na++;
         }
     }
-    if (ver >= 1)
-        putI32(o, 0); // throttle_time_ms
-    putI16(o, E_NONE); // error_code
-    putBytesI32(o, myAssignment, myAssignment is null); // member assignment
+    patchI32(req, naOff, na);
+    if (!r.ok || group.length == 0)
+    {
+        emitSyncErr(o, ver, false, KG_UNKNOWN_MEMBER);
+        return;
+    }
+    syncLoop(o, ver, false, group, memberId, gen, req, null, true, null, true);
 }
 
-/// LeaveGroup (v0-v3): acknowledge. v3+ is a batched leave (members array).
+/// LeaveGroup (v0-v4): real coordinator — removes the member(s) and opens a
+/// rebalance for the survivors. v3+ batches members.
 private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (isFlexible(API_LEAVE_GROUP, ver)) // v4 flexible (batched members)
+    immutable flex = isFlexible(API_LEAVE_GROUP, ver); // v4 flexible
+    const(char)[] group;
+    const(char)[][32] mids;
+    const(char)[][32] giis;
+    bool[32] giiNull;
+    size_t nm;
+    if (flex)
     {
-        cast(void) r.cstr(); // group_id
-        const(char)[][32] fmids; // stack-local (no hop in this handler)
-        const(char)[][32] fgiis;
-        bool[32] fgiiNull;
-        size_t nm;
+        group = r.cstr();
         immutable rawc = r.carrlen();
         immutable cnt = rawc < 0 ? 0 : safeCount(rawc);
         foreach (i; 0 .. cnt)
@@ -1902,41 +2250,6 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
             auto mid = r.cstr();
             auto gii = r.cstr(); // group_instance_id (nullable compact)
             r.skipTaggedFields(); // member tagged fields
-            if (nm < fmids.length && r.ok)
-            {
-                fmids[nm] = mid;
-                fgiis[nm] = gii;
-                fgiiNull[nm] = (gii is null);
-                nm++;
-            }
-        }
-        putI32(o, 0); // throttle_time_ms
-        putI16(o, E_NONE); // error_code
-        putCArrLen(o, cast(int) nm); // members
-        foreach (i; 0 .. nm)
-        {
-            putCStr(o, fmids[i]); // member_id
-            putCStrNull(o, fgiis[i], fgiiNull[i]); // group_instance_id
-            putI16(o, E_NONE); // member error_code
-            putTaggedFields(o); // member tagged fields
-        }
-        putTaggedFields(o); // response tagged fields
-        return;
-    }
-    cast(void) r.str(); // group_id
-    static const(char)[][32] mids;
-    static bool[32] giiNull;
-    static const(char)[][32] giis;
-    size_t nm;
-    if (ver >= 3)
-    {
-        immutable cnt = safeCount(r.i32());
-        foreach (i; 0 .. cnt)
-        {
-            if (!r.ok)
-                break;
-            auto mid = r.str();
-            auto gii = r.str(); // group_instance_id (nullable)
             if (nm < mids.length && r.ok)
             {
                 mids[nm] = mid;
@@ -1948,16 +2261,80 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
     }
     else
     {
-        auto mid = r.str();
-        if (r.ok)
+        group = r.str();
+        if (ver >= 3)
         {
-            mids[0] = mid;
-            nm = 1;
+            immutable cnt = safeCount(r.i32());
+            foreach (i; 0 .. cnt)
+            {
+                if (!r.ok)
+                    break;
+                auto mid = r.str();
+                auto gii = r.str(); // group_instance_id (nullable)
+                if (nm < mids.length && r.ok)
+                {
+                    mids[nm] = mid;
+                    giis[nm] = gii;
+                    giiNull[nm] = (gii is null);
+                    nm++;
+                }
+            }
         }
+        else
+        {
+            auto mid = r.str();
+            if (r.ok)
+            {
+                mids[0] = mid;
+                giiNull[0] = true;
+                nm = 1;
+            }
+        }
+    }
+    // one atomic LEAVE op removes every named member and rebalances once
+    short[32] perr = KG_UNKNOWN_MEMBER;
+    if (r.ok && group.length && nm > 0)
+    {
+        static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+        req.clear();
+        req.appendByte(cast(char) KGOP_LEAVE);
+        putStr(req, group);
+        putI32(req, cast(int) nm);
+        foreach (i; 0 .. nm)
+            putStr(req, mids[i]);
+        if (kgOp(group, cast(const(ubyte)[]) req.data, rep))
+        {
+            Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+            cast(void) rr.i16(); // top-level (always NONE from the FSM)
+            immutable n2 = rr.i32();
+            foreach (i; 0 .. (n2 < 0 ? 0 : n2))
+            {
+                immutable pe = rr.i16();
+                if (cast(size_t) i < nm && rr.ok)
+                    perr[i] = pe;
+            }
+        }
+    }
+    // classic v<3: the single member's error IS the response error
+    immutable short topErr = (!flex && ver < 3 && nm > 0) ? perr[0] : E_NONE;
+    if (flex)
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_NONE); // error_code
+        putCArrLen(o, cast(int) nm); // members
+        foreach (i; 0 .. nm)
+        {
+            putCStr(o, mids[i]); // member_id
+            putCStrNull(o, giis[i], giiNull[i]); // group_instance_id
+            putI16(o, perr[i]); // member error_code
+            putTaggedFields(o); // member tagged fields
+        }
+        putTaggedFields(o); // response tagged fields
+        return;
     }
     if (ver >= 1)
         putI32(o, 0); // throttle_time_ms (LeaveGroup: v1+)
-    putI16(o, E_NONE); // error_code
+    putI16(o, topErr); // error_code
     if (ver >= 3)
     {
         putI32(o, cast(int) nm); // members
@@ -1968,14 +2345,10 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
                 putI16(o, -1); // group_instance_id = null
             else
                 putStr(o, giis[i]);
-            putI16(o, E_NONE); // member error_code
+            putI16(o, perr[i]); // member error_code
         }
     }
 }
-
-/// DescribeConfigs (v0-v3): a stateless broker exposes no per-resource config,
-/// so echo each requested resource with an empty config list (error 0). This is
-/// enough for kadm/franz-go Topics() (Inspector conformance) to enumerate topics.
 private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     immutable nres = safeCount(r.i32());
@@ -2077,8 +2450,8 @@ private bool groupExists(scope const(char)[] group) nothrow @trusted
 private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     immutable ngroups = safeCount(r.i32());
-    // STACK-local: groupExists hops cross-shard and yields; a shared static would
-    // be clobbered by another connection's handleDescribeGroups during the park.
+    // STACK-local: the ops below hop cross-shard and yield; a shared static
+    // would be clobbered by another connection during the park.
     const(char)[][64] groups;
     size_t ng;
     foreach (_; 0 .. ngroups)
@@ -2092,15 +2465,54 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
     if (ver >= 1)
         putI32(o, 0); // throttle_time_ms
     putI32(o, cast(int) ng); // groups count
+    static immutable string[4] stateNames = ["Empty", "PreparingRebalance",
+        "CompletingRebalance", "Stable"];
     foreach (i; 0 .. ng)
     {
-        immutable exists = groupExists(groups[i]);
+        static ByteBuffer req, rep; // TLS: consumed synchronously per hop
+        req.clear();
+        req.appendByte(cast(char) KGOP_DESCRIBE);
+        putStr(req, groups[i]);
+        bool live = kgOp(groups[i], cast(const(ubyte)[]) req.data, rep);
+        Rd rr = Rd(cast(const(ubyte)[]) rep.data);
+        if (live)
+            cast(void) rr.i16(); // FSM error (always NONE)
+        immutable st = live ? rr.i8() : 0;
+        immutable gen = live ? rr.i32() : 0;
+        auto proto = live ? rr.str() : null;
+        auto ptype = live ? rr.str() : null;
+        immutable nmRaw = live ? rr.i32() : 0;
+        immutable nmemb = nmRaw < 0 ? 0 : nmRaw;
+        cast(void) gen;
+        // a group with no live members but committed offsets is "Empty";
+        // fully unknown is "Dead"
+        immutable dead = nmemb == 0 && st == 0 && !groupExists(groups[i]);
         putI16(o, E_NONE); // error_code
         putStr(o, groups[i]); // group_id
-        putStr(o, exists ? "Empty" : "Dead"); // group_state
-        putStr(o, exists ? "consumer" : ""); // protocol_type
-        putStr(o, ""); // protocol_data / assignment protocol
-        putI32(o, 0); // members: empty
+        putStr(o, dead ? "Dead" : stateNames[st < 4 ? st : 0]); // group_state
+        putStr(o, nmemb ? ptype : (dead ? "" : "consumer")); // protocol_type
+        putStr(o, nmemb ? proto : ""); // protocol_data
+        putI32(o, nmemb); // members
+        foreach (_; 0 .. nmemb)
+        {
+            auto mid = rr.str();
+            immutable gN = rr.i8() != 0;
+            auto gii = rr.str();
+            auto meta = rr.bytesI32();
+            auto assign = rr.bytesI32();
+            putStr(o, mid); // member_id
+            if (ver >= 4)
+            {
+                if (gN)
+                    putI16(o, -1); // group_instance_id = null
+                else
+                    putStr(o, gii);
+            }
+            putStr(o, mid); // client_id (not tracked: the member id)
+            putStr(o, ""); // client_host (not tracked)
+            putBytesI32(o, meta, false); // member_metadata
+            putBytesI32(o, assign, false); // member_assignment
+        }
         if (ver >= 3)
             putI32(o, 0); // authorized_operations
     }
@@ -2695,11 +3107,14 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     }
     tMetaProbes = 0;
     // The explicit-topic Metadata request is Kafka's auto-create moment:
-    // register each VALID requested topic so the all-topics form lists it.
+    // register each VALID requested topic so the all-topics form lists it —
+    // but ONLY in auto-create mode. Registry mode (DREADS_KAFKA_AUTOCREATE=
+    // false) must keep a merely-queried topic MISSING (golib Inspector).
     // Safe to yield here — only fiber-local state (o) is staged.
-    foreach (t; topics[0 .. nt])
-        if (validTopic(t))
-            registerTopic(t);
+    if (gKafkaAutoCreate)
+        foreach (t; topics[0 .. nt])
+            if (validTopic(t))
+                registerTopic(t);
 
     putI32(o, 0); // throttle_time_ms
     // brokers: just us

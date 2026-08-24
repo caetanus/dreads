@@ -216,6 +216,12 @@ public enum ShardMsg : uint
     /// reconnecting shard can safely adopt the now-frozen state. Payload:
     /// [clientId]; the owner's drain calls dreads.mqtt mqttResumeSignal.
     mqttResume = 8,
+
+    /// Kafka consumer-group coordinator op (dreads.kafkagroup): the group's
+    /// OWNER shard executes one atomic FSM transition in its drain. Payload:
+    /// [u64 pend][op bytes]; meta = requester shard; the reply travels back as
+    /// ShardMsg.reply with tag = pend (the unbatched-single path).
+    kafkaGroup = 9,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which

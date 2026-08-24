@@ -533,6 +533,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         }, true);
         if (gConfig.amqpPort != 0)
             cast(void) setTimer(50.msecs, () @trusted nothrow { amqpTtlTick(); }, true);
+        if (gConfig.kafkaPort != 0)
+            cast(void) setTimer(50.msecs, () @trusted nothrow {
+                import dreads.kafkagroup : kgroupSweep;
+
+                kgroupSweep(); // group barriers/evictions on THIS shard
+            }, true);
     }
     initReplication();
     // SO_REUSEADDR + SO_REUSEPORT: without reusePort a restarted server can
@@ -592,6 +598,14 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
             amqpDataExec(args, reply, cast(int) gConfig.kafkaDb); // generic exec, Kafka's db
         };
+        {
+            import dreads.kafka : gKafkaGroupHop;
+
+            gKafkaGroupHop = (scope const(char)[] key, scope const(ubyte)[] req,
+                    ref ByteBuffer reply) nothrow {
+                kafkaGroupHopImpl(key, req, reply);
+            };
+        }
         gKafkaFetchRaw = &kafkaFetchDirect;
         gKafkaLenRaw = &kafkaLenDirect;
         gKafkaPort = gConfig.kafkaPort;
@@ -2195,6 +2209,28 @@ private void shardDrainLoop() nothrow
                 shardWake(cast(uint) meta);
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.kafkaGroup)
+        {
+            // Kafka group-coordinator op: one atomic FSM transition on THIS
+            // (owner) shard, reply routed back by pending pointer. The drain
+            // never yields inside kgroupApply, so the transition is atomic.
+            import dreads.kafkagroup : kgroupApply;
+
+            if (p.length >= 8)
+            {
+                auto pend = cast(void*)*cast(const(ulong)*) p.ptr;
+                // STACK-local: shardEnqueue below yields under ring
+                // backpressure; a TLS static would be clobbered by the next
+                // drained kafkaGroup message during that yield.
+                ByteBuffer kgReply;
+                kgroupApply(p[8 .. $], kgReply);
+                if (pend !is null)
+                {
+                    shardEnqueue(cast(uint) meta, kgReply.data, pend, 0, ShardMsg.reply);
+                    shardWake(cast(uint) meta);
+                }
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.amqpCtl)
         {
             // AMQP skin control plane: replicate the declare/bind locally
@@ -2573,6 +2609,60 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply,
     reply.clear();
     reply.append(p.reply.data);
     releaseShardPending(p);
+}
+
+/// Kafka group-coordinator hop: run ONE FSM op on the shard owning
+/// `routingKey` ("kafka.cg.<group>" — same slot as the group's offsets hash).
+/// Same shard = direct call; cross-shard = ShardMsg.kafkaGroup + pending wait
+/// (the amqpDataExec pattern). An empty reply means the hop failed (OOM) —
+/// callers treat it as a retryable error.
+private void kafkaGroupHopImpl(scope const(char)[] routingKey,
+        scope const(ubyte)[] req, ref ByteBuffer reply) nothrow @trusted
+{
+    import dreads.kafkagroup : kgroupApply;
+    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+        shardEnqueue, shardWake, ShardMsg, shardOfSlot;
+    import dreads.slots : keyToSlot;
+
+    immutable owner = sharded() ? cast(int) shardOfSlot(keyToSlot(routingKey))
+        : cast(int) tShard;
+    if (!sharded() || cast(uint) owner == tShard)
+    {
+        kgroupApply(req, reply);
+        return;
+    }
+    auto pnd = acquireShardPending();
+    // hb is STACK-local: shardEnqueue yields under ring backpressure and a TLS
+    // static would be clobbered by another fiber's hop during that yield.
+    ByteBuffer hb;
+    auto space = hb.freeSpace(8 + req.length);
+    if (space.length < 8 + req.length)
+    {
+        releaseShardPending(pnd);
+        reply.clear(); // empty reply = failed hop (caller retries)
+        return;
+    }
+    *cast(ulong*) space.ptr = cast(ulong) cast(void*) pnd;
+    space[8 .. 8 + req.length] = req[];
+    hb.grow(8 + req.length);
+    shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.kafkaGroup);
+    shardWake(cast(uint) owner);
+    while (!pnd.ready)
+    {
+        immutable ec = pnd.done.emitCount;
+        if (pnd.ready)
+            break;
+        try
+            pnd.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    // re-clear AFTER the park: `reply` may be a caller-shared TLS static that
+    // another fiber wrote to while we were parked (see amqpDataExec).
+    reply.clear();
+    reply.append(pnd.reply.data);
+    releaseShardPending(pnd);
 }
 
 // Kafka fetch fast path: when THIS thread owns the key, walk the packed list
@@ -4363,6 +4453,12 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         cast(void) setTimer(1.seconds, () @trusted nothrow { maintEvictionTick(); }, true);
         if (gConfig.amqpPort != 0)
             cast(void) setTimer(50.msecs, () @trusted nothrow { amqpTtlTick(); }, true);
+        if (gConfig.kafkaPort != 0)
+            cast(void) setTimer(50.msecs, () @trusted nothrow {
+                import dreads.kafkagroup : kgroupSweep;
+
+                kgroupSweep(); // group barriers/evictions on THIS shard
+            }, true);
     }
     catch (Exception)
     {
