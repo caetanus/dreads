@@ -7,15 +7,26 @@ else
     {
         import core.stdc.stdio : fwrite, stdout;
 
-        import dreads.config : gConfig, loadConfig, applyDirective;
+        import dreads.config : gConfig, loadConfig, applyDirective, dreadsVersion,
+            redisCompatVersion;
         import dreads.logo : logo, enableAnsi;
         import dreads.server : runServer;
 
         import std.algorithm : startsWith;
         import std.conv : to, ConvException;
         import std.file : exists;
-        import std.stdio : stderr;
+        import std.stdio : stderr, stdout, writeln;
         import std.string : indexOf;
+
+        // `--version`/`-v`: print and exit BEFORE any directive is applied — an
+        // unknown flag would otherwise be ignored and the server would boot.
+        foreach (a; args[1 .. $])
+            if (a == "--version" || a == "-v")
+            {
+                writeln("dreads ", dreadsVersion, " (Redis-compatible ",
+                        redisCompatVersion, ")");
+                return 0;
+            }
 
         // redis/valkey-compatible CLI: a positional non-flag arg is either the
         // config file (an existing path) or the port (numeric); every config

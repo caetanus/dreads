@@ -6,6 +6,11 @@ module dreads.config;
 
 import std.string : strip;
 
+/// dreads build version. The RESP INFO line advertises Redis compatibility
+/// (redis_version 7.4.0); this is dreads' own version, printed by `--version`.
+public enum dreadsVersion = "0.9.0";
+public enum redisCompatVersion = "7.4.0";
+
 public struct Config
 {
     ushort port = 6379;
