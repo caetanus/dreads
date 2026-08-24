@@ -2045,7 +2045,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
                             tb[8 + k] = cast(ubyte)(mlEnc >> ((7 - k) * 8));
-                        ctlBroadcast(3, qq, dlx is null ? "" : dlx,
+                                            ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
                 }
@@ -3359,6 +3359,57 @@ private bool isExpired(scope const(ubyte)[] blob, long ttlMs) nothrow @trusted
 /// Shared by nack/reject (settleNegative) and TTL expiry at delivery.
 // --- x-death header (RabbitMQ dead-letter provenance a DLX consumer reads for
 // poison-message handling: count, reason, queue, ...) ---
+/// x-death bookkeeping for a fresh death at (queue, reason): returns the PRIOR
+/// count for this (queue, reason) and appends every OTHER existing entry
+/// verbatim into `others` ('F' + u32 + table each) — RabbitMQ keeps ONE entry
+/// per (queue, reason), incrementing its count, and preserves the rest.
+private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
+        scope const(char)[] reason, ref ByteBuffer others) @nogc nothrow @trusted
+{
+    long prior = 0;
+    auto h = propsHeaders(props);
+    if (h is null || h.length == 0)
+        return 0;
+    cast(void) tableWalk(h, (scope const(char)[] k, char ty, scope const(ubyte)[] v) @nogc nothrow {
+        if (k != "x-death" || ty != 'A')
+            return true;
+        size_t i = 0;
+        while (i + 5 <= v.length)
+        {
+            immutable et = v[i];
+            immutable ln = (cast(size_t) v[i + 1] << 24) | (cast(size_t) v[i + 2] << 16)
+                | (cast(size_t) v[i + 3] << 8) | v[i + 4];
+            if (et != 'F' || i + 5 + ln > v.length)
+                break;
+            auto elem = v[i .. i + 5 + ln];
+            auto tbl = v[i + 5 .. i + 5 + ln];
+            const(char)[] eq, er;
+            long ec = 0;
+            cast(void) tableWalk(tbl, (scope const(char)[] k2, char t2,
+                    scope const(ubyte)[] v2) @nogc nothrow {
+                if (k2 == "queue" && t2 == 'S')
+                    eq = cast(const(char)[]) v2;
+                else if (k2 == "reason" && t2 == 'S')
+                    er = cast(const(char)[]) v2;
+                else if (k2 == "count" && t2 == 'l' && v2.length == 8)
+                {
+                    ec = 0;
+                    foreach (b2; v2)
+                        ec = (ec << 8) | b2;
+                }
+                return true;
+            });
+            if (eq == queue && er == reason)
+                prior = ec;
+            else
+                others.append(cast(const(char)[]) elem);
+            i += 5 + ln;
+        }
+        return false;
+    });
+    return prior;
+}
+
 private void patchU32(ref ByteBuffer o, size_t at, uint v) @nogc nothrow @trusted
 {
     auto d = cast(ubyte[]) o.data;
@@ -3384,7 +3435,8 @@ private void xtStr(ref ByteBuffer o, scope const(char)[] key, scope const(char)[
 /// table {count 'l', reason/queue/exchange 'S', routing-keys 'A', }.
 private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] reason,
         scope const(char)[] queue, scope const(char)[] rk,
-        scope const(char)[] origEx) @nogc nothrow
+        scope const(char)[] origEx, scope const(char)[] dlrk,
+        scope const(ubyte)[] othersRaw) @nogc nothrow
 {
     o.appendByte(cast(char) 7);
     o.append("x-death");
@@ -3409,11 +3461,21 @@ private void buildXDeathEntry(ref ByteBuffer o, long count, scope const(char)[] 
     immutable rkAt = o.length;
     putU32(o, 0);
     immutable rkStart = o.length;
+    if (dlrk.length && dlrk != rk)
+    {
+        // an x-dead-letter-routing-key override records BOTH keys, override
+        // first — the java suite asserts [dlrk, original] exactly.
+        o.appendByte('S');
+        putU32(o, cast(uint) dlrk.length);
+        o.append(dlrk);
+    }
     o.appendByte('S');
     putU32(o, cast(uint) rk.length);
     o.append(rk);
     patchU32(o, rkAt, cast(uint)(o.length - rkStart));
     patchU32(o, tblAt, cast(uint)(o.length - tblStart));
+    // OTHER (queue, reason) entries survive verbatim after ours
+    o.append(cast(const(char)[]) othersRaw);
     patchU32(o, arrAt, cast(uint)(o.length - arrStart));
 }
 
@@ -3599,7 +3661,11 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     static ByteBuffer xbuf; // TLS: the x-death header entry
     static ByteBuffer paug; // TLS: props + x-death
     xbuf.clear();
-    buildXDeathEntry(xbuf, deaths + 1, reason, queue, origRk, recordExchange(blob));
+    static ByteBuffer xoth; // TLS: prior x-death entries for OTHER (queue,reason)
+    xoth.clear();
+    immutable prior = xDeathOthers(props, queue, reason, xoth);
+    buildXDeathEntry(xbuf, prior + 1, reason, queue, origRk, recordExchange(blob),
+            meta.dlrk, xoth.data);
     mergeXDeath(paug, props, xbuf.data);
     dlrec.clear();
     buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_, meta.dlx);
