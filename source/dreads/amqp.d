@@ -5212,6 +5212,39 @@ package const(char)[] a10ExchangeType(scope const(char)[] x) nothrow @trusted
     return "";
 }
 
+/// Replicated live-consumer count for a queue (0-9-1 + 1.0 consumers both
+/// feed op-12/13).
+package uint a10ConsumerCount(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto p2 = (cast(string) q) in gQueueConsGlobal)
+            return cast(uint)(*p2 < 0 ? 0 : *p2);
+    catch (Exception)
+    {
+    }
+    return 0;
+}
+
+/// 1.0 receiver links register as consumers (op-12/13): x-expires "in use"
+/// and queue-info consumer_count both see them.
+package void a10ConsumerInc(scope const(char)[] q) nothrow @trusted
+{
+    try
+        ctlBroadcast(12, q, "", "");
+    catch (Exception)
+    {
+    }
+}
+
+package void a10ConsumerDec(scope const(char)[] q) nothrow @trusted
+{
+    try
+        ctlBroadcast(13, q, "", "");
+    catch (Exception)
+    {
+    }
+}
+
 package bool a10ExchangeExists(scope const(char)[] x) nothrow @trusted
 {
     try

@@ -1212,7 +1212,12 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
         a10FrameFinish(outb, f);
     }
     if (!lk.clientSender && !lk.isMgmt)
+    {
+        import dreads.amqp : a10ConsumerInc;
+
+        a10ConsumerInc(lk.rkey); // replicated count: queue-info + x-expires
         a10StartDelivery(c, fchan, lk.handle);
+    }
     // grant link-credit to the client sender via flow
     if (lk.clientSender)
     {
@@ -1506,6 +1511,15 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                         a10PutU32(hdrTbl, cast(uint) raw9.length);
                         hdrTbl.append(cast(const(char)[]) raw9);
                     }
+                    else if (fi == 3 && v2.kind == A10Val.Kind.str)
+                    {
+                        // subject: preserved for 1.0 consumers (reserved header)
+                        hdrTbl.appendByte(cast(char) 10);
+                        hdrTbl.append("x-a10-subj");
+                        hdrTbl.appendByte('S');
+                        a10PutU32(hdrTbl, cast(uint) v2.bytes.length);
+                        hdrTbl.append(cast(const(char)[]) v2.bytes);
+                    }
                     else if (fi == 2 && v2.kind == A10Val.Kind.str)
                         msgTo = cast(const(char)[]) v2.bytes;
                     else if (fi == 4 && v2.kind == A10Val.Kind.str)
@@ -1524,11 +1538,22 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                 foreach (mi; 0 .. val.count / 2)
                 {
                     auto k2 = md.readValue();
+                    immutable vAtA = md.i;
                     auto v2 = md.readValue();
+                    auto rawA = val.bytes[vAtA .. md.i];
                     if (!md.ok || k2.kind != A10Val.Kind.str || k2.bytes.length > 127)
                         break;
                     hdrTbl.appendByte(cast(char) k2.bytes.length);
                     hdrTbl.append(cast(const(char)[]) k2.bytes);
+                    // FLOAT (0x72) must round-trip as float, not double:
+                    // preserve the RAW 1.0 encoding ('x') for lossless replay
+                    if (rawA.length && rawA[0] == 0x72)
+                    {
+                        hdrTbl.appendByte('x');
+                        a10PutU32(hdrTbl, cast(uint) rawA.length);
+                        hdrTbl.append(cast(const(char)[]) rawA);
+                        continue;
+                    }
                     final switch (v2.kind)
                     {
                     case A10Val.Kind.str:
@@ -1568,6 +1593,12 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
                     }
                 }
             }
+            break;
+        case SEC_MESSAGE_ANN:
+            // published annotations round-trip to 1.0 consumers: convert into
+            // x-* header entries (raw 'x' for list/map/array/uuid values)
+            if (val.kind == A10Val.Kind.map)
+                a10MapToTable(val.bytes, val.count, hdrTbl);
             break;
         case SEC_DATA:
             if (val.kind == A10Val.Kind.str) // vbin slice
@@ -2046,7 +2077,7 @@ private void a10MgmtRespond(A10Conn c, ushort fchan, scope const(char)[] code,
 
 /// Encode a queue-info map value (client's DefaultQueueInfo contract).
 private void a10QueueInfoMap(ref ByteBuffer o, scope const(char)[] name,
-        ubyte flags, long msgs) @nogc nothrow
+        ubyte flags, long msgs) nothrow
 {
     o.appendByte(0xD1); // map32
     immutable szAt = o.length;
@@ -2116,7 +2147,11 @@ private void a10QueueInfoMap(ref ByteBuffer o, scope const(char)[] name,
         o.appendByte(cast(char)(cast(ulong) msgs >> ((7 - k) * 8)));
     n2 += 2;
     a10Str(o, "consumer_count");
-    a10UInt(o, 0);
+    {
+        import dreads.amqp : a10ConsumerCount;
+
+        a10UInt(o, a10ConsumerCount(name));
+    }
     n2 += 2;
     a10PatchU32(o, szAt, cast(uint)(o.length - cntAt));
     a10PatchU32(o, cntAt, n2);
@@ -2708,7 +2743,19 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             }
             return true;
         });
-    if (contentType.length || correlationId.length || replyTo.length || midRaw.length)
+    const(char)[] subj;
+    if (hdrs0 !is null && hdrs0.length)
+        cast(void) tableWalk(hdrs0, (scope const(char)[] k, char ty,
+                scope const(ubyte)[] v) nothrow {
+            if (k == "x-a10-subj" && ty == 'S')
+            {
+                subj = cast(const(char)[]) v;
+                return false;
+            }
+            return true;
+        });
+    if (contentType.length || correlationId.length || replyTo.length
+            || midRaw.length || subj.length)
     {
         auto pl = a10OpenPerf(o, cast(ubyte) SEC_PROPERTIES);
         if (midRaw.length)
@@ -2720,7 +2767,10 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
         pl.n++;
         a10Null(o); // to
         pl.n++;
-        a10Null(o); // subject
+        if (subj.length)
+            a10Str(o, subj);
+        else
+            a10Null(o); // subject
         pl.n++;
         if (replyTo.length)
             a10Str(o, replyTo);
@@ -2772,7 +2822,7 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
             cast(void) tableWalk(hdrs, (scope const(char)[] k, char ty,
                     scope const(ubyte)[] v) nothrow {
                 if (!(k.length >= 2 && k[0] == 'x' && k[1] == '-') || k == "x-death"
-                        || k == "x-a10-mid")
+                        || k == "x-a10-mid" || k == "x-a10-subj")
                     return true;
                 if (ty == 'S')
                 {
@@ -2835,6 +2885,12 @@ private void a10BuildMessage(scope const(ubyte)[] blob, ref ByteBuffer o) nothro
                 o.appendByte(0x82); // double
                 foreach (k3; 0 .. 8)
                     o.appendByte(cast(char) v[k3]);
+                n2 += 2;
+            }
+            else if (ty == 'x')
+            {
+                a10Str(o, k);
+                o.append(cast(const(char)[]) v); // raw 1.0 value re-emit
                 n2 += 2;
             }
             else if ((ty == 'l' || ty == 'T') && v.length == 8)
@@ -2958,6 +3014,15 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 sleep(2.msecs);
             catch (Exception)
                 return;
+            scope (exit)
+            {
+                import dreads.amqp : a10ConsumerDec;
+
+                auto psx = ch5 in cc.sessions;
+                if (psx !is null)
+                    if (auto plx = h5 in psx.links)
+                        a10ConsumerDec(plx.rkey);
+            }
             while (!cc.closing)
             {
                 auto ps5 = ch5 in cc.sessions;
