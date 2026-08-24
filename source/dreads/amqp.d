@@ -1971,7 +1971,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 auto tag = r.shortStr();
                 immutable bits = r.u8();
                 immutable noAck = (bits & 2) != 0;
-                static char[128] tagbuf = void;
+                immutable subNoWait = (bits & 8) != 0;
+                // STACK buffer, not TLS: the cancel-race wait below YIELDS, and
+                // a concurrent consume on this thread would clobber a shared
+                // static (the delKeyStore hazard all over this file).
+                char[128] tagbuf = void;
                 const(char)[] tg;
                 if (tag.length == 0)
                 {
@@ -1992,9 +1996,23 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (c.consumerCount >= AMQP_MAX_CONSUMERS)
                     return false; // consumer flood: close the connection
-                method(o, chan, 60, 21, (ref ByteBuffer b) @nogc nothrow {
-                    putShortStr(b, tg);
-                });
+                // cancel(nowait) + re-consume with the SAME tag races the old
+                // fiber: until it exits, the tag sits in cancelledTags and a
+                // fresh fiber would see its own tag marked and die instantly.
+                // Wait (bounded) for the old consumer to clear its mark.
+                try
+                {
+                    int spins = 0;
+                    while ((tg in c.cancelledTags) !is null && spins++ < 200)
+                        sleep(1.msecs);
+                }
+                catch (Exception)
+                {
+                }
+                if (!subNoWait) // nowait: the client forbade consume-ok
+                    method(o, chan, 60, 21, (ref ByteBuffer b) @nogc nothrow {
+                        putShortStr(b, tg);
+                    });
                 startConsumer(c, chan, q, tg, noAck);
                 return true;
             }
@@ -3243,7 +3261,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         ByteBuffer cbuf;
                         method(cbuf, chn, 60, 30, (ref ByteBuffer b) @nogc nothrow {
                             putShortStr(b, tt);
-                            b.appendByte(0); // no-wait = 0
+                            // no-wait = 1, like RabbitMQ: a server-initiated
+                            // cancel expects NO cancel-ok, and the Erlang
+                            // client's selective consumer CRASHES on nowait=0
+                            // (pika merely tolerated it).
+                            b.appendByte(1);
                         });
                         sendTo(cc, cbuf.data);
                         return;
