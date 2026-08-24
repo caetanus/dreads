@@ -283,10 +283,15 @@ struct A10Dec
         }
     }
 
-    /// Skip one value (readValue already consumes fully — alias for clarity).
+    /// Skip one COMPLETE value: a described constructor is TWO reads
+    /// (descriptor + value) — rhea's attach taught us the hard way (its
+    /// source/target fields are described lists; a one-read skip left the
+    /// cursor inside them and every later field misparsed).
     void skipValue() @nogc nothrow
     {
-        cast(void) readValue();
+        auto v = readValue();
+        if (v.kind == A10Val.Kind.described)
+            cast(void) readValue();
     }
 }
 
@@ -979,9 +984,12 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     if (nf >= 3)
     {
+        // role: ABSENT/null defaults to false = sender (rhea omits defaults)
         auto role = fields.readValue();
-        lk.clientSender = role.kind == A10Val.Kind.boolean && !role.b;
+        lk.clientSender = !(role.kind == A10Val.Kind.boolean && role.b);
     }
+    else
+        lk.clientSender = true;
     if (nf >= 4)
         fields.skipValue(); // snd-settle-mode
     if (nf >= 5)
