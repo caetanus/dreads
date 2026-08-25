@@ -34,6 +34,7 @@ import core.time : msecs;
 
 import dreads.mem : ByteBuffer;
 import dreads.stream : nowMs;
+import dreads.alloc : MAX_SHARDS;
 
 // ---------------------------------------------------------------------------
 // Hooks installed by server.d (avoid an import cycle): queue data-plane ops
@@ -72,13 +73,61 @@ public __gshared void delegate() nothrow gAmqpAofFlush;
 public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
-public shared ulong gAmqpMessages; // total basic.publish records routed (dashboard)
+
+// PER-SHARD publish/return counters. A single `shared ulong` incremented on every
+// basic.publish bounced its cache line across every core — a write-contended
+// global that is an Amdahl serial fraction (it flattened per-shard AMQP scaling).
+// Each shard now bumps ONLY its own slot (plain ++, no atomic), cache-line padded
+// so slots never false-share; the dashboard/mgmt readers (off the hot path) sum
+// the slots. Total msgs published = sum(gAmqpMsgShard[*].v).
+private struct PadU64
+{
+    ulong v;
+    ulong[7] _pad; // fill the 64-byte line so neighbours don't false-share
+}
+
+private __gshared PadU64[MAX_SHARDS] gAmqpMsgShard;
+private __gshared PadU64[MAX_SHARDS] gAmqpRetShard;
+
+pragma(inline, true)
+private void amqpCountPub() @trusted nothrow @nogc
+{
+    import dreads.shard : tShard;
+
+    ++gAmqpMsgShard[tShard].v; // single writer per slot: no atomic needed
+}
+
+pragma(inline, true)
+private void amqpCountRet() @trusted nothrow @nogc
+{
+    import dreads.shard : tShard;
+
+    ++gAmqpRetShard[tShard].v;
+}
+
+/// Cumulative basic.publish records routed, summed across shards (off hot path).
+public ulong amqpPubTotal() @trusted nothrow @nogc
+{
+    ulong s = 0;
+    foreach (ref c; gAmqpMsgShard)
+        s += c.v;
+    return s;
+}
+
+/// Cumulative mandatory publishes returned (no route), summed across shards.
+public ulong amqpRetTotal() @trusted nothrow @nogc
+{
+    ulong s = 0;
+    foreach (ref c; gAmqpRetShard)
+        s += c.v;
+    return s;
+}
 
 // --- Management API message-rate sampler (M4) -------------------------------
 // The counters above are cumulative; the RMQ management API also wants an
 // instantaneous publish rate (msgs/sec). A timer (server boot, when the mgmt
 // API is on) calls amqpSampleRates() every few seconds; mgmt reads the total
-// plus the last-interval rate. Cheap: two atomics + a subtraction per tick.
+// plus the last-interval rate. Cheap: two sums + a subtraction per tick.
 private __gshared ulong gAmqpRatePrevPub;
 private __gshared ulong gAmqpRatePrevRet;
 private __gshared long gAmqpRatePrevMs;
@@ -87,11 +136,9 @@ private __gshared double gAmqpRetRate = 0;
 
 public void amqpSampleRates() nothrow @trusted
 {
-    import core.atomic : atomicLoad, MemoryOrder;
-
     immutable now = nowMs();
-    immutable pub = atomicLoad!(MemoryOrder.raw)(gAmqpMessages);
-    immutable ret = atomicLoad!(MemoryOrder.raw)(gAmqpReturned);
+    immutable pub = amqpPubTotal();
+    immutable ret = amqpRetTotal();
     if (gAmqpRatePrevMs != 0)
     {
         immutable dt = now - gAmqpRatePrevMs;
@@ -111,14 +158,11 @@ public void amqpSampleRates() nothrow @trusted
 public void amqpMessageStats(out ulong pubTotal, out double pubRate,
         out ulong retTotal, out double retRate) nothrow @trusted
 {
-    import core.atomic : atomicLoad, MemoryOrder;
-
-    pubTotal = atomicLoad!(MemoryOrder.raw)(gAmqpMessages);
-    retTotal = atomicLoad!(MemoryOrder.raw)(gAmqpReturned);
+    pubTotal = amqpPubTotal();
+    retTotal = amqpRetTotal();
     pubRate = gAmqpPubRate;
     retRate = gAmqpRetRate;
 }
-public shared ulong gAmqpReturned; // mandatory publishes returned (no route)
 public shared ulong gAmqpBindingDrops; // duplicate/over-cap bindings refused
 private shared ulong gAmqpQueueGen; // counter for server-generated queue names
 
@@ -1004,17 +1048,23 @@ private bool headersMatch(scope const(ubyte)[] bindArgs,
 /// Route (exchange, routingKey) -> queue names, calling sink for each.
 private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
         scope const(ubyte)[] msgHeaders,
-        scope void delegate(string q) nothrow sink,
+        scope void delegate(scope const(char)[] q) nothrow sink,
         scope const(const(char)[])[] altKeys = null) nothrow @trusted
 {
     try
     {
         if (ex.length == 0)
         {
-            // default exchange: routing key IS the queue name (CC/BCC keys too)
-            sink(rkey.idup);
+            // default exchange: routing key IS the queue name (CC/BCC keys too).
+            // Pass the rkey SLICE straight through — NO idup. The sink consumes
+            // it synchronously (byte-copy into its dedup arena + the RPUSH key,
+            // AA lookups via cast(string)) before any yield and never retains it,
+            // so a GC string is pure waste here — and being ONE GC alloc PER
+            // MESSAGE, that alloc took the global GC lock and serialised every
+            // shard (the Amdahl killer that flattened AMQP's per-shard scaling).
+            sink(rkey);
             foreach (ak; altKeys)
-                sink(ak.idup);
+                sink(ak);
             return;
         }
         auto t = (cast(string) ex) in gExchanges;
@@ -3810,7 +3860,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
         }
         auto payload = (cast(const(ubyte)[]) stamped).asChars;
         int routed = 0;
-        scope void delegate(string) nothrow txSink = (string q) nothrow {
+        scope void delegate(scope const(char)[]) nothrow txSink = (scope const(char)[] q) nothrow {
             if (!queueExists(q))
                 return; // same existing-queues-only rule as the live publish path
             static ByteBuffer kbT; // TLS
@@ -3848,7 +3898,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
                 cur = ae;
             }
         }
-        atomicOp!"+="(gAmqpMessages, 1);
+        amqpCountPub();
         if (tp.mandatory && routed == 0)
         {
             auto exn = tp.exchange;
@@ -3860,7 +3910,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
                 putShortStr(b, rkn);
             });
             emitContent(o, chan, tp.record, c.frameMax);
-            atomicOp!"+="(gAmqpReturned, 1);
+            amqpCountRet();
         }
     }
     foreach (ref ts; ch.txSettles)
@@ -4126,11 +4176,11 @@ private void requeueAndDropChannel(AmqpConn c, ushort chan) nothrow @trusted
 /// (reason "maxlen") when the queue has a DLX, dropped otherwise. Runs inside
 /// the publish sink: every buffer here is stack-local because both the LLEN
 /// and the pops can hop cross-shard and YIELD (the delKeyStore hazard).
-private void enforceMaxLen(string q) nothrow @trusted
+private void enforceMaxLen(scope const(char)[] q) nothrow @trusted
 {
     long ml = 0;
     try
-        if (auto m = q in gQueueMeta)
+        if (auto m = cast(string) q in gQueueMeta) // reinterpret: read-only probe
             ml = m.maxLen;
     catch (Exception)
     {
@@ -4377,7 +4427,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     }
     auto payload = rec.data.asChars;
     auto hdrs = propsHeaders(effProps);
-    atomicOp!"+="(gAmqpMessages, 1);
+    amqpCountPub(); // per-shard counter: no cross-shard atomic on the hot path
     int routed = drRouted;
     // the push stays IN-WALK (the collect-then-push restructure broke the
     // Erlang serialization cases — reverted in b743fa9); CC/BCC dedup happens
@@ -4392,7 +4442,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     uint[64] seenOff = void;
     uint[64] seenLen = void;
     size_t ns = 0;
-    scope void delegate(string) nothrow pushSink = (string q) nothrow {
+    scope void delegate(scope const(char)[]) nothrow pushSink = (scope const(char)[] q) nothrow {
         foreach (di; 0 .. ns)
             if (seenArena[seenOff[di] .. seenOff[di] + seenLen[di]] == q)
                 return; // already delivered for this publish (noDuplicates)
@@ -4427,7 +4477,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                 mlP1 = 0;
                 if (exists)
                     try
-                        if (auto m = q in gQueueMeta)
+                        if (auto m = cast(string) q in gQueueMeta) // reinterpret: read-only AA probe, no alloc
                             mlP1 = m.maxLen;
                     catch (Exception)
                     {
@@ -4518,7 +4568,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             putShortStr(b, rkn);
         });
         emitContent(o, chan, cast(const(ubyte)[]) payload, c.frameMax);
-        atomicOp!"+="(gAmqpReturned, 1);
+        amqpCountRet();
     }
     if (ch.confirmMode)
     {
@@ -5484,7 +5534,7 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     dlrec.clear();
     buildRecord(*dlrec, pm, deaths + 1, origRk, paug.data, body_, meta.dlx);
     auto blobc = dlrec.data.asChars;
-    routeTo(meta.dlx, rk, propsHeaders(paug.data), (string q) nothrow {
+    routeTo(meta.dlx, rk, propsHeaders(paug.data), (scope const(char)[] q) nothrow {
         static ByteBuffer kb5; // TLS
         queueKey(q, kb5);
         if (gAmqpPush !is null)
@@ -5521,17 +5571,17 @@ package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
     rec.clear();
     buildRecord(rec, cast(long) nowMs(), 0, rkey, props, body_, exchange);
     auto payload = rec.data.asChars;
-    atomicOp!"+="(gAmqpMessages, 1);
+    amqpCountPub();
     int routed = 0;
     string[16] seen;
     size_t ns = 0;
-    scope void delegate(string) nothrow sink = (string q) nothrow {
+    scope void delegate(scope const(char)[]) nothrow sink = (scope const(char)[] q) nothrow {
         foreach (d; seen[0 .. ns])
             if (d == q)
                 return;
         if (ns < seen.length)
             try
-                seen[ns++] = q.idup;
+                seen[ns++] = q.idup; // RETAINED for dedup across the fanout: genuine copy
             catch (Exception)
             {
             }

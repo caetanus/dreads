@@ -101,7 +101,7 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
     // multi-protocol skin counters (MQTT/AMQP/Kafka share the same core; the
     // dashboard charts each face's throughput alongside RESP)
     import dreads.mqtt : gMqttMessages, gMqttSubTotal, gMqttDropped;
-    import dreads.amqp : gAmqpMessages, gAmqpConsumers, gAmqpReturned;
+    import dreads.amqp : amqpPubTotal, gAmqpConsumers, amqpRetTotal;
     import dreads.kafka : gKafkaProduced, gKafkaFetched;
 
     int n = snprintf(dst.ptr, dst.length,
@@ -119,9 +119,9 @@ private size_t buildMetricsJson(scope char[] dst, size_t channels, size_t patter
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttMessages),
         cast(long) atomicLoad!(MemoryOrder.raw)(gMqttSubTotal),
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttDropped),
-        cast(ulong) atomicLoad!(MemoryOrder.raw)(gAmqpMessages),
+        cast(ulong) amqpPubTotal(),
         cast(long) atomicLoad!(MemoryOrder.raw)(gAmqpConsumers),
-        cast(ulong) atomicLoad!(MemoryOrder.raw)(gAmqpReturned),
+        cast(ulong) amqpRetTotal(),
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaProduced),
         cast(ulong) atomicLoad!(MemoryOrder.raw)(gKafkaFetched));
     // snprintf returns the WOULD-HAVE-written length: on truncation n >= dst.length,
