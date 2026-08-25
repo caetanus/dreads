@@ -40,16 +40,13 @@ import dreads.alloc : MAX_SHARDS;
 // Hooks installed by server.d (avoid an import cycle): queue data-plane ops
 // and control-plane replication.
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPush;
-/// STAGING publish: fire the RPUSH hop WITHOUT waiting, return an opaque pending
-/// handle (null if it applied locally / nothing to reap). The live-publish path
-/// collects handles across a network batch and reaps them all at the flush
-/// boundary — so a pipelined publisher's cross-shard hops OVERLAP instead of each
-/// paying a full round-trip (the s4 hop tax). Confirms sit in the output buffer
-/// until that flush, which is AFTER the reap: no confirm precedes its message's
-/// durability on the owner shard. Reap via gAmqpReap.
-public __gshared void* delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushStage;
-/// Wait for one gAmqpPushStage handle to complete, then release it.
-public __gshared void delegate(void* pend) nothrow gAmqpReap;
+/// FIRE-AND-FORGET live publish: a local key applies inline; a remote key is
+/// enqueued into the owner shard's SPSC ring and we return immediately. No ack,
+/// no wait — the ring guarantees FIFO delivery in-process, so "enqueued" is a
+/// binding promise the RPUSH will be applied, as durable as the everysec-AOF
+/// confirm already is. This is the cheap replacement for the generic RESP hop:
+/// one cross-thread wake, forward only, no return trip.
+public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushStage;
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushFront;
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
@@ -1919,13 +1916,6 @@ private final class AmqpConn
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
     uint[string] consumerUnacked; // live unacked per consumer tag (qos global=false)
-    // Live-publish hop staging (the s4 hop-tax fix): a batch's cross-shard RPUSH
-    // hops are FIRED without waiting and their handles parked here, then reaped as
-    // a group at the flush boundary — before any confirm in the batch is sent, so
-    // durability-before-confirm holds. Fixed cap forces a reap mid-batch when full
-    // (bounds in-flight hops + ring pressure), exactly like the RESP c.shardPends.
-    void*[256] pubPends;
-    size_t pubPendCount;
     ulong flushSeq; // bumps after each serve-loop reply flush: a consumer's
     // FIRST delivery must wait for the flush carrying its consume-ok (a long
     // pipelined batch outlives the old fixed 1ms park -> "Unsolicited delivery")
@@ -2028,20 +2018,6 @@ private void channelClose(ref ByteBuffer o, ushort chan, ushort code,
 // ---------------------------------------------------------------------------
 // Serve loop
 
-/// Reap all staged live-publish hops (see AmqpConn.pubPends): wait each owner's
-/// reply, in order, releasing the pendings. Called at the serve-loop flush
-/// boundary BEFORE the output batch (with its confirms) is sent, so a confirmed
-/// message is durable on its owner shard before its basic.ack leaves. Most hops
-/// fired concurrently and are already done by the time we get here, so the waits
-/// collapse — that is the whole point (overlap, not one round-trip per message).
-private void reapPubPends(AmqpConn c) nothrow
-{
-    if (gAmqpReap !is null)
-        foreach (i; 0 .. c.pubPendCount)
-            gAmqpReap(c.pubPends[i]);
-    c.pubPendCount = 0;
-}
-
 public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
 {
     TlsLeg* leg;
@@ -2108,7 +2084,6 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
     startKillWatcher(c); // notices a mgmt-API kill request, closes on THIS thread
     scope (exit)
     {
-        reapPubPends(c); // never leak a staged publish hop on any teardown path
         gConnsById.remove(c.connId);
         amqpRegRemove(c.connId);
         c.closing = true;
@@ -2338,8 +2313,6 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
                 return; // framing error
             if (!handleFrame(c, ftype, chan, payload, outb))
             {
-                if (c.pubPendCount > 0)
-                    reapPubPends(c); // durable before any confirm in outb ships
                 if (gAmqpAofFlush !is null)
                     gAmqpAofFlush();
                 if (!outb.empty)
@@ -2348,12 +2321,6 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
             }
             pos += 7 + fsize + 1;
         }
-        // Reap the batch's staged publish hops BEFORE the output (with its
-        // confirms) ships: a basic.ack must never precede its message's
-        // durability on the owner shard. Unconditional — staged hops with no
-        // confirm (no-confirm publishers) must still be reaped so nothing leaks.
-        if (c.pubPendCount > 0)
-            reapPubPends(c);
         if (!outb.empty)
         {
             if (gAmqpAofFlush !is null)
@@ -4496,20 +4463,11 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             return;
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
-        // STAGE the RPUSH (fire the hop, don't wait): parked in c.pubPends and
-        // reaped as a group at the serve-loop flush boundary. A full window forces
-        // a reap now (bounds in-flight hops). Falls back to the synchronous push
-        // if staging isn't wired (never, once server.d installs it).
+        // FIRE the RPUSH: a local key applies inline, a remote one is enqueued into
+        // the owner's ring and forgotten (the ring guarantees delivery — see
+        // gAmqpPushStage). The confirm ships at the batch flush, already promised.
         if (gAmqpPushStage !is null)
-        {
-            auto pd = gAmqpPushStage(kb3.data.asChars, payload);
-            if (pd !is null)
-            {
-                if (c.pubPendCount == c.pubPends.length)
-                    reapPubPends(c);
-                c.pubPends[c.pubPendCount++] = pd;
-            }
-        }
+            gAmqpPushStage(kb3.data.asChars, payload);
         else if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;

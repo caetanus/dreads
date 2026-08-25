@@ -2461,11 +2461,10 @@ private void shardDrainLoop() nothrow
         }
         else if (cast(ShardMsg) kind == ShardMsg.amqpPush)
         {
-            // Owner: a DEDICATED AMQP live-publish hop. Payload [u16 db][u16
-            // keyLen][key][record]. Apply the RPUSH straight from the slices (no
-            // RESP synth/parse — that's the whole point) and ack the requester's
-            // pending so its confirm can ship. This is the cheap replacement for
-            // routing a synthesized RPUSH through ShardMsg.cmd.
+            // Owner: a DEDICATED AMQP live-publish hop, FIRE-AND-FORGET (tag=null,
+            // no ack — the producer already promised the confirm on enqueue; see
+            // amqpPushStage). Payload [u16 db][u16 keyLen][key][record]. Apply the
+            // RPUSH straight from the slices — no RESP synth/parse, no reply.
             if (p.length >= 4)
             {
                 immutable adb = (p[0] << 8) | p[1];
@@ -2473,29 +2472,6 @@ private void shardDrainLoop() nothrow
                 if (4 + klen <= p.length)
                     amqpApplyRpush(cast(int) adb, cast(const(char)[]) p[4 .. 4 + klen],
                             cast(const(char)[]) p[4 + klen .. $]);
-            }
-            if (tag !is null && meta < 64)
-            {
-                // COALESCE the ack into the requester's reply batch (flushed once
-                // per requester at the pass end, one wake) — same path the RESP
-                // cmd replies use. The reap only needs "applied", so the reply is
-                // EMPTY: section = [u32 len=8][u64 pending][no bytes].
-                auto rb = &replyBatch[cast(size_t) meta];
-                enum size_t sect = 12;
-                auto raw = rb.freeSpace(sect);
-                if (raw.length >= sect)
-                {
-                    auto space = raw[0 .. sect];
-                    *cast(uint*) space.ptr = 8; // 8 (pending ptr) + 0 reply bytes
-                    *cast(ulong*)(space.ptr + 4) = cast(ulong) tag;
-                    rb.grow(sect);
-                    replyTouch |= 1UL << meta;
-                }
-            }
-            else if (tag !is null) // wide shard id (>=64): immediate unbatched ack
-            {
-                shardEnqueue(cast(uint) meta, null, tag, 0, ShardMsg.reply);
-                shardWake(cast(uint) meta);
             }
         }
         else if (cast(ShardMsg) kind == ShardMsg.amqpCtl)
@@ -2961,10 +2937,9 @@ private void amqpApplyRpush(int db, scope const(char)[] key, scope const(char)[]
         flushPendingNotify();
 }
 
-private void* amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @trusted
+private void amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @trusted
 {
-    import dreads.shard : tShard, acquireShardPending,
-        shardEnqueue, shardWake, ShardMsg, shardOfSlot;
+    import dreads.shard : tShard, shardEnqueue, shardWake, ShardMsg, shardOfSlot;
     import dreads.slots : keyToSlot;
 
     if (db < 0)
@@ -2976,50 +2951,29 @@ private void* amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @tr
     if (!sharded() || cast(uint) owner == tShard)
     {
         amqpApplyRpush(db, key, record); // local: direct RVal apply, no synthesis
-        return null; // nothing to reap
+        return;
     }
-    // remote shard: FIRE a DEDICATED amqpPush hop carrying [u16 db][u16 keyLen]
-    // [key][record] RAW — no RESP synthesis, no RVal hop-encode. The owner builds
-    // the RPUSH RVal straight from these slices (amqpApplyRpush). hb is STACK-local
-    // (shardEnqueue copies it into the ring before returning); `p` lives in the
-    // caller's reap list until the owner acks.
+    // remote shard: FIRE-AND-FORGET a DEDICATED amqpPush hop carrying [u16 db]
+    // [u16 keyLen][key][record] RAW — no RESP synthesis, no RVal hop-encode. We do
+    // NOT wait for an ack: shardEnqueue only returns once the bytes are COPIED into
+    // the owner's SPSC ring, and the owner drains its ring in FIFO order in THIS
+    // process — so "in the ring" is a PROMISE the work will be applied, as binding
+    // as "applied". The only loss window (in-ring, not-yet-drained) is microseconds
+    // and strictly INSIDE the everysec-AOF window the confirm already accepts (a
+    // process crash there loses in-memory data whether it was applied or merely
+    // enqueued). Dropping the ack removes the whole return trip: no reply hop, no
+    // reap, no pending, one cross-thread wake instead of two. tag=null.
     if (key.length > 0xFFFF)
-        return null; // absurd key: drop (never happens for amq.q.* names)
-    auto p = acquireShardPending();
-    ByteBuffer hb;
+        return; // absurd key: drop (never happens for amq.q.* names)
+    ByteBuffer hb; // STACK-local (shardEnqueue copies it into the ring before returning)
     hb.appendByte(cast(char)(db >> 8));
     hb.appendByte(cast(char)(db & 0xFF));
     hb.appendByte(cast(char)(key.length >> 8));
     hb.appendByte(cast(char)(key.length & 0xFF));
     hb.append(key);
     hb.append(record);
-    shardEnqueue(cast(uint) owner, hb.data, cast(void*) p, tShard, ShardMsg.amqpPush);
+    shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.amqpPush);
     shardWake(cast(uint) owner);
-    return cast(void*) p;
-}
-
-/// Reap ONE staged publish hop: wait for the owner's reply, then release the
-/// pending. Runs at the AMQP serve loop's flush boundary, before any confirm in
-/// the output batch is sent — so no confirm precedes its message's durability.
-private void amqpReapPend(void* pend) nothrow @trusted
-{
-    import dreads.shard : ShardPending, releaseShardPending;
-
-    if (pend is null)
-        return;
-    auto p = cast(ShardPending*) pend;
-    while (!p.ready)
-    {
-        immutable ec = p.done.emitCount;
-        if (p.ready)
-            break;
-        try
-            p.done.wait(ec);
-        catch (Exception)
-        {
-        }
-    }
-    releaseShardPending(p);
 }
 
 /// Kafka group-coordinator hop: run ONE FSM op on the shard owning
@@ -3157,7 +3111,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpReap, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -3166,9 +3120,8 @@ private void amqpInstallHooks() nothrow
     };
     gAmqpPushStage = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         const(char)[][3] a = ["rpush", key, payload];
-        return amqpPushStage(a[]); // fire the RPUSH, return the pending (or null if local)
+        amqpPushStage(a[]); // fire the RPUSH (local inline / remote fire-and-forget)
     };
-    gAmqpReap = (void* pend) nothrow { amqpReapPend(pend); };
     gAmqpPushFront = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rbf; // TLS
         const(char)[][3] a = ["lpush", key, payload]; // requeue goes to the FRONT
