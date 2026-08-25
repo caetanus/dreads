@@ -1766,6 +1766,16 @@ private final class AmqpConn
     TaskMutex wlock;
     Channel[ushort] chans;
     bool closing;
+    // Management API (M4 v2): a cross-thread kill request. The mgmt thread sets
+    // it under the registry mutex; THIS connection's own thread notices at its
+    // next read-wait timeout and closes the socket (a cross-thread tcp.close is
+    // unsafe in vibe-core — only the owning event loop may close).
+    shared bool killReq;
+    char[80] peerName = void; // "host:port" captured at connect (registry list)
+    ubyte peerNameLen;
+    char[64] loginUser = void; // authenticated user (registry list)
+    ubyte loginUserLen;
+    long connectedMs; // wall time at connect (registry age)
     bool[string] cancelledTags; // basic.cancel'ed consumer tags
     Unacked[ulong] unacked; // delivery-tag -> record (no_ack=false consumers)
     size_t unackedBytes; // running sum of unacked blob bytes (byte-cap the window)
@@ -1926,14 +1936,32 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
     c.connId = atomicOp!"+="(gAmqpConnGen, 1);
     if (gDrSecret == 0)
         gDrSecret = monoMs() * 0x9E3779B97F4A7C15 + cast(ulong) cast(void*) c;
+    c.connectedMs = nowMs();
+    try
+    {
+        auto ra = tcp.remoteAddress.toString();
+        immutable rl = ra.length < c.peerName.length ? ra.length : c.peerName.length;
+        c.peerName[0 .. rl] = ra[0 .. rl];
+        c.peerNameLen = cast(ubyte) rl;
+    }
+    catch (Exception)
+    {
+    }
     try
         gConnsById[c.connId] = c; // direct-reply routing (this shard's conns)
     catch (Exception)
     {
     }
+    {
+        import dreads.shard : tShard;
+
+        amqpRegAdd(c, tShard); // cross-shard mgmt registry
+    }
+    startKillWatcher(c); // notices a mgmt-API kill request, closes on THIS thread
     scope (exit)
     {
         gConnsById.remove(c.connId);
+        amqpRegRemove(c.connId);
         c.closing = true;
         requeueAllUnacked(c);
         // exclusive queues die with their owning connection (RabbitMQ):
@@ -2342,6 +2370,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // stay open for the client's close-ok
                 }
                 c.aclAuth = au; // null under legacy accept-any
+                if (auser.length && auser.length <= c.loginUser.length)
+                {
+                    c.loginUser[0 .. auser.length] = auser;
+                    c.loginUserLen = cast(ubyte) auser.length;
+                }
             }
             method(o, 0, 10, 30, (ref ByteBuffer b) @nogc nothrow {
                 putU16(b, 2047); // channel-max
@@ -4711,6 +4744,172 @@ private long xDeathOthers(scope const(ubyte)[] props, scope const(char)[] queue,
 enum DIRECT_REPLY_Q = "amq.rabbitmq.reply-to";
 /// Connections served by THIS shard, keyed by connId (direct-reply routing).
 private AmqpConn[ulong] gConnsById; // TLS
+
+// --- Cross-shard connection registry (management API M4 v2) -----------------
+// A process-global list so the mgmt thread can enumerate/kill AMQP connections
+// across every shard. Each entry copies the display fields plus a pointer to
+// the conn's `killReq` flag (a GC class field: non-moving, stable address while
+// the conn lives; unregistered before the conn is freed). All access under the
+// mutex — the mgmt thread and N shard threads touch it.
+struct AmqpConnEntry
+{
+    ulong connId;
+    shared(bool)* killPtr;
+    char[80] name = void;
+    ubyte nameLen;
+    char[64] user = void;
+    ubyte userLen;
+    long connectedMs;
+    uint shardId;
+}
+
+import core.sync.mutex : Mutex;
+
+private __gshared Mutex gAmqpRegMutex;
+private __gshared AmqpConnEntry[] gAmqpReg;
+private shared bool gAmqpRegInit;
+
+private void amqpRegEnsure() nothrow @trusted
+{
+    import core.atomic : cas;
+
+    if (cas(&gAmqpRegInit, false, true))
+    {
+        try
+            gAmqpRegMutex = new Mutex;
+        catch (Exception)
+        {
+        }
+    }
+    // a losing racer must wait for the winner to publish the Mutex
+    while (gAmqpRegMutex is null)
+    {
+    }
+}
+
+private void amqpRegAdd(AmqpConn c, uint shardId) nothrow @trusted
+{
+    amqpRegEnsure();
+    try
+    {
+        gAmqpRegMutex.lock();
+        scope (exit)
+            gAmqpRegMutex.unlock();
+        AmqpConnEntry e;
+        e.connId = c.connId;
+        e.killPtr = &c.killReq;
+        immutable nl = c.peerNameLen < e.name.length ? c.peerNameLen : cast(ubyte) e.name.length;
+        e.name[0 .. nl] = c.peerName[0 .. nl];
+        e.nameLen = nl;
+        immutable ul = c.loginUserLen < e.user.length ? c.loginUserLen : cast(ubyte) e.user.length;
+        e.user[0 .. ul] = c.loginUser[0 .. ul];
+        e.userLen = ul;
+        e.connectedMs = c.connectedMs;
+        e.shardId = shardId;
+        gAmqpReg ~= e;
+    }
+    catch (Exception)
+    {
+    }
+}
+
+private void amqpRegRemove(ulong connId) nothrow @trusted
+{
+    if (gAmqpRegMutex is null)
+        return;
+    try
+    {
+        gAmqpRegMutex.lock();
+        scope (exit)
+            gAmqpRegMutex.unlock();
+        foreach (i; 0 .. gAmqpReg.length)
+            if (gAmqpReg[i].connId == connId)
+            {
+                gAmqpReg[i] = gAmqpReg[$ - 1];
+                gAmqpReg.length = gAmqpReg.length - 1;
+                break;
+            }
+    }
+    catch (Exception)
+    {
+    }
+}
+
+/// Management API: serialize the live AMQP connections as JSON. Runs on the
+/// mgmt thread — reads the shared registry under the mutex (a pure copy, no
+/// conn touched). name = "host:port", the RabbitMQ connection identifier.
+public void amqpConnectionsJson(ref ByteBuffer o) nothrow @trusted
+{
+    o.append("[");
+    if (gAmqpRegMutex !is null)
+    {
+        try
+        {
+            gAmqpRegMutex.lock();
+            scope (exit)
+                gAmqpRegMutex.unlock();
+            foreach (i, ref e; gAmqpReg)
+            {
+                if (i)
+                    o.append(",");
+                o.append(`{"name":"`);
+                amqpJsonStr(o, e.name[0 .. e.nameLen]);
+                o.append(`","user":"`);
+                amqpJsonStr(o, e.userLen ? e.user[0 .. e.userLen] : cast(char[]) "guest");
+                o.append(`","vhost":"/","protocol":"AMQP 0-9-1","state":"running",`);
+                o.append(`"channels":0,"node":"dreads@localhost"}`);
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+    o.append("]");
+}
+
+/// Management API: request-close every connection whose name == `name` (or ALL
+/// when name is empty). Sets the cross-thread kill flag; the owning shard
+/// thread closes the socket at its next read-wait tick. Returns how many were
+/// flagged.
+public size_t amqpKillConnection(scope const(char)[] name) nothrow @trusted
+{
+    import core.atomic : atomicStore;
+
+    if (gAmqpRegMutex is null)
+        return 0;
+    size_t n;
+    try
+    {
+        gAmqpRegMutex.lock();
+        scope (exit)
+            gAmqpRegMutex.unlock();
+        foreach (ref e; gAmqpReg)
+            if (name.length == 0 || e.name[0 .. e.nameLen] == name)
+            {
+                if (e.killPtr !is null)
+                    atomicStore(*e.killPtr, true);
+                n++;
+            }
+    }
+    catch (Exception)
+    {
+    }
+    return n;
+}
+
+private void amqpJsonStr(ref ByteBuffer o, scope const(char)[] s) nothrow @trusted
+{
+    foreach (ch; s)
+    {
+        if (ch == '"' || ch == '\\')
+        {
+            o.appendByte('\\');
+            o.appendByte(ch);
+        }
+        else if (cast(ubyte) ch >= 0x20)
+            o.appendByte(ch);
+    }
+}
 private __gshared ulong gDrSecret; // keyed into the reply token (anti-forgery)
 
 /// Weak keyed hash for the reply token (anti-tamper, not crypto: the java
@@ -6198,6 +6397,42 @@ private long monoMs() nothrow @trusted
         return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
     catch (Exception)
         return 0;
+}
+
+// Management API (M4 v2): a per-connection fiber on the conn's OWN thread that
+// polls the cross-thread kill flag and closes the socket when set — a
+// cross-thread tcp.close is unsafe in vibe-core, so the mgmt thread only flags
+// and this fiber (co-located with the serve loop) performs the close. Idle
+// cost: one 1s sleep; ends as soon as the connection closes for any reason.
+private void startKillWatcher(AmqpConn c) nothrow
+{
+    import core.time : seconds;
+    import core.atomic : atomicLoad;
+
+    try
+        cast(void) runTask((AmqpConn cc) nothrow {
+            while (!cc.closing)
+            {
+                try
+                    sleep(1.seconds);
+                catch (Exception)
+                    return;
+                if (cc.closing)
+                    return;
+                if (atomicLoad(cc.killReq))
+                {
+                    try
+                        cc.tcp.close(); // same thread as the serve loop: safe
+                    catch (Exception)
+                    {
+                    }
+                    return;
+                }
+            }
+        }, c);
+    catch (Exception)
+    {
+    }
 }
 
 private void startHeartbeat(AmqpConn c) nothrow

@@ -27,6 +27,12 @@ private __gshared bool gMgmtUp;
 /// the AMQP skin is up; null = report only the default exchanges.
 public __gshared void function(ref ByteBuffer o) nothrow gMgmtExchanges;
 
+/// Connection registry hooks (M4 v2): list connections as JSON, and
+/// request-close by name (empty = all). Installed by the server with the AMQP
+/// skin's cross-shard registry.
+public __gshared void function(ref ByteBuffer o) nothrow gMgmtConnections;
+public __gshared size_t function(scope const(char)[] name) nothrow gMgmtKillConn;
+
 public void startManagement() nothrow
 {
     import vibe.core.core : runTask;
@@ -111,7 +117,12 @@ private void route(scope const(char)[] method, scope const(char)[] path, ref Byt
         else if (path == "/api/nodes")
             nodes(o);
         else if (path == "/api/connections")
-            o.append("[]"); // v2: cross-shard conn registry
+        {
+            if (gMgmtConnections !is null)
+                gMgmtConnections(o);
+            else
+                o.append("[]");
+        }
         else if (path == "/api/channels")
             o.append("[]");
         else if (path == "/api/users")
@@ -139,7 +150,20 @@ private void route(scope const(char)[] method, scope const(char)[] path, ref Byt
     }
     else if (method == "DELETE")
     {
-        if (isQueuePath(path))
+        if (path.length > 21 && path[0 .. 21] == "/api/connections/name" && path[21] == '/')
+        {
+            // rabbitmqctl close_all_connections shims to DELETE here
+            if (gMgmtKillConn !is null)
+                cast(void) gMgmtKillConn(urlDecode(path[22 .. $]));
+            o.append(`{"ok":true}`);
+        }
+        else if (path.length > 16 && path[0 .. 16] == "/api/connections" && path[16] == '/')
+        {
+            if (gMgmtKillConn !is null)
+                cast(void) gMgmtKillConn(urlDecode(path[17 .. $]));
+            o.append(`{"ok":true}`);
+        }
+        else if (isQueuePath(path))
         {
             auto name = queueName(path);
             if (name.length)
@@ -567,6 +591,41 @@ private void appendJsonStr(ref ByteBuffer o, scope const(char)[] s) @trusted @no
         else
             o.appendByte(c);
     }
+}
+
+// Percent-decode into a TLS scratch (connection names carry %3A for ':').
+private const(char)[] urlDecode(scope const(char)[] s) @trusted nothrow
+{
+    static ByteBuffer db;
+    db.clear();
+    size_t i = 0;
+    while (i < s.length)
+    {
+        if (s[i] == '%' && i + 2 < s.length)
+        {
+            int hi = hexv(s[i + 1]), lo = hexv(s[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                db.appendByte(cast(char)((hi << 4) | lo));
+                i += 3;
+                continue;
+            }
+        }
+        db.appendByte(s[i]);
+        i++;
+    }
+    return cast(const(char)[]) db.data;
+}
+
+private int hexv(char c) @safe @nogc nothrow
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
 }
 
 private void respCmd(ref ByteBuffer o, scope const(char)[][] args...) @trusted

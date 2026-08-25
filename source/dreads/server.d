@@ -505,10 +505,14 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 startDashCmdBridge();
             if (gConfig.mgmtPort != 0)
             {
-                import dreads.mgmt : startManagement, gMgmtExchanges;
-                import dreads.amqp : amqpExchangeSnapshot;
+                import dreads.mgmt : startManagement, gMgmtExchanges,
+                    gMgmtConnections, gMgmtKillConn;
+                import dreads.amqp : amqpExchangeSnapshot, amqpConnectionsJson,
+                    amqpKillConnection;
 
                 gMgmtExchanges = &amqpExchangeSnapshot;
+                gMgmtConnections = &amqpConnectionsJson;
+                gMgmtKillConn = &amqpKillConnection;
                 startManagement();
             }
             if (gConfig.dashboard)
