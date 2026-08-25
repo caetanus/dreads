@@ -37,6 +37,7 @@ public struct Config
     ushort mqttTlsPort = 0;
     ushort amqpTlsPort = 0;
     ushort kafkaTlsPort = 0;
+    bool kafkaRequireSasl = false; // every data/admin API needs SASL first
     // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
     // log) and the rewrite/snapshot re-emit the cache — EVALSHA survives a
     // restart AND a master failover. `no` = Redis-faithful volatile cache.
@@ -315,6 +316,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         try
             cfg.amqpTlsPort = value.to!ushort;
         catch (Exception)
+            return false;
+        return true;
+    case "kafka-require-sasl":
+        if (value == "yes")
+            cfg.kafkaRequireSasl = true;
+        else if (value == "no")
+            cfg.kafkaRequireSasl = false;
+        else
             return false;
         return true;
     case "kafka-tls-port":

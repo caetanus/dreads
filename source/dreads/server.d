@@ -627,7 +627,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     }
     if (gConfig.kafkaPort != 0)
     {
-        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort,
+        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort, gKafkaRequireSasl,
             gKafkaFetchRaw, gKafkaLenRaw;
 
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
@@ -645,6 +645,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gKafkaLenRaw = &kafkaLenDirect;
         gKafkaPort = gConfig.kafkaPort;
         gKafkaTlsPort = gConfig.kafkaTlsPort;
+        gKafkaRequireSasl = gConfig.kafkaRequireSasl;
         {
             import core.stdc.stdlib : getenv;
             import core.stdc.string : strcmp;

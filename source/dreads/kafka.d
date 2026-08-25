@@ -63,10 +63,13 @@ private enum short API_CREATE_PARTITIONS = 37, API_DELETE_TOPICS = 20,
         API_OFFSET_DELETE = 47;
 private enum short API_INIT_PRODUCER_ID = 22, API_ADD_PARTITIONS_TO_TXN = 24,
         API_ADD_OFFSETS_TO_TXN = 25, API_END_TXN = 26, API_TXN_OFFSET_COMMIT = 28;
+private enum short API_SASL_HANDSHAKE = 17, API_SASL_AUTHENTICATE = 36;
 
 private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_INVALID_TOPIC = 17, E_UNSUPPORTED_VERSION = 35,
-        E_INVALID_RECORD = 87, E_OUT_OF_ORDER_SEQ = 45, E_INVALID_PRODUCER_EPOCH = 47;
+        E_INVALID_RECORD = 87, E_OUT_OF_ORDER_SEQ = 45, E_INVALID_PRODUCER_EPOCH = 47,
+        E_UNSUPPORTED_SASL_MECHANISM = 33, E_ILLEGAL_SASL_STATE = 34,
+        E_SASL_AUTH_FAILED = 58;
 
 /// Hard bound on any wire array count (topics/partitions/records). Kafka
 /// counts are SIGNED i32; a hostile 0x7FFFFFFF made the response-building
@@ -106,6 +109,8 @@ private short maxApiVer(short apiKey) @nogc nothrow pure
     case API_LIST_OFFSETS: return 5; // v6+ flexible (v5 non-flexible)
     case API_METADATA: return 9; // v9+ flexible (handleMetadataFlex)
     case API_API_VERSIONS: return 0;
+    case API_SASL_HANDSHAKE: return 1; // v1 = tokens via SaslAuthenticate(36)
+    case API_SASL_AUTHENTICATE: return 1; // v2+ flexible
     case API_OFFSET_COMMIT: return 7; // v8+ flexible
     case API_OFFSET_FETCH: return 7; // v6+ flexible (v7 adds require_stable)
     case API_FIND_COORDINATOR: return 3; // v3 flexible (single key)
@@ -791,6 +796,7 @@ public void serveKafkaClient(TCPConnection tcp, bool tls = false) nothrow
     auto wlock = new TaskMutex;
     ByteBuffer inb;
     ByteBuffer outb;
+    KafkaConnCtx ctx;
     for (;;)
     {
         if (leg !is null)
@@ -843,7 +849,18 @@ public void serveKafkaClient(TCPConnection tcp, bool tls = false) nothrow
                 break;
             tByteBufferOom = false; // clear any stale flag (leaked from another skin)
             tKafkaAdvPort = leg !is null && gKafkaTlsPort != 0 ? gKafkaTlsPort : gKafkaPort;
-            handleRequest(d[pos + 4 .. pos + 4 + sz], outb);
+            if (ctx.saslRawMode && !ctx.authed)
+            {
+                // legacy SaslHandshake v0: this frame is a BARE SASL token
+                // (no request header). Success answers the empty frame the
+                // client blocks on; failure drops the connection.
+                if (!kafkaPlainCheck(d[pos + 4 .. pos + 4 + sz], &ctx))
+                    return;
+                putI32(outb, 0);
+                pos += 4 + sz;
+                continue;
+            }
+            handleRequest(d[pos + 4 .. pos + 4 + sz], outb, &ctx);
             if (tByteBufferOom)
                 return; // OOM building this reply: drop THIS client, not the broker
             pos += 4 + sz;
@@ -872,12 +889,15 @@ public void serveKafkaClient(TCPConnection tcp, bool tls = false) nothrow
             outb.trim(KAFKA_BUF_KEEP); // a 64MB fetch/produce spike must not pin
         }
         inb.consume(pos);
+        if (ctx.closeConn)
+            return; // failed/required SASL: reply already flushed above
         if (inb.empty && inb.capacity > KAFKA_BUF_KEEP)
             inb.trim(KAFKA_BUF_KEEP);
     }
 }
 
-private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @trusted
+private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o,
+        KafkaConnCtx* ctx = null) nothrow @trusted
 {
     Rd r = Rd(req);
     immutable apiKey = r.i16();
@@ -920,13 +940,74 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         return;
     }
 
+    // kafka-require-sasl: everything but the bootstrap trio must authenticate.
+    // The bare error shell is length-bounded (the librdkafka lesson: clients
+    // read size-first, a short body underflows without desyncing) and the
+    // connection drops right after, like a real SASL listener.
+    if (gKafkaRequireSasl && ctx !is null && !ctx.authed
+            && apiKey != API_API_VERSIONS && apiKey != API_SASL_HANDSHAKE
+            && apiKey != API_SASL_AUTHENTICATE)
+    {
+        putI16(o, E_ILLEGAL_SASL_STATE);
+        ctx.closeConn = true;
+        goto epilogue;
+    }
+
     switch (apiKey)
     {
+    case API_SASL_HANDSHAKE:
+        {
+            auto mech = r.str();
+            immutable known = r.ok && mech == "PLAIN";
+            putI16(o, known ? E_NONE : E_UNSUPPORTED_SASL_MECHANISM);
+            putI32(o, 1); // enabled_mechanisms
+            putStr(o, "PLAIN");
+            if (known && ctx !is null)
+            {
+                ctx.saslHandshook = true;
+                if (apiVer == 0)
+                    ctx.saslRawMode = true; // next frame = bare token
+            }
+            break;
+        }
+    case API_SASL_AUTHENTICATE:
+        {
+            auto tok = r.bytesI32();
+            if (ctx is null || !ctx.saslHandshook || !r.ok)
+            {
+                putI16(o, E_ILLEGAL_SASL_STATE);
+                putI16(o, -1); // error_message null
+                putI32(o, 0); // auth_bytes empty
+                if (apiVer >= 1)
+                    putI64(o, 0);
+                if (ctx !is null)
+                    ctx.closeConn = true;
+                break;
+            }
+            if (kafkaPlainCheck(tok, ctx))
+            {
+                putI16(o, E_NONE);
+                putI16(o, -1);
+                putI32(o, 0);
+                if (apiVer >= 1)
+                    putI64(o, 0); // session_lifetime_ms: unlimited
+            }
+            else
+            {
+                putI16(o, E_SASL_AUTH_FAILED);
+                putStr(o, "SASL PLAIN authentication failed");
+                putI32(o, 0);
+                if (apiVer >= 1)
+                    putI64(o, 0);
+                ctx.closeConn = true; // the broker drops after a failed auth
+            }
+            break;
+        }
     case API_API_VERSIONS:
         // reply v0 regardless; UNSUPPORTED_VERSION + the table lets clients
         // downgrade (the standard dance)
         putI16(o, apiVer == 0 ? E_NONE : E_UNSUPPORTED_VERSION);
-        putI32(o, 31); // array count
+        putI32(o, 33); // array count
         static void row(ref ByteBuffer o2, short k, short lo, short hi) @nogc nothrow
         {
             putI16(o2, k);
@@ -939,6 +1020,8 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         row(o, API_LIST_OFFSETS, 0, 5);
         row(o, API_METADATA, 0, 9);
         row(o, API_API_VERSIONS, 0, 0);
+        row(o, API_SASL_HANDSHAKE, 0, 1);
+        row(o, API_SASL_AUTHENTICATE, 0, 1);
         row(o, API_OFFSET_COMMIT, 0, 7);
         row(o, API_OFFSET_FETCH, 0, 7);
         row(o, API_FIND_COORDINATOR, 0, 3);
@@ -1098,6 +1181,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @
         break;
     }
 
+epilogue:
     // patch the size — but only if the 4 reserved length bytes were actually
     // written. If the reserving putI32(o,0) above hit OOM (tByteBufferOom: the
     // append no-ops and o.length stays at sizeAt), the buffer may have no space
@@ -1130,6 +1214,86 @@ public __gshared ushort gKafkaTlsPort = 0; // the TLS listener (advertised to TL
 // clobber it because the advertise happens before any yield in the handlers,
 // but keep it per-request anyway (cheap, and immune to handler reordering).
 private ushort tKafkaAdvPort;
+
+/// Require SASL authentication before any data/admin API (config
+/// kafka-require-sasl). Off by default: SASL stays available but optional —
+/// the legacy accept-any gate below mirrors every other skin.
+public __gshared bool gKafkaRequireSasl = false;
+
+/// Per-connection auth state, owned by the serve loop's frame and threaded
+/// into handleRequest (SASL is the only conn-stateful surface in the skin).
+public struct KafkaConnCtx
+{
+    const(void)* user; // AclUser* of the authenticated principal (null = anon)
+    char[64] principalBuf = void;
+    ubyte principalLen;
+    bool saslHandshook; // mechanism accepted
+    bool saslRawMode; // handshake v0: the NEXT frame is a bare SASL token
+    bool authed;
+    bool closeConn; // fatal auth state: serve loop drops the connection
+
+    const(char)[] principal() const return scope @nogc nothrow
+    {
+        return principalLen ? principalBuf[0 .. principalLen] : "ANONYMOUS";
+    }
+}
+
+/// PLAIN token: [authzid] NUL authcid NUL passwd — validated against the SAME
+/// ACL users as RESP/AMQP/MQTT (one-ring auth; a10SaslCheck's exact gate:
+/// only the seeded default user => legacy accept-any).
+private bool kafkaPlainCheck(scope const(ubyte)[] tok, KafkaConnCtx* ctx) nothrow @trusted
+{
+    import dreads.acl : aclUser, aclCheckPassword, aclUserCount;
+
+    auto sr = cast(const(char)[]) tok;
+    size_t z1 = sr.length, z2 = sr.length;
+    foreach (k, ch; sr)
+        if (ch == '\0')
+        {
+            if (z1 == sr.length)
+                z1 = k;
+            else
+            {
+                z2 = k;
+                break;
+            }
+        }
+    const(char)[] auser, apass;
+    if (z1 < sr.length && z2 < sr.length)
+    {
+        auser = sr[z1 + 1 .. z2];
+        apass = sr[z2 + 1 .. $];
+    }
+    if (aclUserCount() <= 1)
+    {
+        // legacy accept-any — still RECORD the claimed principal for ACLs
+        if (auser.length && auser.length <= ctx.principalBuf.length)
+        {
+            ctx.principalBuf[0 .. auser.length] = auser;
+            ctx.principalLen = cast(ubyte) auser.length;
+        }
+        ctx.authed = true;
+        return true;
+    }
+    auto au = aclUser(auser.length ? auser : "default");
+    if (au is null || !au.enabled)
+        return false;
+    bool ok;
+    try
+        ok = aclCheckPassword(au, apass);
+    catch (Exception)
+        ok = false;
+    if (!ok)
+        return false;
+    ctx.user = au;
+    if (auser.length && auser.length <= ctx.principalBuf.length)
+    {
+        ctx.principalBuf[0 .. auser.length] = auser;
+        ctx.principalLen = cast(ubyte) auser.length;
+    }
+    ctx.authed = true;
+    return true;
+}
 /// When true (default), any named topic auto-exists with KAFKA_PARTITIONS (the
 /// stateless model — clients need no CreateTopics). When false, a topic exists
 /// only once created (CreateTopics) or produced-into, and Metadata returns
