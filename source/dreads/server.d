@@ -818,6 +818,9 @@ private enum PIPELINE_CAP = 256;
 private struct Conn
 {
     TCPConnection tcp;
+    // cluster-proxy: this client's dedicated upstream sockets to peer nodes
+    // (lazily created; a per-client stream needs no lock). Freed at teardown.
+    Object clusterProxy;
     // TLS leg (null on plaintext conns — every existing path is untouched).
     // Created and freed by the serve fiber ON ITS OWN THREAD (allocator rule);
     // the cipher buffers are per-conn so nothing static crosses a yield.
@@ -4767,6 +4770,13 @@ private void serveClient(TCPConnection tcp, bool tlsMode = false) nothrow
             atomicOp!"-="(gBlockedClients, 1);
         }
         waitPurgeConn(c); // drop any lingering block-waiter entries (no dangling c)
+        if (c.clusterProxy !is null)
+        {
+            import dreads.cluster : ClientProxy, proxyClose;
+
+            proxyClose(cast(ClientProxy) c.clusterProxy);
+            c.clusterProxy = null;
+        }
         tlsTeardown(c, tcp); // close_notify + free on the owning thread
         // Close the socket LAST — after shutdownOutput has drained the output
         // queue. Closing earlier would make the writer see a disconnected socket
@@ -6371,11 +6381,32 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     // doesn't own so a cluster-aware client re-routes.
     if (gConfig.clusterEnabled)
     {
-        import dreads.cluster : redirectIfForeign, clusterCommand;
+        import dreads.cluster : redirectIfForeign, clusterCommand,
+            proxyForeignNode, proxyForward;
 
         if (uname == "CLUSTER")
             return clusterCommand(cmd.arr, o);
-        if (redirectIfForeign(uname, cmd.arr, o))
+        // cluster-proxy: forward a foreign key to its owner and relay the reply
+        // (transparent — works for the skins); else MOVED (cluster-aware client).
+        if (gConfig.clusterProxy)
+        {
+            immutable pnode = proxyForeignNode(uname, cmd.arr);
+            if (pnode >= 0)
+            {
+                import dreads.cluster : ClientProxy;
+
+                // the proxy appends its reply inline; drain any staged local
+                // hops FIRST so the pipeline's reply order is preserved.
+                if (c.shardPendCount > 0)
+                    flushShardPending(c, o);
+                if (c.clusterProxy is null)
+                    c.clusterProxy = new ClientProxy;
+                proxyForward(cast(ClientProxy) c.clusterProxy, pnode,
+                        cast(int) c.dbp.db, rawCmd, o);
+                return true;
+            }
+        }
+        else if (redirectIfForeign(uname, cmd.arr, o))
             return true;
     }
 

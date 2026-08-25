@@ -91,6 +91,10 @@ public struct Config
     // host:port matches its own (matched by port on 127.0.0.1 for local runs).
     bool clusterEnabled = false;
     string clusterNodes;
+    // cluster-proxy: forward a foreign key's command to its owner node and relay
+    // the reply (transparent to any client, incl. the skins), instead of the
+    // default -MOVED redirect (which needs a cluster-aware client).
+    bool clusterProxy = false;
     // thread-per-shard: number of data shards. 1 (default) = the single-thread path,
     // with NO router/shard split and zero added cost. >1 spins N shard-worker threads
     // (each its own keyspace) behind a router; commands route by hash slot.
@@ -568,6 +572,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.clusterEnabled = true;
         else if (value == "no")
             cfg.clusterEnabled = false;
+        else
+            return false;
+        return true;
+    case "cluster-proxy":
+        if (value == "yes")
+            cfg.clusterProxy = true;
+        else if (value == "no")
+            cfg.clusterProxy = false;
         else
             return false;
         return true;
