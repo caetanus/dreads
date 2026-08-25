@@ -2474,9 +2474,26 @@ private void shardDrainLoop() nothrow
                     amqpApplyRpush(cast(int) adb, cast(const(char)[]) p[4 .. 4 + klen],
                             cast(const(char)[]) p[4 + klen .. $]);
             }
-            if (tag !is null)
+            if (tag !is null && meta < 64)
             {
-                // empty durability ack: the reap only needs "applied", not bytes
+                // COALESCE the ack into the requester's reply batch (flushed once
+                // per requester at the pass end, one wake) — same path the RESP
+                // cmd replies use. The reap only needs "applied", so the reply is
+                // EMPTY: section = [u32 len=8][u64 pending][no bytes].
+                auto rb = &replyBatch[cast(size_t) meta];
+                enum size_t sect = 12;
+                auto raw = rb.freeSpace(sect);
+                if (raw.length >= sect)
+                {
+                    auto space = raw[0 .. sect];
+                    *cast(uint*) space.ptr = 8; // 8 (pending ptr) + 0 reply bytes
+                    *cast(ulong*)(space.ptr + 4) = cast(ulong) tag;
+                    rb.grow(sect);
+                    replyTouch |= 1UL << meta;
+                }
+            }
+            else if (tag !is null) // wide shard id (>=64): immediate unbatched ack
+            {
                 shardEnqueue(cast(uint) meta, null, tag, 0, ShardMsg.reply);
                 shardWake(cast(uint) meta);
             }
