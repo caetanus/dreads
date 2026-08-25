@@ -21,7 +21,9 @@ public __gshared void delegate(scope const(char)[][] args, ref ByteBuffer reply)
 private enum string Q_PREFIX = "sqs.q."; // the message list
 private enum string IF_PREFIX = "sqs.if."; // in-flight (visibility) hash
 private enum string Q_REGISTRY = "sqs.queues"; // set of queue names
-private enum string DD_PREFIX = "sqs.dd."; // FIFO dedup hash: dedupId -> msgid
+private enum string DD_PREFIX = "sqs.dd."; // FIFO dedup hash: dedupId -> expiry+msgid
+private enum string DL_PREFIX = "sqs.dl."; // delayed messages: id -> visibleAt+record
+private enum long DEDUP_WINDOW_MS = 5 * 60 * 1000; // AWS FIFO 5-minute dedup window
 private enum string GRP_PREFIX = "sqs.grp."; // FIFO locked message-groups (set)
 private enum char SEP = '\x1f'; // record field separator (never in JSON body text? escaped)
 
@@ -205,7 +207,7 @@ private bool opDeleteQueue(scope const(char)[] b, ref ByteBuffer o) @trusted
     key.append(name);
     const(char)[][2] a3 = ["del", cast(const(char)[]) key.data];
     exec(a3[], rb);
-    foreach (pfx; [DD_PREFIX, GRP_PREFIX])
+    foreach (pfx; [DD_PREFIX, GRP_PREFIX, DL_PREFIX])
     {
         key.clear();
         key.append(pfx);
@@ -267,7 +269,14 @@ private bool opSendMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
         o.append(`"}`);
         return true;
     }
-    sendOne(name, msgBody, group, mid, md5);
+    long delay = jsonInt(b, "DelaySeconds", 0);
+    if (delay < 0)
+        delay = 0;
+    if (delay > 900)
+        delay = 900; // AWS cap
+    if (isFifo(name))
+        delay = 0; // FIFO does not support per-message delay (AWS restriction)
+    sendOne(name, msgBody, group, delay, mid, md5);
     if (isFifo(name) && dedup.length)
         dedupStore(name, dedup, mid, md5);
     o.append(`{"MessageId":"`);
@@ -290,12 +299,23 @@ private bool dedupSeen(scope const(char)[] name, scope const(char)[] dedup,
     const(char)[][3] a = ["hget", cast(const(char)[]) key.data, dedup];
     exec(a[], rb);
     auto v = respBulk(cast(const(char)[]) rb.data);
-    if (v is null || v.length < 33)
+    if (v is null)
         return false;
-    mid[0 .. 32] = v[0 .. 32];
-    // recompute md5 for the reply (stored value carries it after the sep)
-    if (v.length >= 33 + 32 && v[32] == SEP)
-        md5[0 .. 32] = v[33 .. 65];
+    // value = expiryMs  msgid(32)  md5(32)
+    const(char)[] fexp, fmid, fmd5, funused;
+    splitRecord(v, fexp, fmid, fmd5, funused);
+    import dreads.stream : nowMs;
+
+    long exp = 0;
+    foreach (c; fexp)
+        if (c >= '0' && c <= '9')
+            exp = exp * 10 + (c - '0');
+    if (nowMs() > exp)
+        return false; // dedup window passed: treat as a fresh message
+    if (fmid.length == 32)
+        mid[0 .. 32] = fmid[0 .. 32];
+    if (fmd5.length == 32)
+        md5[0 .. 32] = fmd5[0 .. 32];
     else
         md5Hex(cast(const(ubyte)[]) body_, md5[]);
     return true;
@@ -308,7 +328,11 @@ private void dedupStore(scope const(char)[] name, scope const(char)[] dedup,
     key.clear();
     key.append(DD_PREFIX);
     key.append(name);
+    import dreads.stream : nowMs;
+
     val.clear();
+    appendLong2(val, nowMs() + DEDUP_WINDOW_MS);
+    val.appendByte(SEP);
     val.append(mid[]);
     val.appendByte(SEP);
     val.append(md5[]);
@@ -328,8 +352,12 @@ private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @truste
         auto id = jsonStrRaw(entry, "Id");
         auto egroup = jsonStrRaw(entry, "MessageGroupId");
         auto body_ = jsonStr(entry, "MessageBody");
+        long edelay = jsonInt(entry, "DelaySeconds", 0);
+        if (edelay < 0) edelay = 0;
+        if (edelay > 900) edelay = 900;
+        if (isFifo(name)) edelay = 0;
         char[32] mid = void, md5 = void;
-        sendOne(name, body_, egroup, mid, md5);
+        sendOne(name, body_, egroup, edelay, mid, md5);
         if (!first)
             o.append(",");
         first = false;
@@ -571,16 +599,18 @@ private bool opPurgeQueue(scope const(char)[] b, ref ByteBuffer o) @trusted
     return true;
 }
 
-// One send: RPUSH the record msgid\x1fmd5\x1fgroup\x1fbody; return the ids.
+// One send: build the record msgid\x1fmd5\x1fgroup\x1fbody. delaySeconds == 0
+// RPUSHes to the queue now; > 0 parks it in the delayed hash (sqs.dl.<name>,
+// field = a random id, value = visibleAtMs \x1f record) — the visibility sweep
+// promotes it to the queue when the delay elapses.
 private void sendOne(scope const(char)[] name, scope const(char)[] body_,
-        scope const(char)[] group, ref char[32] midOut, ref char[32] md5Out) @trusted nothrow
+        scope const(char)[] group, long delaySeconds, ref char[32] midOut, ref char[32] md5Out) @trusted nothrow
 {
+    import dreads.stream : nowMs;
+
     randHex(midOut[], 16);
     md5Hex(cast(const(ubyte)[]) body_, md5Out[]);
     static ByteBuffer rb, key, rec;
-    key.clear();
-    key.append(Q_PREFIX);
-    key.append(name);
     rec.clear();
     rec.append(midOut[]);
     rec.appendByte(SEP);
@@ -589,6 +619,26 @@ private void sendOne(scope const(char)[] name, scope const(char)[] body_,
     rec.append(group);
     rec.appendByte(SEP);
     rec.append(body_);
+    if (delaySeconds > 0)
+    {
+        key.clear();
+        key.append(DL_PREFIX);
+        key.append(name);
+        char[48] did = void;
+        randHex(did[], 24);
+        static ByteBuffer dval;
+        dval.clear();
+        appendLong2(dval, nowMs() + delaySeconds * 1000);
+        dval.appendByte(SEP);
+        dval.append(rec.data);
+        const(char)[][4] a = ["hset", cast(const(char)[]) key.data,
+            cast(const(char)[]) did[], cast(const(char)[]) dval.data];
+        exec(a[], rb);
+        return;
+    }
+    key.clear();
+    key.append(Q_PREFIX);
+    key.append(name);
     const(char)[][3] a = ["rpush", cast(const(char)[]) key.data, cast(const(char)[]) rec.data];
     exec(a[], rb);
 }
@@ -683,6 +733,87 @@ public void sqsVisibilitySweep() nothrow @trusted
                 const(char)[][3] sr = ["srem", cast(const(char)[]) gk.data, rgrp];
                 exec(sr[], val);
             }
+        }
+
+        // Delay queues: promote delayed messages whose visibility time arrived.
+        static ByteBuffer dlkey, dlall;
+        dlkey.clear();
+        dlkey.append(DL_PREFIX);
+        dlkey.append(name);
+        const(char)[][2] dhg = ["hgetall", cast(const(char)[]) dlkey.data];
+        exec(dhg[], dlall);
+        static const(char)[][256] dueIds;
+        static ByteBuffer dueRecs; // packed [u16 len][bytes]
+        size_t nDue = 0;
+        dueRecs.clear();
+        respEachPair(cast(const(char)[]) dlall.data, (scope const(char)[] id, scope const(char)[] v) {
+            if (nDue >= dueIds.length)
+                return;
+            size_t sep = 0;
+            while (sep < v.length && v[sep] != SEP)
+                sep++;
+            if (sep >= v.length)
+                return;
+            long va = 0;
+            foreach (c; v[0 .. sep])
+                if (c >= '0' && c <= '9')
+                    va = va * 10 + (c - '0');
+            if (va > now)
+                return; // not visible yet
+            dueIds[nDue++] = id;
+            auto rec = v[sep + 1 .. $];
+            dueRecs.appendByte(cast(char)(rec.length >> 8));
+            dueRecs.appendByte(cast(char)(rec.length & 0xFF));
+            dueRecs.append(rec);
+        });
+        {
+            auto packed2 = cast(const(char)[]) dueRecs.data;
+            size_t pj = 0;
+            foreach (i; 0 .. nDue)
+            {
+                if (pj + 2 > packed2.length)
+                    break;
+                immutable rl2 = (cast(size_t) cast(ubyte) packed2[pj] << 8) | cast(ubyte) packed2[pj + 1];
+                pj += 2;
+                if (pj + rl2 > packed2.length)
+                    break;
+                auto rec = packed2[pj .. pj + rl2];
+                pj += rl2;
+                const(char)[][3] rp2 = ["rpush", cast(const(char)[]) qkey.data, rec];
+                exec(rp2[], val);
+                const(char)[][3] hd2 = ["hdel", cast(const(char)[]) dlkey.data, dueIds[i]];
+                exec(hd2[], val);
+            }
+        }
+
+        // Dedup window: reap dedup entries whose 5-minute window elapsed, so the
+        // hash can't grow without bound on a busy FIFO queue.
+        static ByteBuffer ddkey, ddall;
+        ddkey.clear();
+        ddkey.append(DD_PREFIX);
+        ddkey.append(name);
+        const(char)[][2] dda = ["hgetall", cast(const(char)[]) ddkey.data];
+        exec(dda[], ddall);
+        static const(char)[][256] expDedup;
+        size_t nDd = 0;
+        respEachPair(cast(const(char)[]) ddall.data, (scope const(char)[] id, scope const(char)[] v) {
+            if (nDd >= expDedup.length)
+                return;
+            long ex = 0;
+            foreach (c; v)
+            {
+                if (c == SEP)
+                    break;
+                if (c >= '0' && c <= '9')
+                    ex = ex * 10 + (c - '0');
+            }
+            if (now > ex)
+                expDedup[nDd++] = id;
+        });
+        foreach (i; 0 .. nDd)
+        {
+            const(char)[][3] hd3 = ["hdel", cast(const(char)[]) ddkey.data, expDedup[i]];
+            exec(hd3[], val);
         }
     });
 }
