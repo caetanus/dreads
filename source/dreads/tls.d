@@ -71,6 +71,37 @@ private extern (C) @nogc nothrow
     ubyte* SHA256(const(ubyte)* d, size_t n, ubyte* outMd);
     ubyte* SHA512(const(ubyte)* d, size_t n, ubyte* outMd);
     int RAND_bytes(ubyte* buf, int num);
+    ubyte* MD5(const(ubyte)* d, size_t n, ubyte* md); // SQS MD5OfMessageBody
+}
+
+/// MD5 of `data` as 32 lowercase hex chars into dst[0..32].
+public void md5Hex(scope const(ubyte)[] data, scope char[] dst) @trusted @nogc nothrow
+{
+    ubyte[16] md = void;
+    MD5(data.ptr, data.length, md.ptr);
+    static immutable hx = "0123456789abcdef";
+    foreach (i; 0 .. 16)
+    {
+        dst[i * 2] = hx[md[i] >> 4];
+        dst[i * 2 + 1] = hx[md[i] & 0xF];
+    }
+}
+
+/// N random bytes as hex into dst[0 .. 2*n].
+public void randHex(scope char[] dst, size_t nbytes) @trusted @nogc nothrow
+{
+    ubyte[64] rb = void;
+    if (nbytes > rb.length)
+        nbytes = rb.length;
+    if (RAND_bytes(rb.ptr, cast(int) nbytes) != 1)
+        foreach (i; 0 .. nbytes)
+            rb[i] = cast(ubyte)(i * 7 + 13); // last-resort, never on a real box
+    static immutable hx = "0123456789abcdef";
+    foreach (i; 0 .. nbytes)
+    {
+        dst[i * 2] = hx[rb[i] >> 4];
+        dst[i * 2 + 1] = hx[rb[i] & 0xF];
+    }
 }
 
 struct EVP_MD;

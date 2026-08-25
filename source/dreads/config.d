@@ -18,6 +18,9 @@ public struct Config
     ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     ushort amqpPort = 0; // AMQP 0-9-1 skin listener (0 = disabled); e.g. 5672
     ushort kafkaPort = 0; // Kafka skin listener (0 = disabled); e.g. 9092
+    ushort sqsPort = 0; // SQS (HTTP/REST) skin listener (0 = disabled); e.g. 9324
+    string sqsBind = "127.0.0.1";
+    uint sqsDb = 19; // SQS queue/in-flight state db (above the RESP-visible range)
     // Skin-private database indexes (which logical db each skin stores state
     // in). Defaults sit ABOVE the RESP-visible range (SELECT caps at 16), so
     // broker state is invisible to KEYS* and spared by FLUSHALL; point one at
@@ -333,6 +336,26 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         return true;
     case "kafka-super-users":
         cfg.kafkaSuperUsers = value.unquote;
+        return true;
+    case "sqs-port":
+        try
+            cfg.sqsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "sqs-bind":
+        cfg.sqsBind = value.unquote;
+        return true;
+    case "sqs-db":
+        try
+        {
+            immutable n = value.to!uint;
+            if (n >= 256)
+                return false;
+            cfg.sqsDb = n;
+        }
+        catch (Exception)
+            return false;
         return true;
     case "kafka-require-sasl":
         if (value == "yes")

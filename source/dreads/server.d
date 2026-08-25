@@ -648,6 +648,16 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             }, listenOpts);
         printf("dreads AMQP skin on port %u\n", cast(uint) gConfig.amqpPort);
     }
+    if (gConfig.sqsPort != 0)
+    {
+        import dreads.sqs : startSqs, gSqsExec, sqsVisibilitySweep;
+
+        gSqsExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
+            amqpDataExec(args, reply, cast(int) gConfig.sqsDb); // SQS's db
+        };
+        startSqs();
+        setTimer(1.seconds, () nothrow { sqsVisibilitySweep(); }, true);
+    }
     if (gConfig.kafkaPort != 0)
     {
         import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort, gKafkaRequireSasl, gKafkaSuperUsers,
