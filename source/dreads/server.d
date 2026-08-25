@@ -499,9 +499,20 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 startDashCmdBridge;
 
             startDashboard(port);
+            // the management API (M4) shares the dashboard's command bridge;
+            // start the bridge when EITHER surface is enabled
+            if (gConfig.dashboard || gConfig.mgmtPort != 0)
+                startDashCmdBridge();
+            if (gConfig.mgmtPort != 0)
+            {
+                import dreads.mgmt : startManagement, gMgmtExchanges;
+                import dreads.amqp : amqpExchangeSnapshot;
+
+                gMgmtExchanges = &amqpExchangeSnapshot;
+                startManagement();
+            }
             if (gConfig.dashboard)
             {
-                startDashCmdBridge(); // main-side drain for dashboard write/admin ops
                 setTimer(gConfig.dashboardIntervalMs.msecs, () nothrow {
                     snapshotMetrics(gPubSub.channelCount(), gPubSub.patternCount());
                 }, true);

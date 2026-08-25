@@ -136,6 +136,9 @@ public struct Config
     // `dashboard-admin`. Both default OFF.
     bool dashboardWrite = false;
     bool dashboardAdmin = false;
+    // RabbitMQ management HTTP API (drop-in M4). 0 = off; 15672 is RMQ's port.
+    ushort mgmtPort = 0;
+    string mgmtBind = "127.0.0.1";
     // Live-metrics refresh cadence (ms): how often the main loop snapshots metrics
     // and pushes to connected dashboard clients. Lower = finer resolution while
     // debugging a running test; higher = lighter. Only runs while a client is
@@ -297,6 +300,15 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.appendonly = false;
         else
             return false;
+        return true;
+    case "management-port":
+        try
+            cfg.mgmtPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "management-bind":
+        cfg.mgmtBind = value.unquote;
         return true;
     case "appendfilename":
         cfg.appendfilename = value.unquote;

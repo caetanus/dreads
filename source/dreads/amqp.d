@@ -155,6 +155,25 @@ private int[string] gQueueConsGlobal; // TLS
 private QueueMeta[string] gQueueMeta; // TLS, broadcast-replicated
 
 private ExType[string] gExchanges; // TLS
+
+/// Management API hook (M4): serialize this thread's replicated exchange set as
+/// `name\ttype\n` lines (skips the default amq.* names the API adds itself).
+/// Runs ON an AMQP shard thread (gExchanges is TLS) — installed at boot.
+public void amqpExchangeSnapshot(ref ByteBuffer o) nothrow @trusted
+{
+    static immutable string[4] tn = ["direct", "fanout", "topic", "headers"];
+    foreach (name, t; gExchanges)
+    {
+        if (name.length == 0)
+            continue;
+        if (name.length >= 4 && name[0 .. 4] == "amq.")
+            continue; // defaults are emitted by the API
+        o.append(name);
+        o.appendByte('\t');
+        o.append(tn[cast(ubyte) t]);
+        o.appendByte('\n');
+    }
+}
 private string[string] gExchangeAE; // TLS: exchange -> alternate-exchange (replicated via op-1)
 /// Last op seq per exchange NAME. A deleted exchange is removed from gExchanges
 /// but keeps its seq here (tombstone) so a stale lower-seq declare is rejected.

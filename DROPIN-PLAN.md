@@ -7,7 +7,7 @@ TLS → SASL/enforcement Kafka → management API RMQ. Extend-only: cada
 listener plaintext continua idêntico; TLS é porta NOVA, `c.tls is null`
 = caminho atual byte a byte.
 
-## M1 — TLS engine + RESP (`tls-port`)
+## M1 — TLS engine + RESP (`tls-port`) — **LANDADO `04d3683`** (+0,15% instr plaintext)
 
 **Motor: OpenSSL via BIO de memória, bindings extern(C) à mão**
 (source/dreads/tls.d — estilo uringraw: sem dep dub, linka libssl.so.3).
@@ -31,7 +31,7 @@ O socket segue 100% do vibe; o TLS é uma tradução de bytes por conexão:
   s_client`, bench sanity (tls-port não toca o hot path plaintext —
   instr/op idêntico no arbiter).
 
-## M2 — TLS nas skins
+## M2 — TLS nas skins — **LANDADO `097b0fe`** (pika/paho/kafka-python sobre TLS; advertised-port fix)
 
 - `--mqtt-tls-port` (8883), `--amqp-tls-port` (5671, cobre 0-9-1 e 1.0 —
   mesmo listener/detecção de header), `--kafka-tls-port` (SSL://).
@@ -42,7 +42,7 @@ O socket segue 100% do vibe; o TLS é uma tradução de bytes por conexão:
   librdkafka build com SSL → **destrava o estrutural 0064**; kcat -X
   security.protocol=ssl; suites completas re-rodadas na porta TLS.
 
-## M3 — Kafka SASL + ACL enforcement
+## M3 — Kafka SASL + ACL enforcement — **LANDADO** (M3a PLAIN `f1985e7`, M3b SCRAM `8d344ed`, M3c enforcement `1cbb739`)
 
 - SaslHandshake (17) + SaslAuthenticate (36), mecanismos PLAIN e
   SCRAM-SHA-256/512, validando contra os MESMOS usuários ACL do RESP
@@ -59,7 +59,7 @@ O socket segue 100% do vibe; o TLS é uma tradução de bytes por conexão:
   kcat sasl, kafka-python SASL_PLAIN; suítes completas (nada regride sem
   SASL configurado).
 
-## M4 — RabbitMQ management HTTP API
+## M4 — RabbitMQ management HTTP API — **EM ANDAMENTO**
 
 - Porta 15672, servidor HTTP próprio (fundação: dashboard.d já serve
   HTTP). Superfície v1 (o que UI/rabbitmqadmin/operators mais usam):

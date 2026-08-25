@@ -162,6 +162,7 @@ private struct DashCmdSlot
     int status;
     shared(ManualEvent) done;
     bool ready;
+    bool adminTrusted; // management API (own auth): bypass the dashboard write gate
 }
 
 private __gshared void* gDashCmdQ; // dreads.raftq.CrossQueue (opaque here to avoid a cycle)
@@ -176,8 +177,12 @@ public void startDashCmdBridge() nothrow
     import dreads.raftq : CrossQueue;
     import vibe.core.core : runTask;
 
-    if (!gConfig.dashboard)
+    // called only when the dashboard OR the management API (M4) is enabled;
+    // both need this bridge to run RESP commands on the writer thread
+    if (!gConfig.dashboard && gConfig.mgmtPort == 0)
         return;
+    if (gDashBridgeUp)
+        return; // idempotent
     try
     {
         gDashCmdQ = cast(void*) new CrossQueue(256);
@@ -389,8 +394,8 @@ private void dashCmdDrainLoop() nothrow
                         else
                             scriptCommand(cmd.arr[1 .. $], slot.reply);
                     }
-                    else if (auto reason = dashDeny(cmd.arr))
-                        repError(slot.reply, reason);
+                    else if (!slot.adminTrusted && dashDeny(cmd.arr) !is null)
+                        repError(slot.reply, dashDeny(cmd.arr));
                     else if (dashApplyConfig(cmd.arr, slot.reply))
                     {
                         // handled in-place (maxmemory bump)
@@ -430,6 +435,20 @@ private void dashCmdDrainLoop() nothrow
 /// Called from the dashboard thread (HTTP handlers). Blocking round-trip, serialized.
 package bool runCommand(scope const(ubyte)[] respCmd, ushort db, ref ByteBuffer reply) nothrow
 {
+    return runCommandImpl(respCmd, db, reply, false);
+}
+
+/// Management-API variant: the caller (dreads.mgmt) authenticated the request
+/// with HTTP basic auth against the ACL, so its writes bypass the dashboard's
+/// read-only default gate (dashDeny). Reads are identical.
+public bool runCommandAdmin(scope const(ubyte)[] respCmd, ushort db, ref ByteBuffer reply) nothrow
+{
+    return runCommandImpl(respCmd, db, reply, true);
+}
+
+private bool runCommandImpl(scope const(ubyte)[] respCmd, ushort db,
+        ref ByteBuffer reply, bool trusted) nothrow
+{
     import dreads.raftq : CrossQueue;
 
     if (!gDashBridgeUp || gDashCmdQ is null)
@@ -442,6 +461,7 @@ package bool runCommand(scope const(ubyte)[] respCmd, ushort db, ref ByteBuffer 
         gDashSlot.bytes.clear();
         gDashSlot.bytes.append(respCmd);
         gDashSlot.db = db;
+        gDashSlot.adminTrusted = trusted;
         gDashSlot.ready = false;
         (cast(CrossQueue) gDashCmdQ).put(gDashSlot.bytes.data, cast(void*)&gDashSlot, 0);
         while (!gDashSlot.ready)
