@@ -17,6 +17,7 @@ public struct Config
     bool appendonly = false;
     ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     ushort mqttWsPort = 0; // MQTT-over-WebSocket listener (0 = disabled); e.g. 8083
+    ushort mqttWssPort = 0; // MQTT-over-WebSocket-over-TLS (wss); e.g. 8084
     ushort amqpPort = 0; // AMQP 0-9-1 skin listener (0 = disabled); e.g. 5672
     ushort kafkaPort = 0; // Kafka skin listener (0 = disabled); e.g. 9092
     ushort sqsPort = 0; // SQS (HTTP/REST) skin listener (0 = disabled); e.g. 9324
@@ -326,6 +327,12 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "mqtt-ws-port":
         try
             cfg.mqttWsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "mqtt-wss-port":
+        try
+            cfg.mqttWssPort = value.to!ushort;
         catch (Exception)
             return false;
         return true;

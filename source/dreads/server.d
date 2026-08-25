@@ -425,7 +425,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         };
     }
     if (gConfig.tlsPort != 0 || gConfig.mqttTlsPort != 0 || gConfig.amqpTlsPort != 0
-            || gConfig.kafkaTlsPort != 0)
+            || gConfig.kafkaTlsPort != 0 || gConfig.mqttWssPort != 0)
     {
         // built BEFORE any listener/shard thread exists; a bad cert aborts boot
         // (a TLS port that silently fell back to plaintext would be worse)
@@ -625,6 +625,10 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         if (gConfig.mqttWsPort != 0)
             cast(void) listenTCP(gConfig.mqttWsPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveMqttClient(conn, false, true); // MQTT over WebSocket
+            }, listenOpts);
+        if (gConfig.mqttWssPort != 0)
+            cast(void) listenTCP(gConfig.mqttWssPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveMqttClient(conn, true, true); // MQTT over WebSocket over TLS
             }, listenOpts);
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
                 bool retain, ulong seq, ubyte pubQos, scope const(char)[] props) nothrow {
@@ -4595,6 +4599,10 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
             if (gConfig.mqttWsPort != 0)
                 cast(void) listenTCP(gConfig.mqttWsPort, delegate(TCPConnection conn) @trusted nothrow {
                     serveMqttClient(conn, false, true);
+                }, sopts);
+            if (gConfig.mqttWssPort != 0)
+                cast(void) listenTCP(gConfig.mqttWssPort, delegate(TCPConnection conn) @trusted nothrow {
+                    serveMqttClient(conn, true, true);
                 }, sopts);
         }
         catch (Exception)

@@ -236,6 +236,67 @@ bool wsHandshake(TCPConnection conn, scope const(char)[] req, scope const(char)[
         return false;
 }
 
+/// Build the RFC 6455 upgrade response into `resp` instead of writing it — the
+/// caller routes it over the right transport (raw, or through the TLS leg for
+/// wss). Returns false if `req` is not a valid WS upgrade.
+bool wsHandshakeResponse(scope const(char)[] req, scope const(char)[] wantProto,
+        ref ByteBuffer resp) @trusted nothrow
+{
+    import std.digest.sha : sha1Of;
+    import std.base64 : Base64;
+
+    auto key = wsHeader(req, "sec-websocket-key");
+    auto upg = wsHeader(req, "upgrade");
+    if (key.length == 0 || upg.length == 0)
+        return false;
+    try
+    {
+        enum GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        char[128] cat = void;
+        if (key.length + GUID.length > cat.length)
+            return false;
+        cat[0 .. key.length] = key;
+        cat[key.length .. key.length + GUID.length] = GUID;
+        auto sha = sha1Of(cast(const(ubyte)[]) cat[0 .. key.length + GUID.length]);
+        char[32] accBuf = void;
+        auto acc = Base64.encode(sha[], accBuf[]);
+        resp.clear();
+        resp.append("HTTP/1.1 101 Switching Protocols
+");
+        resp.append("Upgrade: websocket
+Connection: Upgrade
+");
+        resp.append("Sec-WebSocket-Accept: ");
+        resp.append(cast(const(char)[]) acc);
+        resp.append("
+");
+        auto offered = wsHeader(req, "sec-websocket-protocol");
+        if (wantProto.length && offered.length && wsListHas(offered, wantProto))
+        {
+            resp.append("Sec-WebSocket-Protocol: ");
+            resp.append(wantProto);
+            resp.append("
+");
+        }
+        resp.append("
+");
+        return true;
+    }
+    catch (Exception)
+        return false;
+}
+
+/// True once `buf` holds a complete HTTP header block (ends with CRLFCRLF).
+bool wsHeadersComplete(scope const(ubyte)[] buf) @trusted @nogc nothrow
+{
+    if (buf.length < 4)
+        return false;
+    foreach (i; 0 .. buf.length - 3)
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            return true;
+    return false;
+}
+
 /// Any application bytes that arrived in the SAME read as the HTTP upgrade
 /// (a client that pipelines the first MQTT CONNECT right after the handshake).
 const(ubyte)[] wsBodyAfterHandshake(return scope const(ubyte)[] raw) @trusted @nogc nothrow

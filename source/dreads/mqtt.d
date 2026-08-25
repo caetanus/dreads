@@ -2377,19 +2377,48 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false
     }
     if (ws)
     {
-        // read the HTTP upgrade request, do the RFC 6455 handshake, then run the
-        // normal MQTT loop with a WS codec framing every read/write
-        ubyte[8192] hb = void;
-        size_t hn;
-        try
+        // Gather the HTTP upgrade request (decrypted through the TLS leg for
+        // wss), do the RFC 6455 handshake, then run the normal MQTT loop with a
+        // WS codec framing every read/write. The response is routed over the
+        // same transport (raw, or TLS-encrypted).
+        static ByteBuffer reqbuf, respbuf;
+        reqbuf.clear();
+        bool gotHeaders = false;
+        foreach (_; 0 .. 64) // bounded: handshake completes in a few round-trips
         {
-            if (tcp.waitForData(30.seconds))
-                hn = tcp.read(hb[], IOMode.once);
+            if (c.tlsLeg !is null)
+            {
+                if (!legPump(c.tlsLeg, tcp))
+                    break;
+                legDrainInto(c.tlsLeg, reqbuf);
+                cast(void) legSend(c.tlsLeg, tcp, null); // flush TLS handshake cipher
+            }
+            else
+            {
+                ubyte[8192] hb = void;
+                size_t hn;
+                try
+                {
+                    if (!tcp.waitForData(30.seconds))
+                        break;
+                    hn = tcp.read(hb[], IOMode.once);
+                }
+                catch (Exception)
+                {
+                    break;
+                }
+                if (hn == 0)
+                    break;
+                reqbuf.append(hb[0 .. hn]);
+            }
+            if (wsHeadersComplete(cast(const(ubyte)[]) reqbuf.data))
+            {
+                gotHeaders = true;
+                break;
+            }
         }
-        catch (Exception)
-        {
-        }
-        if (hn == 0 || !wsHandshake(tcp, cast(const(char)[]) hb[0 .. hn], "mqtt"))
+        if (!gotHeaders
+                || !wsHandshakeResponse(cast(const(char)[]) reqbuf.data, "mqtt", respbuf))
         {
             closeTcp(c);
             return;
@@ -2400,8 +2429,28 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false
             closeTcp(c);
             return;
         }
+        // write the 101 response over the right transport
+        bool sent;
+        if (c.tlsLeg !is null)
+            sent = legSend(c.tlsLeg, tcp, cast(const(ubyte)[]) respbuf.data);
+        else
+        {
+            try
+            {
+                tcp.write(cast(const(ubyte)[]) respbuf.data);
+                sent = true;
+            }
+            catch (Exception)
+            {
+            }
+        }
+        if (!sent)
+        {
+            closeTcp(c);
+            return;
+        }
         // a client that pipelined its CONNECT right after the upgrade
-        auto tail = wsBodyAfterHandshake(hb[0 .. hn]);
+        auto tail = wsBodyAfterHandshake(cast(const(ubyte)[]) reqbuf.data);
         if (tail.length)
             cast(void) c.wsCodec.feed(tail);
     }
