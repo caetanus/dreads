@@ -38,6 +38,7 @@ public struct Config
     ushort amqpTlsPort = 0;
     ushort kafkaTlsPort = 0;
     bool kafkaRequireSasl = false; // every data/admin API needs SASL first
+    string kafkaSuperUsers; // "User:admin,User:kafka" — bypass ACL enforcement
     // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
     // log) and the rewrite/snapshot re-emit the cache — EVALSHA survives a
     // restart AND a master failover. `no` = Redis-faithful volatile cache.
@@ -317,6 +318,9 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.amqpTlsPort = value.to!ushort;
         catch (Exception)
             return false;
+        return true;
+    case "kafka-super-users":
+        cfg.kafkaSuperUsers = value.unquote;
         return true;
     case "kafka-require-sasl":
         if (value == "yes")

@@ -69,7 +69,8 @@ private enum short E_NONE = 0, E_CORRUPT = 2, E_UNKNOWN_TOPIC = 3,
         E_OFFSET_OUT_OF_RANGE = 1, E_INVALID_TOPIC = 17, E_UNSUPPORTED_VERSION = 35,
         E_INVALID_RECORD = 87, E_OUT_OF_ORDER_SEQ = 45, E_INVALID_PRODUCER_EPOCH = 47,
         E_UNSUPPORTED_SASL_MECHANISM = 33, E_ILLEGAL_SASL_STATE = 34,
-        E_SASL_AUTH_FAILED = 58;
+        E_SASL_AUTH_FAILED = 58, E_TOPIC_AUTH_FAILED = 29,
+        E_GROUP_AUTH_FAILED = 30, E_CLUSTER_AUTH_FAILED = 31;
 
 /// Hard bound on any wire array count (topics/partitions/records). Kafka
 /// counts are SIGNED i32; a hostile 0x7FFFFFFF made the response-building
@@ -908,6 +909,7 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o,
     immutable apiVer = r.i16();
     immutable corr = r.i32();
     tKafkaClientId = r.str(); // client_id (nullable) — a normal i16 string even in the
+    tKafkaCtx = ctx; // enforcement principal (read into stack before any hop)
     // flexible request header v2, which then adds tagged fields:
     immutable flex = isFlexible(apiKey, apiVer);
     if (flex)
@@ -1888,12 +1890,17 @@ private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
 /// JoinGroup v6/v7 (flexible): real coordinator via dreads.kafkagroup.
 private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    auto group = r.cstr();
+auto group = r.cstr();
     immutable sessMs = r.i32();
     immutable rebMs = r.i32();
     auto memberId = r.cstr();
     auto gii = r.cstr(); // group_instance_id (nullable, v5+)
     auto protocolType = r.cstr();
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        emitJoinErr(o, ver, true, E_GROUP_AUTH_FAILED, memberId);
+        return;
+    }
     immutable nprotoRaw = r.carrlen();
     immutable nproto = nprotoRaw < 0 ? 0 : safeCount(nprotoRaw);
     static ByteBuffer req; // TLS: consumed synchronously by the hop copy
@@ -1949,6 +1956,11 @@ private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         gii = r.str(); // group_instance_id (nullable) — v5 classic
     auto protocolType = r.str();
     immutable nproto = safeCount(r.i32());
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        emitJoinErr(o, ver, false, E_GROUP_AUTH_FAILED, memberId);
+        return;
+    }
     static ByteBuffer req; // TLS: consumed synchronously by the hop copy
     cast(void) buildJoinReq(req, group, memberId, gii, gii is null, sessMs,
             rebMs, ver >= 4, protocolType);
@@ -4295,6 +4307,134 @@ private bool aclParse(scope const(char)[] f, out KAclBinding b) nothrow @trusted
     return true;
 }
 
+/// ACL ENFORCEMENT (drop-in M3c). Zero-cost until a user actually creates
+/// ACLs (gKafkaAclActive stays 0 => authorize() returns allow immediately —
+/// one relaxed atomic load on the hot path). Once ACLs exist, every data/
+/// group/admin API checks the SASL principal against the stored bindings.
+/// Semantics = Apache Kafka's SimpleAclAuthorizer: an explicit DENY wins;
+/// else an ALLOW grants; else (no matching binding) DENY. The super-user
+/// short-circuit: a principal listed in `kafka-super-users` bypasses checks.
+import core.atomic : atomicLoad, atomicStore, MemoryOrder;
+
+public shared long gKafkaAclActive; // >0 once any ACL binding exists
+
+/// Per-request auth context for the enforcement checks in the handlers. Set
+/// before the dispatch switch; authorize() copies the principal to the stack
+/// before its own cross-shard hop, so a fiber switch cannot clobber it.
+private KafkaConnCtx* tKafkaCtx;
+
+/// Kafka ResourceType / AclOperation / PermissionType numeric constants.
+private enum KRES_TOPIC = 2, KRES_GROUP = 3, KRES_CLUSTER = 4, KRES_TXNID = 5;
+private enum KOP_ALL = 1, KOP_READ = 3, KOP_WRITE = 4, KOP_CREATE = 5,
+        KOP_DELETE = 6, KOP_ALTER = 7, KOP_DESCRIBE = 8, KOP_CLUSTER_ACTION = 9,
+        KOP_DESCRIBE_CONFIGS = 10, KOP_ALTER_CONFIGS = 11, KOP_IDEMPOTENT_WRITE = 12;
+private enum KPERM_DENY = 2, KPERM_ALLOW = 3;
+private enum KPAT_LITERAL = 3, KPAT_PREFIXED = 4;
+
+/// Comma-separated super-user list (config kafka-super-users, e.g.
+/// "User:admin,User:kafka"); a matching principal skips all checks.
+public __gshared string gKafkaSuperUsers;
+
+/// Boot primer: if the ACL store already holds bindings (AOF/keyspace replay),
+/// turn enforcement ON — otherwise a restart would silently drop to allow-all
+/// until the next CreateAcls. Called once after gKafkaExec is installed.
+public void kafkaAclPrime() nothrow @trusted
+{
+    if (gKafkaExec is null)
+        return;
+    static ByteBuffer rb;
+    const(char)[][2] a = ["hlen", KAFKA_ACL_KEY];
+    gKafkaExec(a[], rb);
+    // RESP integer ":N\r\n" — any N>0 means bindings exist
+    auto d = cast(const(char)[]) rb.data;
+    if (d.length >= 3 && d[0] == ':' && !(d.length == 4 && d[1] == '0'))
+    {
+        bool any = false;
+        foreach (ch; d[1 .. $])
+        {
+            if (ch == '\r')
+                break;
+            if (ch >= '1' && ch <= '9')
+                any = true;
+        }
+        if (any)
+            atomicStore!(MemoryOrder.raw)(gKafkaAclActive, 1);
+    }
+}
+
+private bool isSuperUser(scope const(char)[] principal) nothrow @trusted
+{
+    if (gKafkaSuperUsers.length == 0 || principal.length == 0)
+        return false;
+    auto sr = gKafkaSuperUsers;
+    size_t st;
+    foreach (i; 0 .. sr.length + 1)
+        if (i == sr.length || sr[i] == ',')
+        {
+            auto entry = sr[st .. i];
+            // entries are "User:<name>"; compare against "User:<principal>"
+            if (entry.length > 5 && entry[0 .. 5] == "User:"
+                    && entry[5 .. $] == principal)
+                return true;
+            st = i + 1;
+        }
+    return false;
+}
+
+/// True if op is authorized on (rtype,name) for principal. resourceName is the
+/// topic/group/txn id; cluster ops pass "kafka-cluster".
+private bool authorize(KafkaConnCtx* ctx, byte rtype, scope const(char)[] name,
+        byte op) nothrow @trusted
+{
+    if (atomicLoad!(MemoryOrder.raw)(gKafkaAclActive) == 0)
+        return true; // no ACLs configured: allow-all (legacy, zero cost)
+    const(char)[] principal = ctx is null ? "ANONYMOUS" : ctx.principal;
+    if (isSuperUser(principal))
+        return true;
+    // build the "User:<principal>" form once
+    char[96] pb = void;
+    size_t pl = 0;
+    immutable pfx = "User:";
+    if (5 + principal.length <= pb.length)
+    {
+        pb[0 .. 5] = pfx;
+        pb[5 .. 5 + principal.length] = principal;
+        pl = 5 + principal.length;
+    }
+    auto princForm = cast(const(char)[]) pb[0 .. pl];
+
+    static ByteBuffer rb;
+    KAclBinding[128] all;
+    const(char)[][128] fields;
+    immutable n = aclLoadAll(rb, all, fields);
+    bool allow = false;
+    foreach (i; 0 .. n)
+    {
+        auto b = all[i];
+        if (b.rtype != rtype)
+            continue;
+        // principal: exact "User:x" or the wildcard "User:*"
+        if (b.principal != princForm && b.principal != "User:*")
+            continue;
+        // operation: exact or ALL
+        if (b.op != op && b.op != KOP_ALL)
+            continue;
+        // resource name: LITERAL exact or "*", PREFIXED prefix, else skip
+        bool nameHit;
+        if (b.pattern == KPAT_LITERAL)
+            nameHit = b.name == name || b.name == "*";
+        else if (b.pattern == KPAT_PREFIXED)
+            nameHit = name.length >= b.name.length && name[0 .. b.name.length] == b.name;
+        if (!nameHit)
+            continue;
+        if (b.perm == KPERM_DENY)
+            return false; // explicit DENY always wins
+        if (b.perm == KPERM_ALLOW)
+            allow = true;
+    }
+    return allow;
+}
+
 /// KIP-140 filter match. Filter name/principal/host may be null (= any);
 /// pattern: ANY(1) = any pattern (name exact when given), MATCH(2) = LITERAL
 /// equal OR PREFIXED prefixing the filter name, LITERAL(3)/PREFIXED(4) exact.
@@ -4446,6 +4586,7 @@ private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
         const(char)[][4] a = ["hset", KAFKA_ACL_KEY,
             cast(const(char)[]) fb.data, "1"];
         gKafkaExec(a[], rb);
+        atomicStore!(MemoryOrder.raw)(gKafkaAclActive, 1); // enforcement ON
     }
     putI32(o, 0); // throttle_time_ms
     putI32(o, cast(int) nb); // results
@@ -5296,6 +5437,8 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 err = E_INVALID_TOPIC; // illegal NAME is 17, not unknown-topic
             else if (part < 0)
                 err = E_UNKNOWN_TOPIC;
+            else if (!authorize(tKafkaCtx, KRES_TOPIC, topic, KOP_WRITE))
+                err = E_TOPIC_AUTH_FAILED; // ACL: no WRITE on this topic
             // Compaction gate (KIP-purgatory parity): a compacted topic
             // rejects keyless records with INVALID_RECORD + record_errors.
             // The config HGET hops cross-shard, so it runs HERE — before any
@@ -5620,7 +5763,9 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable hw = base + llen; // absolute high watermark
             immutable fetchIdx = fetchOff - base; // list index of the offset
             immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
-            immutable bad = fetchOff < base || fetchOff > hw || !validTopic(topic) || part < 0;
+            immutable noRead = !authorize(tKafkaCtx, KRES_TOPIC, topic, KOP_READ);
+            immutable bad = fetchOff < base || fetchOff > hw || !validTopic(topic)
+                || part < 0 || noRead;
             // transactions: zero-cost while gKafkaTxnSeen is 0 (one atomic
             // load); afterwards LSO + aborted ranges hop BEFORE emission
             long lso = hw;
@@ -5642,7 +5787,8 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             // an OPEN transaction stays invisible until its marker lands
             immutable long servEnd = (isolation == 1 && txnActive && lso < hw) ? lso : hw;
             putI32(o, part);
-            putI16(o, bad ? E_OFFSET_OUT_OF_RANGE : E_NONE);
+            putI16(o, noRead ? E_TOPIC_AUTH_FAILED
+                    : (bad ? E_OFFSET_OUT_OF_RANGE : E_NONE));
             putI64(o, hw); // high watermark
             if (ver >= 4)
             {

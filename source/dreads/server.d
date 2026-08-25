@@ -627,7 +627,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     }
     if (gConfig.kafkaPort != 0)
     {
-        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort, gKafkaRequireSasl,
+        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort, gKafkaRequireSasl, gKafkaSuperUsers,
             gKafkaFetchRaw, gKafkaLenRaw;
 
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
@@ -646,6 +646,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gKafkaPort = gConfig.kafkaPort;
         gKafkaTlsPort = gConfig.kafkaTlsPort;
         gKafkaRequireSasl = gConfig.kafkaRequireSasl;
+        gKafkaSuperUsers = gConfig.kafkaSuperUsers;
+        {
+            import dreads.kafka : kafkaAclPrime;
+
+            kafkaAclPrime(); // enforcement ON if the replayed store has bindings
+        }
         {
             import core.stdc.stdlib : getenv;
             import core.stdc.string : strcmp;
