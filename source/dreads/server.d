@@ -609,7 +609,9 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         // the MQTT skin (dreads.mqtt): same SO_REUSEPORT share-nothing model,
         // one listener per shard thread (shard 0 = here; the rest in
         // shardThreadEntry), fibers per connection on the accepting thread
-        import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal;
+        import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal, mqttSeedStart;
+
+        mqttSeedStart(); // $SYS uptime clock (accurate from the first tick)
         import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec, gMqttResume;
 
         gMqttExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {

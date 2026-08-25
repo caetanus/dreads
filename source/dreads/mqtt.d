@@ -871,8 +871,21 @@ private void mqttSessionDel(scope const(char)[] clientId) nothrow @trusted
     gMqttExec(a[], rb);
 }
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
+public shared long gMqttClientsConnected; // currently-connected clients ($SYS)
+public shared ulong gMqttSent; // messages delivered to subscribers ($SYS)
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
 private shared ulong gMqttStartMs;
+
+/// Seed the broker start clock at boot so $SYS uptime is accurate from the
+/// first tick (else the first publish shows 0). Idempotent.
+public void mqttSeedStart() nothrow @trusted
+{
+    import core.atomic : atomicLoad, atomicStore, MemoryOrder;
+    import dreads.stream : nowMs;
+
+    if (atomicLoad!(MemoryOrder.raw)(gMqttStartMs) == 0)
+        atomicStore!(MemoryOrder.raw)(gMqttStartMs, nowMs());
+}
 
 /// Publish the $SYS/broker/* broker-monitoring topics to THIS shard's local
 /// subscribers (a de-facto MQTT standard; mosquitto-compatible). Called ~every
@@ -904,10 +917,18 @@ public void mqttPublishSys() nothrow @trusted
 
     const(char)[] v;
     pub("$SYS/broker/version", "dreads MQTT 3.1.1");
-    num(nb, (now - atomicLoad!(MemoryOrder.raw)(gMqttStartMs)) / 1000, v);
-    pub("$SYS/broker/uptime", v);
+    immutable up = (now - atomicLoad!(MemoryOrder.raw)(gMqttStartMs)) / 1000;
+    static char[40] ub2 = void;
+    immutable un = snprintf(ub2.ptr, ub2.length, "%llu seconds", up);
+    pub("$SYS/broker/uptime", un > 0 ? cast(const(char)[]) ub2[0 .. un] : "0 seconds");
+    immutable cc = atomicLoad!(MemoryOrder.raw)(gMqttClientsConnected);
+    num(nb, cc < 0 ? 0 : cast(ulong) cc, v);
+    pub("$SYS/broker/clients/connected", v);
+    pub("$SYS/broker/clients/total", v); // no offline-session registry: == connected
     num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttMessages), v);
     pub("$SYS/broker/messages/received", v);
+    num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttSent), v);
+    pub("$SYS/broker/messages/sent", v);
     immutable st = atomicLoad!(MemoryOrder.raw)(gMqttSubTotal);
     num(nb, st < 0 ? 0 : cast(ulong) st, v);
     pub("$SYS/broker/subscriptions/count", v);
@@ -1077,6 +1098,11 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     trieMatch(gTrieRoot, topic, 0);
     if (tMatchLen == 0)
         return;
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"+="(gMqttSent, cast(ulong) tMatchLen); // $SYS messages/sent
+    }
     // QoS0 packet built ONCE and shared (the hot path); QoS1 subscribers get a
     // per-conn packet with their own packet-id (a separate, slower branch that
     // does NOT touch the QoS0 fast path).
@@ -2274,6 +2300,13 @@ public void mqttReapOfflineConns() nothrow @trusted
 
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
+    if (c.connected)
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"-="(gMqttClientsConnected, 1); // $SYS clients/connected
+        c.connected = false;
+    }
     scope (exit)
     {
         if (c.tlsLeg !is null)
@@ -3394,6 +3427,12 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     c.aclUser = au;
             }
             c.connected = okPair;
+            if (okPair)
+            {
+                import core.atomic : atomicOp;
+
+                atomicOp!"+="(gMqttClientsConnected, 1);
+            }
             // [MQTT-3.1.3-6] empty ClientId on v5: the server assigns a unique one
             // and MUST return it (Assigned Client Identifier in the CONNACK). The
             // global gen counter makes it unique across shards; registered locally
