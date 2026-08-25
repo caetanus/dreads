@@ -59,7 +59,7 @@ O socket segue 100% do vibe; o TLS é uma tradução de bytes por conexão:
   kcat sasl, kafka-python SASL_PLAIN; suítes completas (nada regride sem
   SASL configurado).
 
-## M4 — RabbitMQ management HTTP API — **EM ANDAMENTO**
+## M4 — RabbitMQ management HTTP API — **LANDADO** (v1 `7799bb7` read plane + queues; v2 `0644282` connection registry list + close)
 
 - Porta 15672, servidor HTTP próprio (fundação: dashboard.d já serve
   HTTP). Superfície v1 (o que UI/rabbitmqadmin/operators mais usam):
