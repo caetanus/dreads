@@ -2839,6 +2839,117 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply,
     releaseShardPending(p);
 }
 
+/// STAGING variant of amqpDataExec for the LIVE publish RPUSH: a local key is
+/// applied inline (identical to amqpDataExec's local path); a REMOTE key has its
+/// hop FIRED without waiting and the pending returned. The caller (the AMQP serve
+/// loop) collects the pendings across a network batch and reaps them all at the
+/// flush boundary — so a pipelined publisher's cross-shard hops OVERLAP instead
+/// of each paying a full round-trip (the s4 hop tax). The reply is discarded (an
+/// RPUSH's :length is unused by the publish path). Returns the pending, or null
+/// when it applied locally / had nothing to stage (OOM). MIRRORS the RESP shard
+/// hop staging (c.shardPends) but stays entirely off the RESP path.
+private void* amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @trusted
+{
+    import dreads.acl : aclCmdIndex;
+    import dreads.commands : cmdWriteByIdx;
+    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+        shardEnqueue, shardWake, ShardMsg, shardOfSlot;
+    import dreads.slots : keyToSlot;
+
+    if (db < 0)
+        db = cast(int) gConfig.amqpDb;
+    static ByteBuffer raw; // TLS: fully consumed into `hb`/dispatch before any yield
+    raw.clear();
+    repArrayHeader(raw, args.length);
+    foreach (a; args)
+        repBulk(raw, a);
+    static Arena arena; // TLS scratch
+    arena.reset();
+    RVal cmd;
+    size_t pp = 0;
+    if (parseValue(raw.data, pp, arena, cmd) != ParseStatus.ok)
+        return null;
+    immutable opcode = aclCmdIndex(args[0]);
+    immutable owner = sharded() ? cast(int) shardOfSlot(keyToSlot(args[1])) : cast(int) tShard;
+    if (!sharded() || cast(uint) owner == tShard)
+    {
+        // local shard: apply inline, exactly like amqpDataExec — the reply is
+        // discarded (the publish path never reads the RPUSH :length).
+        static ByteBuffer lrep; // TLS: discarded reply sink
+        lrep.clear();
+        gRespProto = 2;
+        gWriteNoOp = false;
+        {
+            import dreads.notify : gNotifyDb;
+
+            gNotifyDb = db;
+        }
+        cast(void) dispatch(cmd, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]), lrep, arena, 0, opcode);
+        if (cmdWriteByIdx(opcode) && !gWriteNoOp && lrep.length && lrep.data[0] != '-')
+        {
+            gWriteEpoch++;
+            wakeKeyActivity();
+            signalReadyKeys(db, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]));
+            if (myAof().enabled)
+            {
+                import dreads.commands : propagationOverride;
+
+                if (!propagationOverride.empty)
+                    myAof().append(propagationOverride.data);
+                else
+                    myAof().appendIR(cmd, opcode, raw.data);
+            }
+        }
+        {
+            import dreads.commands : propagationOverride;
+
+            propagationOverride.clear();
+        }
+        if (gNotifyFlags)
+            flushPendingNotify();
+        return null; // applied locally: nothing to reap
+    }
+    // remote shard: FIRE the hop and return the pending (reaped later, at the
+    // batch flush). hb is STACK-local: shardEnqueue COPIES it into the ring before
+    // returning, so it need not survive past this call; `p` (embedded in hb for
+    // the coalesced reply) lives in the caller's list until reaped.
+    auto p = acquireShardPending();
+    ByteBuffer hb;
+    appendHopCmd(hb, cmd, raw.data, opcode, cast(uint) db, cast(void*) p);
+    if (hb.length == 0)
+    {
+        releaseShardPending(p); // OOM: drop (like amqpDataExec's empty reply)
+        return null;
+    }
+    shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.cmd);
+    shardWake(cast(uint) owner);
+    return cast(void*) p;
+}
+
+/// Reap ONE staged publish hop: wait for the owner's reply, then release the
+/// pending. Runs at the AMQP serve loop's flush boundary, before any confirm in
+/// the output batch is sent — so no confirm precedes its message's durability.
+private void amqpReapPend(void* pend) nothrow @trusted
+{
+    import dreads.shard : ShardPending, releaseShardPending;
+
+    if (pend is null)
+        return;
+    auto p = cast(ShardPending*) pend;
+    while (!p.ready)
+    {
+        immutable ec = p.done.emitCount;
+        if (p.ready)
+            break;
+        try
+            p.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    releaseShardPending(p);
+}
+
 /// Kafka group-coordinator hop: run ONE FSM op on the shard owning
 /// `routingKey` ("kafka.cg.<group>" — same slot as the group's offsets hash).
 /// Same shard = direct call; cross-shard = ShardMsg.kafkaGroup + pending wait
@@ -2974,13 +3085,18 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpReap, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
         const(char)[][3] a = ["rpush", key, payload];
         amqpDataExec(a[], rb);
     };
+    gAmqpPushStage = (scope const(char)[] key, scope const(char)[] payload) nothrow {
+        const(char)[][3] a = ["rpush", key, payload];
+        return amqpPushStage(a[]); // fire the RPUSH, return the pending (or null if local)
+    };
+    gAmqpReap = (void* pend) nothrow { amqpReapPend(pend); };
     gAmqpPushFront = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rbf; // TLS
         const(char)[][3] a = ["lpush", key, payload]; // requeue goes to the FRONT
