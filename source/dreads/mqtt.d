@@ -1,6 +1,8 @@
 module dreads.mqtt;
 
 import dreads.tls;
+import dreads.ws;
+import vibe.core.stream : IOMode;
 
 // MQTT 3.1.1 frontend — the FIRST non-RESP skin over the sharded core (the
 // "one ring" thesis made concrete: same process, same threads, same
@@ -178,6 +180,7 @@ private struct SubInfo
 public final class MqttConn
 {
     dreads.tls.TlsLeg* tlsLeg; // null = plaintext (every existing path untouched)
+    dreads.ws.WsCodec* wsCodec; // null = raw TCP; non-null = MQTT-over-WebSocket
     TCPConnection tcp;
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
@@ -1749,6 +1752,28 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
         c.wlock.lock();
         scope (exit)
             c.wlock.unlock();
+        if (c.wsCodec !is null)
+        {
+            // flush any control frames (pong/close) the decoder queued, then
+            // the MQTT payload as a binary frame — all under the wlock so
+            // frames keep order on the wire
+            static ByteBuffer wb; // TLS scratch, consumed synchronously
+            wb.clear();
+            if (!c.wsCodec.ctlOut.empty)
+            {
+                wb.append(c.wsCodec.ctlOut.data);
+                c.wsCodec.ctlOut.clear();
+            }
+            if (bytes.length)
+                wsEncodeBinary(wb, bytes);
+            if (!wb.empty)
+            {
+                if (c.tlsLeg !is null)
+                    return legSend(c.tlsLeg, c.tcp, cast(const(ubyte)[]) wb.data);
+                c.tcp.write(wb.data);
+            }
+            return true;
+        }
         if (c.tlsLeg !is null)
             return legSend(c.tlsLeg, c.tcp, bytes);
         c.tcp.write(bytes);
@@ -2250,11 +2275,18 @@ public void mqttReapOfflineConns() nothrow @trusted
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
     scope (exit)
+    {
         if (c.tlsLeg !is null)
         {
             c.tlsLeg.free(); // owning thread; after the writer joined
             c.tlsLeg = null;
         }
+        if (c.wsCodec !is null)
+        {
+            c.wsCodec.free();
+            c.wsCodec = null;
+        }
+    }
     // Model A: a persistent session that dropped its socket is held ALIVE by its
     // parked serve fiber (mqttParkOrEnd), NOT here. Teardown is the REAL end —
     // reached only when the session ended (expiry, park set sessionExpiry=0) or
@@ -2326,7 +2358,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     c.obox.release(); // the writer no longer releases obox (offline-hold keeps it)
 }
 
-public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
+public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false) nothrow
 {
     try
         tcp.tcpNoDelay = true; // PUBACK/deliveries are tiny — Nagle throttles
@@ -2342,6 +2374,36 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
             closeTcp(c);
             return;
         }
+    }
+    if (ws)
+    {
+        // read the HTTP upgrade request, do the RFC 6455 handshake, then run the
+        // normal MQTT loop with a WS codec framing every read/write
+        ubyte[8192] hb = void;
+        size_t hn;
+        try
+        {
+            if (tcp.waitForData(30.seconds))
+                hn = tcp.read(hb[], IOMode.once);
+        }
+        catch (Exception)
+        {
+        }
+        if (hn == 0 || !wsHandshake(tcp, cast(const(char)[]) hb[0 .. hn], "mqtt"))
+        {
+            closeTcp(c);
+            return;
+        }
+        c.wsCodec = WsCodec.create();
+        if (c.wsCodec is null)
+        {
+            closeTcp(c);
+            return;
+        }
+        // a client that pipelined its CONNECT right after the upgrade
+        auto tail = wsBodyAfterHandshake(hb[0 .. hn]);
+        if (tail.length)
+            cast(void) c.wsCodec.feed(tail);
     }
     c.shardId = tShard; // the shard that accepted this socket (for cross-shard resume)
     Task writer;
@@ -2361,6 +2423,14 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
     ByteBuffer outb;
     readloop: for (;;)
     {
+        // MQTT-over-WS: decoded bytes from a prior read (or the handshake tail)
+        // may already hold a full packet — process them WITHOUT blocking on the
+        // socket, or a client awaiting CONNACK after a pipelined CONNECT hangs.
+        immutable bool wsHavePre = c.wsCodec !is null && !c.wsCodec.pin.empty;
+        if (wsHavePre)
+            c.wsCodec.drainInto(inb);
+        else
+        {
         // read at least one byte; a keepalive-exceeded silence closes the conn
         // (waitForData returns false on BOTH the deadline and a real close —
         // both mean "drop it", exactly the MQTT keepalive contract). c.tcp (not
@@ -2399,7 +2469,52 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
             }
             return;
         }
-        if (c.tlsLeg !is null)
+        if (c.wsCodec !is null)
+        {
+            // read raw socket bytes (optionally through TLS for wss), decode WS
+            // frames into MQTT bytes. A pong/close the decoder queued goes out
+            // via sendTo(null). Any already-buffered decoded bytes (from the
+            // handshake tail) also drain here.
+            static ubyte[65536] wsread = void;
+            long rn;
+            if (c.tlsLeg !is null)
+            {
+                if (!legPump(c.tlsLeg, c.tcp))
+                {
+                    if (mqttParkOrEnd(c, false)) { inb.clear(); outb.clear(); continue readloop; }
+                    return;
+                }
+                static ByteBuffer plain;
+                plain.clear();
+                legDrainInto(c.tlsLeg, plain);
+                if (!c.wsCodec.feed(cast(const(ubyte)[]) plain.data))
+                {
+                    sendTo(c, null); // flush the close echo
+                    return;
+                }
+            }
+            else
+            {
+                try
+                    rn = c.tcp.read(wsread[0 .. (avail < wsread.length ? cast(size_t) avail : wsread.length)], IOMode.once);
+                catch (Exception)
+                {
+                    if (mqttParkOrEnd(c, false)) { inb.clear(); outb.clear(); continue readloop; }
+                    return;
+                }
+                if (rn <= 0)
+                    return;
+                if (!c.wsCodec.feed(wsread[0 .. cast(size_t) rn]))
+                {
+                    sendTo(c, null); // flush the close echo, then end
+                    return;
+                }
+            }
+            if (!c.wsCodec.ctlOut.empty)
+                sendTo(c, null); // flush pong(s)
+            c.wsCodec.drainInto(inb);
+        }
+        else if (c.tlsLeg !is null)
         {
             // cipher -> engine -> plaintext into inb; packet loop unchanged.
             // sendTo(null) flushes handshake cipher under the wlock.
@@ -2434,6 +2549,7 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
         }
         inb.grow(cast(size_t) avail);
         }
+        } // end: else (blocking read when no pre-buffered WS bytes)
 
         // parse complete packets off the front
         size_t pos = 0;

@@ -622,6 +622,10 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             cast(void) listenTCP(gConfig.mqttTlsPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveMqttClient(conn, true);
             }, listenOpts);
+        if (gConfig.mqttWsPort != 0)
+            cast(void) listenTCP(gConfig.mqttWsPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveMqttClient(conn, false, true); // MQTT over WebSocket
+            }, listenOpts);
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
                 bool retain, ulong seq, ubyte pubQos, scope const(char)[] props) nothrow {
             shardMqttFanout(topic, payload, retain, seq, pubQos, props);
@@ -4587,6 +4591,10 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
             if (gConfig.mqttTlsPort != 0)
                 cast(void) listenTCP(gConfig.mqttTlsPort, delegate(TCPConnection conn) @trusted nothrow {
                     serveMqttClient(conn, true);
+                }, sopts);
+            if (gConfig.mqttWsPort != 0)
+                cast(void) listenTCP(gConfig.mqttWsPort, delegate(TCPConnection conn) @trusted nothrow {
+                    serveMqttClient(conn, false, true);
                 }, sopts);
         }
         catch (Exception)
