@@ -873,6 +873,11 @@ private void mqttSessionDel(scope const(char)[] clientId) nothrow @trusted
 public shared ulong gMqttMessages; // total publishes routed (INFO/debug)
 public shared long gMqttClientsConnected; // currently-connected clients ($SYS)
 public shared ulong gMqttSent; // messages delivered to subscribers ($SYS)
+public shared ulong gMqttBytesRx; // MQTT bytes received ($SYS, opt-in)
+public shared ulong gMqttBytesTx; // MQTT bytes sent ($SYS, opt-in)
+// Byte accounting is OFF by default: it adds an atomic per packet in/out on the
+// hot path. Enable with `mqtt-sys-bytes yes` to get $SYS/broker/bytes/*.
+public __gshared bool gMqttSysBytes;
 /// Broker start time (ms) for $SYS/broker/uptime; stamped on the first $SYS tick.
 private shared ulong gMqttStartMs;
 
@@ -934,6 +939,13 @@ public void mqttPublishSys() nothrow @trusted
     pub("$SYS/broker/subscriptions/count", v);
     num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttDropped), v);
     pub("$SYS/broker/messages/dropped", v);
+    if (gMqttSysBytes)
+    {
+        num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttBytesRx), v);
+        pub("$SYS/broker/bytes/received", v);
+        num(nb, cast(ulong) atomicLoad!(MemoryOrder.raw)(gMqttBytesTx), v);
+        pub("$SYS/broker/bytes/sent", v);
+    }
     // deliver the $SYS batch (mqttDeliverLocal queued into subscriber outboxes)
     mqttFlushDirty();
 }
@@ -1773,6 +1785,12 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 {
     import dreads.tls : legSend;
 
+    if (gMqttSysBytes && bytes.length)
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"+="(gMqttBytesTx, cast(ulong) bytes.length);
+    }
     try
     {
         c.wlock.lock();
@@ -2664,6 +2682,12 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false
                 break; // incomplete body
             immutable ubyte h = d[pos];
             auto body_ = d[hp .. hp + rem];
+            if (gMqttSysBytes)
+            {
+                import core.atomic : atomicOp;
+
+                atomicOp!"+="(gMqttBytesRx, cast(ulong)(hp + rem - pos));
+            }
             if (!handlePacket(c, h, body_, outb))
             {
                 // v5: on a protocol-error close of an ESTABLISHED session, send a

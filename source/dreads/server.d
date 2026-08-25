@@ -612,6 +612,11 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         import dreads.mqtt : serveMqttClient, gMqttFanout, mqttDeliverLocal, mqttSeedStart;
 
         mqttSeedStart(); // $SYS uptime clock (accurate from the first tick)
+        {
+            import dreads.mqtt : gMqttSysBytes;
+
+            gMqttSysBytes = gConfig.mqttSysBytes; // opt-in $SYS/broker/bytes/*
+        }
         import dreads.mqtt : gMqttSubTotal, gMqttConnBcast, gMqttExec, gMqttResume;
 
         gMqttExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {

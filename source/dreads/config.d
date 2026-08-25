@@ -18,6 +18,7 @@ public struct Config
     ushort mqttPort = 0; // MQTT skin listener (0 = disabled); e.g. 1883
     ushort mqttWsPort = 0; // MQTT-over-WebSocket listener (0 = disabled); e.g. 8083
     ushort mqttWssPort = 0; // MQTT-over-WebSocket-over-TLS (wss); e.g. 8084
+    bool mqttSysBytes = false; // publish $SYS/broker/bytes/* (adds a hot-path atomic)
     ushort amqpPort = 0; // AMQP 0-9-1 skin listener (0 = disabled); e.g. 5672
     ushort kafkaPort = 0; // Kafka skin listener (0 = disabled); e.g. 9092
     ushort sqsPort = 0; // SQS (HTTP/REST) skin listener (0 = disabled); e.g. 9324
@@ -322,6 +323,14 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         try
             cfg.tlsPort = value.to!ushort;
         catch (Exception)
+            return false;
+        return true;
+    case "mqtt-sys-bytes":
+        if (value == "yes")
+            cfg.mqttSysBytes = true;
+        else if (value == "no")
+            cfg.mqttSysBytes = false;
+        else
             return false;
         return true;
     case "mqtt-ws-port":
