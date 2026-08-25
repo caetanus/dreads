@@ -241,6 +241,15 @@ public enum ShardMsg : uint
     /// [raw RESP]; meta = the client's shard; tag = its ShardPending (carried back
     /// to the client via the owning shard's ShardMsg.reply).
     raftPropose = 11,
+
+    /// AMQP live-publish DIRECT hop: carries [u16 db][u16 keyLen][key][record] raw
+    /// — NO synthesized RESP command, NO RVal encode. The owner builds the RPUSH
+    /// RVal straight from the key/record slices and applies it (dispatch + AOF +
+    /// consumer wake), skipping the RESP synthesize-on-producer / parse-on-owner /
+    /// hop-encode / hop-decode that the generic ShardMsg.cmd path pays. This is the
+    /// bulk of the cross-shard publish hop cost, so hopped publishes get cheap.
+    /// tag = the requester's ShardPending (durability ack), meta = requester shard.
+    amqpPush = 12,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which

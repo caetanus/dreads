@@ -2459,6 +2459,28 @@ private void shardDrainLoop() nothrow
                 shardWake(rq);
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.amqpPush)
+        {
+            // Owner: a DEDICATED AMQP live-publish hop. Payload [u16 db][u16
+            // keyLen][key][record]. Apply the RPUSH straight from the slices (no
+            // RESP synth/parse — that's the whole point) and ack the requester's
+            // pending so its confirm can ship. This is the cheap replacement for
+            // routing a synthesized RPUSH through ShardMsg.cmd.
+            if (p.length >= 4)
+            {
+                immutable adb = (p[0] << 8) | p[1];
+                immutable klen = (p[2] << 8) | p[3];
+                if (4 + klen <= p.length)
+                    amqpApplyRpush(cast(int) adb, cast(const(char)[]) p[4 .. 4 + klen],
+                            cast(const(char)[]) p[4 + klen .. $]);
+            }
+            if (tag !is null)
+            {
+                // empty durability ack: the reap only needs "applied", not bytes
+                shardEnqueue(cast(uint) meta, null, tag, 0, ShardMsg.reply);
+                shardWake(cast(uint) meta);
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.amqpCtl)
         {
             // AMQP skin control plane: replicate the declare/bind locally
@@ -2848,80 +2870,113 @@ private void amqpDataExec(scope const(char)[][] args, ref ByteBuffer reply,
 /// RPUSH's :length is unused by the publish path). Returns the pending, or null
 /// when it applied locally / had nothing to stage (OOM). MIRRORS the RESP shard
 /// hop staging (c.shardPends) but stays entirely off the RESP path.
-private void* amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @trusted
+// Apply an AMQP live-publish RPUSH on THIS shard's keyspace, building the command
+// RVal STRAIGHT from the key/record slices — no RESP text synthesize + re-parse.
+// Used by BOTH the local publish path AND the ShardMsg.amqpPush owner handler, so
+// a hopped publish costs the same as a local one minus the SPSC transfer (the
+// generic hop's synthesize-on-producer / parse-on-owner / hop-encode / hop-decode
+// are all gone). AOF, when enabled, still needs the RESP bytes for its record, so
+// that (cold) branch synthesizes them and keeps the IR-compressed encoding.
+private void amqpApplyRpush(int db, scope const(char)[] key, scope const(char)[] record) nothrow @trusted
 {
     import dreads.acl : aclCmdIndex;
-    import dreads.commands : cmdWriteByIdx;
-    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+    import dreads.commands : propagationOverride;
+
+    static int rpushOp = -2; // resolved once
+    if (rpushOp == -2)
+        rpushOp = aclCmdIndex("rpush");
+    static Arena arena;
+    arena.reset();
+    static ByteBuffer reply, raw;
+    reply.clear();
+    gRespProto = 2;
+    gWriteNoOp = false;
+    {
+        import dreads.notify : gNotifyDb;
+
+        gNotifyDb = db;
+    }
+    immutable aofOn = myAof().enabled;
+    auto ks = sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db];
+    RVal cmd;
+    RVal[3] argv = void;
+    if (aofOn)
+    {
+        // AOF's record is the RESP bytes: synthesize + parse so the args are
+        // slices INTO raw and the IR encoding still applies.
+        raw.clear();
+        repArrayHeader(raw, 3);
+        repBulk(raw, "rpush");
+        repBulk(raw, key);
+        repBulk(raw, record);
+        size_t pp = 0;
+        if (parseValue(raw.data, pp, arena, cmd) != ParseStatus.ok)
+            return;
+    }
+    else
+    {
+        // no AOF: build the RVal in place, ZERO synthesis.
+        argv[0].type = RType.BulkString;
+        argv[0].str = "rpush";
+        argv[1].type = RType.BulkString;
+        argv[1].str = key;
+        argv[2].type = RType.BulkString;
+        argv[2].str = record;
+        cmd.type = RType.Array;
+        cmd.arr = argv[]; // stack-local; dispatch below is yield-free so it stays valid
+    }
+    cast(void) dispatch(cmd, *ks, reply, arena, 0, rpushOp);
+    if (!gWriteNoOp && reply.length && reply.data[0] != '-')
+    {
+        gWriteEpoch++;
+        wakeKeyActivity();
+        signalReadyKeys(db, *ks);
+        if (aofOn)
+        {
+            if (!propagationOverride.empty)
+                myAof().append(propagationOverride.data);
+            else
+                myAof().appendIR(cmd, rpushOp, raw.data);
+        }
+    }
+    propagationOverride.clear();
+    if (gNotifyFlags)
+        flushPendingNotify();
+}
+
+private void* amqpPushStage(scope const(char)[][] args, int db = -1) nothrow @trusted
+{
+    import dreads.shard : tShard, acquireShardPending,
         shardEnqueue, shardWake, ShardMsg, shardOfSlot;
     import dreads.slots : keyToSlot;
 
     if (db < 0)
         db = cast(int) gConfig.amqpDb;
-    static ByteBuffer raw; // TLS: fully consumed into `hb`/dispatch before any yield
-    raw.clear();
-    repArrayHeader(raw, args.length);
-    foreach (a; args)
-        repBulk(raw, a);
-    static Arena arena; // TLS scratch
-    arena.reset();
-    RVal cmd;
-    size_t pp = 0;
-    if (parseValue(raw.data, pp, arena, cmd) != ParseStatus.ok)
-        return null;
-    immutable opcode = aclCmdIndex(args[0]);
-    immutable owner = sharded() ? cast(int) shardOfSlot(keyToSlot(args[1])) : cast(int) tShard;
+    // args = ["rpush", key, record] (installed by amqpInstallHooks).
+    auto key = args[1];
+    auto record = args[2];
+    immutable owner = sharded() ? cast(int) shardOfSlot(keyToSlot(key)) : cast(int) tShard;
     if (!sharded() || cast(uint) owner == tShard)
     {
-        // local shard: apply inline, exactly like amqpDataExec — the reply is
-        // discarded (the publish path never reads the RPUSH :length).
-        static ByteBuffer lrep; // TLS: discarded reply sink
-        lrep.clear();
-        gRespProto = 2;
-        gWriteNoOp = false;
-        {
-            import dreads.notify : gNotifyDb;
-
-            gNotifyDb = db;
-        }
-        cast(void) dispatch(cmd, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]), lrep, arena, 0, opcode);
-        if (cmdWriteByIdx(opcode) && !gWriteNoOp && lrep.length && lrep.data[0] != '-')
-        {
-            gWriteEpoch++;
-            wakeKeyActivity();
-            signalReadyKeys(db, *(sharded() ? myKeyspace2(cast(uint) db) : &gDbs[db]));
-            if (myAof().enabled)
-            {
-                import dreads.commands : propagationOverride;
-
-                if (!propagationOverride.empty)
-                    myAof().append(propagationOverride.data);
-                else
-                    myAof().appendIR(cmd, opcode, raw.data);
-            }
-        }
-        {
-            import dreads.commands : propagationOverride;
-
-            propagationOverride.clear();
-        }
-        if (gNotifyFlags)
-            flushPendingNotify();
-        return null; // applied locally: nothing to reap
+        amqpApplyRpush(db, key, record); // local: direct RVal apply, no synthesis
+        return null; // nothing to reap
     }
-    // remote shard: FIRE the hop and return the pending (reaped later, at the
-    // batch flush). hb is STACK-local: shardEnqueue COPIES it into the ring before
-    // returning, so it need not survive past this call; `p` (embedded in hb for
-    // the coalesced reply) lives in the caller's list until reaped.
+    // remote shard: FIRE a DEDICATED amqpPush hop carrying [u16 db][u16 keyLen]
+    // [key][record] RAW — no RESP synthesis, no RVal hop-encode. The owner builds
+    // the RPUSH RVal straight from these slices (amqpApplyRpush). hb is STACK-local
+    // (shardEnqueue copies it into the ring before returning); `p` lives in the
+    // caller's reap list until the owner acks.
+    if (key.length > 0xFFFF)
+        return null; // absurd key: drop (never happens for amq.q.* names)
     auto p = acquireShardPending();
     ByteBuffer hb;
-    appendHopCmd(hb, cmd, raw.data, opcode, cast(uint) db, cast(void*) p);
-    if (hb.length == 0)
-    {
-        releaseShardPending(p); // OOM: drop (like amqpDataExec's empty reply)
-        return null;
-    }
-    shardEnqueue(cast(uint) owner, hb.data, null, tShard, ShardMsg.cmd);
+    hb.appendByte(cast(char)(db >> 8));
+    hb.appendByte(cast(char)(db & 0xFF));
+    hb.appendByte(cast(char)(key.length >> 8));
+    hb.appendByte(cast(char)(key.length & 0xFF));
+    hb.append(key);
+    hb.append(record);
+    shardEnqueue(cast(uint) owner, hb.data, cast(void*) p, tShard, ShardMsg.amqpPush);
     shardWake(cast(uint) owner);
     return cast(void*) p;
 }
