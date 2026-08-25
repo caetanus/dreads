@@ -187,6 +187,10 @@ SSL_CTX* tlsClientCtx(scope const(char)[] caFile) @trusted @nogc nothrow
     return ctx;
 }
 
+// One SSL_CTX shared by every TLS listener (one cert set for the server, the
+// Redis model). Built at boot by the server before any listener/shard starts.
+public __gshared SSL_CTX* gTlsCtx;
+
 // ---------------------------------------------------------------------------
 // Per-connection engine
 // ---------------------------------------------------------------------------
@@ -467,4 +471,117 @@ version (unittest)
     wire.release();
     srvPlain.release();
     cliPlain.release();
+}
+
+// ---------------------------------------------------------------------------
+// TlsLeg — the per-connection kit the protocol skins embed (engine + the three
+// buffers). The skins keep their own socket/lock discipline: every socket
+// write of produced cipher happens inside the skin's wlock'd send helper, so
+// records keep SSL's output order; the pump here never writes.
+// ---------------------------------------------------------------------------
+
+import vibe.core.net : TCPConnection;
+
+public struct TlsLeg
+{
+    TlsConn* t;
+    ByteBuffer cin; // cipher read scratch
+    ByteBuffer cout; // cipher write staging (used inside the skin's lock)
+    ByteBuffer pin; // decrypted plaintext not yet consumed by the skin
+
+    /// malloc'd; created/freed on the owning shard thread (allocator rule).
+    static TlsLeg* create(bool server) @trusted nothrow
+    {
+        import core.stdc.stdlib : calloc, cfree = free;
+
+        if (gTlsCtx is null)
+            return null;
+        auto L = cast(TlsLeg*) calloc(1, TlsLeg.sizeof);
+        if (L is null)
+            return null;
+        L.t = TlsConn.create(gTlsCtx, server);
+        if (L.t is null)
+        {
+            cfree(L);
+            return null;
+        }
+        return L;
+    }
+
+    void free() @trusted nothrow
+    {
+        import core.stdc.stdlib : cfree = free;
+
+        if (t !is null)
+            t.free();
+        cin.release();
+        cout.release();
+        pin.release();
+        cfree(&this);
+    }
+}
+
+/// ONE blocking socket read, decrypted into pin. False = peer gone or fatal
+/// TLS error (close the connection). Handshake output produced here stays in
+/// the engine until the skin's next send (call it with null right after).
+public bool legPump(TlsLeg* L, TCPConnection tcp) nothrow @trusted
+{
+    try
+    {
+        if (!tcp.waitForData())
+            return false;
+        auto avail = tcp.leastSize;
+        if (avail == 0)
+            return false;
+        if (avail > 256 * 1024)
+            avail = 256 * 1024;
+        auto cs = L.cin.freeSpace(cast(size_t) avail);
+        if (cs.length < cast(size_t) avail)
+            return false; // OOM growing the cipher scratch
+        tcp.read(cs[0 .. cast(size_t) avail]);
+        return L.t.feed(cast(const(ubyte)[]) cs[0 .. cast(size_t) avail])
+            && L.t.readPlain(L.pin);
+    }
+    catch (Exception)
+        return false;
+}
+
+/// Copies decrypted bytes out of pin (up to dst.length), consuming them.
+public size_t legTake(TlsLeg* L, scope ubyte[] dst) nothrow @trusted
+{
+    immutable n = L.pin.length < dst.length ? L.pin.length : dst.length;
+    if (n == 0)
+        return 0;
+    dst[0 .. n] = (cast(const(ubyte)[]) L.pin.data)[0 .. n];
+    L.pin.consume(n);
+    return n;
+}
+
+/// Moves ALL of pin into the skin's input buffer (the avail-style read loops).
+public void legDrainInto(TlsLeg* L, ref ByteBuffer dst) nothrow @trusted
+{
+    if (L.pin.empty)
+        return;
+    dst.append(L.pin.data);
+    L.pin.clear();
+}
+
+/// Encrypt + drain + socket write. The CALLER holds its connection's write
+/// lock (the same hold that orders plaintext writers today). plain may be
+/// null/empty: that just flushes buffered handshake/pending cipher.
+public bool legSend(TlsLeg* L, TCPConnection tcp, scope const(ubyte)[] plain) nothrow @trusted
+{
+    cast(void) L.t.writePlain(plain);
+    L.cout.clear();
+    L.t.drainCipher(L.cout);
+    bool ok = true;
+    if (!L.cout.empty)
+    {
+        try
+            tcp.write(L.cout.data);
+        catch (Exception)
+            ok = false;
+    }
+    L.cout.clear();
+    return ok && !L.t.failed;
 }

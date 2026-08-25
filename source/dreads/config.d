@@ -33,6 +33,10 @@ public struct Config
     string tlsKeyFile;
     string tlsCaCertFile;
     string tlsAuthClients = "no"; // no | optional | yes (mTLS)
+    // per-skin TLS listeners (same cert set): 8883/5671/SSL:// equivalents
+    ushort mqttTlsPort = 0;
+    ushort amqpTlsPort = 0;
+    ushort kafkaTlsPort = 0;
     // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
     // log) and the rewrite/snapshot re-emit the cache — EVALSHA survives a
     // restart AND a master failover. `no` = Redis-faithful volatile cache.
@@ -298,6 +302,24 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
     case "tls-port":
         try
             cfg.tlsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "mqtt-tls-port":
+        try
+            cfg.mqttTlsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "amqp-tls-port":
+        try
+            cfg.amqpTlsPort = value.to!ushort;
+        catch (Exception)
+            return false;
+        return true;
+    case "kafka-tls-port":
+        try
+            cfg.kafkaTlsPort = value.to!ushort;
         catch (Exception)
             return false;
         return true;

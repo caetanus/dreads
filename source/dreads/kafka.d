@@ -769,18 +769,42 @@ private long offsetForTime(scope const(char)[] key, long hw, long ts) nothrow @t
 // ---------------------------------------------------------------------------
 // serve loop
 
-public void serveKafkaClient(TCPConnection tcp) nothrow
+public void serveKafkaClient(TCPConnection tcp, bool tls = false) nothrow
 {
+    import dreads.tls : TlsLeg, legPump, legDrainInto, legSend;
+
     try
         tcp.tcpNoDelay = true;
     catch (Exception)
     {
     }
+    TlsLeg* leg;
+    if (tls)
+    {
+        leg = TlsLeg.create(true);
+        if (leg is null)
+            return;
+    }
+    scope (exit)
+        if (leg !is null)
+            leg.free();
     auto wlock = new TaskMutex;
     ByteBuffer inb;
     ByteBuffer outb;
     for (;;)
     {
+        if (leg !is null)
+        {
+            // cipher in -> plaintext lands in inb; the frame loop is unchanged.
+            // Single fiber: the handshake flush right after the pump is safe.
+            if (!legPump(leg, tcp))
+                return;
+            legDrainInto(leg, inb);
+            if (!legSend(leg, tcp, null))
+                return;
+        }
+        else
+        {
         bool alive;
         try
             alive = tcp.waitForData();
@@ -803,6 +827,7 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
         catch (Exception)
             return;
         inb.grow(cast(size_t) avail);
+        }
 
         size_t pos = 0;
         for (;;)
@@ -817,6 +842,7 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
             if (d.length - pos < 4 + sz)
                 break;
             tByteBufferOom = false; // clear any stale flag (leaked from another skin)
+            tKafkaAdvPort = leg !is null && gKafkaTlsPort != 0 ? gKafkaTlsPort : gKafkaPort;
             handleRequest(d[pos + 4 .. pos + 4 + sz], outb);
             if (tByteBufferOom)
                 return; // OOM building this reply: drop THIS client, not the broker
@@ -833,7 +859,13 @@ public void serveKafkaClient(TCPConnection tcp) nothrow
                 wlock.lock();
                 scope (exit)
                     wlock.unlock();
-                tcp.write(outb.data);
+                if (leg !is null)
+                {
+                    if (!legSend(leg, tcp, cast(const(ubyte)[]) outb.data))
+                        return;
+                }
+                else
+                    tcp.write(outb.data);
             }
             catch (Exception)
                 return;
@@ -1089,6 +1121,15 @@ public shared ulong gKafkaProduced; // records stored via Produce (dashboard)
 public shared ulong gKafkaFetched;  // records served via Fetch (dashboard)
 public __gshared const(char)[] gKafkaHost = "127.0.0.1";
 public __gshared ushort gKafkaPort = 9092;
+public __gshared ushort gKafkaTlsPort = 0; // the TLS listener (advertised to TLS conns)
+
+// Which port THIS connection should see in Metadata/FindCoordinator broker
+// entries: a client that connected over TLS must be pointed back at the TLS
+// listener, or its next (re)connect handshakes plaintext and times out. Set
+// per REQUEST (before handleRequest) — a fiber switch mid-response cannot
+// clobber it because the advertise happens before any yield in the handlers,
+// but keep it per-request anyway (cheap, and immune to handler reordering).
+private ushort tKafkaAdvPort;
 /// When true (default), any named topic auto-exists with KAFKA_PARTITIONS (the
 /// stateless model — clients need no CreateTopics). When false, a topic exists
 /// only once created (CreateTopics) or produced-into, and Metadata returns
@@ -3332,7 +3373,7 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
         putCStrNull(o, null, true); // error_message = null
         putI32(o, 0); // node_id = us
         putCStr(o, gKafkaHost);
-        putI32(o, gKafkaPort);
+        putI32(o, tKafkaAdvPort);
         putTaggedFields(o);
         return;
     }
@@ -3346,7 +3387,7 @@ private void handleFindCoordinator(ref Rd r, short ver, ref ByteBuffer o) nothro
         putI16(o, -1); // error_message = null
     putI32(o, 0); // node_id = us
     putStr(o, gKafkaHost);
-    putI32(o, gKafkaPort);
+    putI32(o, tKafkaAdvPort);
 }
 
 // Topic registry: created topics live in the hash `kafka.topics`, field=name,
@@ -4579,7 +4620,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     putCArrLen(o, 1);
     putI32(o, 0); // node_id
     putCStr(o, gKafkaHost);
-    putI32(o, gKafkaPort);
+    putI32(o, tKafkaAdvPort);
     putCStrNull(o, null, true); // rack: null
     putTaggedFields(o); // broker tagged fields
     putCStrNull(o, "dreads-cluster", false); // cluster_id (0063/0121 read it)
@@ -4685,7 +4726,7 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     putI32(o, 1);
     putI32(o, 0); // node_id 0
     putStr(o, gKafkaHost);
-    putI32(o, gKafkaPort);
+    putI32(o, tKafkaAdvPort);
     if (ver >= 1)
         putI16(o, -1); // rack: null
     if (ver >= 2)

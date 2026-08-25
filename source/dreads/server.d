@@ -49,7 +49,7 @@ private bool heldByWritePause(scope const(char)[] uname, const ref RVal cmd) @no
     return isPausedByWrite(uname);
 }
 import dreads.config : applyDirective, gConfig, isRuntimeSettable, isCompatModeParam, parseMemory;
-import dreads.tls : SSL_CTX, TlsClientAuth, TlsConn, tlsServerCtx;
+import dreads.tls : SSL_CTX, TlsClientAuth, TlsConn, tlsServerCtx, gTlsCtx;
 import dreads.mem : Arena, ByteBuffer;
 import dreads.alloc : ConnAllocator;
 import emplace.vector : Vector;
@@ -424,7 +424,8 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 : gPubSub.publish(chan, msg);
         };
     }
-    if (gConfig.tlsPort != 0)
+    if (gConfig.tlsPort != 0 || gConfig.mqttTlsPort != 0 || gConfig.amqpTlsPort != 0
+            || gConfig.kafkaTlsPort != 0)
     {
         // built BEFORE any listener/shard thread exists; a bad cert aborts boot
         // (a TLS port that silently fell back to plaintext would be worse)
@@ -594,6 +595,10 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
             serveMqttClient(conn);
         }, listenOpts);
+        if (gConfig.mqttTlsPort != 0)
+            cast(void) listenTCP(gConfig.mqttTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveMqttClient(conn, true);
+            }, listenOpts);
         gMqttFanout = (scope const(char)[] topic, scope const(char)[] payload,
                 bool retain, ulong seq, ubyte pubQos, scope const(char)[] props) nothrow {
             shardMqttFanout(topic, payload, retain, seq, pubQos, props);
@@ -614,11 +619,15 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         cast(void) listenTCP(gConfig.amqpPort, delegate(TCPConnection conn) @trusted nothrow {
             serveAmqpClient(conn);
         }, listenOpts);
+        if (gConfig.amqpTlsPort != 0)
+            cast(void) listenTCP(gConfig.amqpTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveAmqpClient(conn, true);
+            }, listenOpts);
         printf("dreads AMQP skin on port %u\n", cast(uint) gConfig.amqpPort);
     }
     if (gConfig.kafkaPort != 0)
     {
-        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort,
+        import dreads.kafka : serveKafkaClient, gKafkaExec, gKafkaPort, gKafkaTlsPort,
             gKafkaFetchRaw, gKafkaLenRaw;
 
         gKafkaExec = (scope const(char)[][] args, ref ByteBuffer reply) nothrow {
@@ -635,6 +644,7 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         gKafkaFetchRaw = &kafkaFetchDirect;
         gKafkaLenRaw = &kafkaLenDirect;
         gKafkaPort = gConfig.kafkaPort;
+        gKafkaTlsPort = gConfig.kafkaTlsPort;
         {
             import core.stdc.stdlib : getenv;
             import core.stdc.string : strcmp;
@@ -648,6 +658,10 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
             serveKafkaClient(conn);
         }, listenOpts);
+        if (gConfig.kafkaTlsPort != 0)
+            cast(void) listenTCP(gConfig.kafkaTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                serveKafkaClient(conn, true);
+            }, listenOpts);
         printf("dreads Kafka skin on port %u\n", cast(uint) gConfig.kafkaPort);
     }
     // sharded: main thread becomes shard 0 (this listener is its router); spawn the
@@ -745,11 +759,6 @@ private void initReplication()
 // Max raft writes a single connection can hold in flight before we reap them.
 // Bounds per-connection state (8 bytes each) and the group-commit batch depth.
 private enum PIPELINE_CAP = 256;
-
-// The RESP TLS listener's context (config tls-port; null = no TLS listener).
-// Built ONCE at boot before any listener/shard starts; SSL_CTX is thread-safe
-// for the per-connection SSL_new that follows.
-package __gshared SSL_CTX* gTlsCtx;
 
 private struct Conn
 {
@@ -4531,9 +4540,15 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         import dreads.mqtt : serveMqttClient;
 
         try
+        {
             cast(void) listenTCP(gConfig.mqttPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveMqttClient(conn);
             }, sopts);
+            if (gConfig.mqttTlsPort != 0)
+                cast(void) listenTCP(gConfig.mqttTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                    serveMqttClient(conn, true);
+                }, sopts);
+        }
         catch (Exception)
         {
         }
@@ -4543,9 +4558,15 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         import dreads.amqp : serveAmqpClient;
 
         try
+        {
             cast(void) listenTCP(gConfig.amqpPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveAmqpClient(conn);
             }, sopts);
+            if (gConfig.amqpTlsPort != 0)
+                cast(void) listenTCP(gConfig.amqpTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                    serveAmqpClient(conn, true);
+                }, sopts);
+        }
         catch (Exception)
         {
         }
@@ -4555,9 +4576,15 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
         import dreads.kafka : serveKafkaClient;
 
         try
+        {
             cast(void) listenTCP(gConfig.kafkaPort, delegate(TCPConnection conn) @trusted nothrow {
                 serveKafkaClient(conn);
             }, sopts);
+            if (gConfig.kafkaTlsPort != 0)
+                cast(void) listenTCP(gConfig.kafkaTlsPort, delegate(TCPConnection conn) @trusted nothrow {
+                    serveKafkaClient(conn, true);
+                }, sopts);
+        }
         catch (Exception)
         {
         }

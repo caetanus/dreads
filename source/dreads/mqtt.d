@@ -1,5 +1,7 @@
 module dreads.mqtt;
 
+import dreads.tls;
+
 // MQTT 3.1.1 frontend — the FIRST non-RESP skin over the sharded core (the
 // "one ring" thesis made concrete: same process, same threads, same
 // share-nothing fabric; RESP is just one protocol face among several).
@@ -175,6 +177,7 @@ private struct SubInfo
 
 public final class MqttConn
 {
+    dreads.tls.TlsLeg* tlsLeg; // null = plaintext (every existing path untouched)
     TCPConnection tcp;
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
@@ -1739,11 +1742,15 @@ private void mqttReleaseHeld(MqttConn s) nothrow @trusted
 
 private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
 {
+    import dreads.tls : legSend;
+
     try
     {
         c.wlock.lock();
         scope (exit)
             c.wlock.unlock();
+        if (c.tlsLeg !is null)
+            return legSend(c.tlsLeg, c.tcp, bytes);
         c.tcp.write(bytes);
         return true;
     }
@@ -2242,6 +2249,12 @@ public void mqttReapOfflineConns() nothrow @trusted
 
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
+    scope (exit)
+        if (c.tlsLeg !is null)
+        {
+            c.tlsLeg.free(); // owning thread; after the writer joined
+            c.tlsLeg = null;
+        }
     // Model A: a persistent session that dropped its socket is held ALIVE by its
     // parked serve fiber (mqttParkOrEnd), NOT here. Teardown is the REAL end —
     // reached only when the session ended (expiry, park set sessionExpiry=0) or
@@ -2313,7 +2326,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     c.obox.release(); // the writer no longer releases obox (offline-hold keeps it)
 }
 
-public void serveMqttClient(TCPConnection tcp) nothrow
+public void serveMqttClient(TCPConnection tcp, bool tls = false) nothrow
 {
     try
         tcp.tcpNoDelay = true; // PUBACK/deliveries are tiny — Nagle throttles
@@ -2321,6 +2334,15 @@ public void serveMqttClient(TCPConnection tcp) nothrow
     {
     }
     auto c = new MqttConn(tcp);
+    if (tls)
+    {
+        c.tlsLeg = TlsLeg.create(true);
+        if (c.tlsLeg is null)
+        {
+            closeTcp(c);
+            return;
+        }
+    }
     c.shardId = tShard; // the shard that accepted this socket (for cross-shard resume)
     Task writer;
     try
@@ -2377,6 +2399,24 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             }
             return;
         }
+        if (c.tlsLeg !is null)
+        {
+            // cipher -> engine -> plaintext into inb; packet loop unchanged.
+            // sendTo(null) flushes handshake cipher under the wlock.
+            if (!legPump(c.tlsLeg, c.tcp) || !sendTo(c, null))
+            {
+                if (mqttParkOrEnd(c, false))
+                {
+                    inb.clear();
+                    outb.clear();
+                    continue readloop;
+                }
+                return;
+            }
+            legDrainInto(c.tlsLeg, inb);
+        }
+        else
+        {
         auto space = inb.freeSpace(cast(size_t) avail);
         if (space.length < cast(size_t) avail)
             return; // OOM growing the input buffer: drop THIS client, not the broker
@@ -2393,6 +2433,7 @@ public void serveMqttClient(TCPConnection tcp) nothrow
             return;
         }
         inb.grow(cast(size_t) avail);
+        }
 
         // parse complete packets off the front
         size_t pos = 0;

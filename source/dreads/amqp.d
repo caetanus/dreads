@@ -1,5 +1,7 @@
 module dreads.amqp;
 
+import dreads.tls : TlsLeg, legPump, legTake, legDrainInto, legSend;
+
 // AMQP 0-9-1 frontend — the SECOND non-RESP skin over the sharded core.
 //
 // The structural bet: an AMQP QUEUE IS A LIST in the keyspace of the shard
@@ -1740,6 +1742,7 @@ private struct Unacked
 
 private final class AmqpConn
 {
+    TlsLeg* tlsLeg; // null = plaintext
     TCPConnection tcp;
     TaskMutex wlock;
     Channel[ushort] chans;
@@ -1796,7 +1799,10 @@ private void sendTo(AmqpConn c, scope const(ubyte)[] bytes) nothrow
         c.wlock.lock();
         scope (exit)
             c.wlock.unlock();
-        c.tcp.write(bytes);
+        if (c.tlsLeg !is null)
+            cast(void) legSend(c.tlsLeg, c.tcp, bytes);
+        else
+            c.tcp.write(bytes);
     }
     catch (Exception)
     {
@@ -1859,8 +1865,26 @@ private void channelClose(ref ByteBuffer o, ushort chan, ushort code,
 // ---------------------------------------------------------------------------
 // Serve loop
 
-public void serveAmqpClient(TCPConnection tcp) nothrow
+public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
 {
+    TlsLeg* leg;
+    if (tls)
+    {
+        leg = TlsLeg.create(true);
+        if (leg is null)
+        {
+            try
+                tcp.close();
+            catch (Exception)
+            {
+            }
+            return;
+        }
+    }
+    scope (exit)
+        if (leg !is null)
+            leg.free(); // nulled below once a conn (or the 1.0 skin) owns it
+
     seedWellKnownExchanges(); // once per shard thread: the mandated amq.* defaults
     try
         tcp.tcpNoDelay = true;
@@ -1868,6 +1892,7 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
     {
     }
     auto c = new AmqpConn(tcp);
+    c.tlsLeg = leg; // conn owns it for send/recv; serve's scope(exit) still frees
     static void closeQuiet(AmqpConn cc) nothrow
     {
         try
@@ -1923,6 +1948,15 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         size_t got = 0;
         while (got < 8)
         {
+            if (leg !is null)
+            {
+                got += legTake(leg, hdr[got .. 8]);
+                if (got == 8)
+                    break;
+                if (!legPump(leg, tcp) || !legSend(leg, tcp, null))
+                    return; // handshake flush is single-fiber here (no conn yet)
+                continue;
+            }
             try
             {
                 if (!tcp.waitForData())
@@ -1948,16 +1982,23 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
             {
                 import dreads.amqp10 : amqp10Serve;
 
-                amqp10Serve(tcp, hdr[4] == 3);
+                auto legHand = leg;
+                leg = null; // the 1.0 skin owns it now (frees on its teardown)
+                amqp10Serve(tcp, hdr[4] == 3, legHand);
                 return;
             }
             // bad/unsupported protocol header: reply with the header we DO
             // support, then close (the 0-9-1 spec's negotiation-failure path —
             // the java suite's crazyProtocolHeader reads it back)
-            try
-                tcp.write(cast(const(ubyte)[]) "AMQP\x00\x00\x09\x01");
-            catch (Exception)
+            if (leg !is null)
+                cast(void) legSend(leg, tcp, cast(const(ubyte)[]) "AMQP\x00\x00\x09\x01");
+            else
             {
+                try
+                    tcp.write(cast(const(ubyte)[]) "AMQP\x00\x00\x09\x01");
+                catch (Exception)
+                {
+                }
             }
             return;
         }
@@ -2019,31 +2060,56 @@ public void serveAmqpClient(TCPConnection tcp) nothrow
         outb.clear();
     }
 
+    // TLS: plaintext decrypted PAST the 8-byte header (e.g. a pipelined
+    // StartOk) is already in pin — parse it BEFORE blocking for fresh bytes,
+    // or a client that awaits our reply deadlocks against our waitForData.
+    bool preDrained = false;
+    if (leg !is null && !leg.pin.empty)
+    {
+        legDrainInto(leg, inb);
+        preDrained = true;
+    }
     for (;;)
     {
-        bool alive;
-        try
-            alive = tcp.waitForData();
-        catch (Exception)
-            alive = false;
-        if (!alive)
-            return;
-        ulong avail;
-        try
-            avail = tcp.leastSize;
-        catch (Exception)
-            return;
-        if (avail == 0)
-            return;
-        auto space = inb.freeSpace(cast(size_t) avail);
-        if (space.length < cast(size_t) avail)
-            return; // OOM growing the input buffer: drop THIS client, not the broker
-        try
-            tcp.read(space[0 .. cast(size_t) avail]);
-        catch (Exception)
-            return;
-        c.lastReadMs = monoMs(); // heartbeat dead-peer clock
-        inb.grow(cast(size_t) avail);
+        if (preDrained)
+            preDrained = false; // one shot: parse what we already hold
+        else
+        {
+            bool alive;
+            try
+                alive = tcp.waitForData();
+            catch (Exception)
+                alive = false;
+            if (!alive)
+                return;
+            ulong avail;
+            try
+                avail = tcp.leastSize;
+            catch (Exception)
+                return;
+            if (avail == 0)
+                return;
+            if (leg !is null)
+            {
+                if (!legPump(leg, tcp))
+                    return;
+                legDrainInto(leg, inb);
+                sendTo(c, null); // flush handshake cipher under the wlock
+                c.lastReadMs = monoMs();
+            }
+            else
+            {
+                auto space = inb.freeSpace(cast(size_t) avail);
+                if (space.length < cast(size_t) avail)
+                    return; // OOM growing the input buffer: drop THIS client, not the broker
+                try
+                    tcp.read(space[0 .. cast(size_t) avail]);
+                catch (Exception)
+                    return;
+                c.lastReadMs = monoMs(); // heartbeat dead-peer clock
+                inb.grow(cast(size_t) avail);
+            }
+        }
 
         size_t pos = 0;
         for (;;)

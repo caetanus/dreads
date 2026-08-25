@@ -9,6 +9,8 @@
 /// monotonic clocks for dead-peer, hold replies until their flush.
 module dreads.amqp10;
 
+import dreads.tls : TlsLeg, legPump, legTake, legSend;
+
 import vibe.core.net : TCPConnection;
 import vibe.core.core : runTask, sleep;
 import vibe.core.sync : TaskMutex;
@@ -586,6 +588,7 @@ private struct A10Session
 
 private final class A10Conn
 {
+    TlsLeg* tlsLeg; // null = plaintext (handed over by the 0-9-1 accept)
     TCPConnection tcp;
     bool closing;
     uint peerIdleMs; // peer's open.idle-time-out: we SEND empties at half it
@@ -644,7 +647,13 @@ private void a10Send(A10Conn c, scope const(ubyte)[] bytes) nothrow
         c.wlock.lock();
         scope (exit)
             c.wlock.unlock();
-        c.tcp.write(bytes);
+        if (c.tlsLeg !is null)
+        {
+            if (!legSend(c.tlsLeg, c.tcp, bytes))
+                c.closing = true;
+        }
+        else
+            c.tcp.write(bytes);
     }
     catch (Exception)
         c.closing = true;
@@ -691,17 +700,23 @@ private bool a10SaslCheck(scope const(ubyte)[] mech, scope const(ubyte)[] resp) 
 /// Entry point from dreads.amqp's header dispatch. `saslLayer` = the client
 /// sent the SASL header (protocol-id 3); bare (0) skips straight to open.
 /// The dispatching caller has ALREADY consumed the 8-byte header.
-public void amqp10Serve(TCPConnection tcp, bool saslLayer) nothrow
+public void amqp10Serve(TCPConnection tcp, bool saslLayer, TlsLeg* leg = null) nothrow
 {
     import dreads.amqp : a10NewConnId;
 
     auto c = new A10Conn(tcp);
+    c.tlsLeg = leg; // ownership transferred from the 0-9-1 accept
     c.connId = a10NewConnId();
     scope (exit)
     {
         c.closing = true;
         a10TeardownRequeue(c);
         closeQuiet(tcp);
+        if (c.tlsLeg !is null)
+        {
+            c.tlsLeg.free(); // owning thread, after every sender is done
+            c.tlsLeg = null;
+        }
     }
 
     ByteBuffer outb;
@@ -4092,6 +4107,19 @@ private bool a10ReadExact(A10Conn c, scope ubyte[] dst) nothrow
     size_t got = 0;
     while (got < dst.length)
     {
+        if (c.tlsLeg !is null)
+        {
+            got += legTake(c.tlsLeg, dst[got .. $]);
+            if (got == dst.length)
+                break;
+            // a10Send(null) flushes handshake cipher under the wlock
+            if (!legPump(c.tlsLeg, c.tcp))
+                return false;
+            a10Send(c, null);
+            if (c.closing)
+                return false;
+            continue;
+        }
         try
         {
             if (!c.tcp.waitForData())
