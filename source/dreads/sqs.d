@@ -21,6 +21,8 @@ public __gshared void delegate(scope const(char)[][] args, ref ByteBuffer reply)
 private enum string Q_PREFIX = "sqs.q."; // the message list
 private enum string IF_PREFIX = "sqs.if."; // in-flight (visibility) hash
 private enum string Q_REGISTRY = "sqs.queues"; // set of queue names
+private enum string DD_PREFIX = "sqs.dd."; // FIFO dedup hash: dedupId -> msgid
+private enum string GRP_PREFIX = "sqs.grp."; // FIFO locked message-groups (set)
 private enum char SEP = '\x1f'; // record field separator (never in JSON body text? escaped)
 
 public void startSqs() nothrow
@@ -203,6 +205,14 @@ private bool opDeleteQueue(scope const(char)[] b, ref ByteBuffer o) @trusted
     key.append(name);
     const(char)[][2] a3 = ["del", cast(const(char)[]) key.data];
     exec(a3[], rb);
+    foreach (pfx; [DD_PREFIX, GRP_PREFIX])
+    {
+        key.clear();
+        key.append(pfx);
+        key.append(name);
+        const(char)[][2] ad = ["del", cast(const(char)[]) key.data];
+        exec(ad[], rb);
+    }
     o.append("{}");
     return true;
 }
@@ -240,15 +250,70 @@ private bool opSendMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     auto name = queueFromUrl(jsonStrRaw(b, "QueueUrl"));
     if (name.length == 0 || !queueExists(name))
         return false;
+    auto group = jsonStrRaw(b, "MessageGroupId");
+    auto dedup = jsonStrRaw(b, "MessageDeduplicationId");
     auto msgBody = jsonStr(b, "MessageBody");
+    if (isFifo(name) && group.length == 0)
+        return false; // FIFO requires MessageGroupId
     char[32] mid = void, md5 = void;
-    sendOne(name, msgBody, mid, md5);
+    // FIFO dedup: a repeat DeduplicationId within the window is a no-op that
+    // returns the original MessageId (exactly-once). Stored in sqs.dd.<name>.
+    if (isFifo(name) && dedup.length && dedupSeen(name, dedup, mid, md5, msgBody))
+    {
+        o.append(`{"MessageId":"`);
+        o.append(mid[]);
+        o.append(`","MD5OfMessageBody":"`);
+        o.append(md5[]);
+        o.append(`"}`);
+        return true;
+    }
+    sendOne(name, msgBody, group, mid, md5);
+    if (isFifo(name) && dedup.length)
+        dedupStore(name, dedup, mid, md5);
     o.append(`{"MessageId":"`);
     o.append(mid[]);
     o.append(`","MD5OfMessageBody":"`);
     o.append(md5[]);
     o.append(`"}`);
     return true;
+}
+
+// FIFO dedup: returns true (and fills mid/md5) if this DeduplicationId was
+// already used — the message is NOT re-enqueued. Value = msgidmd5.
+private bool dedupSeen(scope const(char)[] name, scope const(char)[] dedup,
+        ref char[32] mid, ref char[32] md5, scope const(char)[] body_) @trusted nothrow
+{
+    static ByteBuffer rb, key;
+    key.clear();
+    key.append(DD_PREFIX);
+    key.append(name);
+    const(char)[][3] a = ["hget", cast(const(char)[]) key.data, dedup];
+    exec(a[], rb);
+    auto v = respBulk(cast(const(char)[]) rb.data);
+    if (v is null || v.length < 33)
+        return false;
+    mid[0 .. 32] = v[0 .. 32];
+    // recompute md5 for the reply (stored value carries it after the sep)
+    if (v.length >= 33 + 32 && v[32] == SEP)
+        md5[0 .. 32] = v[33 .. 65];
+    else
+        md5Hex(cast(const(ubyte)[]) body_, md5[]);
+    return true;
+}
+
+private void dedupStore(scope const(char)[] name, scope const(char)[] dedup,
+        ref char[32] mid, ref char[32] md5) @trusted nothrow
+{
+    static ByteBuffer rb, key, val;
+    key.clear();
+    key.append(DD_PREFIX);
+    key.append(name);
+    val.clear();
+    val.append(mid[]);
+    val.appendByte(SEP);
+    val.append(md5[]);
+    const(char)[][4] a = ["hset", cast(const(char)[]) key.data, dedup, cast(const(char)[]) val.data];
+    exec(a[], rb);
 }
 
 private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @trusted
@@ -261,9 +326,10 @@ private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @truste
     // Entries: [{"Id":"..","MessageBody":".."}, ...]
     jsonEachEntry(b, "Entries", (scope const(char)[] entry) {
         auto id = jsonStrRaw(entry, "Id");
+        auto egroup = jsonStrRaw(entry, "MessageGroupId");
         auto body_ = jsonStr(entry, "MessageBody");
         char[32] mid = void, md5 = void;
-        sendOne(name, body_, mid, md5);
+        sendOne(name, body_, egroup, mid, md5);
         if (!first)
             o.append(",");
         first = false;
@@ -295,26 +361,96 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     if (visTimeout < 0)
         visTimeout = 0;
 
-    static ByteBuffer rb, qkey, ifkey, val;
+    static ByteBuffer rb, qkey, ifkey, val, grpkey;
     qkey.clear();
     qkey.append(Q_PREFIX);
     qkey.append(name);
     ifkey.clear();
     ifkey.append(IF_PREFIX);
     ifkey.append(name);
+    grpkey.clear();
+    grpkey.append(GRP_PREFIX);
+    grpkey.append(name);
+    immutable fifo = isFifo(name);
+
+    // FIFO delivery snapshots the queue once (LRANGE) and picks messages in
+    // order, skipping any whose group is locked (has an in-flight message) or
+    // already taken in THIS batch — so groups run in parallel but each group is
+    // strictly ordered. A picked record is removed with LREM (records are
+    // unique by msgid, so it matches exactly one). Standard queues just LPOP.
+    static ByteBuffer snap;
+    const(char)[][32] batchGroups; // groups locked within this batch
+    size_t nBatchGroups = 0;
+    if (fifo)
+    {
+        const(char)[][4] lr = ["lrange", cast(const(char)[]) qkey.data, "0", "-1"];
+        exec(lr[], snap);
+    }
+    size_t scanPos = 0;
+    // parse the LRANGE reply lazily via an index cursor over its bulk items
+    static const(char)[][1024] recs;
+    size_t nrecs = 0;
+    if (fifo)
+    {
+        nrecs = 0;
+        respEachBulk(cast(const(char)[]) snap.data, (scope const(char)[] r) {
+            if (nrecs < recs.length)
+                recs[nrecs++] = r;
+        });
+    }
 
     o.append(`{"Messages":[`);
     bool first = true;
     foreach (_; 0 .. maxN)
     {
-        const(char)[][2] pop = ["lpop", cast(const(char)[]) qkey.data];
-        exec(pop[], rb);
-        auto rec = respBulk(cast(const(char)[]) rb.data);
-        if (rec is null)
-            break; // queue empty
-        // record = msgid\x1fmd5\x1fbody
-        const(char)[] mid, md5, body_;
-        splitRecord(rec, mid, md5, body_);
+        const(char)[] rec;
+        if (fifo)
+        {
+            // find the next deliverable record from scanPos
+            rec = null;
+            for (; scanPos < nrecs; scanPos++)
+            {
+                const(char)[] m2, d2, g2, b2;
+                splitRecord(recs[scanPos], m2, d2, g2, b2);
+                bool takenThisBatch = false;
+                foreach (k; 0 .. nBatchGroups)
+                    if (batchGroups[k] == g2)
+                    {
+                        takenThisBatch = true;
+                        break;
+                    }
+                if (takenThisBatch)
+                    continue;
+                // group locked by an outstanding in-flight message?
+                const(char)[][3] sm = ["sismember", cast(const(char)[]) grpkey.data, g2];
+                exec(sm[], rb);
+                if (respInt(cast(const(char)[]) rb.data) == 1)
+                    continue;
+                rec = recs[scanPos];
+                scanPos++;
+                if (nBatchGroups < batchGroups.length)
+                    batchGroups[nBatchGroups++] = g2;
+                // remove exactly this record from the queue
+                const(char)[][4] lrem = ["lrem", cast(const(char)[]) qkey.data, "1", rec];
+                exec(lrem[], rb);
+                // lock the group until the message is deleted
+                const(char)[][3] sadd = ["sadd", cast(const(char)[]) grpkey.data, g2];
+                exec(sadd[], rb);
+                break;
+            }
+            if (rec is null)
+                break; // nothing deliverable
+        }
+        else
+        {
+            const(char)[][2] pop = ["lpop", cast(const(char)[]) qkey.data];
+            exec(pop[], rb);
+            rec = respBulk(cast(const(char)[]) rb.data);
+            if (rec is null)
+                break; // queue empty
+        }
+        const(char)[] mid, md5, group, body_;
+        splitRecord(rec, mid, md5, group, body_);
         // move to in-flight with a fresh receipt handle + visibility deadline
         char[48] handle = void;
         randHex(handle[], 24);
@@ -349,10 +485,36 @@ private bool opDeleteMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     auto handle = jsonStrRaw(b, "ReceiptHandle");
     if (name.length == 0 || handle.length == 0)
         return false;
-    static ByteBuffer rb, ifkey;
+    static ByteBuffer rb, ifkey, grpkey;
     ifkey.clear();
     ifkey.append(IF_PREFIX);
     ifkey.append(name);
+    // FIFO: unlock the message's group so its next message can be delivered.
+    // At most one message per group is ever in-flight (the lock blocks the
+    // rest), so the group is removed unconditionally here.
+    if (isFifo(name))
+    {
+        const(char)[][3] hg = ["hget", cast(const(char)[]) ifkey.data, handle];
+        exec(hg[], rb);
+        auto v = respBulk(cast(const(char)[]) rb.data);
+        if (v !is null)
+        {
+            // v = deadlineMs  (msgid  md5  group  body)
+            size_t sep = 0;
+            while (sep < v.length && v[sep] != SEP)
+                sep++;
+            if (sep < v.length)
+            {
+                const(char)[] mid2, md52, group2, body2;
+                splitRecord(v[sep + 1 .. $], mid2, md52, group2, body2);
+                grpkey.clear();
+                grpkey.append(GRP_PREFIX);
+                grpkey.append(name);
+                const(char)[][3] sr = ["srem", cast(const(char)[]) grpkey.data, group2];
+                exec(sr[], rb);
+            }
+        }
+    }
     const(char)[][3] a = ["hdel", cast(const(char)[]) ifkey.data, handle];
     exec(a[], rb);
     o.append("{}");
@@ -409,9 +571,9 @@ private bool opPurgeQueue(scope const(char)[] b, ref ByteBuffer o) @trusted
     return true;
 }
 
-// One send: RPUSH the record msgid\x1fmd5\x1fbody; return the generated ids.
+// One send: RPUSH the record msgid\x1fmd5\x1fgroup\x1fbody; return the ids.
 private void sendOne(scope const(char)[] name, scope const(char)[] body_,
-        ref char[32] midOut, ref char[32] md5Out) @trusted nothrow
+        scope const(char)[] group, ref char[32] midOut, ref char[32] md5Out) @trusted nothrow
 {
     randHex(midOut[], 16);
     md5Hex(cast(const(ubyte)[]) body_, md5Out[]);
@@ -423,6 +585,8 @@ private void sendOne(scope const(char)[] name, scope const(char)[] body_,
     rec.append(midOut[]);
     rec.appendByte(SEP);
     rec.append(md5Out[]);
+    rec.appendByte(SEP);
+    rec.append(group);
     rec.appendByte(SEP);
     rec.append(body_);
     const(char)[][3] a = ["rpush", cast(const(char)[]) key.data, cast(const(char)[]) rec.data];
@@ -502,10 +666,23 @@ public void sqsVisibilitySweep() nothrow @trusted
                 break;
             auto rec = packed[pi .. pi + rl];
             pi += rl;
+            // re-deliver at the FRONT so ordering is preserved (FIFO), and
+            // unlock the message's group so it can be picked again
             const(char)[][3] rp = ["lpush", cast(const(char)[]) qkey.data, rec];
             exec(rp[], val);
             const(char)[][3] hd = ["hdel", cast(const(char)[]) ifkey.data, expHandles[i]];
             exec(hd[], val);
+            if (isFifo(name))
+            {
+                const(char)[] rm, rmd5, rgrp, rbody;
+                splitRecord(rec, rm, rmd5, rgrp, rbody);
+                static ByteBuffer gk;
+                gk.clear();
+                gk.append(GRP_PREFIX);
+                gk.append(name);
+                const(char)[][3] sr = ["srem", cast(const(char)[]) gk.data, rgrp];
+                exec(sr[], val);
+            }
         }
     });
 }
@@ -566,18 +743,28 @@ private bool validName(scope const(char)[] n) @safe @nogc nothrow
     return true;
 }
 
-private void splitRecord(return scope const(char)[] rec, out const(char)[] mid,
-        out const(char)[] md5, out const(char)[] body_) @trusted @nogc nothrow
+private bool isFifo(scope const(char)[] name) @safe @nogc nothrow
 {
-    size_t a = 0;
-    while (a < rec.length && rec[a] != SEP)
-        a++;
-    mid = rec[0 .. a];
-    size_t b = a + 1;
-    while (b < rec.length && rec[b] != SEP)
-        b++;
-    md5 = a + 1 <= rec.length ? rec[a + 1 .. (b <= rec.length ? b : rec.length)] : null;
-    body_ = b + 1 <= rec.length ? rec[b + 1 .. $] : null;
+    return name.length > 5 && name[$ - 5 .. $] == ".fifo";
+}
+
+// record = msgid  md5  group  body  (group is "" for standard queues)
+private void splitRecord(return scope const(char)[] rec, out const(char)[] mid,
+        out const(char)[] md5, out const(char)[] group, out const(char)[] body_) @trusted @nogc nothrow
+{
+    const(char)[][4] f;
+    size_t nf, st;
+    foreach (i; 0 .. rec.length)
+        if (rec[i] == SEP && nf < 3)
+        {
+            f[nf++] = rec[st .. i];
+            st = i + 1;
+        }
+    f[nf] = rec[st .. $];
+    mid = f[0];
+    md5 = f[1];
+    group = f[2];
+    body_ = f[3];
 }
 
 // --- tiny JSON field extraction (request bodies are small, flat-ish) --------
