@@ -63,6 +63,51 @@ public __gshared void delegate(scope const(ubyte)[] ctl) nothrow gAmqpCtlFanout;
 
 public shared long gAmqpConsumers; // gate: publish-side wake fan-out etc (future)
 public shared ulong gAmqpMessages; // total basic.publish records routed (dashboard)
+
+// --- Management API message-rate sampler (M4) -------------------------------
+// The counters above are cumulative; the RMQ management API also wants an
+// instantaneous publish rate (msgs/sec). A timer (server boot, when the mgmt
+// API is on) calls amqpSampleRates() every few seconds; mgmt reads the total
+// plus the last-interval rate. Cheap: two atomics + a subtraction per tick.
+private __gshared ulong gAmqpRatePrevPub;
+private __gshared ulong gAmqpRatePrevRet;
+private __gshared long gAmqpRatePrevMs;
+private __gshared double gAmqpPubRate = 0;
+private __gshared double gAmqpRetRate = 0;
+
+public void amqpSampleRates() nothrow @trusted
+{
+    import core.atomic : atomicLoad, MemoryOrder;
+
+    immutable now = nowMs();
+    immutable pub = atomicLoad!(MemoryOrder.raw)(gAmqpMessages);
+    immutable ret = atomicLoad!(MemoryOrder.raw)(gAmqpReturned);
+    if (gAmqpRatePrevMs != 0)
+    {
+        immutable dt = now - gAmqpRatePrevMs;
+        if (dt > 0)
+        {
+            immutable secs = cast(double) dt / 1000.0;
+            gAmqpPubRate = cast(double)(pub - gAmqpRatePrevPub) / secs;
+            gAmqpRetRate = cast(double)(ret - gAmqpRatePrevRet) / secs;
+        }
+    }
+    gAmqpRatePrevPub = pub;
+    gAmqpRatePrevRet = ret;
+    gAmqpRatePrevMs = now;
+}
+
+/// Management API: cumulative publish/return totals + their last-interval rate.
+public void amqpMessageStats(out ulong pubTotal, out double pubRate,
+        out ulong retTotal, out double retRate) nothrow @trusted
+{
+    import core.atomic : atomicLoad, MemoryOrder;
+
+    pubTotal = atomicLoad!(MemoryOrder.raw)(gAmqpMessages);
+    retTotal = atomicLoad!(MemoryOrder.raw)(gAmqpReturned);
+    pubRate = gAmqpPubRate;
+    retRate = gAmqpRetRate;
+}
 public shared ulong gAmqpReturned; // mandatory publishes returned (no route)
 public shared ulong gAmqpBindingDrops; // duplicate/over-cap bindings refused
 private shared ulong gAmqpQueueGen; // counter for server-generated queue names

@@ -506,15 +506,22 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             if (gConfig.mgmtPort != 0)
             {
                 import dreads.mgmt : startManagement, gMgmtExchanges,
-                    gMgmtConnections, gMgmtKillConn, gMgmtBindings;
+                    gMgmtConnections, gMgmtKillConn, gMgmtBindings, gMgmtMsgStats;
                 import dreads.amqp : amqpExchangeSnapshot, amqpConnectionsJson,
-                    amqpKillConnection, amqpBindingsSnapshot;
+                    amqpKillConnection, amqpBindingsSnapshot, amqpMessageStats;
 
                 gMgmtExchanges = &amqpExchangeSnapshot;
                 gMgmtBindings = &amqpBindingsSnapshot;
+                gMgmtMsgStats = &amqpMessageStats;
                 gMgmtConnections = &amqpConnectionsJson;
                 gMgmtKillConn = &amqpKillConnection;
                 startManagement();
+                {
+                    import dreads.amqp : amqpSampleRates;
+
+                    // instantaneous message-rate sampler for message_stats
+                    setTimer(5.seconds, () nothrow { amqpSampleRates(); }, true);
+                }
             }
             if (gConfig.dashboard)
             {

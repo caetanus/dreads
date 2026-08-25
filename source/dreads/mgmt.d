@@ -31,6 +31,10 @@ public __gshared void function(ref ByteBuffer o) nothrow gMgmtExchanges;
 /// binding set as `source\tdest\tkind\trouting_key\n` lines (kind = q|e).
 public __gshared void function(ref ByteBuffer o) nothrow gMgmtBindings;
 
+/// Message-stats hook: cumulative publish/return totals + last-interval rates.
+public __gshared void function(out ulong pubTotal, out double pubRate,
+        out ulong retTotal, out double retRate) nothrow gMgmtMsgStats;
+
 /// Connection registry hooks (M4 v2): list connections as JSON, and
 /// request-close by name (empty = all). Installed by the server with the AMQP
 /// skin's cross-shard registry.
@@ -203,7 +207,44 @@ private void overview(ref ByteBuffer o) @trusted
     o.append(`"listeners":[{"node":"dreads@localhost","protocol":"amqp","port":`);
     appendUint(o, gConfig.amqpPort);
     o.append(`}],"queue_totals":{"messages":0,"messages_ready":0,`);
-    o.append(`"messages_unacknowledged":0}}`);
+    o.append(`"messages_unacknowledged":0}`);
+    appendMsgStats(o);
+    o.append(`}`);
+}
+
+// RabbitMQ message_stats: {"publish":N,"publish_details":{"rate":R}, ...}.
+// dreads counts publishes/returns GLOBALLY (no per-queue counter), so this is
+// the broker-wide throughput — accurate for /overview; per-queue rate is not
+// tracked (documented). Prepends a comma (always follows a field).
+private void appendMsgStats(ref ByteBuffer o) @trusted
+{
+    if (gMgmtMsgStats is null)
+        return;
+    ulong pub, ret;
+    double pubRate, retRate;
+    gMgmtMsgStats(pub, pubRate, ret, retRate);
+    o.append(`,"message_stats":{"publish":`);
+    appendUint(o, pub);
+    o.append(`,"publish_details":{"rate":`);
+    appendRate(o, pubRate);
+    o.append(`},"return_unroutable":`);
+    appendUint(o, ret);
+    o.append(`,"return_unroutable_details":{"rate":`);
+    appendRate(o, retRate);
+    o.append(`}}`);
+}
+
+// A rate as a JSON number with one decimal (RabbitMQ renders floats; the UI
+// parses them). Small non-negative values, so a compact fixed format suffices.
+private void appendRate(ref ByteBuffer o, double r) @trusted @nogc nothrow
+{
+    if (!(r > 0)) // catches nan/negative/zero (nan fails every comparison)
+        r = 0;
+    immutable whole = cast(ulong) r;
+    immutable frac = cast(ulong)((r - cast(double) whole) * 10.0 + 0.5);
+    appendUint(o, frac >= 10 ? whole + 1 : whole);
+    o.appendByte('.');
+    o.appendByte(cast(char)('0' + (frac >= 10 ? 0 : frac)));
 }
 
 private void nodes(ref ByteBuffer o) @trusted
