@@ -852,11 +852,15 @@ public void serveKafkaClient(TCPConnection tcp, bool tls = false) nothrow
             if (ctx.saslRawMode && !ctx.authed)
             {
                 // legacy SaslHandshake v0: this frame is a BARE SASL token
-                // (no request header). Success answers the empty frame the
-                // client blocks on; failure drops the connection.
-                if (!kafkaPlainCheck(d[pos + 4 .. pos + 4 + sz], &ctx))
+                // (no request header). Reply = [i32 len][server token] — the
+                // empty frame for PLAIN, server-first/final for SCRAM rounds.
+                static ByteBuffer rawTok; // TLS scratch, consumed right below
+                rawTok.clear();
+                if (!kafkaSaslStep(d[pos + 4 .. pos + 4 + sz], &ctx, rawTok))
                     return;
-                putI32(outb, 0);
+                putI32(outb, cast(int) rawTok.length);
+                if (!rawTok.empty)
+                    outb.append(rawTok.data);
                 pos += 4 + sz;
                 continue;
             }
@@ -958,15 +962,23 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o,
     case API_SASL_HANDSHAKE:
         {
             auto mech = r.str();
-            immutable known = r.ok && mech == "PLAIN";
+            immutable isPlain = mech == "PLAIN";
+            immutable isS256 = mech == "SCRAM-SHA-256";
+            immutable isS512 = mech == "SCRAM-SHA-512";
+            immutable known = r.ok && (isPlain || isS256 || isS512);
             putI16(o, known ? E_NONE : E_UNSUPPORTED_SASL_MECHANISM);
-            putI32(o, 1); // enabled_mechanisms
+            putI32(o, 3); // enabled_mechanisms
             putStr(o, "PLAIN");
+            putStr(o, "SCRAM-SHA-256");
+            putStr(o, "SCRAM-SHA-512");
             if (known && ctx !is null)
             {
                 ctx.saslHandshook = true;
+                ctx.mechScram = isS256 || isS512;
+                ctx.scram512 = isS512;
+                ctx.scramStage = 0;
                 if (apiVer == 0)
-                    ctx.saslRawMode = true; // next frame = bare token
+                    ctx.saslRawMode = true; // next frame(s) = bare tokens
             }
             break;
         }
@@ -984,18 +996,22 @@ private void handleRequest(scope const(ubyte)[] req, ref ByteBuffer o,
                     ctx.closeConn = true;
                 break;
             }
-            if (kafkaPlainCheck(tok, ctx))
+            static ByteBuffer rtok; // TLS scratch: consumed synchronously below
+            rtok.clear();
+            if (kafkaSaslStep(tok, ctx, rtok))
             {
                 putI16(o, E_NONE);
                 putI16(o, -1);
-                putI32(o, 0);
+                putI32(o, cast(int) rtok.length); // server token (SCRAM rounds)
+                if (!rtok.empty)
+                    o.append(rtok.data);
                 if (apiVer >= 1)
                     putI64(o, 0); // session_lifetime_ms: unlimited
             }
             else
             {
                 putI16(o, E_SASL_AUTH_FAILED);
-                putStr(o, "SASL PLAIN authentication failed");
+                putStr(o, "SASL authentication failed");
                 putI32(o, 0);
                 if (apiVer >= 1)
                     putI64(o, 0);
@@ -1231,11 +1247,190 @@ public struct KafkaConnCtx
     bool saslRawMode; // handshake v0: the NEXT frame is a bare SASL token
     bool authed;
     bool closeConn; // fatal auth state: serve loop drops the connection
+    // SCRAM (RFC 5802) server state — verifier keys COPIED out of the AclUser
+    // at client-first (the user could be deleted mid-handshake; no dangling)
+    bool mechScram, scram512;
+    ubyte scramStage; // 0 = await client-first, 1 = await client-final
+    ubyte[64] scramStored = void, scramServer = void;
+    char[128] nonceBuf = void; // combined client+server nonce
+    ubyte nonceLen;
+    char[256] cfbBuf = void; // client-first-bare (AuthMessage part 1)
+    ushort cfbLen;
+    char[192] sfBuf = void; // server-first (AuthMessage part 2)
+    ushort sfLen;
 
     const(char)[] principal() const return scope @nogc nothrow
     {
         return principalLen ? principalBuf[0 .. principalLen] : "ANONYMOUS";
     }
+}
+
+/// SCRAM-SHA-256/512 server flow. Returns false = auth failed (drop). A true
+/// return with !ctx.authed means "round accepted, more to come" (server-first
+/// went out). Verifiers come from the ACL user (derived at `>password`).
+private bool kafkaScramStep(scope const(ubyte)[] tok, KafkaConnCtx* ctx,
+        ref ByteBuffer rtok) nothrow @trusted
+{
+    import dreads.acl : aclUser;
+    import dreads.tls : b64enc, b64dec, scramHmac, scramSha, tlsRandBytes;
+
+    immutable dl = ctx.scram512 ? 64 : 32;
+    auto sr = cast(const(char)[]) tok;
+    if (ctx.scramStage == 0)
+    {
+        // client-first: gs2-header "n,," (or "y,,") + bare "n=user,r=cnonce"
+        if (sr.length < 4 || (sr[0] != 'n' && sr[0] != 'y') || sr[1] != ',')
+            return false;
+        size_t c2 = sr.length;
+        foreach (k; 2 .. sr.length)
+            if (sr[k] == ',')
+            {
+                c2 = k;
+                break;
+            }
+        if (c2 >= sr.length)
+            return false;
+        auto bare = sr[c2 + 1 .. $];
+        if (bare.length >= 2 && bare[0] == 'm')
+            return false; // mandatory extensions unsupported, per RFC
+        const(char)[] user, cnonce;
+        size_t st;
+        foreach (k; 0 .. bare.length + 1)
+        {
+            if (k == bare.length || bare[k] == ',')
+            {
+                auto attr = bare[st .. k];
+                if (attr.length >= 2 && attr[0] == 'n' && attr[1] == '=')
+                    user = attr[2 .. $];
+                else if (attr.length >= 2 && attr[0] == 'r' && attr[1] == '=')
+                    cnonce = attr[2 .. $];
+                st = k + 1;
+            }
+        }
+        if (user.length == 0 || cnonce.length == 0 || cnonce.length > 96
+                || bare.length > ctx.cfbBuf.length)
+            return false;
+        auto au = aclUser(user);
+        if (au is null || !au.enabled || !au.hasScram)
+            return false; // SCRAM needs a real user with a stored verifier
+        if (ctx.scram512)
+        {
+            ctx.scramStored[0 .. 64] = au.scram512Stored;
+            ctx.scramServer[0 .. 64] = au.scram512Server;
+        }
+        else
+        {
+            ctx.scramStored[0 .. 32] = au.scram256Stored;
+            ctx.scramServer[0 .. 32] = au.scram256Server;
+        }
+        if (user.length <= ctx.principalBuf.length)
+        {
+            ctx.principalBuf[0 .. user.length] = user;
+            ctx.principalLen = cast(ubyte) user.length;
+        }
+        // combined nonce = cnonce + 24 chars of ours
+        ubyte[18] rnd = void;
+        if (!tlsRandBytes(rnd))
+            return false;
+        char[24] snb = void;
+        auto sn = b64enc(rnd, snb);
+        ctx.nonceBuf[0 .. cnonce.length] = cnonce;
+        ctx.nonceBuf[cnonce.length .. cnonce.length + sn.length] = sn;
+        ctx.nonceLen = cast(ubyte)(cnonce.length + sn.length);
+        ctx.cfbBuf[0 .. bare.length] = bare;
+        ctx.cfbLen = cast(ushort) bare.length;
+        // server-first: r=<nonce>,s=<b64 salt>,i=<iter>
+        char[32] sb = void;
+        auto saltB = b64enc(au.scramSalt, sb);
+        char[192] sf = void;
+        size_t o;
+        sf[o .. o + 2] = "r=";
+        o += 2;
+        sf[o .. o + ctx.nonceLen] = ctx.nonceBuf[0 .. ctx.nonceLen];
+        o += ctx.nonceLen;
+        sf[o .. o + 3] = ",s=";
+        o += 3;
+        sf[o .. o + saltB.length] = saltB;
+        o += saltB.length;
+        sf[o .. o + 3] = ",i=";
+        o += 3;
+        uint iv = au.scramIter;
+        char[10] itmp = void;
+        size_t il;
+        do
+        {
+            itmp[il++] = cast(char)('0' + iv % 10);
+            iv /= 10;
+        }
+        while (iv);
+        foreach_reverse (k; 0 .. il)
+            sf[o++] = itmp[k];
+        ctx.sfBuf[0 .. o] = sf[0 .. o];
+        ctx.sfLen = cast(ushort) o;
+        rtok.append(sf[0 .. o]);
+        ctx.scramStage = 1;
+        return true;
+    }
+    // stage 1 — client-final: c=biws,r=<nonce>,p=<b64 proof>
+    size_t pAt = sr.length;
+    foreach_reverse (k; 0 .. sr.length >= 3 ? sr.length - 2 : 0)
+        if (sr[k] == ',' && sr[k + 1] == 'p' && sr[k + 2] == '=')
+        {
+            pAt = k;
+            break;
+        }
+    if (pAt >= sr.length)
+        return false;
+    auto cfwp = sr[0 .. pAt];
+    auto proofB = sr[pAt + 3 .. $];
+    // channel binding must be "biws" (base64 "n,,") and the nonce must match
+    if (cfwp.length < 7 || cfwp[0 .. 7] != "c=biws,")
+        return false;
+    auto rAttr = cfwp[7 .. $];
+    if (rAttr.length < 2 + ctx.nonceLen || rAttr[0 .. 2] != "r="
+            || rAttr[2 .. 2 + ctx.nonceLen] != ctx.nonceBuf[0 .. ctx.nonceLen])
+        return false;
+    ubyte[64] proof = void;
+    auto pf = b64dec(proofB, proof);
+    if (pf is null || pf.length != dl)
+        return false;
+    // AuthMessage = client-first-bare , server-first , client-final-no-proof
+    ubyte[704] am = void;
+    size_t ao;
+    am[ao .. ao + ctx.cfbLen] = cast(const(ubyte)[]) ctx.cfbBuf[0 .. ctx.cfbLen];
+    ao += ctx.cfbLen;
+    am[ao++] = ',';
+    am[ao .. ao + ctx.sfLen] = cast(const(ubyte)[]) ctx.sfBuf[0 .. ctx.sfLen];
+    ao += ctx.sfLen;
+    am[ao++] = ',';
+    if (ao + cfwp.length > am.length)
+        return false;
+    am[ao .. ao + cfwp.length] = cast(const(ubyte)[]) cfwp;
+    ao += cfwp.length;
+    ubyte[64] csig = void, ckey = void, hck = void;
+    scramHmac(ctx.scram512, ctx.scramStored[0 .. dl], am[0 .. ao], csig[0 .. dl]);
+    foreach (k; 0 .. dl)
+        ckey[k] = pf[k] ^ csig[k];
+    scramSha(ctx.scram512, ckey[0 .. dl], hck[0 .. dl]);
+    if (hck[0 .. dl] != ctx.scramStored[0 .. dl])
+        return false; // wrong password
+    ubyte[64] ssig = void;
+    scramHmac(ctx.scram512, ctx.scramServer[0 .. dl], am[0 .. ao], ssig[0 .. dl]);
+    char[96] vb = void;
+    auto v = b64enc(ssig[0 .. dl], vb);
+    rtok.append("v=");
+    rtok.append(v);
+    ctx.authed = true;
+    return true;
+}
+
+/// One SASL token exchange (any mechanism). True + !authed = more rounds.
+private bool kafkaSaslStep(scope const(ubyte)[] tok, KafkaConnCtx* ctx,
+        ref ByteBuffer rtok) nothrow @trusted
+{
+    if (ctx.mechScram)
+        return kafkaScramStep(tok, ctx, rtok);
+    return kafkaPlainCheck(tok, ctx); // PLAIN: empty reply token
 }
 
 /// PLAIN token: [authzid] NUL authcid NUL passwd — validated against the SAME

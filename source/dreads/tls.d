@@ -60,7 +60,20 @@ private extern (C) @nogc nothrow
     ulong ERR_get_error();
     void ERR_error_string_n(ulong e, char* buf, size_t len);
     void ERR_clear_error();
+
+    // libcrypto digests/KDF (SCRAM verifiers + proofs — drop-in M3b)
+    const(EVP_MD)* EVP_sha256();
+    const(EVP_MD)* EVP_sha512();
+    int PKCS5_PBKDF2_HMAC(const(char)* pass, int passlen, const(ubyte)* salt,
+            int saltlen, int iter, const(EVP_MD)* digest, int keylen, ubyte* outKey);
+    ubyte* HMAC(const(EVP_MD)* md, const(void)* key, int keyLen,
+            const(ubyte)* d, size_t n, ubyte* outMd, uint* outLen);
+    ubyte* SHA256(const(ubyte)* d, size_t n, ubyte* outMd);
+    ubyte* SHA512(const(ubyte)* d, size_t n, ubyte* outMd);
+    int RAND_bytes(ubyte* buf, int num);
 }
+
+struct EVP_MD;
 
 private enum SSL_FILETYPE_PEM = 1;
 private enum SSL_ERROR_WANT_READ = 2;
@@ -584,4 +597,170 @@ public bool legSend(TlsLeg* L, TCPConnection tcp, scope const(ubyte)[] plain) no
     }
     L.cout.clear();
     return ok && !L.t.failed;
+}
+
+// ---------------------------------------------------------------------------
+// SCRAM crypto (RFC 5802) — shared by the ACL verifier derivation and the
+// Kafka SASL server flow. digest length = 32 (SHA-256) or 64 (SHA-512).
+// ---------------------------------------------------------------------------
+
+/// SaltedPassword -> StoredKey/ServerKey. storedKey/serverKey must be the
+/// digest length. Only called where the PLAINTEXT exists (ACL SETUSER's `>`).
+public void scramDerive(scope const(char)[] password, scope const(ubyte)[] salt,
+        uint iter, bool sha512, scope ubyte[] storedKey, scope ubyte[] serverKey) @trusted @nogc nothrow
+{
+    immutable dl = sha512 ? 64 : 32;
+    auto md = sha512 ? EVP_sha512() : EVP_sha256();
+    ubyte[64] salted = void;
+    cast(void) PKCS5_PBKDF2_HMAC(password.ptr, cast(int) password.length,
+            salt.ptr, cast(int) salt.length, cast(int) iter, md, dl, salted.ptr);
+    ubyte[64] ck = void;
+    uint cl;
+    cast(void) HMAC(md, salted.ptr, dl, cast(const(ubyte)*) "Client Key".ptr, 10, ck.ptr, &cl);
+    if (sha512)
+        cast(void) SHA512(ck.ptr, dl, storedKey.ptr);
+    else
+        cast(void) SHA256(ck.ptr, dl, storedKey.ptr);
+    uint sl;
+    cast(void) HMAC(md, salted.ptr, dl, cast(const(ubyte)*) "Server Key".ptr, 10, serverKey.ptr, &sl);
+}
+
+/// HMAC over the AuthMessage (ClientSignature/ServerSignature legs).
+public void scramHmac(bool sha512, scope const(ubyte)[] key,
+        scope const(ubyte)[] data, scope ubyte[] outMd) @trusted @nogc nothrow
+{
+    uint l;
+    cast(void) HMAC(sha512 ? EVP_sha512() : EVP_sha256(), key.ptr,
+            cast(int) key.length, data.ptr, data.length, outMd.ptr, &l);
+}
+
+/// H(ClientKey) — the StoredKey check.
+public void scramSha(bool sha512, scope const(ubyte)[] data, scope ubyte[] outMd) @trusted @nogc nothrow
+{
+    if (sha512)
+        cast(void) SHA512(data.ptr, data.length, outMd.ptr);
+    else
+        cast(void) SHA256(data.ptr, data.length, outMd.ptr);
+}
+
+public bool tlsRandBytes(scope ubyte[] dst) @trusted @nogc nothrow
+{
+    return RAND_bytes(dst.ptr, cast(int) dst.length) == 1;
+}
+
+// ---------------------------------------------------------------------------
+// base64 (standard alphabet, padding) — @nogc, for SCRAM wire fields
+// ---------------------------------------------------------------------------
+
+private immutable char[64] B64C = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encodes src into dst; returns the used slice (needs ceil(n/3)*4 bytes).
+public const(char)[] b64enc(scope const(ubyte)[] src, return scope char[] dst) @trusted @nogc nothrow
+{
+    size_t o;
+    size_t i;
+    while (i + 3 <= src.length)
+    {
+        immutable v = (cast(uint) src[i] << 16) | (cast(uint) src[i + 1] << 8) | src[i + 2];
+        dst[o++] = B64C[(v >> 18) & 63];
+        dst[o++] = B64C[(v >> 12) & 63];
+        dst[o++] = B64C[(v >> 6) & 63];
+        dst[o++] = B64C[v & 63];
+        i += 3;
+    }
+    immutable rem = src.length - i;
+    if (rem == 1)
+    {
+        immutable v = cast(uint) src[i] << 16;
+        dst[o++] = B64C[(v >> 18) & 63];
+        dst[o++] = B64C[(v >> 12) & 63];
+        dst[o++] = '=';
+        dst[o++] = '=';
+    }
+    else if (rem == 2)
+    {
+        immutable v = (cast(uint) src[i] << 16) | (cast(uint) src[i + 1] << 8);
+        dst[o++] = B64C[(v >> 18) & 63];
+        dst[o++] = B64C[(v >> 12) & 63];
+        dst[o++] = B64C[(v >> 6) & 63];
+        dst[o++] = '=';
+    }
+    return dst[0 .. o];
+}
+
+/// Decodes src into dst; returns the used slice or null on bad input.
+public const(ubyte)[] b64dec(scope const(char)[] src, return scope ubyte[] dst) @trusted @nogc nothrow
+{
+    static int val(char c) @nogc nothrow
+    {
+        if (c >= 'A' && c <= 'Z')
+            return c - 'A';
+        if (c >= 'a' && c <= 'z')
+            return c - 'a' + 26;
+        if (c >= '0' && c <= '9')
+            return c - '0' + 52;
+        if (c == '+')
+            return 62;
+        if (c == '/')
+            return 63;
+        return -1;
+    }
+
+    if (src.length % 4 != 0 || src.length == 0)
+        return null;
+    size_t o;
+    size_t i;
+    while (i < src.length)
+    {
+        immutable pad1 = src[i + 2] == '=';
+        immutable pad2 = src[i + 3] == '=';
+        immutable a = val(src[i]), b = val(src[i + 1]);
+        immutable c = pad1 ? 0 : val(src[i + 2]);
+        immutable d = pad2 ? 0 : val(src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 || (pad1 && !pad2)
+                || (pad1 && i + 4 != src.length) || (pad2 && i + 4 != src.length))
+            return null;
+        immutable v = (cast(uint) a << 18) | (cast(uint) b << 12) | (cast(uint) c << 6) | d;
+        if (o >= dst.length)
+            return null;
+        dst[o++] = cast(ubyte)(v >> 16);
+        if (!pad1)
+        {
+            if (o >= dst.length)
+                return null;
+            dst[o++] = cast(ubyte)((v >> 8) & 0xFF);
+        }
+        if (!pad2)
+        {
+            if (o >= dst.length)
+                return null;
+            dst[o++] = cast(ubyte)(v & 0xFF);
+        }
+        i += 4;
+    }
+    return dst[0 .. o];
+}
+
+@trusted unittest // b64 roundtrip + SCRAM derive is deterministic
+{
+    ubyte[300] db = void;
+    char[400] eb = void;
+    foreach (n; [0, 1, 2, 3, 4, 20, 65])
+    {
+        ubyte[80] src;
+        foreach (i; 0 .. n)
+            src[i] = cast(ubyte)(i * 7 + n);
+        auto e = b64enc(src[0 .. n], eb);
+        if (n == 0)
+            continue;
+        auto d = b64dec(e, db);
+        assert(d !is null && d == src[0 .. n]);
+    }
+    ubyte[16] salt = 1;
+    ubyte[32] st1, sv1, st2, sv2;
+    scramDerive("secret", salt, 4096, false, st1, sv1);
+    scramDerive("secret", salt, 4096, false, st2, sv2);
+    assert(st1 == st2 && sv1 == sv2);
+    scramDerive("other", salt, 4096, false, st2, sv2);
+    assert(st1 != st2);
 }

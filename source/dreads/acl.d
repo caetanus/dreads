@@ -269,6 +269,14 @@ struct AclUser
     bool enabled;
     bool nopass;
     Vector!(const(char)[]) passwords; // malloc'd hashes (Argon2id PHC or sha256 hex)
+    // SCRAM verifiers (Kafka SASL SCRAM-SHA-256/512) — derived at `>password`
+    // time, the only moment the plaintext exists. One credential per user
+    // (the LAST password set wins), one salt shared by both digests.
+    ubyte[16] scramSalt;
+    uint scramIter;
+    ubyte[32] scram256Stored, scram256Server;
+    ubyte[64] scram512Stored, scram512Server;
+    bool hasScram;
     AclPerm root;
 
     ~this() @nogc nothrow @trusted
@@ -379,6 +387,69 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
             || tok == "skip-sanitize-payload" || tok == "clearselectors")
         return true;
 
+    if (tok.length > 6 && tok[0 .. 6] == "scram=")
+    {
+        // canonical/replay form: scram=<iter>:<b64 salt>:<b64 st256>:<b64
+        // sv256>:<b64 st512>:<b64 sv512> — verifiers verbatim, no re-derive
+        import dreads.tls : b64dec;
+
+        auto rest = tok[6 .. $];
+        const(char)[][6] parts;
+        size_t np, st;
+        foreach (i, ch; rest)
+            if (ch == ':')
+            {
+                if (np < 5)
+                    parts[np++] = rest[st .. i];
+                st = i + 1;
+            }
+        if (np != 5)
+        {
+            err = "ERR Error in ACL SETUSER modifier 'scram=': malformed";
+            return false;
+        }
+        parts[np++] = rest[st .. $];
+        uint iter;
+        foreach (ch; parts[0])
+        {
+            if (ch < '0' || ch > '9')
+            {
+                err = "ERR Error in ACL SETUSER modifier 'scram=': malformed";
+                return false;
+            }
+            iter = iter * 10 + (ch - '0');
+        }
+        ubyte[80] db = void;
+        auto salt = b64dec(parts[1], db[0 .. 24]);
+        bool ok = salt !is null && salt.length == 16;
+        if (ok)
+            u.scramSalt[] = salt[0 .. 16];
+        auto s256 = b64dec(parts[2], db[0 .. 48]);
+        ok = ok && s256 !is null && s256.length == 32;
+        if (ok)
+            u.scram256Stored[] = s256[0 .. 32];
+        auto v256 = b64dec(parts[3], db[0 .. 48]);
+        ok = ok && v256 !is null && v256.length == 32;
+        if (ok)
+            u.scram256Server[] = v256[0 .. 32];
+        auto s512 = b64dec(parts[4], db[0 .. 80]);
+        ok = ok && s512 !is null && s512.length == 64;
+        if (ok)
+            u.scram512Stored[] = s512[0 .. 64];
+        auto v512 = b64dec(parts[5], db[0 .. 80]);
+        ok = ok && v512 !is null && v512.length == 64;
+        if (ok)
+            u.scram512Server[] = v512[0 .. 64];
+        if (!ok)
+        {
+            err = "ERR Error in ACL SETUSER modifier 'scram=': malformed";
+            return false;
+        }
+        u.scramIter = iter;
+        u.hasScram = true;
+        return true;
+    }
+
     switch (tok[0])
     {
     case '(':
@@ -387,6 +458,21 @@ bool aclApplyRule(AclUser* u, scope const(char)[] tok, ref const(char)[] err) @t
     case '>':
         u.nopass = false;
         u.passwords.put(cast(const(char)[]) mallocDup(hashPassword(tok[1 .. $])));
+        {
+            // SCRAM credential (Kafka drop-in): salt + verifiers for both
+            // digests, derived NOW — replay carries them via the scram= token
+            import dreads.tls : scramDerive, tlsRandBytes;
+
+            if (tlsRandBytes(u.scramSalt))
+            {
+                u.scramIter = 4096;
+                scramDerive(tok[1 .. $], u.scramSalt, u.scramIter, false,
+                        u.scram256Stored, u.scram256Server);
+                scramDerive(tok[1 .. $], u.scramSalt, u.scramIter, true,
+                        u.scram512Stored, u.scram512Server);
+                u.hasScram = true;
+            }
+        }
         return true;
     case '#':
         {
@@ -1478,6 +1564,8 @@ void aclEncodeCanonicalSetuser(const(AclUser)* u, ref ByteBuffer o) @trusted not
     if (u.nopass)
         n++;
     n += u.passwords.length;
+    if (u.hasScram)
+        n++;
     n += u.root.allKeys ? 1 : u.root.keyPats.length;
     n += u.root.allChannels ? 1 : u.root.chanPats.length;
     if (!u.root.allDbs)
@@ -1499,6 +1587,37 @@ void aclEncodeCanonicalSetuser(const(AclUser)* u, ref ByteBuffer o) @trusted not
         tb.clear();
         tb.append("#");
         tb.append(u.passwords[i]);
+        repBulk(o, cast(const(char)[]) tb.data);
+    }
+    if (u.hasScram)
+    {
+        import dreads.tls : b64enc;
+
+        char[96] eb = void;
+        char[16] ib = void;
+        tb.clear();
+        tb.append("scram=");
+        size_t il = 0;
+        uint iv = u.scramIter;
+        char[10] tmp = void;
+        do
+        {
+            tmp[il++] = cast(char)('0' + iv % 10);
+            iv /= 10;
+        }
+        while (iv);
+        foreach_reverse (k; 0 .. il)
+            tb.append(tmp[k .. k + 1]);
+        tb.append(":");
+        tb.append(b64enc(u.scramSalt, eb));
+        tb.append(":");
+        tb.append(b64enc(u.scram256Stored, eb));
+        tb.append(":");
+        tb.append(b64enc(u.scram256Server, eb));
+        tb.append(":");
+        tb.append(b64enc(u.scram512Stored, eb));
+        tb.append(":");
+        tb.append(b64enc(u.scram512Server, eb));
         repBulk(o, cast(const(char)[]) tb.data);
     }
     if (u.root.allKeys)
