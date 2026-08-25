@@ -506,11 +506,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
             if (gConfig.mgmtPort != 0)
             {
                 import dreads.mgmt : startManagement, gMgmtExchanges,
-                    gMgmtConnections, gMgmtKillConn;
+                    gMgmtConnections, gMgmtKillConn, gMgmtBindings;
                 import dreads.amqp : amqpExchangeSnapshot, amqpConnectionsJson,
-                    amqpKillConnection;
+                    amqpKillConnection, amqpBindingsSnapshot;
 
                 gMgmtExchanges = &amqpExchangeSnapshot;
+                gMgmtBindings = &amqpBindingsSnapshot;
                 gMgmtConnections = &amqpConnectionsJson;
                 gMgmtKillConn = &amqpKillConnection;
                 startManagement();

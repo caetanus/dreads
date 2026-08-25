@@ -27,6 +27,10 @@ private __gshared bool gMgmtUp;
 /// the AMQP skin is up; null = report only the default exchanges.
 public __gshared void function(ref ByteBuffer o) nothrow gMgmtExchanges;
 
+/// Binding snapshot hook: an AMQP shard thread serializes its (replicated)
+/// binding set as `source\tdest\tkind\trouting_key\n` lines (kind = q|e).
+public __gshared void function(ref ByteBuffer o) nothrow gMgmtBindings;
+
 /// Connection registry hooks (M4 v2): list connections as JSON, and
 /// request-close by name (empty = all). Installed by the server with the AMQP
 /// skin's cross-shard registry.
@@ -131,7 +135,7 @@ private void route(scope const(char)[] method, scope const(char)[] path, ref Byt
                 || path == "/api/exchanges/%2f")
             exchanges(o);
         else if (path == "/api/bindings")
-            o.append("[]"); // v2: binding enumeration snapshot
+            bindings(o);
         else if (path == "/api/queues" || path == "/api/queues/%2F"
                 || path == "/api/queues/%2f")
             queues(o, null);
@@ -279,6 +283,105 @@ private void exchangeObj(ref ByteBuffer o, scope const(char)[] name, scope const
     o.append(`","vhost":"/","type":"`);
     o.append(type);
     o.append(`","durable":true,"auto_delete":false,"internal":false,"arguments":{}}`);
+}
+
+// GET /api/bindings: RabbitMQ reports (a) the implicit default-exchange binding
+// every queue has (source "", routing_key = queue name), plus (b) every
+// explicit binding from the AMQP snapshot. destination_type = queue|exchange.
+private void bindings(ref ByteBuffer o) @trusted
+{
+    o.append("[");
+    bool first = true;
+    // (a) implicit default-exchange bindings, one per queue
+    static ByteBuffer cmd, reply;
+    cmd.clear();
+    respCmd(cmd, "KEYS", "amq.q.*");
+    if (runCommand(cmd.data, cast(ushort) gConfig.amqpDb, reply))
+    {
+        auto d = cast(const(char)[]) reply.data;
+        size_t i = 0;
+        if (d.length && d[0] == '*')
+        {
+            i = 1;
+            long cnt = 0;
+            while (i < d.length && d[i] != '\r')
+                cnt = cnt * 10 + (d[i++] - '0');
+            i += 2;
+            foreach (_; 0 .. cnt)
+            {
+                if (i >= d.length || d[i] != '$')
+                    break;
+                i++;
+                long bl = 0;
+                while (i < d.length && d[i] != '\r')
+                    bl = bl * 10 + (d[i++] - '0');
+                i += 2;
+                if (bl < 0 || i + bl + 2 > d.length)
+                    break;
+                auto key = d[i .. i + cast(size_t) bl];
+                i += cast(size_t) bl + 2;
+                if (key.length <= 6 || key[0 .. 6] != "amq.q.")
+                    continue;
+                auto name = key[6 .. $];
+                if (!first)
+                    o.append(",");
+                first = false;
+                bindingObj(o, "", name, "queue", name);
+            }
+        }
+    }
+    // (b) explicit bindings from the AMQP-thread snapshot
+    if (gMgmtBindings !is null)
+    {
+        static ByteBuffer snap;
+        snap.clear();
+        gMgmtBindings(snap);
+        auto d = cast(const(char)[]) snap.data;
+        size_t i = 0;
+        while (i < d.length)
+        {
+            size_t nl = i;
+            while (nl < d.length && d[nl] != '\n')
+                nl++;
+            auto line = d[i .. nl];
+            // split into 4 tab fields: source, dest, kind, key
+            const(char)[][4] f;
+            size_t nf, st;
+            foreach (k; 0 .. line.length + 1)
+                if (k == line.length || line[k] == '\t')
+                {
+                    if (nf < 4)
+                        f[nf++] = line[st .. k];
+                    st = k + 1;
+                }
+            if (nf == 4)
+            {
+                if (!first)
+                    o.append(",");
+                first = false;
+                bindingObj(o, f[0], f[1], f[2].length && f[2][0] == 'e'
+                        ? "exchange" : "queue", f[3]);
+            }
+            i = nl + 1;
+        }
+    }
+    o.append("]");
+}
+
+private void bindingObj(ref ByteBuffer o, scope const(char)[] src, scope const(char)[] dst,
+        scope const(char)[] dstType, scope const(char)[] key) @trusted
+{
+    o.append(`{"source":"`);
+    appendJsonStr(o, src);
+    o.append(`","vhost":"/","destination":"`);
+    appendJsonStr(o, dst);
+    o.append(`","destination_type":"`);
+    o.append(dstType);
+    o.append(`","routing_key":"`);
+    appendJsonStr(o, key);
+    o.append(`","arguments":{},"properties_key":"`);
+    appendJsonStr(o, key);
+    o.append(`"}`);
 }
 
 // GET queues: enumerate `amq.q.*` via the command bridge, LLEN each for depth.

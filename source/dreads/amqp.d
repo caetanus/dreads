@@ -174,6 +174,28 @@ public void amqpExchangeSnapshot(ref ByteBuffer o) nothrow @trusted
         o.appendByte('\n');
     }
 }
+
+/// Management API hook (M4): serialize the replicated binding set as
+/// `source\tdestination\tdest_kind\trouting_key\n` lines (dest_kind = q|e),
+/// skipping tombstones (unbound elements kept for seq-gating). Runs ON an AMQP
+/// shard thread (gBindings is TLS+replicated) — installed at boot.
+public void amqpBindingsSnapshot(ref ByteBuffer o) nothrow @trusted
+{
+    foreach (exch, ref lst; gBindings)
+        foreach (ref b; lst)
+        {
+            if (!b.alive)
+                continue; // tombstone
+            o.append(exch);
+            o.appendByte('\t');
+            o.append(b.queue);
+            o.appendByte('\t');
+            o.appendByte(b.toExchange ? 'e' : 'q');
+            o.appendByte('\t');
+            o.append(b.key);
+            o.appendByte('\n');
+        }
+}
 private string[string] gExchangeAE; // TLS: exchange -> alternate-exchange (replicated via op-1)
 /// Last op seq per exchange NAME. A deleted exchange is removed from gExchanges
 /// but keeps its seq here (tombstone) so a stale lower-seq declare is rejected.
