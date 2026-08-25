@@ -222,6 +222,25 @@ public enum ShardMsg : uint
     /// [u64 pend][op bytes]; meta = requester shard; the reply travels back as
     /// ShardMsg.reply with tag = pend (the unbatched-single path).
     kafkaGroup = 9,
+
+    /// Raft commit applied to a sharded keyspace (dreads.replicator): the apply
+    /// loop (on shard 0) FIRES each committed command to the shard owning its key,
+    /// applied THERE with the injected HLC clock — reusing the same slot routing
+    /// the AOF replay (aofLoadSharded) uses, so raft over N local shards is the
+    /// AOF's per-shard routing, not new machinery. The owning shard then delivers
+    /// the RESP reply straight to the client's ShardPending (ShardMsg.reply), so
+    /// the apply loop never waits. Payload: [u64 clock][u16 db][raw RESP]; meta =
+    /// the client's shard; tag = its ShardPending (null on a follower → no reply).
+    raftApply = 10,
+
+    /// A client (any shard) funnels a write to shard 0, where the one raft group
+    /// per node lives. Shard 0 FIRES the propose into the log fire-and-forget
+    /// (proposeForClient) and the OWNING shard delivers the reply straight to the
+    /// client's ShardPending — so the apply loop never blocks and no fiber ever
+    /// parks on a raft slot (the under-load waiter-list crash). Payload: [u16 db]
+    /// [raw RESP]; meta = the client's shard; tag = its ShardPending (carried back
+    /// to the client via the owning shard's ShardMsg.reply).
+    raftPropose = 11,
 }
 
 // A reply slot owned by the REQUESTER thread. Passed by pointer to the owner (which
@@ -469,14 +488,16 @@ public void shardInit(uint count) @trusted nothrow
         return;
     }
     // the per-shard allocator slots are a fixed array (never resized so live freelist
-    // state is never moved) — clamp to its capacity.
+    // state is never moved) — clamp to its capacity. The TOP slot (MAX_SHARDS-1) is
+    // reserved for the raft worker thread (RAFT_ALLOC_SLOT), so data shards stop one
+    // short: no shard thread ever shares the raft thread's allocator freelist.
     import dreads.alloc : MAX_SHARDS;
     import core.stdc.stdio : printf;
 
-    if (count > MAX_SHARDS)
+    if (count > MAX_SHARDS - 1)
     {
-        printf("dreads: shards clamped to %u (max)\n", cast(uint) MAX_SHARDS);
-        count = MAX_SHARDS;
+        printf("dreads: shards clamped to %u (max)\n", cast(uint)(MAX_SHARDS - 1));
+        count = MAX_SHARDS - 1;
     }
     gShardCount = count;
     shardCaptureCpus(); // main thread, before any worker exists

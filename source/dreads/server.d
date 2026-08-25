@@ -446,6 +446,13 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
 
         // thread-per-shard: no-op when shards<=1 (single-thread path untouched).
         shardInit(gConfig.shards);
+        {
+            import dreads.replicator : gShardedApply;
+            import dreads.shard : gShardCount;
+
+            if (gShardCount > 1)
+                gShardedApply = &raftShardedApply; // raft apply routes to shards
+        }
         if (gShardCount > 1)
             printf("dreads: %u shards\n", gShardCount);
         gAofs = new Aof[](gShardCount > 1 ? gShardCount : 1);
@@ -2386,6 +2393,72 @@ private void shardDrainLoop() nothrow
                 }
             }
         }
+        else if (cast(ShardMsg) kind == ShardMsg.raftApply)
+        {
+            // Owner: apply a raft-committed command on THIS shard's keyspace with
+            // the injected HLC clock (deterministic replay across nodes). Payload
+            // [u64 clock][u16 db][raw]; tag = the client's ShardPending (opaque),
+            // meta = its shard. The reply hops STRAIGHT to that ShardPending — the
+            // same cross-shard reply path a command hop uses — so the apply loop
+            // never waits. tag is null on a follower → apply only, no reply.
+            import dreads.obj : gApplying, NUM_DBS;
+
+            if (p.length >= 10)
+            {
+                ulong clk = 0;
+                foreach (k; 0 .. 8)
+                    clk = (clk << 8) | p[k];
+                size_t adb = (p[8] << 8) | p[9];
+                if (adb >= NUM_DBS)
+                    adb = 0;
+                RVal acmd;
+                size_t apos = 0;
+                ByteBuffer arReply; // STACK-local: shardEnqueue below yields
+                if (parseValue(p[10 .. $], apos, arena, acmd) == ParseStatus.ok)
+                {
+                    gApplying = true;
+                    cast(void) dispatch(acmd, *myKeyspace(cast(uint) adb), arReply,
+                            arena, clk);
+                    gApplying = false;
+                }
+                if (tag !is null)
+                {
+                    shardEnqueue(cast(uint) meta, arReply.data, tag, 0, ShardMsg.reply);
+                    shardWake(cast(uint) meta);
+                }
+            }
+        }
+        else if (cast(ShardMsg) kind == ShardMsg.raftPropose)
+        {
+            // Shard 0: a client (any shard) funneled a write to the node's raft
+            // group. FIRE it into the log fire-and-forget — proposeForClient does
+            // NOT block; on apply the owning shard delivers the reply straight to
+            // the client's ShardPending (meta=reqShard, tag=pend). No fiber ever
+            // parks on a raft slot (the under-load waiter-list crash). Payload
+            // [u16 db][raw]. A non-leader replies READONLY here.
+            import dreads.stream : nowMs;
+
+            immutable rq = cast(uint) meta;
+            auto pend = cast(ShardPending*) tag;
+            bool ok = false;
+            if (p.length >= 2)
+            {
+                immutable ushort adb = cast(ushort)((p[0] << 8) | p[1]);
+                if (gReplicator !is null)
+                    ok = gReplicator.proposeForClient(p[2 .. $], nowMs(), adb, rq,
+                            cast(void*) pend);
+            }
+            if (!ok && pend !is null)
+            {
+                // not the leader (or malformed): the client never gets an apply
+                // reply, so answer here so its fiber never hangs.
+                static ByteBuffer eb; // TLS, drain fiber only
+                eb.clear();
+                repError(eb, "READONLY You can't write against a read only replica.");
+                shardEnqueue(rq, eb.data, cast(void*) pend, 0, ShardMsg.reply);
+                shardWake(rq);
+            }
+        }
         else if (cast(ShardMsg) kind == ShardMsg.amqpCtl)
         {
             // AMQP skin control plane: replicate the declare/bind locally
@@ -3259,6 +3332,118 @@ enum uint HOP_NOBLOCK = 0x2000;
 
 // IR-1: the caller resolved the opcode (one lowercase+hash per command, at the
 // top of executeCommand) — this only maps it to a slot and a shard.
+// A client (any shard) funnels its raft write to shard 0 — where the one raft
+// group per node lives — and blocks on a ShardPending for the reply. Shard 0
+// FIRES the propose into the log (proposeForClient, fire-and-forget); the OWNING
+// shard applies it and delivers the reply straight to this ShardPending. Nothing
+// ever parks on a raft slot, so the client-ack LocalManualEvent lives only on the
+// client's own shard (never emitted cross-thread). tShard==0 is a self-hop — the
+// same uniform path, keeping the client-ack the proven cross-shard hop everywhere.
+// Payload [u16 db][raw]; tag = this ShardPending, carried back verbatim.
+private void raftWriteViaHop(scope const(ubyte)[] rawCmd, ushort db, ref ByteBuffer o) nothrow
+{
+    import dreads.shard : tShard, acquireShardPending, releaseShardPending,
+        shardEnqueue, shardWake, ShardMsg;
+
+    auto p = acquireShardPending();
+    ByteBuffer hb; // STACK-local (shardEnqueue may yield under backpressure)
+    hb.appendByte(cast(char)(db >> 8));
+    hb.appendByte(cast(char)(db & 0xFF));
+    hb.append(rawCmd);
+    shardEnqueue(0, hb.data, cast(void*) p, tShard, ShardMsg.raftPropose);
+    shardWake(0);
+    while (!p.ready)
+    {
+        immutable ec = p.done.emitCount;
+        if (p.ready)
+            break;
+        try
+            p.done.wait(ec);
+        catch (Exception)
+        {
+        }
+    }
+    o.append(p.reply.data);
+    releaseShardPending(p);
+}
+
+// command is routed to the shard owning its key and applied THERE with the
+// injected HLC `clock`. Runs on the apply loop (shard 0). A local key is applied
+// here; a remote key is FIRED to its owner (never awaited — the apply loop must
+// not block). Either way the RESP reply is delivered straight to the client's
+// awaiting ShardPending (reqShard, clientPend); clientPend is null on a follower
+// / server write → apply only, no reply. Keyless/crossslot apply on shard 0.
+// This IS the AOF's per-shard routing (aofLoadSharded) at runtime.
+private int raftShardedApply(scope const(ubyte)[] raw, ushort db, ulong clock,
+        uint reqShard, void* clientPend, ref ByteBuffer reply) nothrow @trusted
+{
+    import dreads.shard : tShard, sharded, shardOfSlot, myKeyspace,
+        shardEnqueue, shardWake, ShardMsg;
+    import dreads.acl : aclCmdIndex, commandRouteSlot, ROUTE_CROSSSLOT;
+
+    if (!sharded())
+        return 0; // shards==1: caller uses gDbs[db]
+    static Arena aarena;
+    aarena.reset();
+    RVal cmd;
+    size_t pos = 0;
+    if (parseValue(raw, pos, aarena, cmd) != ParseStatus.ok
+            || cmd.type != RType.Array || cmd.arr.length == 0)
+        return 0; // malformed → let the fallback try gDbs
+
+    // resolve opcode + owning slot (first-key routing, like the command path)
+    auto name = cmd.arr[0].str;
+    char[32] lb = void;
+    if (name.length > lb.length)
+        return 0;
+    foreach (i, ch; name)
+        lb[i] = ch >= 'A' && ch <= 'Z' ? cast(char)(ch + 32) : ch;
+    auto lname = cast(const(char)[]) lb[0 .. name.length];
+    immutable opcode = aclCmdIndex(lname);
+    immutable rslot = commandRouteSlot(opcode, cast(string) lname, cmd.arr);
+    // keyless or crossslot → apply on shard 0 (this thread) directly
+    immutable owner = (rslot < 0 || rslot == ROUTE_CROSSSLOT)
+        ? cast(int) tShard : cast(int) shardOfSlot(cast(ushort) rslot);
+
+    if (cast(uint) owner == tShard)
+    {
+        // local shard (shard 0): apply here with the injected clock, then deliver
+        // the reply to the client's ShardPending (a self-hop when reqShard==0).
+        reply.clear();
+        cast(void) dispatch(cmd, *myKeyspace(db), reply, aarena, clock, opcode);
+        if (clientPend !is null)
+        {
+            shardEnqueue(reqShard, reply.data, clientPend, 0, ShardMsg.reply);
+            shardWake(reqShard);
+        }
+        return 1;
+    }
+
+    // remote shard: FIRE the apply to the owner and RETURN — the apply loop never
+    // waits (a wait here nested inside a client-ack wait corrupts vibe's waiter
+    // list under load). The owner applies, then hops the reply STRAIGHT to the
+    // client's ShardPending (meta=reqShard, tag=clientPend). clientPend null on a
+    // follower → the owner applies and skips the reply.
+    ByteBuffer hb; // STACK-local (shardEnqueue may yield under backpressure)
+    hb.appendByte(cast(char)(clock >> 56));
+    hb.appendByte(cast(char)(clock >> 48));
+    hb.appendByte(cast(char)(clock >> 40));
+    hb.appendByte(cast(char)(clock >> 32));
+    hb.appendByte(cast(char)(clock >> 24));
+    hb.appendByte(cast(char)(clock >> 16));
+    hb.appendByte(cast(char)(clock >> 8));
+    hb.appendByte(cast(char)(clock & 0xFF));
+    hb.appendByte(cast(char)(db >> 8));
+    hb.appendByte(cast(char)(db & 0xFF));
+    hb.append(raw);
+    // pack the reply target into meta: high bit marks "client reply" so the owner
+    // knows to hop the reply to reqShard; without a client (follower) we still
+    // pass reqShard but tag=null suppresses the reply.
+    shardEnqueue(cast(uint) owner, hb.data, clientPend, reqShard, ShardMsg.raftApply);
+    shardWake(cast(uint) owner);
+    return 1; // handled (reply, if any, is delivered by the owner)
+}
+
 private int shardOwnerOf(const ref RVal cmd, int opcode, scope const(char)[] lname) nothrow
 {
     import dreads.shard : shardOfSlot;
@@ -6894,25 +7079,36 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
     {
         import dreads.shard : tShard, acquireShardPending;
 
-        if (cast(uint) shardOwner != tShard)
+        // Under raft, a WRITE must NOT take the cross-shard command hop: that
+        // dispatches it on the owner shard OUTSIDE the raft log, so the entry
+        // never replicates and a follower never sees it. Let raft writes fall
+        // through to the raft gate below, which funnels them to shard 0's single
+        // log; the apply loop then routes each to its owning shard. GETEX mutates
+        // a TTL, so it funnels too. (Reads still hop here at full speed.)
+        immutable raftWrite = gReplicator !is null
+            && (cmdWriteByIdx(shardOpcode) || uname == "GETEX");
+        if (!raftWrite)
         {
-            shardFire(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, o); // remote hop, carries current db
-            return true;
+            if (cast(uint) shardOwner != tShard)
+            {
+                shardFire(c, shardOwner, shardOpcode, cast(uint) c.dbp.db, cmd, rawCmd, o); // remote hop, carries current db
+                return true;
+            }
+            if (c.shardPendCount > 0)
+            {
+                // self-shard, but cross-shard replies sit ahead of us in the
+                // pipeline: execute into an ordered ready slot instead of `o`.
+                auto p = acquireShardPending();
+                p.reply.clear();
+                cast(void) dispatch(cmd, *c.dbp, p.reply, arena, 0, shardOpcode);
+                p.ready = true;
+                if (c.shardPendCount == PIPELINE_CAP)
+                    flushShardPending(c, o);
+                c.shardPends[c.shardPendCount++] = cast(void*) p;
+                return true;
+            }
         }
-        if (c.shardPendCount > 0)
-        {
-            // self-shard, but cross-shard replies sit ahead of us in the pipeline:
-            // execute into an ordered ready slot instead of straight to `o`.
-            auto p = acquireShardPending();
-            p.reply.clear();
-            cast(void) dispatch(cmd, *c.dbp, p.reply, arena, 0, shardOpcode);
-            p.ready = true;
-            if (c.shardPendCount == PIPELINE_CAP)
-                flushShardPending(c, o);
-            c.shardPends[c.shardPendCount++] = cast(void*) p;
-            return true;
-        }
-        // self-shard, nothing pending → fall through to the full local dispatch below.
+        // self-shard (or a raft write) with nothing pending → fall through.
     }
 
     // IR-1: the opcode was resolved ONCE at the top — the whole tail (write/OOM
@@ -6937,7 +7133,24 @@ private bool executeCommand(ref Conn c, const ref RVal cmd, scope const(ubyte)[]
         if (cmdIsWrite || uname == "GETEX")
         {
             import dreads.stream : nowMs;
+            import dreads.shard : sharded, tShard;
 
+            // Sharded + raft: the single raft group per node lives on shard 0
+            // (main thread). EVERY write — from any shard, INCLUDING shard 0 —
+            // funnels to it via a ShardPending hop (a self-hop when tShard==0):
+            // shard 0 fires the propose into the log, and the OWNING shard delivers
+            // the reply straight back to this ShardPending. The apply loop never
+            // blocks and no fiber ever parks on a raft slot (the under-load waiter
+            // crash). Uniform for shard 0 and workers, so the client-ack path is
+            // the proven cross-shard hop everywhere. Staged read hops flush first
+            // so a pipelined client's read/write order holds.
+            if (sharded())
+            {
+                if (c.shardPendCount > 0)
+                    flushShardPending(c, o);
+                raftWriteViaHop(rawCmd, cast(ushort) c.dbp.db, o);
+                return true;
+            }
             // Inside a transaction keep it synchronous (atomicity + EXEC reply
             // shape); otherwise pipeline: fire without blocking and reap the
             // reply at the next flush point, so a connection's consecutive

@@ -54,6 +54,18 @@ import dreads.resp;
 /// Installed by the server when replication is configured; null = standalone.
 public __gshared Replicator gReplicator;
 
+/// Sharded-apply hook (installed by the server when shards>1). Routes a committed
+/// command to the shard owning its key and applies it there with the injected
+/// clock — reusing the AOF's per-shard slot routing. The apply loop NEVER blocks
+/// here: a remote key is FIRED to its owner shard and the owner delivers the RESP
+/// reply straight to the client's ShardPending — so no wait ever nests inside a
+/// client-ack wait (the source of the under-load waiter-list crash). `clientPend`
+/// is the awaiting ShardPending on shard `reqShard` (null on a follower / server
+/// write → apply only, no reply). Returns 1 when handled (sharded), 0 when not
+/// (shards==1 → caller falls back to the single-thread gDbs[db] dispatch).
+public __gshared int function(scope const(ubyte)[] raw, ushort db, ulong clock,
+        uint reqShard, void* clientPend, ref ByteBuffer reply) nothrow gShardedApply;
+
 // In-flight proposals keyed by log index on the raft thread (idx % RING).
 // Bounded by concurrent in-flight writes (connections x pipeline depth), far
 // below RING; a stale wrap-around is impossible because the slot travels with
@@ -98,6 +110,13 @@ private struct Pending
     bool ready;
     bool failed; // proposal rejected (leadership lost)
     bool ackResult; // membership-change outcome
+    // SHARDED raft only (proposeForClient): the awaiter is NOT this slot but a
+    // ShardPending on the client's shard. clientPend != null marks a fire-and-
+    // forget propose — applyOne routes the reply to (reqShard, clientPend) via the
+    // cross-shard hop and releases the slot; NOBODY blocks on `done`. This is why
+    // a sharded write never parks a spawned fiber on a raft slot (the crash).
+    uint reqShard;
+    void* clientPend;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +287,8 @@ final class Replicator
         p.failed = false;
         p.ackResult = false;
         p.idx = 0; // set when proposed; a reused slot must not carry a stale index
+        p.reqShard = 0;
+        p.clientPend = null; // default: an awaited slot (proposeAsync), not fire-and-forget
         p.reply.clear();
         return p;
     }
@@ -337,6 +358,35 @@ final class Replicator
         if (h is null)
             return false;
         return awaitWrite(h, o);
+    }
+
+    /// SHARDED raft client write — FIRE and forget the raft slot. The awaiter is a
+    /// ShardPending on shard `reqShard` (the client's shard); on apply, gShardedApply
+    /// routes the reply straight there and releases this slot. NOTHING blocks on the
+    /// slot's `done`, so no per-write fiber ever parks on a raft slot (which corrupts
+    /// vibe's thread-local waiter list under load). On a non-leader the caller must
+    /// reply READONLY itself (this returns false without proposing). `clientPend` is
+    /// carried opaquely to the apply and back to the client's drain.
+    bool proposeForClient(scope const(ubyte)[] rawCmd, ulong clock, ushort db,
+            uint reqShard, void* clientPend) nothrow
+    {
+        if (!atomicLoad(leaderFlag))
+            return false;
+        clock = hlcNext(lastClock, clock);
+        lastClock = clock;
+        auto slot = acquireSlot();
+        slot.reqShard = reqShard;
+        slot.clientPend = clientPend;
+        slot.reqBuf.clear();
+        ubyte[10] hdr = void;
+        foreach (i; 0 .. 8)
+            hdr[i] = cast(ubyte)(clock >> (8 * i));
+        hdr[8] = cast(ubyte) db;
+        hdr[9] = cast(ubyte)(db >> 8);
+        slot.reqBuf.append(hdr[]);
+        slot.reqBuf.append(rawCmd);
+        propQ.put(slot.reqBuf.data, cast(void*) slot, 0, CommitKind.apply);
+        return true;
     }
 
     /// Fire-and-forget propose of a SERVER-originated write — an expiry or
@@ -510,16 +560,34 @@ final class Replicator
         // in place and NOT propose a fresh DEL (which would be ordered after this
         // very command). Live reads run with gApplying=false → the reap hook
         // routes their expiry through the leader instead.
+        auto slot = cast(Pending*) tag;
+        immutable uint reqShard = slot ? slot.reqShard : 0;
+        void* clientPend = slot ? slot.clientPend : null;
+
         gApplying = true;
-        dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
+        // Sharded: route the committed command to the shard owning its key and
+        // apply it THERE with this injected clock (the AOF's per-shard routing).
+        // The apply loop NEVER blocks — a remote key is fired to its owner, which
+        // delivers the reply straight to the client's ShardPending (reqShard,
+        // clientPend). Standalone / shards==1: the single-thread gDbs[db] dispatch.
+        immutable r = (gShardedApply is null) ? 0
+            : gShardedApply(raw, cast(ushort) db, clock, reqShard, clientPend, reply);
+        if (r == 0)
+            dispatch(cmd, gDbs[db], reply, arena, clock); // injected clock, routed db
         gApplying = false;
-        if (tag !is null)
+        if (slot is null)
+            return; // follower / server write: nobody to ack
+        if (clientPend !is null)
         {
-            auto slot = cast(Pending*) tag;
-            slot.reply.clear();
-            slot.reply.append(reply.data);
-            wakeSlot(slot, false, false);
+            // sharded client write: the reply was routed to the client's
+            // ShardPending by the hook; the raft slot has no awaiter — free it.
+            releaseSlot(slot);
+            return;
         }
+        // shards==1 client write (proposeAsync): the connection fiber awaits here.
+        slot.reply.clear();
+        slot.reply.append(reply.data);
+        wakeSlot(slot, false, false);
     }
 
     /// Replaces the keyspace with a snapshot (a canonical command dump).
@@ -598,6 +666,13 @@ final class Replicator
     // node/transport/log are thus affine to this thread) and runs it forever.
     private static void raftEntry() nothrow
     {
+        // Route THIS thread's allocations to the reserved raft slot: the raft
+        // worker allocates ConnAllocator buffers off every shard thread, and slot
+        // 0 (the main thread / shard 0) has no lock — sharing it corrupts the
+        // freelist under commit load. shardInit keeps this slot clear of shards.
+        import dreads.alloc : gAllocShard, RAFT_ALLOC_SLOT;
+
+        gAllocShard = RAFT_ALLOC_SLOT;
         try
         {
             auto w = new RaftWorker(gReplicator);

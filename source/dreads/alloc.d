@@ -224,6 +224,14 @@ private __gshared ConnAllocatorT[MAX_SHARDS] gConnAllocs;
 /// its shard id when it starts, so all its allocations route to its own slot.
 public uint gAllocShard = 0;
 
+/// Dedicated allocator slot for the raft worker thread. It runs OFF every shard
+/// thread but allocates ConnAllocator buffers (log entries, transport, commit
+/// payloads); left on slot 0 it would race the main thread's (shard 0) freelist
+/// with no lock — a latent corruption that a sharded raft's high commit volume
+/// turns into a reliable crash. shardInit reserves this slot by clamping the data
+/// shard count to MAX_SHARDS-1, so no shard thread ever indexes it.
+public enum uint RAFT_ALLOC_SLOT = MAX_SHARDS - 1;
+
 /// Keyspace (data) plane — every RObj value routes here; drives maxmemory.
 struct KeyspaceAllocator
 {
