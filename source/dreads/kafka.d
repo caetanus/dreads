@@ -5499,6 +5499,9 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    auto advPort = tKafkaAdvPort; // captured at top for symmetry with the flex path. The classic
+    // broker block below is emitted BEFORE any parking hop, so this is defensive (future-proofs
+    // against a hop being inserted ahead of the broker array), not a fix for a live clobber.
     if (isFlexible(API_METADATA, ver))
     {
         handleMetadataFlex(r, ver, o);
@@ -5546,7 +5549,7 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     putI32(o, 1);
     putI32(o, 0); // node_id 0
     putStr(o, gKafkaHost);
-    putI32(o, tKafkaAdvPort);
+    putI32(o, advPort);
     if (ver >= 1)
         putI16(o, -1); // rack: null
     if (ver >= 2)
