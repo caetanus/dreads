@@ -9,7 +9,7 @@
 		"fluent-asserts": "2.0.5",
 		"libdparse": "0.25.1",
 		"libsodiumd": "0.2.0+1.0.18",
-		"silly": "1.1.1",
+		"silly": "1.2.0-dev.2",
 		"stdx-allocator": "2.77.5",
 		"taggedalgebraic": "1.0.1",
 		"test_allocator": "0.3.4",

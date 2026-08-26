@@ -17,8 +17,10 @@ services:
     image: ghcr.io/caetanus/dreads:latest          # multi-arch: amd64 + arm64 (Apple Silicon / Graviton)
     # image: ghcr.io/caetanus/dreads:latest-alpine  # smaller (~16 MB), slightly slower
     ports:
-      - "6379:6379"          # RESP — REDIS_URL=redis://localhost:6379
-      - "6380:6380"          # built-in dashboard
+      - "6379:6379"                # RESP — REDIS_URL=redis://localhost:6379
+      - "127.0.0.1:6380:6380"      # dashboard — LOOPBACK ONLY. It is an admin UI:
+                                   # publish it beyond localhost only behind a proxy
+                                   # that terminates TLS and authenticates.
     volumes:
       - dreads-data:/data    # AOF persistence (survives restarts)
     environment:
@@ -27,8 +29,11 @@ services:
       DREADS_APPENDONLY: "yes"
       # ---- built-in dashboard (opt-in; costs nothing when off) ----
       DREADS_DASHBOARD: "yes"
-      DREADS_DASHBOARD_BIND: "0.0.0.0"             # reachable through the port mapping
-      DREADS_DASHBOARD_PASSWORD: "changeme"        # REQUIRED once bound off localhost
+      DREADS_DASHBOARD_BIND: "0.0.0.0"             # inside the container; the host side is
+                                                   # loopback-only via the port mapping above
+      # No default password: compose fails fast if it is unset. Put it in .env —
+      #   echo "DREADS_DASHBOARD_PASSWORD=$(openssl rand -base64 24)" >> .env
+      DREADS_DASHBOARD_PASSWORD: "${DREADS_DASHBOARD_PASSWORD:?set DREADS_DASHBOARD_PASSWORD (e.g. in .env) — the dashboard has no safe default}"
       # DREADS_DASHBOARD_WRITE: "yes"              # allow writes from the dashboard (LPUSH/DEL/…)
       # DREADS_DASHBOARD_ADMIN: "yes"              # allow ACL-user + CONFIG admin from the dashboard
       # ---- optional: run it as a bounded cache ----
@@ -36,8 +41,9 @@ services:
       # DREADS_MAXMEMORY_POLICY: "allkeys-lru"
     restart: unless-stopped
     healthcheck:
-      # the image bundles a busybox shell; nc opens the RESP port to prove it is up
-      test: ["CMD-SHELL", "nc -w1 127.0.0.1 6379 </dev/null || exit 1"]
+      # speak RESP: send an inline PING and require PONG back. Opening the socket
+      # only proves the listener is bound — this proves the server answers.
+      test: ["CMD-SHELL", "printf 'PING\\r\\n' | nc -w1 127.0.0.1 6379 | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 5

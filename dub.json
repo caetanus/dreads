@@ -17,8 +17,8 @@
 		},
 		{
 			"dependencies": {
-				"fluent-asserts": "*",
-				"unit-threaded": "*"
+				"fluent-asserts": "~>2.0.5",
+				"unit-threaded": "~>2.2.3"
 			},
 			"excludedSourceFiles": [
 				"src/main.d"
@@ -38,8 +38,8 @@
 		{
 			"comment": "the unittest suite compiled WITHOUT the dashboard (no DreadsDashboard version) — proves the core still builds + passes when the dashboard is dropped. `dub test --config=unittest-no-dashboard`.",
 			"dependencies": {
-				"fluent-asserts": "*",
-				"unit-threaded": "*"
+				"fluent-asserts": "~>2.0.5",
+				"unit-threaded": "~>2.2.3"
 			},
 			"excludedSourceFiles": [
 				"src/main.d"
