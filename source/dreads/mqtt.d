@@ -333,6 +333,10 @@ private enum size_t MQTT_OBOX_CAP = 64 << 20;
 /// Largest accepted remaining-length. The varint allows 256MB; accepting that
 /// from an unauthenticated socket is an invitation. Oversized frame = close.
 private enum uint MQTT_MAX_PACKET = 16 << 20;
+/// Pre-CONNECT cap: a CONNECT is small, so refuse to buffer megabytes for an
+/// unauthenticated peer (16MB/conn held for CONNECT_TIMEOUT with no aggregate
+/// budget is a cheap amplification). Raised to MQTT_MAX_PACKET once connected.
+private enum uint MQTT_PRECONNECT_MAX = 256 << 10;
 /// Per-connection outbound in-flight window (QoS1 inflight + QoS2 handshakes,
 /// combined): past this, a QoS1/2 delivery is sent as QoS0 (graceful
 /// degradation, no unbounded in-flight growth for a slow acker).
@@ -2318,6 +2322,7 @@ public void mqttReapOfflineConns() nothrow @trusted
 
 private void mqttTeardown(MqttConn c, Task writer) nothrow
 {
+    immutable wasConnected = c.connected;
     if (c.connected)
     {
         import core.atomic : atomicOp;
@@ -2381,7 +2386,7 @@ private void mqttTeardown(MqttConn c, Task writer) nothrow
     // left willTopic set (a clean DISCONNECT cleared it) -> publish it now, the
     // same path a live PUBLISH takes (local delivery + cross-shard fan-out +
     // retained if the will-retain flag was set).
-    if (c.connected)
+    if (wasConnected)
         fireWill(c); // no-op if a clean DISCONNECT or the park already fired it
     // wake OTHER subscribers whose outboxes this connection's last batch filled
     // (PUBLISH+DISCONNECT coalesced in one read batch is the standard
@@ -2668,7 +2673,8 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false
                     return;
                 break; // incomplete header
             }
-            if (rem > MQTT_MAX_PACKET)
+            immutable pktCap = c.connected ? MQTT_MAX_PACKET : MQTT_PRECONNECT_MAX;
+            if (rem > pktCap)
             {
                 // oversized frame: refuse to buffer it. Tell a connected v5
                 // client why (Packet Too Large) before dropping the socket.
@@ -3319,8 +3325,8 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 return false; // [MQTT-3.1.2-14]
             if (!(flags & 0x04) && (flags & 0x38))
                 return false; // [MQTT-3.1.2-11/13/15] will qos/retain w/o will
-            if ((flags & 0x40) && !(flags & 0x80))
-                return false; // [MQTT-3.1.2-22] password flag requires username flag
+            if (c.protoVer < 5 && (flags & 0x40) && !(flags & 0x80))
+                return false; // [MQTT-3.1.2-22] v3.1.1 only: password requires username (v5 removed this)
             // keepalive seconds: enforce 1.5x as the read deadline [MQTT-3.1.2-24]
             if (i + 2 > p.length)
                 return false; // truncated CONNECT: no keepalive field (a body

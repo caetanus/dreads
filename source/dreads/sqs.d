@@ -254,7 +254,11 @@ private bool opSendMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
         return false;
     auto group = jsonStrRaw(b, "MessageGroupId");
     auto dedup = jsonStrRaw(b, "MessageDeduplicationId");
-    auto msgBody = jsonStr(b, "MessageBody");
+    // copy out of jsonStr's shared TLS ub: dedupSeen()/sendOne() park under
+    // sharding and a sibling fiber would refill ub.
+    ByteBuffer bodyBuf;
+    bodyBuf.append(jsonStr(b, "MessageBody"));
+    auto msgBody = cast(const(char)[]) bodyBuf.data;
     if (isFifo(name) && group.length == 0)
         return false; // FIFO requires MessageGroupId
     char[32] mid = void, md5 = void;
@@ -351,7 +355,10 @@ private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @truste
     jsonEachEntry(b, "Entries", (scope const(char)[] entry) {
         auto id = jsonStrRaw(entry, "Id");
         auto egroup = jsonStrRaw(entry, "MessageGroupId");
-        auto body_ = jsonStr(entry, "MessageBody");
+        // copy out of jsonStr's shared TLS ub before sendOne() may park
+        ByteBuffer ebodyBuf;
+        ebodyBuf.append(jsonStr(entry, "MessageBody"));
+        auto body_ = cast(const(char)[]) ebodyBuf.data;
         long edelay = jsonInt(entry, "DelaySeconds", 0);
         if (edelay < 0) edelay = 0;
         if (edelay > 900) edelay = 900;
@@ -388,6 +395,8 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     long visTimeout = jsonInt(b, "VisibilityTimeout", 30);
     if (visTimeout < 0)
         visTimeout = 0;
+    if (visTimeout > 43200)
+        visTimeout = 43200; // AWS max (12h); also prevents *1000 long overflow
 
     static ByteBuffer rb, qkey, ifkey, val, grpkey;
     qkey.clear();
@@ -434,6 +443,10 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
         const(char)[] rec;
         if (fifo)
         {
+            // TODO(FIFO-atomic): sismember -> lrem -> sadd is a non-atomic
+            // check-then-act; concurrent receives can double-deliver / bypass the
+            // group lock. Fix with an owner-side atomic op (deferred: an in-process
+            // lock held across a fiber park can deadlock the shard).
             // find the next deliverable record from scanPos
             rec = null;
             for (; scanPos < nrecs; scanPos++)
@@ -477,6 +490,12 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
             if (rec is null)
                 break; // queue empty
         }
+        // copy the record out of the shared TLS rb/snap: the hset below reuses
+        // rb and (under sharding) parks — a sibling fiber refills it, so the
+        // response slices must not point into a shared static.
+        ByteBuffer recCopy;
+        recCopy.append(rec);
+        rec = cast(const(char)[]) recCopy.data;
         const(char)[] mid, md5, group, body_;
         splitRecord(rec, mid, md5, group, body_);
         // move to in-flight with a fresh receipt handle + visibility deadline
@@ -507,42 +526,50 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     return true;
 }
 
+// FIFO: unlock the message's group (srem sqs.grp.<name> <group>) so the group's
+// next message can be delivered. Reads the in-flight record by receipt handle.
+// group2 is passed as an exec ARG (serialized before the reply is clobbered), so
+// this is park-safe.
+private void fifoUnlock(scope const(char)[] name, ref ByteBuffer ifkey,
+        scope const(char)[] handle) @trusted nothrow
+{
+    if (!isFifo(name))
+        return;
+    static ByteBuffer rb, grpkey;
+    const(char)[][3] hg = ["hget", cast(const(char)[]) ifkey.data, handle];
+    exec(hg[], rb);
+    auto v = respBulk(cast(const(char)[]) rb.data);
+    if (v is null)
+        return;
+    // v = deadlineMs  (msgid  md5  group  body)
+    size_t sep = 0;
+    while (sep < v.length && v[sep] != SEP)
+        sep++;
+    if (sep >= v.length)
+        return;
+    const(char)[] mid2, md52, group2, body2;
+    splitRecord(v[sep + 1 .. $], mid2, md52, group2, body2);
+    grpkey.clear();
+    grpkey.append(GRP_PREFIX);
+    grpkey.append(name);
+    const(char)[][3] sr = ["srem", cast(const(char)[]) grpkey.data, group2];
+    exec(sr[], rb);
+}
+
 private bool opDeleteMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
 {
     auto name = queueFromUrl(jsonStrRaw(b, "QueueUrl"));
     auto handle = jsonStrRaw(b, "ReceiptHandle");
     if (name.length == 0 || handle.length == 0)
         return false;
-    static ByteBuffer rb, ifkey, grpkey;
+    static ByteBuffer rb, ifkey;
     ifkey.clear();
     ifkey.append(IF_PREFIX);
     ifkey.append(name);
     // FIFO: unlock the message's group so its next message can be delivered.
     // At most one message per group is ever in-flight (the lock blocks the
     // rest), so the group is removed unconditionally here.
-    if (isFifo(name))
-    {
-        const(char)[][3] hg = ["hget", cast(const(char)[]) ifkey.data, handle];
-        exec(hg[], rb);
-        auto v = respBulk(cast(const(char)[]) rb.data);
-        if (v !is null)
-        {
-            // v = deadlineMs  (msgid  md5  group  body)
-            size_t sep = 0;
-            while (sep < v.length && v[sep] != SEP)
-                sep++;
-            if (sep < v.length)
-            {
-                const(char)[] mid2, md52, group2, body2;
-                splitRecord(v[sep + 1 .. $], mid2, md52, group2, body2);
-                grpkey.clear();
-                grpkey.append(GRP_PREFIX);
-                grpkey.append(name);
-                const(char)[][3] sr = ["srem", cast(const(char)[]) grpkey.data, group2];
-                exec(sr[], rb);
-            }
-        }
-    }
+    fifoUnlock(name, ifkey, handle);
     const(char)[][3] a = ["hdel", cast(const(char)[]) ifkey.data, handle];
     exec(a[], rb);
     o.append("{}");
@@ -565,6 +592,8 @@ private bool opDeleteMessageBatch(scope const(char)[] b, ref ByteBuffer o) @trus
         auto handle = jsonStrRaw(entry, "ReceiptHandle");
         if (handle.length)
         {
+            // FIFO: unlock the message's group before dropping the in-flight copy
+            fifoUnlock(name, ifkey, handle);
             const(char)[][3] a = ["hdel", cast(const(char)[]) ifkey.data, handle];
             exec(a[], rb);
         }
@@ -696,6 +725,8 @@ public void sqsVisibilitySweep() nothrow @trusted
                 return; // still invisible
             expHandles[nExp++] = handle;
             auto rec = v[sep + 1 .. $];
+            expRecs.appendByte(cast(char)(rec.length >> 24));
+            expRecs.appendByte(cast(char)(rec.length >> 16));
             expRecs.appendByte(cast(char)(rec.length >> 8));
             expRecs.appendByte(cast(char)(rec.length & 0xFF));
             expRecs.append(rec);
@@ -708,10 +739,12 @@ public void sqsVisibilitySweep() nothrow @trusted
         size_t pi = 0;
         foreach (i; 0 .. nExp)
         {
-            if (pi + 2 > packed.length)
+            if (pi + 4 > packed.length)
                 break;
-            immutable rl = (cast(size_t) cast(ubyte) packed[pi] << 8) | cast(ubyte) packed[pi + 1];
-            pi += 2;
+            immutable rl = (cast(size_t) cast(ubyte) packed[pi] << 24)
+                | (cast(size_t) cast(ubyte) packed[pi + 1] << 16)
+                | (cast(size_t) cast(ubyte) packed[pi + 2] << 8) | cast(ubyte) packed[pi + 3];
+            pi += 4;
             if (pi + rl > packed.length)
                 break;
             auto rec = packed[pi .. pi + rl];
@@ -762,6 +795,8 @@ public void sqsVisibilitySweep() nothrow @trusted
                 return; // not visible yet
             dueIds[nDue++] = id;
             auto rec = v[sep + 1 .. $];
+            dueRecs.appendByte(cast(char)(rec.length >> 24));
+            dueRecs.appendByte(cast(char)(rec.length >> 16));
             dueRecs.appendByte(cast(char)(rec.length >> 8));
             dueRecs.appendByte(cast(char)(rec.length & 0xFF));
             dueRecs.append(rec);
@@ -771,10 +806,12 @@ public void sqsVisibilitySweep() nothrow @trusted
             size_t pj = 0;
             foreach (i; 0 .. nDue)
             {
-                if (pj + 2 > packed2.length)
+                if (pj + 4 > packed2.length)
                     break;
-                immutable rl2 = (cast(size_t) cast(ubyte) packed2[pj] << 8) | cast(ubyte) packed2[pj + 1];
-                pj += 2;
+                immutable rl2 = (cast(size_t) cast(ubyte) packed2[pj] << 24)
+                    | (cast(size_t) cast(ubyte) packed2[pj + 1] << 16)
+                    | (cast(size_t) cast(ubyte) packed2[pj + 2] << 8) | cast(ubyte) packed2[pj + 3];
+                pj += 4;
                 if (pj + rl2 > packed2.length)
                     break;
                 auto rec = packed2[pj .. pj + rl2];
@@ -946,7 +983,7 @@ private const(char)[] jsonStr(return scope const(char)[] j, scope const(char)[] 
     i++;
     immutable start = i;
     // find the closing quote, honoring backslash escapes (unescape into a TLS buf)
-    static char[65536] ub;
+    static char[262144] ub; // AWS SQS max message size (256 KiB)
     size_t o = 0;
     while (i < j.length && j[i] != '"')
     {

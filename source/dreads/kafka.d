@@ -1463,12 +1463,11 @@ private bool kafkaPlainCheck(scope const(ubyte)[] tok, KafkaConnCtx* ctx) nothro
     }
     if (aclUserCount() <= 1)
     {
-        // legacy accept-any — still RECORD the claimed principal for ACLs
-        if (auser.length && auser.length <= ctx.principalBuf.length)
-        {
-            ctx.principalBuf[0 .. auser.length] = auser;
-            ctx.principalLen = cast(ubyte) auser.length;
-        }
+        // legacy accept-any (no ACL users): the connection is UNAUTHENTICATED.
+        // Do NOT record the client-claimed principal — otherwise an attacker
+        // claiming a super-user name would be treated as that principal once
+        // Kafka ACLs/super-users are configured (gKafkaAclActive>0).
+        ctx.principalLen = 0; // principal() => "ANONYMOUS"
         ctx.authed = true;
         return true;
     }
@@ -1626,6 +1625,11 @@ private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     {
         if (names[i].length == 0)
             continue;
+        if (!authorize(tKafkaCtx, KRES_GROUP, names[i], KOP_DELETE))
+        {
+            errs[i] = E_GROUP_AUTH_FAILED; // per-group ACL denial (echoed below)
+            continue;
+        }
         static ByteBuffer req, rep; // TLS: consumed synchronously per hop
         req.clear();
         req.appendByte(cast(char) KGOP_DROP);
@@ -1681,6 +1685,13 @@ private void handleOffsetDelete(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     import core.stdc.stdio : snprintf;
 
     auto group = r.str();
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_DELETE))
+    {
+        putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics
+        return;
+    }
     immutable ntopics = safeCount(r.i32());
     putI16(o, E_NONE); // top-level error_code
     putI32(o, 0); // throttle_time_ms
@@ -2242,6 +2253,13 @@ private bool fetchGroupMeta(scope const(char)[] group, scope const(char)[] topic
 private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto group = r.str();
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        if (ver >= 3)
+            putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics = well-formed GROUP authorization denial
+        return;
+    }
     int genId = -1;
     const(char)[] cMember = null;
     if (ver >= 1)
@@ -2515,6 +2533,12 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
     immutable pid = r.i64();
     immutable epoch = r.i16();
     immutable committed = r.i8() != 0;
+    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        return;
+    }
     short err = E_NONE;
     static ByteBuffer req, rep; // TLS: rep parsed into stack copies below
     req.clear();
@@ -3085,11 +3109,12 @@ private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothro
                 immutable part = r.i32();
                 immutable off = (r.ok && validTopic(topic) && part >= 0)
                     ? fetchGroupOffset(group, topic, part) : -1;
-                static ByteBuffer mbf; // TLS: consumed before the next hop
-                immutable hasMeta = off >= 0 && fetchGroupMeta(group, topic, part, mbf);
                 putI32(o, part);
                 putI64(o, off); // committed_offset (-1 = none)
                 putI32(o, off >= 0 ? fetchGroupEpoch(group, topic, part) : -1);
+                // fill meta LAST: no hop between fill and read.
+                static ByteBuffer mbf;
+                immutable hasMeta = off >= 0 && fetchGroupMeta(group, topic, part, mbf);
                 if (hasMeta)
                     putCStr(o, cast(const(char)[]) mbf.data);
                 else
@@ -3151,12 +3176,14 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
                 immutable part = r.i32();
                 immutable off = (r.ok && validTopic(topic) && part >= 0)
                     ? fetchGroupOffset(group, topic, part) : -1;
-                static ByteBuffer mb; // TLS: consumed before the next hop
-                immutable hasMeta = off >= 0 && fetchGroupMeta(group, topic, part, mb);
                 putI32(o, part);
                 putI64(o, off); // committed_offset (-1 = none)
                 if (ver >= 5)
                     putI32(o, off >= 0 ? fetchGroupEpoch(group, topic, part) : -1);
+                // fill meta LAST — no hop between the fill and the read, so a
+                // sibling OffsetFetch cannot clobber the shared TLS buffer.
+                static ByteBuffer mb;
+                immutable hasMeta = off >= 0 && fetchGroupMeta(group, topic, part, mb);
                 if (hasMeta)
                     putStr(o, cast(const(char)[]) mb.data);
                 else
@@ -3843,6 +3870,13 @@ private enum short E_INVALID_CONFIG = 40;
 
 private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_CREATE))
+    {
+        if (ver >= 2)
+            putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics = well-formed authorization denial
+        return;
+    }
     immutable ntopics = safeCount(r.i32());
     // STACK-local (not TLS static): registerTopic below hops cross-shard and
     // yields; a shared static would be clobbered by another connection's
@@ -3943,6 +3977,12 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// INVALID_CONFIG for the resource. Non-topic resources are acked untouched.
 private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero resources = well-formed authorization denial
+        return;
+    }
     immutable nres = safeCount(r.i32());
     byte[16] rtypes;
     const(char)[][16] rnames;
@@ -4041,6 +4081,12 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
     import core.atomic : atomicOp;
     import core.stdc.stdio : snprintf;
 
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
+    {
+        putI32(o, 0); // throttle_time_ms (v0+)
+        putI32(o, 0); // zero topics = well-formed authorization denial
+        return;
+    }
     immutable ntopics = safeCount(r.i32());
     putI32(o, 0); // throttle_time_ms (v0+)
     immutable tOff = o.length;
@@ -4131,6 +4177,12 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
 /// (INVALID_PARTITIONS), growth re-registers the new count (capped).
 private void handleCreatePartitions(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    {
+        putI32(o, 0); // throttle_time_ms (v0+)
+        putI32(o, 0); // zero results = well-formed authorization denial
+        return;
+    }
     immutable ntopics = safeCount(r.i32());
     const(char)[][64] names;
     int[64] counts;
@@ -4560,6 +4612,14 @@ private void putStrNullable(ref ByteBuffer o, scope const(char)[] v, bool isNull
 /// CreateAcls (v0-v1): store each binding. LITERAL/PREFIXED only.
 private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    // ACL administration requires cluster ALTER (super-users pass); otherwise an
+    // anonymous client could self-grant a wildcard binding (AOF-persisted).
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero results = well-formed authorization denial
+        return;
+    }
     immutable n = safeCount(r.i32());
     KAclBinding[64] bs;
     short[64] errs;
@@ -4653,6 +4713,13 @@ private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// DeleteAcls (v0-v1): per filter, delete + echo the matching bindings.
 private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    // ACL administration requires cluster ALTER (super-users pass).
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero filter_results = well-formed authorization denial
+        return;
+    }
     immutable nf = safeCount(r.i32());
     KAclBinding[16] filters;
     size_t nfl;
@@ -4726,6 +4793,12 @@ private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 /// compile-time here). validate_only skips the writes.
 private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero responses = well-formed authorization denial
+        return;
+    }
     immutable nres = safeCount(r.i32());
     // response staged AFTER the full parse (writes hop cross-shard mid-parse
     // is fine — slices point into the stable request buffer)
@@ -4888,6 +4961,13 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
 /// Metadata, so "deleted" means "registry + data gone".
 private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
+    {
+        if (ver >= 1)
+            putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero results = well-formed authorization denial
+        return;
+    }
     immutable ntopics = safeCount(r.i32());
     const(char)[][64] names;
     size_t nt;
@@ -5021,7 +5101,10 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     immutable ntopics = rawn < 0 ? 0 : safeCount(rawn);
     const(char)[][512] topics; // all-topics window: a full-suite run registers hundreds
     size_t nt = 0;
-    static ByteBuffer allBuf; // TLS: SMEMBERS reply for the all-topics form
+    // FIBER-LOCAL (not static): topics[] slices point INTO this buffer and are
+    // read across registerTopic's cross-shard park below. A shared TLS buffer
+    // would be clobbered by a sibling all-topics Metadata during that park.
+    ByteBuffer allBuf; // SMEMBERS reply for the all-topics form
     if (rawn < 0 && gKafkaExec !is null)
     {
         // all-topics request: list the produce-time registry (kafka.topics).

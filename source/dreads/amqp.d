@@ -1927,6 +1927,7 @@ private final class AmqpConn
     // frozen per-command gClock behind nowMs() would leave stale stamps)
     bool hbStarted;  // the sender fiber is spawned exactly once
     const(void)* aclAuth; // authenticated ACL user (AclUser*); null = legacy accept-any
+    bool opened; // connection.open-ok sent; data-plane classes gated behind this when ACL configured
     // NEGOTIATED max frame size. Starts at the spec's frame-min-size (4096):
     // until tune-ok lands, a peer frame beyond that is a negotiation-phase
     // frame error (rejectLargeFramesDuringConnectionNegotiation pins it).
@@ -2292,7 +2293,7 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
             immutable chan = cast(ushort)((d[pos + 1] << 8) | d[pos + 2]);
             immutable fsize = (cast(uint) d[pos + 3] << 24) | (cast(uint) d[pos + 4] << 16)
                 | (cast(uint) d[pos + 5] << 8) | d[pos + 6];
-            if (fsize + 8 > c.frameMax)
+            if (cast(ulong) fsize + 8 > c.frameMax)
             {
                 // exceeds the NEGOTIATED frame-max (frame-max counts header +
                 // payload + end octet): connection-level 501 FRAME_ERROR, like
@@ -2408,6 +2409,19 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 return true;
             }
     immutable mth = r.u16();
+    // HANDSHAKE GATE: with an ACL configured (aclUserCount()>1), no class other
+    // than connection (10) may be dispatched until connection.open-ok has been
+    // sent. Legacy accept-any (aclUserCount()<=1) leaves the gate open (unchanged).
+    if (cls != 10 && !c.opened)
+    {
+        import dreads.acl : aclUserCount;
+
+        if (aclUserCount() > 1)
+        {
+            connectionClose(o, 503, "COMMAND_INVALID - expected connection.open", cast(ushort) cls, 0);
+            return true;
+        }
+    }
     switch (cls)
     {
     case 10: // connection
@@ -2560,6 +2574,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 method(o, 0, 10, 41, (ref ByteBuffer b) @nogc nothrow {
                     putShortStr(b, "");
                 });
+                c.opened = true; // handshake complete — data-plane classes now allowed
                 return true;
             }
         case 50: // close

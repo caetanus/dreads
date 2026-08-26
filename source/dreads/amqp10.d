@@ -629,6 +629,10 @@ private void closeQuiet(TCPConnection tcp) nothrow
 
 enum uint A10_OUR_IDLE_MS = 30_000; // what we advertise in open
 enum uint A10_MAX_FRAME = 1 << 20;
+/// Per-connection link cap: each attach inserts ps.links[handle] for any u32
+/// and (for receivers) spawns a delivery fiber able to buffer a 16MiB fragment.
+/// Bound the total so one connection can't exhaust memory/fibers.
+enum uint A10_MAX_LINKS_PER_CONN = 4096;
 
 private long monoMs10() nothrow @trusted
 {
@@ -801,7 +805,19 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer, TlsLeg* leg = null) n
         a10Send(c, AMQP10_HDR_BARE[]);
     }
     else
+    {
+        import dreads.acl : aclUserCount;
+
+        // ACL configured: a bare (SASL-less) header MUST NOT reach the AMQP
+        // layer unauthenticated. Offer the SASL header and hang up so the
+        // client renegotiates with credentials. (accept-any stays for <=1 user.)
+        if (aclUserCount() > 1)
+        {
+            a10Send(c, AMQP10_HDR_SASL[]);
+            return;
+        }
         a10Send(c, AMQP10_HDR_BARE[]);
+    }
 
     // ---- AMQP layer: expect open ----
     bool opened = false;
@@ -1131,6 +1147,19 @@ private void a10HandleAttach(A10Conn c, ushort fchan, ref A10Dec fields,
     }
     else
         lk.clientSender = true;
+    // Per-connection link cap (aggregate across sessions): no bound would let a
+    // client attach 2^32 links, each spawning a fiber / buffering 16MiB. Refuse
+    // past the cap — lk.name/handle/role are set, so the refuse frame is valid.
+    {
+        size_t totalLinks = 0;
+        foreach (ref s2; c.sessions)
+            totalLinks += s2.links.length;
+        if (totalLinks >= A10_MAX_LINKS_PER_CONN)
+        {
+            a10RefuseAttach(c, fchan, lk, "amqp:resource-limit-exceeded", "link cap");
+            return;
+        }
+    }
     if (nf >= 4)
         fields.skipValue(); // snd-settle-mode
     if (nf >= 5)
@@ -1939,8 +1968,11 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
     props.appendByte(cast(char)(flags & 0xFF));
     if (flags & 0x8000)
     {
-        props.appendByte(cast(char) contentType.length);
-        props.append(contentType);
+        // 0-9-1 shortstr length is ONE byte: >255 truncates the length and
+        // misframes the record. Clamp value+len together (extend-only).
+        immutable ctl = contentType.length > 255 ? 255 : contentType.length;
+        props.appendByte(cast(char) ctl);
+        props.append(contentType[0 .. ctl]);
     }
     if (flags & 0x2000)
     {
@@ -1953,13 +1985,15 @@ private void a10MapMessage(scope const(ubyte)[] msg, ref ByteBuffer props,
         props.appendByte(cast(char) priority);
     if (flags & 0x0400)
     {
-        props.appendByte(cast(char) correlationId.length);
-        props.append(correlationId);
+        immutable cil = correlationId.length > 255 ? 255 : correlationId.length;
+        props.appendByte(cast(char) cil);
+        props.append(correlationId[0 .. cil]);
     }
     if (flags & 0x0200)
     {
-        props.appendByte(cast(char) replyTo.length);
-        props.append(replyTo);
+        immutable rtl = replyTo.length > 255 ? 255 : replyTo.length;
+        props.appendByte(cast(char) rtl);
+        props.append(replyTo[0 .. rtl]);
     }
     if (flags & 0x0100)
     {
@@ -2066,7 +2100,22 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
             }
         }
     }
-    foreach (id; first .. last + 1)
+    // first/last are client-controlled: iterating the raw numeric span would
+    // spin the shard loop over up to 2^64 ids probing the AA. Snapshot the
+    // unsettled SET filtered to [first,last] and walk that (bounded by real
+    // in-flight deliveries) — same settle result, no unbounded loop.
+    static ulong[] dispIds; // TLS: drain fiber only
+    dispIds.length = 0;
+    try
+    {
+        foreach (uid, ref uo; ps.unsettled)
+            if (uid >= first && uid <= last)
+                dispIds ~= uid;
+    }
+    catch (Exception)
+    {
+    }
+    foreach (id; dispIds)
     {
         auto po = id in ps.unsettled;
         if (po is null)

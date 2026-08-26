@@ -100,6 +100,7 @@ private struct KgTxn
     string[] tps; // "topic\x1fpartition" touched by the OPEN transaction
     string offGroup; // consumer group of the buffered TxnOffsetCommit
     KgTxnOff[] offs; // offsets applied on COMMIT, dropped on abort
+    long lastMs; // MonoTime ms of the last txn op — idle eviction in kgroupSweep
 }
 
 private KgTxn*[string] tTxns; // TLS: transactional ids owned by THIS shard
@@ -805,6 +806,11 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             {
                 import core.atomic : atomicOp;
 
+                if (tTxns.length >= KG_MAX_GROUPS)
+                {
+                    wI16(o, 50); // INVALID_TRANSACTION_TIMEOUT: coordinator at capacity
+                    return;
+                }
                 t = new KgTxn;
                 t.pid = atomicOp!"+="(gKgPidCtr, 1);
                 t.epoch = -1;
@@ -814,6 +820,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             t.tps = null;
             t.offs = null;
             t.offGroup = null;
+            t.lastMs = now;
             wI16(o, KG_NONE);
             immutable long pv = t.pid;
             foreach_reverse (k; 0 .. 8)
@@ -841,6 +848,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 wI16(o, 47); // INVALID_PRODUCER_EPOCH: fenced
                 return;
             }
+            t.lastMs = now;
             foreach (_; 0 .. (n2 < 0 || n2 > 1024 ? 0 : n2))
             {
                 if (!r.ok)
@@ -849,8 +857,10 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 immutable part = r.i32();
                 if (!r.ok)
                     break;
+                if (topic.length > 249)
+                    continue; // Kafka topic max is 249; refuse to truncate+collide
                 char[300] tb = void;
-                size_t tl = topic.length <= 280 ? topic.length : 280;
+                size_t tl = topic.length;
                 tb[0 .. tl] = topic[0 .. tl];
                 tb[tl] = '\x1f';
                 import core.stdc.stdio : snprintf;
@@ -891,6 +901,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 wI16(o, 47); // fenced
                 return;
             }
+            t.lastMs = now;
             t.offGroup = grp.idup;
             foreach (_; 0 .. (n2 < 0 || n2 > 4096 ? 0 : n2))
             {
@@ -930,6 +941,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 wI16(o, 47); // fenced
                 return;
             }
+            t.lastMs = now;
             wI16(o, KG_NONE);
             wI32(o, cast(int) t.tps.length);
             foreach (x; t.tps)
@@ -1039,7 +1051,7 @@ private void evictStale(KgGroup* g, long now) nothrow
 /// evict members whose session timeout lapsed, drop empty groups.
 public void kgroupSweep() nothrow @trusted
 {
-    if (tGroups.length == 0)
+    if (tGroups.length == 0 && tTxns.length == 0)
         return;
     immutable now = kgNowMs();
     string[] drop;
@@ -1053,4 +1065,12 @@ public void kgroupSweep() nothrow @trusted
     }
     foreach (name; drop)
         tGroups.remove(name);
+    // idle transactions: evict txns whose last op is older than the max
+    // transaction timeout (bounds tTxns like KG_MAX_GROUPS bounds tGroups).
+    string[] dropTxn;
+    foreach (name, t; tTxns)
+        if (now - t.lastMs > TXN_MAX_TIMEOUT_MS)
+            dropTxn ~= name;
+    foreach (name; dropTxn)
+        tTxns.remove(name);
 }
