@@ -117,7 +117,15 @@ message rates, users) when `management-port` is set.
 ## Durability and publisher confirms
 
 A confirmed publish is durable at the **`appendonly=everysec`** level — the same
-guarantee Redis gives with `appendfsync everysec`. Concretely:
+guarantee Redis gives with `appendfsync everysec`.
+
+> **Disparity vs RabbitMQ.** RabbitMQ `fsync`s a *persistent* message to disk
+> before confirming it; dreads confirms at everysec durability, so a **hard**
+> `kill -9` / power loss can forfeit up to the last ~1s of confirmed messages.
+> A **clean** shutdown (`SIGTERM`) loses nothing (see graceful shutdown below).
+> This is the same tradeoff Redis makes and is **divergent by design**, not a bug.
+
+Concretely:
 
 - **Same-shard (local) publish** — the message is applied and its AOF record
   `fwrite`+`fflush`'d to the OS **before** the `basic.ack` ships. Not a promise,
@@ -156,23 +164,42 @@ msg/s at 1 shard, staying near that through 4 shards; a single hop-bound stream
 runs ~3–4× faster than the naive synchronous hop it replaced. RabbitMQ's peak on
 the same box is ~264K msg/s.
 
-## Deliberately not here yet
+## Where it differs from RabbitMQ
 
-Honest scope — these are known gaps, not hidden ones:
+Everything on the wire — method framing, error codes, property tables, content
+headers — targets RabbitMQ byte-for-byte (the `pika` suite is the yardstick). The
+differences below are the exceptions, split the way the [README](README.md#compatibility-stated-honestly)
+splits them: **divergent by design** (permanent, an architectural choice) vs.
+**not done yet** (a gap that will close). Read them before migrating an app that
+leans on RabbitMQ's exact semantics.
 
+### Divergent by design — these will stay
+
+- **Confirm durability is everysec, not fsync-per-message** — see the box above.
+  A confirm means "in memory + written to the AOF, fsync within 1s / on clean
+  shutdown," not "on disk right now."
+- **A queue is a single list on one shard.** It cannot be split across shards, so
+  one hot queue does not get faster with `--shards`; scale by using **many**
+  queues. This is the Redis-Cluster slot model, applied to queues.
+- **`queue.declare-ok` `consumer_count` is shard-local** — it reports this shard's
+  consumers, not a cluster-wide sum.
+- **No RDB / no classic mirrored-queue replication.** Persistence is the AOF (and,
+  under `--raft`, the committed log); there is no `.rdb`-style snapshot and no
+  RabbitMQ HA-policy mirroring. Redundancy comes from Raft, not queue mirrors.
+
+### Not done yet — gaps we will close
+
+- **Auto-ack is the delivery model — no crash-time redelivery.** ⚠️ The behavioral
+  one to know: a message is **acked on delivery**, so if a consumer dies while
+  processing it, it is **not redelivered** — RabbitMQ, with manual ack, *would*
+  requeue it. Explicit `basic.ack`/`nack`/`reject` are accepted and `nack
+  requeue=true` works, but the per-consumer unacked set (PEL) that powers
+  crash-redelivery is the stream-backed v2. **Do not rely on at-least-once
+  redelivery across a consumer crash today.**
 - **No heartbeat enforcement.** Heartbeats are negotiated but a dead peer is
   detected by read timeout, not by missed heartbeats.
-- **No `basic.qos` prefetch windows.** Consumers poll; a global/per-consumer
-  prefetch cap is accepted but not used to throttle delivery.
-- **Auto-ack is the redelivery model.** Explicit acks are accepted and honored
-  for requeue, but crash-time redelivery of un-acked in-flight messages (a
-  per-consumer PEL) is the stream-backed v2, not here.
-- **Consumer-count aggregation is shard-local.** `queue.declare-ok`'s
-  consumer_count reflects this shard's consumers, not a cross-shard sum.
-
-Everything else on the wire — method framing, error codes, property tables,
-content headers — targets RabbitMQ byte-for-byte, with the `pika` client suite as
-the yardstick.
+- **No `basic.qos` prefetch windows.** Consumers poll; a prefetch cap is accepted
+  but does not throttle delivery.
 
 ## Interop
 

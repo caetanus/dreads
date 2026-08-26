@@ -100,20 +100,40 @@ over 1.0 (validated against RabbitMQ's own `SourceFiltersTest`):
 A stream consumer's `attach` is refused if its `source` would drop the filters it
 asked for — so a client always knows whether its filter took effect.
 
-## Deliberately not here yet
+## Where it differs from RabbitMQ
 
-Honest scope — known gaps, not hidden ones:
+Everything on the wire — the type-system codec, performative framing, SASL,
+flow/credit accounting, settlement, stream offsets and filters — targets the spec
+and RabbitMQ's behavior (the **rabbitmq-amqp-java-client** suite is the yardstick).
+The differences below are the exceptions, split the way the
+[README](README.md#compatibility-stated-honestly) splits them.
 
-- **No transactions** (the 1.0 transactional-messaging feature).
-- **No link resume** — a detached link's unsettled map is not preserved for
-  re-attach; a reconnecting client starts fresh.
-- **No link-routing / multi-hop** — links terminate at a queue/exchange on this
-  broker, not routed onward.
+Note that on the **delivery side 1.0 is more faithful than 0-9-1**: settlement is
+explicit (a `disposition`, driven by the client), and on a link detach or session
+end the broker **requeues** the link's unsettled deliveries — so at-least-once
+holds across a clean reconnect (no silent drop like 0-9-1's auto-ack).
 
-Everything on the wire below that — the type-system codec, performative framing,
-SASL, flow/credit accounting, settlement, stream offsets and filters — targets
-the spec and RabbitMQ's behavior, with the **rabbitmq-amqp-java-client** suite as
-the yardstick.
+### Divergent by design — these will stay
+
+- **Confirm durability is everysec, not fsync-per-message.** A settled publish is
+  "in memory + written to the AOF, fsync within 1s / on clean shutdown," not "on
+  disk right now" — the same tradeoff as [AMQP 0-9-1](AMQP.md#durability-and-publisher-confirms)
+  and Redis. A hard crash can forfeit the sub-second tail; a clean `SIGTERM` loses
+  nothing.
+- **A queue is a single list on one shard** — it does not parallelize across
+  `--shards`; scale by using many queues (the Redis-Cluster slot model).
+- **No RDB / no classic queue mirroring** — persistence is the AOF (or the Raft
+  log); redundancy is Raft, not HA-policy mirrors.
+
+### Not done yet — gaps we will close
+
+- **No transactions** — the 1.0 transactional-messaging feature (coordinator,
+  `txn-id`, discharge) is not implemented.
+- **No link resume.** A reconnecting client re-attaches **fresh** — the detached
+  link's unsettled deliveries were requeued (above), so nothing is lost, but the
+  unsettled map is not restored for exactly-once dedup on resume.
+- **No link-routing / multi-hop** — a link terminates at a queue/exchange on this
+  broker; it is not routed onward to another node.
 
 ## Interop with 0-9-1
 
