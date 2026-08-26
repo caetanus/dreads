@@ -5773,10 +5773,28 @@ package void a10EnsureQueue(scope const(char)[] q) nothrow @trusted
 package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
         scope const(ubyte)[] props, scope const(ubyte)[] body_) nothrow @trusted
 {
-    static ByteBuffer rec; // TLS: consumed by the push sink in-walk
-    rec.clear();
-    buildRecord(rec, cast(long) nowMs(), 0, rkey, props, body_, exchange);
-    auto payload = rec.data.asChars;
+    // `payload` slices `rec` and is re-read by the sink on EACH routed queue —
+    // across gAmqpPush's cross-shard park. A bare TLS static would be clobbered by
+    // a REENTRANT a10Publish (another 1.0 transfer on this thread) that runs during
+    // the park and rewrites it, splicing its bytes into this publish's later
+    // destinations. Mirror finishPublish: the first (non-reentrant) caller uses the
+    // TLS static (zero-alloc); a reentrant caller takes a stack-local, leaving the
+    // outer call's buffer — and its live `payload` slice — intact.
+    static ByteBuffer recStatic; // TLS
+    static bool recBusy;
+    ByteBuffer recLocal;
+    ByteBuffer* recp = &recLocal;
+    if (!recBusy)
+    {
+        recBusy = true;
+        recp = &recStatic;
+    }
+    scope (exit)
+        if (recp is &recStatic)
+            recBusy = false;
+    recp.clear();
+    buildRecord(*recp, cast(long) nowMs(), 0, rkey, props, body_, exchange);
+    auto payload = recp.data.asChars;
     amqpCountPub();
     int routed = 0;
     string[16] seen;

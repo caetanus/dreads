@@ -1552,7 +1552,8 @@ private void registerGroupName(scope const(char)[] group, scope const(char)[] pt
 /// filter client-side.
 private void handleListGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
     {
         if (ver >= 1)
             putI32(o, 0); // throttle_time_ms (v1+)
@@ -1617,6 +1618,7 @@ private void handleListGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 /// (NON_EMPTY_GROUP).
 private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     immutable ngr = safeCount(r.i32());
     const(char)[][64] names;
     size_t ng;
@@ -1638,7 +1640,7 @@ private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @
             errs[i] = 24; // INVALID_GROUP_ID
             continue;
         }
-        if (!authorize(tKafkaCtx, KRES_GROUP, names[i], KOP_DELETE))
+        if (!authorize(ctx, KRES_GROUP, names[i], KOP_DELETE))
         {
             errs[i] = E_GROUP_AUTH_FAILED; // per-group ACL denial (echoed below)
             continue;
@@ -1695,10 +1697,11 @@ private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// top-level error FIRST, then throttle, then topics.
 private void handleOffsetDelete(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     import core.stdc.stdio : snprintf;
 
     auto group = r.str();
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_DELETE))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_DELETE))
     {
         putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
         putI32(o, 0); // throttle_time_ms
@@ -1921,13 +1924,14 @@ private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
 /// JoinGroup v6/v7 (flexible): real coordinator via dreads.kafkagroup.
 private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
 auto group = r.cstr();
     immutable sessMs = r.i32();
     immutable rebMs = r.i32();
     auto memberId = r.cstr();
     auto gii = r.cstr(); // group_instance_id (nullable, v5+)
     auto protocolType = r.cstr();
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         emitJoinErr(o, ver, true, E_GROUP_AUTH_FAILED, memberId);
         return;
@@ -1973,6 +1977,7 @@ auto group = r.cstr();
 /// stub missed it — librdkafka v5 joins misparsed into a retry loop).
 private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     if (isFlexible(API_JOIN_GROUP, ver)) // v6/v7 flexible
     {
         handleJoinGroupFlex(r, ver, o);
@@ -1987,7 +1992,7 @@ private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         gii = r.str(); // group_instance_id (nullable) — v5 classic
     auto protocolType = r.str();
     immutable nproto = safeCount(r.i32());
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         emitJoinErr(o, ver, false, E_GROUP_AUTH_FAILED, memberId);
         return;
@@ -2272,8 +2277,9 @@ private bool fetchGroupMeta(scope const(char)[] group, scope const(char)[] topic
 /// OffsetCommit (v0-v7): persist the committed offset per partition.
 private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto group = r.str();
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         if (ver >= 3)
             putI32(o, 0); // throttle_time_ms
@@ -2408,6 +2414,7 @@ private short txnInit(scope const(char)[] tid, int txnTimeoutMs, out long pid,
 /// producers keep the historic fresh-pid counter.
 private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     import core.atomic : atomicOp;
 
     const(char)[] tid;
@@ -2429,7 +2436,7 @@ private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow
         txnTimeout = r.i32();
     }
     if (tid !is null && tid.length
-            && !authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+            && !authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
@@ -2465,8 +2472,9 @@ private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow
 /// (fencing validated); the response echoes one error for all partitions.
 private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto tid = r.str();
-    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero topics = well-formed authorization denial
@@ -2549,11 +2557,12 @@ private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) not
 /// (the offsets themselves arrive via TxnOffsetCommit).
 private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto tid = r.str(); // transactional_id
     cast(void) r.i64(); // producer_id
     cast(void) r.i16(); // producer_epoch
     cast(void) r.str(); // group
-    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
@@ -2569,6 +2578,7 @@ private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothro
 /// `kafka.txa.<t>.<p>` for Fetch's aborted_transactions.
 private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     import core.atomic : atomicStore;
     import core.stdc.stdio : snprintf;
 
@@ -2576,7 +2586,7 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
     immutable pid = r.i64();
     immutable epoch = r.i16();
     immutable committed = r.i8() != 0;
-    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
@@ -2763,8 +2773,9 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
 /// classic path (hop-safe interleave; see handleOffsetCommit).
 private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto tid = r.cstr(); // transactional_id
-    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putCArrLen(o, 0); // zero topics (compact) = well-formed authz denial
@@ -2845,13 +2856,14 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
 
 private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     if (isFlexible(API_TXN_OFFSET_COMMIT, ver)) // v3 flexible
     {
         handleTxnOffsetCommitFlex(r, ver, o);
         return;
     }
     auto tid = r.str(); // transactional_id
-    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero topics = well-formed authorization denial
@@ -3135,8 +3147,9 @@ private void emitAllGroupOffsetsFlex(scope const(char)[] group, short ver, ref B
 /// require_stable to the request.
 private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto group = r.cstr();
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         putI32(o, 0); // throttle_time_ms
         putCArrLen(o, 0); // zero topics (compact)
@@ -3202,13 +3215,14 @@ private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothro
 
 private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     if (isFlexible(API_OFFSET_FETCH, ver)) // v6/v7 flexible
     {
         handleOffsetFetchFlex(r, ver, o);
         return;
     }
     auto group = r.str();
-    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         if (ver >= 3)
             putI32(o, 0); // throttle_time_ms
@@ -3279,6 +3293,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
 /// re-join).
 private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     immutable flex = isFlexible(API_HEARTBEAT, ver); // v4 flexible
     const(char)[] group, mid;
     int gen;
@@ -3297,7 +3312,7 @@ private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         if (ver >= 3)
             cast(void) r.str(); // group_instance_id
     }
-    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (group.length && !authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         if (flex)
         {
@@ -3431,8 +3446,9 @@ private void syncLoop(ref ByteBuffer o, short ver, bool flex, scope const(char)[
 /// (the old stub read them at v4 too — a misparse).
 private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto group = r.cstr();
-    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (group.length && !authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         emitSyncErr(o, ver, true, E_GROUP_AUTH_FAILED);
         return;
@@ -3488,13 +3504,14 @@ private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow 
 /// SyncGroup v0-v3 (classic): real coordinator.
 private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     if (isFlexible(API_SYNC_GROUP, ver)) // v4/v5 flexible
     {
         handleSyncGroupFlex(r, ver, o);
         return;
     }
     auto group = r.str();
-    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (group.length && !authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         emitSyncErr(o, ver, false, E_GROUP_AUTH_FAILED);
         return;
@@ -3543,6 +3560,7 @@ private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
 /// rebalance for the survivors. v3+ batches members.
 private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     immutable flex = isFlexible(API_LEAVE_GROUP, ver); // v4 flexible
     const(char)[] group;
     const(char)[][32] mids;
@@ -3609,7 +3627,7 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
                 cast(int) ver, flex ? 1 : 0, cast(int) group.length, group.ptr,
                 cast(int) nm, r.ok ? 1 : 0);
     }
-    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    if (group.length && !authorize(ctx, KRES_GROUP, group, KOP_READ))
     {
         if (flex)
         {
@@ -3688,7 +3706,8 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 }
 private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero results = well-formed authorization denial
@@ -3800,6 +3819,7 @@ private bool groupExists(scope const(char)[] group) nothrow @trusted
 /// are reported empty; the inspector derives partitions from OffsetFetch.
 private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     immutable ngroups = safeCount(r.i32());
     // STACK-local: the ops below hop cross-shard and yield; a shared static
     // would be clobbered by another connection during the park.
@@ -3829,7 +3849,7 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
         "CompletingRebalance", "Stable"];
     foreach (i; 0 .. ng)
     {
-        if (!authorize(tKafkaCtx, KRES_GROUP, groups[i], KOP_DESCRIBE))
+        if (!authorize(ctx, KRES_GROUP, groups[i], KOP_DESCRIBE))
         {
             putI16(o, E_GROUP_AUTH_FAILED); // error_code
             putStr(o, groups[i]); // group_id
@@ -4008,7 +4028,8 @@ private enum short E_INVALID_CONFIG = 40;
 
 private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_CREATE))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_CREATE))
     {
         if (ver >= 2)
             putI32(o, 0); // throttle_time_ms
@@ -4115,7 +4136,8 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// INVALID_CONFIG for the resource. Non-topic resources are acked untouched.
 private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero resources = well-formed authorization denial
@@ -4216,10 +4238,11 @@ private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// watermark; past-the-end/negative = OFFSET_OUT_OF_RANGE(1).
 private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     import core.atomic : atomicOp;
     import core.stdc.stdio : snprintf;
 
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
     {
         putI32(o, 0); // throttle_time_ms (v0+)
         putI32(o, 0); // zero topics = well-formed authorization denial
@@ -4350,7 +4373,8 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
 /// (INVALID_PARTITIONS), growth re-registers the new count (capped).
 private void handleCreatePartitions(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
     {
         putI32(o, 0); // throttle_time_ms (v0+)
         putI32(o, 0); // zero results = well-formed authorization denial
@@ -4785,9 +4809,10 @@ private void putStrNullable(ref ByteBuffer o, scope const(char)[] v, bool isNull
 /// CreateAcls (v0-v1): store each binding. LITERAL/PREFIXED only.
 private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     // ACL administration requires cluster ALTER (super-users pass); otherwise an
     // anonymous client could self-grant a wildcard binding (AOF-persisted).
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero results = well-formed authorization denial
@@ -4833,8 +4858,9 @@ private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 /// DescribeAcls (v0-v1): filter the store, grouped by resource.
 private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     // The ACL store dump (principals/hosts) requires cluster DESCRIBE.
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
     {
         putI32(o, 0); // throttle_time_ms
         putI16(o, E_CLUSTER_AUTH_FAILED); // error_code
@@ -4895,8 +4921,9 @@ private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// DeleteAcls (v0-v1): per filter, delete + echo the matching bindings.
 private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     // ACL administration requires cluster ALTER (super-users pass).
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero filter_results = well-formed authorization denial
@@ -4975,7 +5002,8 @@ private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 /// compile-time here). validate_only skips the writes.
 private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
     {
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero responses = well-formed authorization denial
@@ -5143,7 +5171,8 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
 /// Metadata, so "deleted" means "registry + data gone".
 private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
     {
         if (ver >= 1)
             putI32(o, 0); // throttle_time_ms
@@ -5277,6 +5306,7 @@ private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) n
 /// Metadata v9+ (flexible dialect: compact strings/arrays + tagged fields).
 private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     // request: topics COMPACT array of { name compact-string, TAGGED_FIELDS };
     // then allow_auto_topic_creation + include_*_authorized_operations bools.
     immutable rawn = r.carrlen(); // -1 = null array (all topics)
@@ -5376,7 +5406,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     immutable perTopicAuthz = rawn >= 0;
     if (perTopicAuthz)
         foreach (k; 0 .. nt)
-            tauth[k] = authorize(tKafkaCtx, KRES_TOPIC, topics[k], KOP_DESCRIBE);
+            tauth[k] = authorize(ctx, KRES_TOPIC, topics[k], KOP_DESCRIBE);
     // The explicit-topic Metadata request is Kafka's auto-create moment:
     // register each VALID requested topic so the all-topics form lists it —
     // but ONLY when BOTH the broker mode and the request allow it (and the
@@ -5463,6 +5493,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 
 private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     if (isFlexible(API_METADATA, ver))
     {
         handleMetadataFlex(r, ver, o);
@@ -5530,7 +5561,7 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
         // per-topic error INSIDE the array (never a blanket denial). Classic
         // Metadata answers only explicitly-named topics, so an unauthorized
         // name is reported with error 29. No-op when gKafkaAclActive==0.
-        if (!authorize(tKafkaCtx, KRES_TOPIC, t, KOP_DESCRIBE))
+        if (!authorize(ctx, KRES_TOPIC, t, KOP_DESCRIBE))
         {
             putI16(o, E_TOPIC_AUTH_FAILED); // 29
             putStr(o, t);
@@ -5696,6 +5727,7 @@ private void pidUpdate(scope const(char)[] topic, int part, long pid, short epoc
 /// stale correlation id against no in-flight request and disconnect).
 private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     tKafkaDecompUsed = 0; // reset the per-request decompression budget
     if (ver >= 3)
         cast(void) r.str(); // transactional_id (nullable) — ignored (no txn support)
@@ -5734,7 +5766,7 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                 err = E_INVALID_TOPIC; // illegal NAME is 17, not unknown-topic
             else if (part < 0)
                 err = E_UNKNOWN_TOPIC;
-            else if (!authorize(tKafkaCtx, KRES_TOPIC, topic, KOP_WRITE))
+            else if (!authorize(ctx, KRES_TOPIC, topic, KOP_WRITE))
                 err = E_TOPIC_AUTH_FAILED; // ACL: no WRITE on this topic
             // Compaction gate (KIP-purgatory parity): a compacted topic
             // rejects keyless records with INVALID_RECORD + record_errors.
@@ -5980,6 +6012,7 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
 
 private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     cast(void) r.i32(); // replica_id
     cast(void) r.i32(); // max_wait
     cast(void) r.i32(); // min_bytes
@@ -6060,7 +6093,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             immutable hw = base + llen; // absolute high watermark
             immutable fetchIdx = fetchOff - base; // list index of the offset
             immutable overCap = o.length > KAFKA_MAX_RESP; // response ceiling
-            immutable noRead = !authorize(tKafkaCtx, KRES_TOPIC, topic, KOP_READ);
+            immutable noRead = !authorize(ctx, KRES_TOPIC, topic, KOP_READ);
             immutable bad = fetchOff < base || fetchOff > hw || !validTopic(topic)
                 || part < 0 || noRead;
             // transactions: zero-cost while gKafkaTxnSeen is 0 (one atomic

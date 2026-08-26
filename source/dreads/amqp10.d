@@ -2165,6 +2165,18 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
             }
         }
     }
+    // Copy the modified-state annotation bytes out of a10ReadFrame's shared TLS
+    // `buf`: the settle loop below parks in a10RequeueAnn/a10Requeue/a10Reject
+    // (data-plane hop) and re-parses modAnnBytes on later iterations; a sibling
+    // connection's a10ReadFrame would refill `buf` during a park -> cross-client
+    // annotation corruption. (dispScratch is already connection-scoped for the
+    // same reason; modAnnBytes was the missed sibling.)
+    ByteBuffer modAnnCopy;
+    if (modAnnBytes.length)
+    {
+        modAnnCopy.append(modAnnBytes);
+        modAnnBytes = cast(const(ubyte)[]) modAnnCopy.data;
+    }
     // first/last are client-controlled: iterating the raw numeric span would
     // spin the shard loop over up to 2^64 ids probing the AA. Snapshot the
     // unsettled SET filtered to [first,last] and walk that (bounded by real
