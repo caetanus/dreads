@@ -2428,6 +2428,17 @@ private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow
         tid = r.str(); // transactional_id (nullable)
         txnTimeout = r.i32();
     }
+    if (tid !is null && tid.length
+            && !authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        putI64(o, -1); // producer_id
+        putI16(o, -1); // producer_epoch
+        if (flex)
+            putTaggedFields(o);
+        return;
+    }
     short err = E_NONE;
     long pid;
     short epoch = 0;
@@ -2455,6 +2466,12 @@ private void handleInitProducerId(ref Rd r, short ver, ref ByteBuffer o) nothrow
 private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto tid = r.str();
+    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics = well-formed authorization denial
+        return;
+    }
     immutable pid = r.i64();
     immutable epoch = r.i16();
     immutable ntopics = safeCount(r.i32());
@@ -2532,10 +2549,16 @@ private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) not
 /// (the offsets themselves arrive via TxnOffsetCommit).
 private void handleAddOffsetsToTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
-    cast(void) r.str(); // transactional_id
+    auto tid = r.str(); // transactional_id
     cast(void) r.i64(); // producer_id
     cast(void) r.i16(); // producer_epoch
     cast(void) r.str(); // group
+    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, 53); // TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+        return;
+    }
     putI32(o, 0); // throttle_time_ms
     putI16(o, E_NONE); // error_code
 }
@@ -2741,6 +2764,13 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
 private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto tid = r.cstr(); // transactional_id
+    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putCArrLen(o, 0); // zero topics (compact) = well-formed authz denial
+        putTaggedFields(o);
+        return;
+    }
     auto group = r.cstr();
     immutable pid = r.i64();
     immutable epoch = r.i16();
@@ -2821,6 +2851,12 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
         return;
     }
     auto tid = r.str(); // transactional_id
+    if (!authorize(tKafkaCtx, KRES_TXNID, tid, KOP_WRITE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics = well-formed authorization denial
+        return;
+    }
     auto group = r.str();
     immutable pid = r.i64();
     immutable epoch = r.i16();
@@ -3261,6 +3297,22 @@ private void handleHeartbeat(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         if (ver >= 3)
             cast(void) r.str(); // group_instance_id
     }
+    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        if (flex)
+        {
+            putI32(o, 0); // throttle_time_ms
+            putI16(o, E_GROUP_AUTH_FAILED); // error_code
+            putTaggedFields(o);
+        }
+        else
+        {
+            if (ver >= 1)
+                putI32(o, 0); // throttle_time_ms
+            putI16(o, E_GROUP_AUTH_FAILED); // error_code
+        }
+        return;
+    }
     short err = KG_REBALANCE_IN_PROGRESS; // transport failure: safe retryable
     if (r.ok && group.length)
     {
@@ -3380,6 +3432,11 @@ private void syncLoop(ref ByteBuffer o, short ver, bool flex, scope const(char)[
 private void handleSyncGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto group = r.cstr();
+    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        emitSyncErr(o, ver, true, E_GROUP_AUTH_FAILED);
+        return;
+    }
     immutable gen = r.i32();
     auto memberId = r.cstr();
     cast(void) r.cstr(); // group_instance_id (nullable, v3+)
@@ -3437,6 +3494,11 @@ private void handleSyncGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         return;
     }
     auto group = r.str();
+    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        emitSyncErr(o, ver, false, E_GROUP_AUTH_FAILED);
+        return;
+    }
     immutable gen = r.i32();
     auto memberId = r.str();
     if (ver >= 3)
@@ -3546,6 +3608,25 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
         fprintf(stderr, "KG WIRE-LEAVE v%d flex=%d group=%.*s nm=%d ok=%d\n",
                 cast(int) ver, flex ? 1 : 0, cast(int) group.length, group.ptr,
                 cast(int) nm, r.ok ? 1 : 0);
+    }
+    if (group.length && !authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        if (flex)
+        {
+            putI32(o, 0); // throttle_time_ms
+            putI16(o, E_GROUP_AUTH_FAILED); // error_code
+            putCArrLen(o, 0); // members
+            putTaggedFields(o);
+        }
+        else
+        {
+            if (ver >= 1)
+                putI32(o, 0); // throttle_time_ms
+            putI16(o, E_GROUP_AUTH_FAILED); // error_code
+            if (ver >= 3)
+                putI32(o, 0); // members
+        }
+        return;
     }
     // one atomic LEAVE op removes every named member and rebalances once
     short[32] perr = KG_UNKNOWN_MEMBER;

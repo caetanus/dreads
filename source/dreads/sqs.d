@@ -65,6 +65,16 @@ private void onConn(TCPConnection conn) @trusted nothrow
         auto req = cast(const(char)[]) buf[0 .. n];
         // read the rest of the body if Content-Length exceeds what we have
         immutable clen = header(req, "content-length").toSize;
+        // cap the declared body: SQS max message is 256 KiB; 4 MiB gives ample
+        // header/attribute headroom while bounding single-connection memory.
+        enum size_t MAX_BODY = 4 * 1024 * 1024;
+        if (clen > MAX_BODY)
+        {
+            writeErr(conn, 413, "AWS.SimpleQueueService.MessageTooLong",
+                "The request body exceeds the maximum allowed size.");
+            conn.close();
+            return;
+        }
         size_t hend = bodyStart(buf[0 .. n]);
         ByteBuffer whole;
         if (hend != 0 && clen != 0 && hend + clen > n)
@@ -318,6 +328,8 @@ private bool dedupSeen(scope const(char)[] name, scope const(char)[] dedup,
         return false; // dedup window passed: treat as a fresh message
     if (fmid.length == 32)
         mid[0 .. 32] = fmid[0 .. 32];
+    else
+        randHex(mid[], 16); // never echo uninitialized stack bytes on a malformed value
     if (fmd5.length == 32)
         md5[0 .. 32] = fmd5[0 .. 32];
     else
@@ -1073,16 +1085,55 @@ private long jsonInt(scope const(char)[] j, scope const(char)[] key, long dflt) 
     return neg ? -v : v;
 }
 
-// Find `"key"` at a shallow level; returns index just after the closing quote,
-// or -1. (Flat request bodies; nested Entries handled by jsonEachEntry.)
+// Find `"key"` used as a field name at the TOP LEVEL of the given object (depth
+// 1), returning the index just after its closing quote, or -1. Structure-aware:
+// tracks brace/bracket depth and string state and requires a ':' after the name,
+// so a key-looking substring inside an attacker-controlled value or a nested
+// object (e.g. MessageAttributes) cannot spoof a real field.
+// (Flat request bodies; nested Entries handled by jsonEachEntry, which passes
+// each entry object as `j` so its fields are depth 1 there.)
 private long findKey(scope const(char)[] j, scope const(char)[] key) @safe @nogc nothrow
 {
+    int depth = 0;
+    bool inStr = false;
     size_t i = 0;
-    while (i + key.length + 2 <= j.length)
+    while (i < j.length)
     {
-        if (j[i] == '"' && j[i + 1 .. i + 1 + key.length] == key
-                && j[i + 1 + key.length] == '"')
-            return cast(long)(i + 1 + key.length + 1);
+        immutable char c = j[i];
+        if (inStr)
+        {
+            if (c == '\\')
+            {
+                i += 2;
+                continue;
+            }
+            if (c == '"')
+                inStr = false;
+            i++;
+            continue;
+        }
+        if (c == '"')
+        {
+            if (depth == 1 && i + 1 + key.length < j.length
+                    && j[i + 1 .. i + 1 + key.length] == key
+                    && j[i + 1 + key.length] == '"')
+            {
+                immutable after = i + 1 + key.length + 1;
+                size_t k = after;
+                while (k < j.length && (j[k] == ' ' || j[k] == '\t'
+                        || j[k] == '\n' || j[k] == '\r'))
+                    k++;
+                if (k < j.length && j[k] == ':')
+                    return cast(long) after;
+            }
+            inStr = true;
+            i++;
+            continue;
+        }
+        if (c == '{' || c == '[')
+            depth++;
+        else if (c == '}' || c == ']')
+            depth--;
         i++;
     }
     return -1;

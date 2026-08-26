@@ -638,6 +638,11 @@ enum uint A10_MAX_LINKS_PER_CONN = 4096;
 /// Per-connection aggregate cap on concurrently-accumulating multi-frame
 /// fragment bytes: without it 4096 links x 16MiB per-link pending ~= 64GiB.
 enum size_t A10_MAX_PENDING_BYTES_PER_CONN = 128UL << 20;
+/// Per-session cap on undisposed (unsettled) deliveries: a client can grant huge
+/// link-credit and never settle, so unsettled[] (each entry holds an idup'd blob)
+/// would grow without bound. At the cap the delivery fiber stops popping (spec-
+/// legal backpressure) until the client disposes some deliveries.
+enum size_t A10_MAX_UNSETTLED_PER_SESSION = 8192;
 
 private long monoMs10() nothrow @trusted
 {
@@ -3958,6 +3963,19 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                         // drain with nothing to send: burn the credit and echo
                         pl5.drain = false;
                     }
+                    try
+                        sleep(1.msecs);
+                    catch (Exception)
+                        return;
+                    continue;
+                }
+                // Unsettled backpressure: a client granting huge credit and never
+                // disposing would grow ps5.unsettled (each entry an idup'd blob)
+                // without bound -> memory exhaustion. Stop delivering (don't pop or
+                // burn credit) until it settles some deliveries. Popped-but-unsettled
+                // messages are still safe (a10TeardownRequeue returns them on close).
+                if (ps5.unsettled.length >= A10_MAX_UNSETTLED_PER_SESSION)
+                {
                     try
                         sleep(1.msecs);
                     catch (Exception)

@@ -181,6 +181,9 @@ public final class MqttConn
 {
     dreads.tls.TlsLeg* tlsLeg; // null = plaintext (every existing path untouched)
     dreads.ws.WsCodec* wsCodec; // null = raw TCP; non-null = MQTT-over-WebSocket
+    ByteBuffer wsOut; // per-conn WS write frame: tcp.write can yield on backpressure
+    // while holding a slice of it, so it MUST NOT be a TLS static shared across
+    // connections' sendTo (that would leak one client's bytes to another).
     TCPConnection tcp;
     TaskMutex wlock;
     bool connected; // CONNECT seen and CONNACKed
@@ -337,6 +340,10 @@ private enum uint MQTT_MAX_PACKET = 16 << 20;
 /// unauthenticated peer (16MB/conn held for CONNECT_TIMEOUT with no aggregate
 /// budget is a cheap amplification). Raised to MQTT_MAX_PACKET once connected.
 private enum uint MQTT_PRECONNECT_MAX = 256 << 10;
+/// Bound on distinct $share group names tracked in the TLS delivery maps
+/// (groupIdx / gShareRR). Attacker-chosen, churned group names would otherwise
+/// accumulate map keys without bound (a slow memory leak / DoS).
+private enum size_t MQTT_MAX_SHARE_GROUPS = 4096;
 /// Per-connection outbound in-flight window (QoS1 inflight + QoS2 handshakes,
 /// combined): past this, a QoS1/2 delivery is sent as QoS0 (graceful
 /// degradation, no unbounded in-flight growth for a slow acker).
@@ -1394,10 +1401,23 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     // Pass 1: deliver to every NORMAL subscriber; collect shared members per group
     // (their indices into tMatchBuf, in match order) for the round-robin below.
     static size_t[][string] groupIdx; // TLS, reused: group -> member indices
+    static string[] groupDead; // TLS scratch: keys to drop (empty last delivery)
     bool anyShared = false;
     try
-        foreach (ref lst; groupIdx.byValue)
-            lst.length = 0; // reset lengths, keep capacity (reuse across messages)
+    {
+        // Reset member lists AND drop keys that had no members last delivery, so
+        // churned/attacker-chosen $share names can't grow the map without bound.
+        groupDead.length = 0;
+        foreach (g, ref lst; groupIdx)
+        {
+            if (lst.length == 0)
+                groupDead ~= g;
+            else
+                lst.length = 0; // active last time: keep capacity, reset length
+        }
+        foreach (g; groupDead)
+            groupIdx.remove(g);
+    }
     catch (Exception)
     {
     }
@@ -1407,7 +1427,10 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
         {
             anyShared = true;
             try
-                groupIdx.require(m.shareGroup, null) ~= i;
+                // cap distinct groups: a known group keeps working; a NEW group
+                // past the cap is skipped for this delivery (bounded map growth)
+                if (m.shareGroup in groupIdx || groupIdx.length < MQTT_MAX_SHARE_GROUPS)
+                    groupIdx.require(m.shareGroup, null) ~= i;
             catch (Exception)
             {
             }
@@ -1461,6 +1484,15 @@ public void mqttDeliverLocal(scope const(char)[] topic, scope const(char)[] payl
     // maxPktSize) so a message is never lost for the whole group.
     if (anyShared)
     {
+        // gShareRR keys (RR cursors) are never removed individually; if churned
+        // group names have grown it past the cap, drop the lot (RR position loss
+        // is a harmless fairness blip) so it can't leak unbounded memory.
+        if (gShareRR.length > MQTT_MAX_SHARE_GROUPS)
+            try
+                gShareRR.clear();
+            catch (Exception)
+            {
+            }
         try
             foreach (g, ref idxs; groupIdx)
             {
@@ -1804,8 +1836,11 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
         {
             // flush any control frames (pong/close) the decoder queued, then
             // the MQTT payload as a binary frame — all under the wlock so
-            // frames keep order on the wire
-            static ByteBuffer wb; // TLS scratch, consumed synchronously
+            // frames keep order on the wire. The frame buffer is PER-CONNECTION
+            // (c.wsOut): tcp.write/legSend below can yield on write backpressure
+            // while referencing it, so a TLS static shared across connections'
+            // sendTo would be clobbered mid-write -> cross-client disclosure.
+            auto wb = &c.wsOut;
             wb.clear();
             if (!c.wsCodec.ctlOut.empty)
             {
@@ -1813,7 +1848,7 @@ private bool sendTo(MqttConn c, scope const(ubyte)[] bytes) nothrow
                 c.wsCodec.ctlOut.clear();
             }
             if (bytes.length)
-                wsEncodeBinary(wb, bytes);
+                wsEncodeBinary(*wb, bytes);
             if (!wb.empty)
             {
                 if (c.tlsLeg !is null)
@@ -2173,6 +2208,14 @@ private bool mqttResumeXShard(MqttConn newc) nothrow @trusted
     }
     if (!ok)
         return false; // owner didn't freeze in time -> start a fresh session
+    // TODO(xshard-adopt-lifetime): the owner holds `parked` as a redirect for a
+    // FIXED ~1s window (mqttParkOrEnd's rdl = now + 1000ms), NOT an ownership/
+    // refcount handshake. If this fiber is descheduled >1s between the freeze and
+    // finishing mqttAdoptState's reads of parked.obox/heldQ/filters, the owner
+    // tears `parked` down and releases its obox -> use-after-free read here. The
+    // correct fix is an ownership/refcount handshake (adopter marks "adopting",
+    // owner waits for "adopted" before teardown), NOT a longer timeout. Latent,
+    // time-based, hard to trigger; left as-is pending that rework.
     mqttAdoptState(parked, newc); // parked is frozen (redirect=drop) -> safe to read
     return true;
 }
@@ -3543,6 +3586,12 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                     else if (parked !is null && c.cleanStart)
                         mqttDiscardParked(parked); // fresh session takes over
                     else if (parked is null && !c.cleanStart)
+                        // NOTE(xshard-double-session): if this returns false after
+                        // the owner was asked to freeze but didn't in time, the
+                        // keyspace session record can still make sessPresent=1 below
+                        // while the old shard's parked session lingers subscribed for
+                        // its ~1s redirect window -> transient double delivery. The
+                        // clean fix needs the ownership handshake above, so left as-is.
                         resumedOffline = mqttResumeXShard(c); // cross-shard resume
                     takeoverLocal(c.clientId, g);
                     try

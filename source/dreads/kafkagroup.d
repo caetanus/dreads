@@ -98,6 +98,7 @@ private struct KgTxn
     long pid;
     short epoch;
     string[] tps; // "topic\x1fpartition" touched by the OPEN transaction
+    bool[string] tpsSeen; // O(1) membership for tps dedup (same lifetime as tps)
     string offGroup; // consumer group of the buffered TxnOffsetCommit
     KgTxnOff[] offs; // offsets applied on COMMIT, dropped on abort
     long lastMs; // MonoTime ms of the last txn op — idle eviction in kgroupSweep
@@ -823,6 +824,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             }
             t.epoch++; // re-init fences the previous epoch (zombie producer)
             t.tps = null;
+            t.tpsSeen = null;
             t.offs = null;
             t.offGroup = null;
             t.metaBytes = 0;
@@ -871,6 +873,8 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                     break;
                 if (topic.length > 249)
                     continue; // Kafka topic max is 249; refuse to truncate+collide
+                if (part < 0)
+                    continue; // partitions are non-negative; drop mangled entry
                 char[300] tb = void;
                 size_t tl = topic.length;
                 tb[0 .. tl] = topic[0 .. tl];
@@ -879,15 +883,14 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
 
                 immutable pl = snprintf(tb.ptr + tl + 1, tb.length - tl - 1, "%d", part);
                 auto tps = (cast(const(char)[]) tb[0 .. tl + 1 + pl]).idup;
-                bool have = false;
-                foreach (x; t.tps)
-                    if (x == tps)
-                    {
-                        have = true;
-                        break;
-                    }
-                if (!have)
+                // O(1) dedup via a hash set: the old linear scan was O(N) per
+                // insert -> O(N^2) per request, GBs touched with no yield under
+                // the KG_TXN_MAX_TPS cap -> shard-drain stall.
+                if (tps !in t.tpsSeen)
+                {
+                    t.tpsSeen[tps] = true;
                     t.tps ~= tps;
+                }
             }
             wI16(o, KG_NONE);
             return;
@@ -997,6 +1000,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 wStr16(o, e.meta);
             }
             t.tps = null; // txn closed
+            t.tpsSeen = null;
             t.offs = null;
             t.offGroup = null;
             t.metaBytes = 0;

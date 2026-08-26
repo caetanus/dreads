@@ -407,62 +407,81 @@ private void seedWellKnownExchanges() nothrow
 /// AMQP topic match: dot-separined; `*` = exactly one word, `#` = zero+ words.
 package bool amqpTopicMatches(scope const(char)[] pattern, scope const(char)[] key) @nogc nothrow
 {
-    // Bound the '#'-backtracking: routing keys are attacker-controlled and a
-    // key with thousands of dot-words against a multi-'#' pattern is
-    // exponential recursion + fiber-stack growth. Real routing keys have a
-    // handful of segments; refuse to match absurd ones on the hot path.
+    // Segment both keys on '.', then match with the CLASSIC linear wildcard
+    // algorithm using a single backtrack pointer: '#' behaves like glob '*'
+    // (matches zero-or-more words), '*' matches exactly one word. This is
+    // O(nPat * nKey) — the previous recursive matcher backtracked EXPONENTIALLY
+    // on a multi-'#' binding key (e.g. "#.#.#.#…"), letting one publish freeze
+    // the shard event loop. Segment counts are capped (real routing/binding keys
+    // have a handful of words); an absurd one simply does not match.
+    enum size_t MAXSEG = 128;
+    size_t[MAXSEG + 1] pOff = void, kOff = void; // seg start offsets (+ end sentinel)
+    size_t nPat = 0, nKey = 0;
     {
-        size_t words = 1;
-        foreach (ch; key)
+        size_t s = 0;
+        foreach (i, ch; pattern)
             if (ch == '.')
-                words++;
-        if (words > 128)
-            return false;
-    }
-    size_t pi = 0, ki = 0;
-    for (;;)
-    {
-        size_t pe = pi;
-        while (pe < pattern.length && pattern[pe] != '.')
-            pe++;
-        auto pseg = pattern[pi .. pe];
-        if (pseg == "#")
-        {
-            if (pe >= pattern.length)
-                return true; // trailing # swallows the rest (incl. zero words)
-            // '#' mid-pattern: try to match the remainder at every position
-            auto rest = pattern[pe + 1 .. $];
-            size_t k2 = ki;
-            for (;;)
             {
-                if (amqpTopicMatches(rest, key[k2 .. $]))
-                    return true;
-                while (k2 < key.length && key[k2] != '.')
-                    k2++;
-                if (k2 >= key.length)
+                if (nPat >= MAXSEG)
                     return false;
-                k2++;
+                pOff[nPat++] = s;
+                s = i + 1;
+            }
+        if (nPat >= MAXSEG)
+            return false;
+        pOff[nPat++] = s;
+        pOff[nPat] = pattern.length + 1; // sentinel: last seg end = len
+    }
+    {
+        size_t s = 0;
+        foreach (i, ch; key)
+            if (ch == '.')
+            {
+                if (nKey >= MAXSEG)
+                    return false;
+                kOff[nKey++] = s;
+                s = i + 1;
+            }
+        if (nKey >= MAXSEG)
+            return false;
+        kOff[nKey++] = s;
+        kOff[nKey] = key.length + 1;
+    }
+    size_t pp = 0, kk = 0;
+    long starPat = -1; // pattern index of the most recent '#'
+    size_t starKey = 0; // key word to resume from on backtrack
+    while (kk < nKey)
+    {
+        auto kseg = key[kOff[kk] .. kOff[kk + 1] - 1];
+        if (pp < nPat)
+        {
+            auto pseg = pattern[pOff[pp] .. pOff[pp + 1] - 1];
+            if (pseg == "*" || pseg == kseg)
+            {
+                pp++;
+                kk++;
+                continue;
+            }
+            if (pseg == "#")
+            {
+                starPat = cast(long) pp; // record '#'; try it matching zero words
+                starKey = kk;
+                pp++;
+                continue;
             }
         }
-        size_t ke = ki;
-        while (ke < key.length && key[ke] != '.')
-            ke++;
-        auto kseg = key[ki .. ke];
-        if (ki > key.length)
-            return false;
-        if (pseg != "*" && pseg != kseg)
-            return false;
-        immutable pDone = pe >= pattern.length;
-        immutable kDone = ke >= key.length;
-        if (pDone || kDone)
+        if (starPat >= 0)
         {
-            if (kDone && !pDone && pattern[pe + 1 .. $] == "#")
-                return true;
-            return pDone && kDone;
+            pp = cast(size_t) starPat + 1; // let the last '#' absorb one more word
+            starKey++;
+            kk = starKey;
+            continue;
         }
-        pi = pe + 1;
-        ki = ke + 1;
+        return false;
     }
+    while (pp < nPat && pattern[pOff[pp] .. pOff[pp + 1] - 1] == "#")
+        pp++; // trailing '#'s match zero words
+    return pp == nPat;
 }
 
 // Apply a control op locally. Wire: [op u8][len u16][exchange][len u16][a][len u16][b]
@@ -2069,8 +2088,29 @@ public void serveAmqpClient(TCPConnection tcp, bool tls = false) nothrow
     import core.atomic : atomicOp;
 
     c.connId = atomicOp!"+="(gAmqpConnGen, 1);
-    if (gDrSecret == 0)
-        gDrSecret = monoMs() * 0x9E3779B97F4A7C15 + cast(ulong) cast(void*) c;
+    // Reply-to anti-forgery secret: seed ONCE from a CSPRNG. The old
+    // monoMs()^pointer seed was guessable — an attacker could forge another
+    // client's direct-reply token and inject into its reply consumer. CAS so
+    // concurrent first-connects converge on a single value; the weak scheme
+    // survives only as a last-resort fallback if the CSPRNG is unavailable.
+    {
+        import core.atomic : cas, atomicLoad;
+        import dreads.tls : tlsRandBytes;
+
+        if (atomicLoad(gDrSecret) == 0)
+        {
+            ubyte[8] rb = void;
+            ulong seed = 0;
+            if (tlsRandBytes(rb[]))
+                seed = (cast(ulong) rb[0]) | (cast(ulong) rb[1] << 8)
+                    | (cast(ulong) rb[2] << 16) | (cast(ulong) rb[3] << 24)
+                    | (cast(ulong) rb[4] << 32) | (cast(ulong) rb[5] << 40)
+                    | (cast(ulong) rb[6] << 48) | (cast(ulong) rb[7] << 56);
+            if (seed == 0)
+                seed = monoMs() * 0x9E3779B97F4A7C15 + cast(ulong) cast(void*) c;
+            cast(void) cas(&gDrSecret, 0UL, seed);
+        }
+    }
     c.connectedMs = nowMs();
     try
     {
@@ -4391,6 +4431,28 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             }
         }
     }
+    // CC/BCC add extra routing destinations. On the DEFAULT exchange each extra
+    // key IS a destination queue, so it must pass the same per-op WRITE ACL as
+    // the primary routing key — else a restricted user reaches queues it cannot
+    // name directly. (Named exchanges authorize on the exchange itself, checked
+    // above; CC/BCC route through that same exchange.)
+    if (nCc && ch.pub.exchange.length == 0)
+    {
+        import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+        if (aclUserCount() > 1)
+        {
+            auto au = cast(const(AclUser)*) c.aclAuth;
+            if (au !is null)
+                foreach (ck; ccKeys[0 .. nCc])
+                    if (!aclCanAccessKey(au, ck, false, true))
+                    {
+                        channelClose(o, chan, 403, "ACCESS_REFUSED - write access refused", 60, 40);
+                        requeueAndDropChannel(c, chan);
+                        return;
+                    }
+        }
+    }
     // direct reply-to: a request published with reply-to=amq.rabbitmq.reply-to
     // gets the property REWRITTEN to this channel's live reply token; without
     // an active reply consumer it is a channel 406 (RabbitMQ's fast-reply rule)
@@ -4660,10 +4722,16 @@ private void emitContent(ref ByteBuffer o, ushort chan, scope const(ubyte)[] blo
     putU16(o, 60); // class basic
     putU16(o, 0); // weight
     putU64(o, body_.length);
-    if (props.length >= 2)
+    // The content-header frame carries the property block in ONE frame (there is
+    // no header continuation), so it must fit the peer's negotiated frame-max. A
+    // consumer with a smaller frame-max than the publisher — or a cross-protocol
+    // record with an oversized headers table — would otherwise get a header frame
+    // exceeding frame-max and desync/drop. Frame = 7 hdr + 12 fixed + props + 1
+    // end; emit props only when they fit, else send an empty property block.
+    if (props.length >= 2 && cast(ulong) props.length + 20 <= frameMax)
         o.append(props);
     else
-        putU16(o, 0); // no properties
+        putU16(o, 0); // no properties (absent, or too large for this frame-max)
     frameFinish(o, at);
     // BODY frames: an EMPTY body emits NO body frame (a spurious zero-length
     // body frame after body-size=0 desyncs a strict client's parser — pika
