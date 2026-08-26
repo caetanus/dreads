@@ -721,7 +721,14 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
         {
             import dreads.kafka : kafkaAclPrime;
 
-            kafkaAclPrime(); // enforcement ON if the replayed store has bindings
+            // enforcement ON if the replayed store has bindings. DEFER it: priming
+            // reads the ACL key through the data plane, which under sharding may
+            // HOP to a worker shard and BLOCK on the reply — but that worker's
+            // drain (and the event loop) aren't up yet during setup, so a direct
+            // call here would DEADLOCK the whole boot (every skin, not just Kafka).
+            // runTask runs it once the loop starts and startShards has spawned the
+            // shards, when the hop can complete.
+            runTask(() nothrow { kafkaAclPrime(); });
         }
         {
             import core.stdc.stdlib : getenv;
