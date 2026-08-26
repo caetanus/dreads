@@ -741,7 +741,7 @@ private int rangeRecords(scope const(char)[] key, long from, int maxN,
 /// Stored blobs are MessageSet v1 entries: [size i32][crc u32][magic i8]
 /// [attrs i8][timestamp i64]... — the timestamp sits at bytes 10..18. Scan is
 /// budget-capped (conformance partitions are tiny); past the cap = -1.
-private long offsetForTime(scope const(char)[] key, long hw, long ts) nothrow @trusted
+private long offsetForTime(scope const(char)[] key, long hw, long ts, ref size_t probes) nothrow @trusted
 {
     enum CHUNK = 512;
     enum SCAN_CAP = 4096;
@@ -762,7 +762,7 @@ private long offsetForTime(scope const(char)[] key, long hw, long ts) nothrow @t
                     found = idx;
                 idx++;
             });
-        tHopProbes++; // each chunk is one keyspace hop against the budget
+        probes++; // each chunk is one keyspace hop against the (handler-local) budget
         if (found >= 0)
             return found;
         if (got < CHUNK)
@@ -1495,10 +1495,6 @@ private bool kafkaPlainCheck(scope const(ubyte)[] tok, KafkaConnCtx* ctx) nothro
 /// only once created (CreateTopics) or produced-into, and Metadata returns
 /// UNKNOWN_TOPIC for the rest — which lets an inspector see a missing topic.
 public __gshared bool gKafkaAutoCreate = true;
-/// Per-request Metadata gate: the request's allow_auto_topic_creation flag
-/// (v4+; librdkafka consumers send FALSE — KIP-361/0109). ANDed with
-/// gKafkaAutoCreate wherever a missing topic would auto-exist.
-private bool tMetaAllowAuto = true;
 /// The current request's header client_id (slice of the request buffer —
 /// valid for the request's lifetime; joins record it per member).
 private const(char)[] tKafkaClientId;
@@ -1905,7 +1901,8 @@ private void joinLoop(ref ByteBuffer o, short ver, bool flex,
 /// appends the [i32 nproto]{name,meta}* tail itself.
 private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
         scope const(char)[] memberId, scope const(char)[] gii, bool giiNull,
-        int sessMs, int rebMs, bool v4plus, scope const(char)[] protocolType) nothrow @trusted
+        int sessMs, int rebMs, bool v4plus, scope const(char)[] protocolType,
+        scope const(char)[] clientId) nothrow @trusted
 {
     req.clear();
     req.appendByte(cast(char) KGOP_JOIN);
@@ -1917,7 +1914,7 @@ private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
     putI32(req, rebMs);
     req.appendByte(v4plus ? 1 : 0);
     putStr(req, protocolType);
-    putStr(req, tKafkaClientId is null ? "" : tKafkaClientId);
+    putStr(req, clientId is null ? "" : clientId);
     return cast(int) req.length; // caller appends [i32 nproto]{...} itself
 }
 
@@ -1925,7 +1922,8 @@ private int buildJoinReq(ref ByteBuffer req, scope const(char)[] group,
 private void handleJoinGroupFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-auto group = r.cstr();
+    auto clientId = tKafkaClientId; // stack-capture: per-request client-id, immune to sibling clobber
+    auto group = r.cstr();
     immutable sessMs = r.i32();
     immutable rebMs = r.i32();
     auto memberId = r.cstr();
@@ -1938,9 +1936,11 @@ auto group = r.cstr();
     }
     immutable nprotoRaw = r.carrlen();
     immutable nproto = nprotoRaw < 0 ? 0 : safeCount(nprotoRaw);
-    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    ByteBuffer req; // FIBER-LOCAL: registerGroupName below PARKS; a static req
+    // would let a sibling JoinGroup rebuild it during the park, making us submit
+    // the sibling's join payload (cross-connection). Owned by this fiber = safe.
     cast(void) buildJoinReq(req, group, memberId, gii, gii is null, sessMs,
-            rebMs, true, protocolType is null ? "consumer" : protocolType);
+            rebMs, true, protocolType is null ? "consumer" : protocolType, clientId);
     immutable npOff = req.length;
     putI32(req, 0);
     int np = 0;
@@ -1978,6 +1978,7 @@ auto group = r.cstr();
 private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    auto clientId = tKafkaClientId; // stack-capture: per-request client-id, immune to sibling clobber
     if (isFlexible(API_JOIN_GROUP, ver)) // v6/v7 flexible
     {
         handleJoinGroupFlex(r, ver, o);
@@ -1997,9 +1998,11 @@ private void handleJoinGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tru
         emitJoinErr(o, ver, false, E_GROUP_AUTH_FAILED, memberId);
         return;
     }
-    static ByteBuffer req; // TLS: consumed synchronously by the hop copy
+    ByteBuffer req; // FIBER-LOCAL: registerGroupName below PARKS; a static req
+    // would let a sibling JoinGroup rebuild it during the park, making us submit
+    // the sibling's join payload (cross-connection). Owned by this fiber = safe.
     cast(void) buildJoinReq(req, group, memberId, gii, gii is null, sessMs,
-            rebMs, ver >= 4, protocolType);
+            rebMs, ver >= 4, protocolType, clientId);
     immutable npOff = req.length;
     putI32(req, 0);
     int np = 0;
@@ -5246,15 +5249,15 @@ private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 /// many topics (each with many populated partitions) can't drive a hop storm.
 /// Owner-shard probes (gKafkaLenRaw, no hop) are free and don't count.
 private enum size_t KAFKA_META_PROBE_BUDGET = 1024;
-private size_t tMetaProbes; // TLS, reset at the top of handleMetadata
-/// Per-request budget on cross-shard partLen hops in Fetch/ListOffsets, reset at
-/// each handler's top. Owner-shard reads (gKafkaLenRaw, no hop) are free and
-/// never counted, so single-shard mode never trips it — only sharded mode, where
-/// a 64 MB request naming millions of tiny partition entries would otherwise
-/// drive a partLen hop storm across sibling shards (same guard as Metadata).
-private size_t tHopProbes;
+// The per-request cross-shard probe budget (Metadata's metaProbes, Fetch/
+// ListOffsets' hopProbes) is a HANDLER-LOCAL counter, NOT a TLS global: a shared
+// global would be reset/consumed by a sibling request during a park, corrupting
+// our budget (under-reported partitions / truncated fetches). Owner-shard reads
+// (gKafkaLenRaw, no hop) are free and never counted, so single-shard mode never
+// trips it — only sharded mode, where a 64 MB request naming millions of tiny
+// partition entries would otherwise drive a partLen hop storm across siblings.
 
-private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
+private int topicPartitionCount(scope const(char)[] topic, ref size_t probes) nothrow @trusted
 {
     if (!validTopic(topic))
         return cast(int) KAFKA_PARTITIONS;
@@ -5267,9 +5270,9 @@ private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
         long len = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
         if (len < 0)
         {
-            if (tMetaProbes >= KAFKA_META_PROBE_BUDGET)
+            if (probes >= KAFKA_META_PROBE_BUDGET)
                 break; // hop budget exhausted: stop probing cross-shard
-            tMetaProbes++;
+            probes++; // per-request counter (handler-local; sibling can't clobber)
             len = partLen(key); // not the owner shard: data-plane LLEN (hops)
         }
         if (len <= 0)
@@ -5282,7 +5285,8 @@ private int topicPartitionCount(scope const(char)[] topic) nothrow @trusted
 /// Resolve a topic's advertised partition count and error code (shared by the
 /// classic and flexible Metadata responses). reg>=0 = created; else glob-probe;
 /// else auto-exist (compat) or UNKNOWN_TOPIC (registry mode).
-private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) nothrow @trusted
+private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr,
+        bool allowAuto, ref size_t probes) nothrow @trusted
 {
     immutable reg = registeredTopicPartitions(t);
     terr = E_NONE;
@@ -5290,10 +5294,10 @@ private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) n
         np = reg;
     else
     {
-        np = topicPartitionCount(t);
+        np = topicPartitionCount(t, probes);
         if (np == 0)
         {
-            if (gKafkaAutoCreate && tMetaAllowAuto)
+            if (gKafkaAutoCreate && allowAuto)
                 np = cast(int) KAFKA_PARTITIONS;
             else
                 terr = E_UNKNOWN_TOPIC;
@@ -5307,6 +5311,7 @@ private void metaTopicParts(scope const(char)[] t, ref int np, ref short terr) n
 private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
+    auto advPort = tKafkaAdvPort; // stack-capture: per-request advertised port (read after hops below)
     // request: topics COMPACT array of { name compact-string, TAGGED_FIELDS };
     // then allow_auto_topic_creation + include_*_authorized_operations bools.
     immutable rawn = r.carrlen(); // -1 = null array (all topics)
@@ -5370,18 +5375,18 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
                 topics[nt++] = t; // invalid names STAY: emitted with error 17
         }
     }
-    tMetaProbes = 0;
+    size_t metaProbes = 0; // handler-local per-request probe budget (was TLS)
     // v4+ request flag: consumers with allow.auto.create.topics=false ask for
     // metadata WITHOUT creating (KIP-361, test 0109). Default true when the
     // read fails (truncated request) — the historic behavior.
-    tMetaAllowAuto = true;
+    bool allowAuto = true; // handler-local (was TLS tMetaAllowAuto)
     bool wantTopicAuthz = false;
     bool wantClusterAuthz = false;
     if (r.ok)
     {
         immutable aat = r.i8();
         if (r.ok)
-            tMetaAllowAuto = aat != 0;
+            allowAuto = aat != 0;
         else
             r.ok = true; // flag absent: tolerate (header-only probes)
     }
@@ -5413,7 +5418,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     // principal is authorized). Registry mode (DREADS_KAFKA_AUTOCREATE=false)
     // must keep a merely-queried topic MISSING (golib Inspector).
     // Safe to yield here — only fiber-local state (o) is staged.
-    if (gKafkaAutoCreate && tMetaAllowAuto)
+    if (gKafkaAutoCreate && allowAuto)
         foreach (k, t; topics[0 .. nt])
             if (tauth[k] && validTopic(t))
                 registerTopic(t);
@@ -5423,7 +5428,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     putCArrLen(o, 1);
     putI32(o, 0); // node_id
     putCStr(o, gKafkaHost);
-    putI32(o, tKafkaAdvPort);
+    putI32(o, advPort);
     putCStrNull(o, null, true); // rack: null
     putTaggedFields(o); // broker tagged fields
     putCStrNull(o, "dreads-cluster", false); // cluster_id (0063/0121 read it)
@@ -5457,7 +5462,7 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         }
         int np;
         short terr;
-        metaTopicParts(t, np, terr);
+        metaTopicParts(t, np, terr, allowAuto, metaProbes);
         putI16(o, terr);
         putCStr(o, t);
         o.appendByte(0); // is_internal = false
@@ -5526,13 +5531,13 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 topics[nt++] = t;
         }
     }
-    tMetaProbes = 0; // reset the per-request cross-shard LLEN-probe budget
-    tMetaAllowAuto = true;
+    size_t metaProbes = 0; // handler-local per-request probe budget (was TLS)
+    bool allowAuto = true; // handler-local (was TLS tMetaAllowAuto)
     if (ver >= 4 && r.ok)
     {
         immutable aat = r.i8(); // allow_auto_topic_creation (v4+)
         if (r.ok)
-            tMetaAllowAuto = aat != 0;
+            allowAuto = aat != 0;
         else
             r.ok = true; // tolerate a truncated tail
     }
@@ -5577,10 +5582,10 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
             np = reg; // created topic: exact registered partition count
         else
         {
-            np = topicPartitionCount(t); // glob: 0 if empty
+            np = topicPartitionCount(t, metaProbes); // glob: 0 if empty
             if (np == 0)
             {
-                if (gKafkaAutoCreate && tMetaAllowAuto)
+                if (gKafkaAutoCreate && allowAuto)
                     np = cast(int) KAFKA_PARTITIONS; // auto-exist (compat default)
                 else
                     terr = E_UNKNOWN_TOPIC; // registry mode / request said no
@@ -6026,7 +6031,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         cast(void) r.i32(); // session_id
         cast(void) r.i32(); // session_epoch
     }
-    tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
+    size_t hopProbes = 0; // handler-local per-request partLen budget (was a shared TLS counter)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 1)
         putI32(o, 0); // throttle
@@ -6042,7 +6047,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
     {
         if (!r.ok)
             break;
-        if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+        if (o.length > KAFKA_MAX_RESP || hopProbes >= KAFKA_META_PROBE_BUDGET)
             break; // capped: stop before misreading the next topic (desync-safe)
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
@@ -6057,7 +6062,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
         {
             if (!r.ok)
                 break;
-            if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+            if (o.length > KAFKA_MAX_RESP || hopProbes >= KAFKA_META_PROBE_BUDGET)
                 break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
             if (ver >= 9)
@@ -6087,7 +6092,7 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
             long llen = gKafkaLenRaw !is null ? gKafkaLenRaw(key) : -1;
             if (llen < 0)
             {
-                tHopProbes++; // count the cross-shard hop against the budget
+                hopProbes++; // count the cross-shard hop against the budget
                 llen = partLen(key);
             }
             immutable hw = base + llen; // absolute high watermark
@@ -6291,7 +6296,7 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
     byte isolation = 0;
     if (ver >= 2)
         isolation = r.i8(); // isolation_level (v2+; 1 = read_committed)
-    tHopProbes = 0; // per-request cross-shard partLen budget (sharded mode)
+    size_t hopProbes = 0; // handler-local per-request partLen budget (was a shared TLS counter)
     immutable ntopics = safeCount(r.i32());
     if (ver >= 2)
         putI32(o, 0); // throttle_time_ms (v2+)
@@ -6302,7 +6307,7 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
     {
         if (!r.ok)
             break;
-        if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+        if (o.length > KAFKA_MAX_RESP || hopProbes >= KAFKA_META_PROBE_BUDGET)
             break; // capped: stop before misreading the next topic (desync-safe)
         auto topic = r.str();
         immutable nparts = safeCount(r.i32());
@@ -6317,7 +6322,7 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
         {
             if (!r.ok)
                 break;
-            if (o.length > KAFKA_MAX_RESP || tHopProbes >= KAFKA_META_PROBE_BUDGET)
+            if (o.length > KAFKA_MAX_RESP || hopProbes >= KAFKA_META_PROBE_BUDGET)
                 break; // response ceiling / cross-shard hop budget (DoS)
             immutable part = r.i32();
             if (ver >= 4)
@@ -6337,7 +6342,7 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
             long llen = gKafkaLenRaw !is null ? gKafkaLenRaw(k3) : -1;
             if (llen < 0)
             {
-                tHopProbes++; // count the cross-shard hop against the budget
+                hopProbes++; // count the cross-shard hop against the budget
                 llen = partLen(k3);
             }
             long off;
@@ -6356,7 +6361,7 @@ private void handleListOffsets(ref Rd r, short ver, ref ByteBuffer o) nothrow
                 off = lend; // -1 = latest (LSO under read_committed)
             else
             {
-                off = offsetForTime(k3, llen, ts); // KIP-79; -1 = no match
+                off = offsetForTime(k3, llen, ts, hopProbes); // KIP-79; -1 = no match
                 if (off >= 0)
                     off += base;
             }

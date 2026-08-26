@@ -617,6 +617,10 @@ private final class A10Conn
     A10Session[ushort] sessions; // keyed by the CLIENT channel
     ulong[] dispScratch; // disposition settle-id snapshot (read fiber only)
     size_t pendingBytes; // aggregate multi-frame fragment bytes in flight
+    ubyte[] frameBuf; // PER-CONN frame assembly for a10ReadFrame: a10ReadExact
+    // PARKS mid-frame (waitForData) with this as the live destination, so it MUST
+    // NOT be a thread-shared static (a sibling's a10ReadFrame would refill it
+    // during the park -> this conn parses the sibling's frame bytes).
     TaskMutex wlock; // two writers (read-loop replies + delivery fibers)
 
     this(TCPConnection c) nothrow
@@ -4049,6 +4053,20 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                     import dreads.amqp : a10PeekAt;
 
                     got = a10PeekAt(pl5.rkey, pl5.streamPos, pay);
+                    // Re-validate after the peek park: a concurrent DETACH/END may
+                    // have freed/moved the A10Link pl5 aliases (same pattern as the
+                    // post-fetch block below). A stream peek popped nothing, so on a
+                    // gone/changed link just stop; otherwise refresh pl5/ps5 before
+                    // the derefs that follow.
+                    {
+                        auto ps5r = ch5 in cc.sessions;
+                        auto pl5r = ps5r !is null ? h5 in ps5r.links : null;
+                        if (cc.closing || pl5r is null || pl5r.detached
+                                || pl5r.rkey != linkRkey)
+                            return;
+                        ps5 = ps5r;
+                        pl5 = pl5r;
+                    }
                     if (got)
                     {
                         streamOffThis = pl5.streamPos;
@@ -4077,7 +4095,20 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                                 foreach (k9c; 0 .. CHUNK)
                                 {
                                     sb2.clear();
-                                    if (!a10PeekAt(pl5.rkey, chunk * CHUNK + k9c, sb2))
+                                    immutable okc = a10PeekAt(linkRkey,
+                                            chunk * CHUNK + k9c, sb2);
+                                    // re-validate after this peek park BEFORE any pl5
+                                    // deref (incl. the !okc break's downstream uses)
+                                    {
+                                        auto ps5r = ch5 in cc.sessions;
+                                        auto pl5r = ps5r !is null ? h5 in ps5r.links : null;
+                                        if (cc.closing || pl5r is null || pl5r.detached
+                                                || pl5r.rkey != linkRkey)
+                                            return;
+                                        ps5 = ps5r;
+                                        pl5 = pl5r;
+                                    }
+                                    if (!okc)
                                     {
                                         full = false;
                                         break;
@@ -4326,14 +4357,18 @@ private bool a10ReadFrame(A10Conn c, out const(ubyte)[] body_, out ubyte ftype,
     fchan = cast(ushort)((h[6] << 8) | h[7]);
     if (size < 8 || doff < 2 || size > A10_MAX_FRAME || cast(size_t) doff * 4 > size)
         return false;
-    static ubyte[] buf; // TLS scratch (consumed before return; no yield holds it)
+    // PER-CONNECTION buffer (c.frameBuf), NOT a thread-shared static: a10ReadExact
+    // below parks at waitForData between partial reads when a frame spans TCP
+    // segments, holding this slice live across the park. A shared static would be
+    // refilled/reallocated by a sibling connection's a10ReadFrame during that park,
+    // making body_ below point at the sibling's bytes (cross-client frame injection).
     immutable rest = size - 8;
-    if (buf.length < rest)
-        buf.length = rest;
-    if (rest && !a10ReadExact(c, buf[0 .. rest]))
+    if (c.frameBuf.length < rest)
+        c.frameBuf.length = rest;
+    if (rest && !a10ReadExact(c, c.frameBuf[0 .. rest]))
         return false;
     immutable skip = cast(size_t) doff * 4 - 8; // extended header
-    body_ = buf[skip .. rest];
+    body_ = c.frameBuf[skip .. rest];
     return true;
 }
 

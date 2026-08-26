@@ -629,7 +629,11 @@ private bool opDeleteMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     auto handle = jsonStrRaw(b, "ReceiptHandle");
     if (name.length == 0 || handle.length == 0)
         return false;
-    static ByteBuffer rb, ifkey;
+    static ByteBuffer rb;
+    // ifkey is per-call (NOT static): it is re-read to build the HDEL arg AFTER
+    // fifoUnlock's exec hop parks; a sibling opDeleteMessage would clobber a
+    // shared static -> HDEL against the wrong queue (delete silently no-ops).
+    ByteBuffer ifkey;
     ifkey.clear();
     ifkey.append(IF_PREFIX);
     ifkey.append(name);
@@ -648,7 +652,11 @@ private bool opDeleteMessageBatch(scope const(char)[] b, ref ByteBuffer o) @trus
     auto name = queueFromUrl(jsonStrRaw(b, "QueueUrl"));
     if (name.length == 0)
         return false;
-    static ByteBuffer rb, ifkey;
+    static ByteBuffer rb;
+    // ifkey is per-call (NOT static): each entry re-reads it to build the HDEL
+    // arg AFTER fifoUnlock's/earlier entries' exec hops park; a sibling batch
+    // would clobber a shared static -> an entry's HDEL hits the wrong queue.
+    ByteBuffer ifkey;
     ifkey.clear();
     ifkey.append(IF_PREFIX);
     ifkey.append(name);
@@ -1219,7 +1227,11 @@ private void jsonEachEntry(scope const(char)[] j, scope const(char)[] key,
             if (inStr)
             {
                 if (c == '\\')
+                {
+                    if (i + 1 >= j.length)
+                        break; // trailing backslash (unterminated): stop, don't overrun
                     i++;
+                }
                 else if (c == '"')
                     inStr = false;
             }
@@ -1238,7 +1250,7 @@ private void jsonEachEntry(scope const(char)[] j, scope const(char)[] key,
             }
             i++;
         }
-        dg(j[start .. i]);
+        dg(j[start .. i > j.length ? j.length : i]); // clamp: never slice past end
     }
 }
 
@@ -1387,7 +1399,10 @@ private size_t toSize(scope const(char)[] s) @safe @nogc nothrow
     {
         if (c < '0' || c > '9')
             break;
-        v = v * 10 + (c - '0');
+        immutable d = cast(size_t)(c - '0');
+        if (v > (size_t.max - d) / 10)
+            return size_t.max; // overflow: saturate so callers reject (not wrap small)
+        v = v * 10 + d;
     }
     return v;
 }
@@ -1434,7 +1449,10 @@ private void writeErr(TCPConnection conn, int code, scope const(char)[] type, sc
 {
     import core.stdc.stdio : snprintf;
 
-    static ByteBuffer body_;
+    // per-call (NOT static): body_ is written AFTER the header conn.write, which
+    // can yield; a sibling connection would clobber a shared static -> wrong body
+    // / Content-Length mismatch.
+    ByteBuffer body_;
     body_.clear();
     body_.append(`{"__type":"`);
     body_.append(type);
