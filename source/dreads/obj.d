@@ -137,7 +137,9 @@ public enum RESP_DBS = 16; // SELECT/MOVE/COPY/SWAPDB/FLUSH* cap: the Redis 0-15
 /// nor nuke broker state. A skin db may be pointed back at 0-15 to share with
 /// RESP deliberately. The AOF's SELECT framing carries any db index, so they
 /// persist and reload unchanged.
-public enum NUM_DBS = 19; // total per-shard keyspaces (RESP 0-15 + 3 skin slots)
+public enum NUM_DBS = 20; // total per-shard keyspaces (RESP 0-15 + 4 skin slots:
+// AMQP=16, MQTT=17, Kafka=18, SQS=19). MUST cover every skin's db, or that skin's
+// keyspace access indexes out of bounds (SQS at 19 crashed under NUM_DBS=19).
 public __gshared Keyspace[NUM_DBS] gDbs;
 
 /// Stamp each slot with its identity at startup, so `gDbs[i].db == i`.
