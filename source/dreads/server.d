@@ -100,6 +100,22 @@ private __gshared Aof[] gAofs;
 private __gshared Aof gAofFallback; // pre-boot / unit tests: a disabled sink
 private __gshared const(char)[] gAofPath;
 
+// GRACEFUL SHUTDOWN. On SIGTERM we keep the fire-and-forget promise: deny new
+// requests, drain every shard's inbound ring (apply confirmed-but-not-yet-applied
+// publishes), flush every AOF, THEN exit. gShutdownPhase: 0 = running, 1 = shutting
+// down. SIGTERM freezes every event loop, so gracefulDrain() drains the rings from
+// the main thread (impersonating each shard) — see shutdownDrainShard.
+import core.atomic : atomicLoad, atomicStore, MemoryOrder;
+
+public shared int gShutdownPhase = 0;
+
+/// True once SIGTERM started the graceful drain: serve fibers that still run must
+/// refuse new work so no fresh ring entry outlives the drain.
+public bool shuttingDown() @trusted nothrow @nogc
+{
+    return atomicLoad!(MemoryOrder.acq)(gShutdownPhase) != 0;
+}
+
 // Boot-time AOF setup (phase 2.6): discover the per-shard files, replay them
 // into the per-shard keyspaces, open the writers, and — when the shard count
 // CHANGED since the files were written (the `<path>.shards` sidecar) — re-route
@@ -732,6 +748,12 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     if (sharded())
         startShards(port);
     auto rc = runEventLoop();
+    // GRACEFUL SHUTDOWN (keep the fire-and-forget promise): SIGTERM stopped the
+    // main loop. Now deny new work and drain every shard's inbound ring — applying
+    // confirmed-but-not-yet-applied publishes — and flush every AOF, so a clean
+    // SIGTERM loses nothing that was acked. Standalone (shards==1) has no rings; a
+    // final AOF flush covers its last in-line writes.
+    gracefulDrain();
     // Clean shutdown: stop the non-daemon worker-pool threads (Lua, raft) so
     // druntime doesn't block joining their infinite loops when main() returns —
     // otherwise SIGTERM appears to hang for seconds. Daemon threads (lazyfree,
@@ -748,6 +770,36 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
     if (gReplicator !is null)
         gReplicator.stop();
     return rc;
+}
+
+// Drain every shard's inbound ring + flush every AOF on SIGTERM, so a confirmed
+// fire-and-forget publish (enqueued but maybe not yet applied) is never lost on a
+// clean shutdown. Standalone (shards==1) has no rings — just flush the last writes.
+private void gracefulDrain() nothrow @trusted
+{
+    import dreads.shard : gShardCount;
+
+    // Publish the shutdown phase so any serve fiber that still runs before its loop
+    // fully unwinds refuses new work.
+    atomicStore!(MemoryOrder.rel)(gShutdownPhase, 1);
+    if (!sharded())
+    {
+        myAof().flush(); // single-thread: no rings, just the last in-line writes
+        return;
+    }
+    // SIGTERM froze EVERY event loop (main + workers), so no shard drains itself.
+    // Drain each ring here on the main thread by impersonating the shard — safe,
+    // its consumer fiber is frozen — applying in-ring fire-and-forget publishes and
+    // flushing each AOF. Then terminate the worker pools so druntime does not block
+    // joining their (now-idle) threads when main() returns.
+    foreach (i; 0 .. gShardCount)
+        shutdownDrainShard(cast(uint) i);
+    foreach (pool; gShardPools)
+        try
+            (cast(TaskPool) pool).terminate();
+        catch (Exception)
+        {
+        }
 }
 
 /// Builds the Replicator from config when raft-node-id is set. Peers list:
@@ -2631,6 +2683,43 @@ private void shardDrainLoop() nothrow
         {
         }
     }
+}
+
+// SHUTDOWN drain — runs on the MAIN thread, AFTER SIGTERM froze every event loop
+// (vibe broadcasts the term flag, so the shard drain fibers can't run themselves).
+// Shard `sid`'s consumer fiber is frozen, so the main thread safely BECOMES its
+// consumer: impersonate the shard (tShard/gAllocShard → slot sid so keyspace +
+// allocator + AOF route there) and apply every FIRE-AND-FORGET publish still in
+// its ring, then flush its AOF. Only amqpPush matters: a RESP cross-shard write
+// (ShardMsg.cmd) is un-confirmed until its reply ships (which is AFTER apply+flush),
+// so an un-applied one was never acked — dropping it is correct, not a loss.
+private void shutdownDrainShard(uint sid) nothrow @trusted
+{
+    import dreads.shard : tShard, shardDrainOnce, ShardMsg;
+    import dreads.alloc : gAllocShard;
+    import dreads.obj : NUM_DBS;
+
+    immutable saveShard = tShard;
+    immutable saveAlloc = gAllocShard;
+    tShard = sid;
+    gAllocShard = sid;
+    static void applyPush(scope const(ubyte)[] p, void* tag, ulong meta, uint kind) nothrow
+    {
+        if (cast(ShardMsg) kind != ShardMsg.amqpPush || p.length < 4)
+            return; // only fire-and-forget publishes carry un-acked durable writes
+        immutable adb = (p[0] << 8) | p[1];
+        immutable klen = (p[2] << 8) | p[3];
+        if (4 + klen <= p.length && adb < NUM_DBS)
+            amqpApplyRpush(cast(int) adb, cast(const(char)[]) p[4 .. 4 + klen],
+                    cast(const(char)[]) p[4 + klen .. $]);
+    }
+
+    while (shardDrainOnce!applyPush())
+    {
+    }
+    myAof().flush(); // myAof() == gAofs[sid] now (tShard impersonated)
+    tShard = saveShard;
+    gAllocShard = saveAlloc;
 }
 
 // Serve a broadcast CLIENT UNBLOCK section on THIS shard (phase 2.5b): look the
