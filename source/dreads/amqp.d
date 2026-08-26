@@ -179,6 +179,11 @@ enum size_t AMQP_MAX_EXCHANGES = 65536;
 enum size_t AMQP_MAX_QUEUEMETA = 65536;
 /// Per-connection caps.
 enum size_t AMQP_MAX_CHANNELS = 2047;   // matches the advertised channel-max
+/// Per-connection cap on the SUM of in-progress content-body assemblies across
+/// all channels. Without it, 2047 channels each mid-publish with a 128MB
+/// bodySize whose final body frame is withheld pin ~256GB. 256MB clears a legit
+/// single max body (AMQP_MAX_BODY=128MB) with headroom while bounding the flood.
+enum size_t AMQP_MAX_PENDING_BYTES = 256UL << 20;
 enum size_t AMQP_MAX_CONSUMERS = 4096;
 /// A dead-letter is dropped once it has been dead-lettered this many times
 /// (the x-death hop count) — bounds an A->X->A dead-letter cycle.
@@ -1262,8 +1267,12 @@ private void putU64(ref ByteBuffer o, ulong v) @nogc nothrow
 
 private void putShortStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
 {
-    o.appendByte(cast(char) s.length);
-    o.append(s);
+    // shortstr carries a ONE-byte length prefix (AMQP max 255). A >255-byte value
+    // would truncate the length byte while the full bytes still follow, desyncing
+    // a spec-strict consumer's frame stream. Emit at most 255 with a matching len.
+    immutable n = s.length > 255 ? 255 : s.length;
+    o.appendByte(cast(char) n);
+    o.append(s[0 .. n]);
 }
 
 private void putLongStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
@@ -1903,6 +1912,7 @@ private final class AmqpConn
     bool[string] cancelledTags; // basic.cancel'ed consumer tags
     Unacked[ulong] unacked; // delivery-tag -> record (no_ack=false consumers)
     size_t unackedBytes; // running sum of unacked blob bytes (byte-cap the window)
+    size_t pendingBytes; // running sum of in-progress publish body bytes across channels (DoS cap)
     ulong nextTag = 1;
     ulong nextCtag = 1; // server-assigned consumer tags (unique per connection)
     ulong connId; // process-unique id (exclusive-queue ownership token)
@@ -2387,6 +2397,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             return true;
         }
         ch.pub.payload.append(p);
+        // Per-connection cap on the SUM of in-progress body assemblies across all
+        // channels: a client that opens many channels and withholds each final
+        // body frame would otherwise pin unbounded memory. Completion
+        // (finishPublish) and channel drop (requeueAndDropChannel) decrement it.
+        c.pendingBytes += p.length;
+        if (c.pendingBytes > AMQP_MAX_PENDING_BYTES)
+        {
+            connectionClose(o, 501, "FRAME_ERROR - staged publish bodies exceed the connection limit", 60, 40);
+            return false; // over budget: close the connection
+        }
         if (ch.pub.payload.length >= ch.pub.bodySize)
             finishPublish(c, chan, *ch, o);
         return true;
@@ -3225,6 +3245,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable getNoAck = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
                 if (exclusiveDenied(c, chan, o, q, 60, 70))
                     return true; // another connection's exclusive queue: 405
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    if (aclUserCount() > 1) // per-op ACL: authorize READ on the queue
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, true, false))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - read access to queue refused", 60, 70);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 // a basic.get counts as "use": extend an x-expires lease
                 try
                     if (auto qm0 = (cast(string) q) in gQueueMeta)
@@ -3339,6 +3373,23 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     return true; // consume on an unopened channel: ignore
                 cast(void) r.u16();
                 auto q = r.shortStr();
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    // per-op ACL: authorize READ on the queue ONCE at consume setup
+                    // (never per delivery). The direct reply-to pseudo-queue is not
+                    // a real queue and is exempt.
+                    if (q != DIRECT_REPLY_Q && aclUserCount() > 1)
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, true, false))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - read access to queue refused", 60, 20);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 if (q == DIRECT_REPLY_Q)
                 {
                     // direct reply-to pseudo-queue: no-ack ONLY, at most one
@@ -4147,6 +4198,18 @@ private void requeueAndDropChannel(AmqpConn c, ushort chan) nothrow @trusted
         sort!"a > b"(mine);
         foreach (t; mine)
             settleNegative(c, t, true);
+        // an incomplete publish assembly on this channel still counts against the
+        // per-connection in-progress cap; release it before dropping the channel.
+        // finishPublish already cleared active for completed bodies, so this fires
+        // only for a channel dropped mid-assembly (e.g. channel.close).
+        if (auto dch = chan in c.chans)
+            if (dch.pub.active && dch.pub.payload.length < dch.pub.bodySize)
+            {
+                if (c.pendingBytes >= dch.pub.payload.length)
+                    c.pendingBytes -= dch.pub.payload.length;
+                else
+                    c.pendingBytes = 0;
+            }
         c.chans.remove(chan);
     }
     catch (Exception)
@@ -4191,6 +4254,13 @@ private void enforceMaxLen(scope const(char)[] q) nothrow @trusted
 
 private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o) nothrow @trusted
 {
+    // this assembly is complete: release its bytes from the in-progress cap
+    // (accumulated frame-by-frame in the FRAME_BODY path). active goes false
+    // just below, so a later requeueAndDropChannel won't double-decrement.
+    if (c.pendingBytes >= ch.pub.payload.length)
+        c.pendingBytes -= ch.pub.payload.length;
+    else
+        c.pendingBytes = 0;
     ch.pub.active = false;
     // basic.publish to a non-existent exchange is a channel 404 NOT_FOUND, like
     // RabbitMQ ("no exchange 'x'"). The default exchange ("") and the seeded
@@ -4210,6 +4280,26 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         channelClose(o, chan, 406, "PRECONDITION_FAILED - invalid expiration", 60, 40);
         requeueAndDropChannel(c, chan);
         return;
+    }
+    // Per-operation ACL (no-op unless an ACL is configured — fast global load +
+    // predicted branch, identical in shape to the Kafka skin's gate). Authorize
+    // WRITE on the exchange being published to; for the default exchange ("")
+    // authorize the routing key (= destination queue). Checked ONCE here on the
+    // channel-resident operands, never per destination queue inside routeTo.
+    {
+        import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+        if (aclUserCount() > 1)
+        {
+            auto au = cast(const(AclUser)*) c.aclAuth;
+            auto target = ch.pub.exchange.length ? ch.pub.exchange : ch.pub.rkey;
+            if (au !is null && !aclCanAccessKey(au, target, false, true))
+            {
+                channelClose(o, chan, 403, "ACCESS_REFUSED - write access refused", 60, 40);
+                requeueAndDropChannel(c, chan);
+                return;
+            }
+        }
     }
     immutable mandatory = ch.pub.mandatory;
     // route to queues and RPUSH the framed record through the data plane. rec

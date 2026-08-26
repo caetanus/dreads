@@ -101,11 +101,16 @@ private struct KgTxn
     string offGroup; // consumer group of the buffered TxnOffsetCommit
     KgTxnOff[] offs; // offsets applied on COMMIT, dropped on abort
     long lastMs; // MonoTime ms of the last txn op — idle eviction in kgroupSweep
+    long metaBytes; // accumulated bytes of buffered offset metadata (OOM budget)
 }
 
 private KgTxn*[string] tTxns; // TLS: transactional ids owned by THIS shard
 private shared long gKgPidCtr = 5000; // producer-id source for transactional ids
 private enum int TXN_MAX_TIMEOUT_MS = 900_000; // transaction.max.timeout.ms
+private enum size_t KG_TXN_MAX_TPS = 8192; // partitions buffered in one open txn
+private enum size_t KG_TXN_MAX_OFFS = 16384; // offsets buffered in one open txn
+private enum size_t KG_TXN_META_BUDGET = 8 * 1024 * 1024; // buffered-meta byte cap
+private enum int KG_MAX_SESSION_MS = 1_800_000; // group.max.session.timeout.ms
 
 /// Monotonic milliseconds (never the per-command frozen wall clock).
 public long kgNowMs() @nogc nothrow @trusted
@@ -437,7 +442,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                         nm.protoType = ptype.idup;
                         nm.protoNames = pnames;
                         nm.protoMetas = pmetas;
-                        nm.sessMs = sessMs > 0 ? sessMs : 45_000;
+                        nm.sessMs = sessMs > 0 ? (sessMs > KG_MAX_SESSION_MS ? KG_MAX_SESSION_MS : sessMs) : 45_000;
                         nm.rebMs = rebMs > 0 ? rebMs : 60_000;
                         nm.lastMs = now;
                         g.members[useMid] = nm;
@@ -481,7 +486,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             mp.protoType = ptype.idup;
             mp.protoNames = pnames;
             mp.protoMetas = pmetas;
-            mp.sessMs = sessMs > 0 ? sessMs : 45_000;
+            mp.sessMs = sessMs > 0 ? (sessMs > KG_MAX_SESSION_MS ? KG_MAX_SESSION_MS : sessMs) : 45_000;
             mp.rebMs = rebMs > 0 ? rebMs : 60_000;
             mp.lastMs = now;
             // a fresh join re-opens the barrier unless one is already open
@@ -820,6 +825,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             t.tps = null;
             t.offs = null;
             t.offGroup = null;
+            t.metaBytes = 0;
             t.lastMs = now;
             wI16(o, KG_NONE);
             immutable long pv = t.pid;
@@ -849,7 +855,13 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 return;
             }
             t.lastMs = now;
-            foreach (_; 0 .. (n2 < 0 || n2 > 1024 ? 0 : n2))
+            immutable addN = n2 < 0 || n2 > 1024 ? 0 : n2;
+            if (t.tps.length + addN > KG_TXN_MAX_TPS)
+            {
+                wI16(o, 51); // too many partitions accumulated in one open txn
+                return;
+            }
+            foreach (_; 0 .. addN)
             {
                 if (!r.ok)
                     break;
@@ -903,7 +915,13 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             }
             t.lastMs = now;
             t.offGroup = grp.idup;
-            foreach (_; 0 .. (n2 < 0 || n2 > 4096 ? 0 : n2))
+            immutable offN = n2 < 0 || n2 > 4096 ? 0 : n2;
+            if (t.offs.length + offN > KG_TXN_MAX_OFFS)
+            {
+                wI16(o, 51); // too many buffered offsets accumulated in one open txn
+                return;
+            }
+            foreach (_; 0 .. offN)
             {
                 if (!r.ok)
                     break;
@@ -916,7 +934,12 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                 e.hasMeta = r.u8() != 0;
                 e.meta = r.str16().idup;
                 if (r.ok)
+                {
+                    if (t.metaBytes + e.meta.length > KG_TXN_META_BUDGET)
+                        break; // meta byte budget exhausted: stop buffering (EndTxn)
+                    t.metaBytes += e.meta.length;
                     t.offs ~= e;
+                }
             }
             wI16(o, KG_NONE);
             return;
@@ -976,6 +999,7 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             t.tps = null; // txn closed
             t.offs = null;
             t.offGroup = null;
+            t.metaBytes = 0;
             return;
         }
 

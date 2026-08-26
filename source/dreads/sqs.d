@@ -416,21 +416,26 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     // strictly ordered. A picked record is removed with LREM (records are
     // unique by msgid, so it matches exactly one). Standard queues just LPOP.
     static ByteBuffer snap;
-    const(char)[][32] batchGroups; // groups locked within this batch
+    // Own the snapshot per-call: the scan loop below holds slices into it ACROSS
+    // exec() parks (sismember/lrem/sadd). A sibling opReceiveMessage would refill
+    // the shared static `snap`/`recs` during a park -> cross-queue disclosure.
+    ByteBuffer snapCopy;
+    const(char)[][32] batchGroups; // groups locked within this batch (into snapCopy)
     size_t nBatchGroups = 0;
     if (fifo)
     {
         const(char)[][4] lr = ["lrange", cast(const(char)[]) qkey.data, "0", "-1"];
         exec(lr[], snap);
+        snapCopy.append(snap.data); // copy before any further (parking) exec
     }
     size_t scanPos = 0;
     // parse the LRANGE reply lazily via an index cursor over its bulk items
-    static const(char)[][1024] recs;
+    const(char)[][1024] recs; // per-call: slices point into snapCopy, not a shared static
     size_t nrecs = 0;
     if (fifo)
     {
         nrecs = 0;
-        respEachBulk(cast(const(char)[]) snap.data, (scope const(char)[] r) {
+        respEachBulk(cast(const(char)[]) snapCopy.data, (scope const(char)[] r) {
             if (nrecs < recs.length)
                 recs[nrecs++] = r;
         });
@@ -446,7 +451,9 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
             // TODO(FIFO-atomic): sismember -> lrem -> sadd is a non-atomic
             // check-then-act; concurrent receives can double-deliver / bypass the
             // group lock. Fix with an owner-side atomic op (deferred: an in-process
-            // lock held across a fiber park can deadlock the shard).
+            // lock held across a fiber park can deadlock the shard). Same deferred
+            // bucket: dedupSeen()->dedupStore() (send) is the same TOCTOU family —
+            // two concurrent same-DeduplicationId sends can both miss and enqueue.
             // find the next deliverable record from scanPos
             rec = null;
             for (; scanPos < nrecs; scanPos++)
@@ -624,6 +631,16 @@ private bool opPurgeQueue(scope const(char)[] b, ref ByteBuffer o) @trusted
     key.append(name);
     const(char)[][2] a2 = ["del", cast(const(char)[]) key.data];
     exec(a2[], rb);
+    // also drop FIFO group locks, the dedup window and delayed messages, else a
+    // purged group stays locked forever (mirror opDeleteQueue's key list).
+    foreach (pfx; [DD_PREFIX, GRP_PREFIX, DL_PREFIX])
+    {
+        key.clear();
+        key.append(pfx);
+        key.append(name);
+        const(char)[][2] ad = ["del", cast(const(char)[]) key.data];
+        exec(ad[], rb);
+    }
     o.append("{}");
     return true;
 }

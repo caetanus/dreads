@@ -1844,6 +1844,14 @@ private void fireWill(MqttConn c) nothrow @trusted
 {
     if (c.willTopic.length == 0)
         return;
+    // defensive: never publish a will the authenticated user can't access (the
+    // CONNECT path already drops it; this guards any other fire site). No-op
+    // without ACL (c.aclUser is null).
+    if (c.aclUser !is null && !aclCanAccessChannel(c.aclUser, c.willTopic))
+    {
+        c.willTopic = null;
+        return;
+    }
     immutable rseq = c.willRetain ? atomicOp!"+="(gMqttRetainSeq, 1) : 0;
     mqttDeliverLocal(c.willTopic, cast(const(char)[]) c.willPayload, c.willRetain,
             rseq, 0, null, c.willProps);
@@ -3455,6 +3463,17 @@ private bool handlePacket(MqttConn c, ubyte h, scope const(ubyte)[] p,
                 }
                 else
                     c.aclUser = au;
+            }
+            // Last Will topic ACL: the will PUBLISHes on the client's behalf on an
+            // abnormal disconnect, so it must clear the SAME channel ACL a live
+            // PT_PUBLISH does. An unauthorized will topic is dropped (no-op when no
+            // ACL is configured: c.aclUser is null -> allowed).
+            if (c.willTopic.length != 0 && c.aclUser !is null
+                    && !aclCanAccessChannel(c.aclUser, c.willTopic))
+            {
+                c.willTopic = null; // never fire an unauthorized will
+                c.willPayload = null;
+                c.willProps = null;
             }
             c.connected = okPair;
             if (okPair)

@@ -596,6 +596,8 @@ private final class A10Conn
     bool hbStarted;
     ulong connId; // exclusivity token (shared generator with 0-9-1 conns)
     A10Session[ushort] sessions; // keyed by the CLIENT channel
+    ulong[] dispScratch; // disposition settle-id snapshot (read fiber only)
+    size_t pendingBytes; // aggregate multi-frame fragment bytes in flight
     TaskMutex wlock; // two writers (read-loop replies + delivery fibers)
 
     this(TCPConnection c) nothrow
@@ -633,6 +635,9 @@ enum uint A10_MAX_FRAME = 1 << 20;
 /// and (for receivers) spawns a delivery fiber able to buffer a 16MiB fragment.
 /// Bound the total so one connection can't exhaust memory/fibers.
 enum uint A10_MAX_LINKS_PER_CONN = 4096;
+/// Per-connection aggregate cap on concurrently-accumulating multi-frame
+/// fragment bytes: without it 4096 links x 16MiB per-link pending ~= 64GiB.
+enum size_t A10_MAX_PENDING_BYTES_PER_CONN = 128UL << 20;
 
 private long monoMs10() nothrow @trusted
 {
@@ -1041,13 +1046,16 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer, TlsLeg* leg = null) n
                     import core.stdc.stdio : fprintf, stderr;
                     fprintf(stderr, "A10 DETACH-IN ch=%u\n", cast(uint) fchan);
                 }
-                uint handle;
+                uint handle = uint.max;
                 if (nf >= 1)
                 {
                     auto h2 = fields.readValue();
                     if (h2.kind == A10Val.Kind.u64)
                         handle = cast(uint) h2.u;
                 }
+                if (handle == uint.max)
+                    break; // detach with no handle: ignore (don't tear down link 0
+                // or mass-requeue via the uint.max "all handles" sentinel)
                 bool weAlreadyDetached = false;
                 if (auto ps = fchan in c.sessions)
                 {
@@ -1061,6 +1069,9 @@ public void amqp10Serve(TCPConnection tcp, bool saslLayer, TlsLeg* leg = null) n
                         // as a connection error (uncorrelated handle).
                         weAlreadyDetached = pl4.detached;
                         pl4.detached = true; // delivery fiber exits on its next pass
+                        if (pl4.pendingActive) // reclaim any in-flight fragment budget
+                            c.pendingBytes = c.pendingBytes >= pl4.pending.length
+                                ? c.pendingBytes - pl4.pending.length : 0;
                     }
                     a10RequeueUnsettled(c, fchan, handle);
                     ps.links.remove(handle);
@@ -1575,6 +1586,8 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
         {
             // RabbitMQ's default max message size: refuse with the 1.0
             // link error the client maps to a size exception
+            c.pendingBytes = c.pendingBytes >= plk.pending.length
+                ? c.pendingBytes - plk.pending.length : 0;
             plk.pendingActive = false;
             plk.pending = null;
             a10SendDetachError(c, fchan, handle,
@@ -1582,18 +1595,38 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
             plk.detached = true;
             return;
         }
+        // Per-connection aggregate budget: a client could open A10_MAX_LINKS_PER_CONN
+        // links and hold a near-16MiB fragment on each (~64GiB) by never sending the
+        // final (more=false) frame. Bound the concurrently-accumulating total.
+        if (c.pendingBytes + msg.length > A10_MAX_PENDING_BYTES_PER_CONN)
+        {
+            c.pendingBytes = c.pendingBytes >= plk.pending.length
+                ? c.pendingBytes - plk.pending.length : 0;
+            plk.pendingActive = false;
+            plk.pending = null;
+            a10SendDetachError(c, fchan, handle,
+                    "amqp:resource-limit-exceeded", plk.rkey);
+            plk.detached = true;
+            return;
+        }
         try
             plk.pending ~= msg;
         catch (Exception)
         {
+            // failed append: reclaim what was already counted for this link
+            c.pendingBytes = c.pendingBytes >= plk.pending.length
+                ? c.pendingBytes - plk.pending.length : 0;
             plk.pendingActive = false;
             return;
         }
+        c.pendingBytes += msg.length; // count only a successful append
         if (more)
             return;
         msg = plk.pending;
         deliveryId = plk.pendingDeliveryId;
         settled = settled || plk.pendingSettled;
+        c.pendingBytes = c.pendingBytes >= plk.pending.length
+            ? c.pendingBytes - plk.pending.length : 0; // delivery complete: reclaim
         plk.pendingActive = false;
     }
     plk.deliveryCount++;
@@ -2104,18 +2137,22 @@ private void a10HandleDisposition(A10Conn c, ushort fchan, ref A10Dec fields,
     // spin the shard loop over up to 2^64 ids probing the AA. Snapshot the
     // unsettled SET filtered to [first,last] and walk that (bounded by real
     // in-flight deliveries) — same settle result, no unbounded loop.
-    static ulong[] dispIds; // TLS: drain fiber only
-    dispIds.length = 0;
+    // Connection-scoped, NOT a TLS static: the foreach below parks in
+    // a10Requeue/a10Reject (data-plane hop), and a static shared across every
+    // connection's read fiber could be reset/realloc'd under a parked fiber ->
+    // cross-client settle/requeue corruption. One read fiber per connection, so
+    // c.dispScratch is stable across the park within this connection.
+    c.dispScratch.length = 0;
     try
     {
         foreach (uid, ref uo; ps.unsettled)
             if (uid >= first && uid <= last)
-                dispIds ~= uid;
+                c.dispScratch ~= uid;
     }
     catch (Exception)
     {
     }
-    foreach (id; dispIds)
+    foreach (id; c.dispScratch)
     {
         auto po = id in ps.unsettled;
         if (po is null)

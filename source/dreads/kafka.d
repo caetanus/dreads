@@ -1552,6 +1552,14 @@ private void registerGroupName(scope const(char)[] group, scope const(char)[] pt
 /// filter client-side.
 private void handleListGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    {
+        if (ver >= 1)
+            putI32(o, 0); // throttle_time_ms (v1+)
+        putI16(o, E_CLUSTER_AUTH_FAILED); // error_code
+        putI32(o, 0); // zero groups
+        return;
+    }
     static ByteBuffer rb;
     if (ver >= 1)
         putI32(o, 0); // throttle_time_ms (v1+)
@@ -1625,6 +1633,11 @@ private void handleDeleteGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     {
         if (names[i].length == 0)
             continue;
+        if (names[i].length > 249) // Kafka group-id max: reject vs. truncating the key
+        {
+            errs[i] = 24; // INVALID_GROUP_ID
+            continue;
+        }
         if (!authorize(tKafkaCtx, KRES_GROUP, names[i], KOP_DELETE))
         {
             errs[i] = E_GROUP_AUTH_FAILED; // per-group ACL denial (echoed below)
@@ -1688,6 +1701,13 @@ private void handleOffsetDelete(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_DELETE))
     {
         putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics
+        return;
+    }
+    if (group.length > 249) // Kafka group-id max: reject vs. truncating the key
+    {
+        putI16(o, 24); // INVALID_GROUP_ID (top-level error_code)
         putI32(o, 0); // throttle_time_ms
         putI32(o, 0); // zero topics
         return;
@@ -2600,7 +2620,9 @@ private void handleEndTxn(ref Rd r, short ver, ref ByteBuffer o) nothrow @truste
                 auto m2 = rr.str();
                 if (!rr.ok)
                     break;
-                if (committed && nol < oparts.length)
+                // ogrp.length > 249 would truncate into gbuf[256] and alias a
+                // different group's key — skip applying rather than mis-store.
+                if (committed && ogrp.length <= 249 && nol < oparts.length)
                 {
                     immutable tl2 = t2.length <= 256 ? t2.length : 256;
                     otb[nol][0 .. tl2] = t2[0 .. tl2];
@@ -3078,6 +3100,14 @@ private void emitAllGroupOffsetsFlex(scope const(char)[] group, short ver, ref B
 private void handleOffsetFetchFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto group = r.cstr();
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putCArrLen(o, 0); // zero topics (compact)
+        putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
+        putTaggedFields(o);
+        return;
+    }
     immutable rawN = r.carrlen(); // -1 = null topics (fetch all)
     immutable respStart = o.length;
     putI32(o, 0); // throttle_time_ms
@@ -3142,6 +3172,15 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
         return;
     }
     auto group = r.str();
+    if (!authorize(tKafkaCtx, KRES_GROUP, group, KOP_READ))
+    {
+        if (ver >= 3)
+            putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero topics
+        if (ver >= 2)
+            putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
+        return;
+    }
     immutable rawN = r.i32();
     immutable respStart = o.length;
     if (ver >= 3)
@@ -3568,6 +3607,12 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 }
 private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI32(o, 0); // zero results = well-formed authorization denial
+        return;
+    }
     immutable nres = safeCount(r.i32());
     // STACK-local: the existence probe below hops cross-shard and yields; a
     // TLS static would be clobbered by another connection during the park.
@@ -3703,6 +3748,18 @@ private void handleDescribeGroups(ref Rd r, short ver, ref ByteBuffer o) nothrow
         "CompletingRebalance", "Stable"];
     foreach (i; 0 .. ng)
     {
+        if (!authorize(tKafkaCtx, KRES_GROUP, groups[i], KOP_DESCRIBE))
+        {
+            putI16(o, E_GROUP_AUTH_FAILED); // error_code
+            putStr(o, groups[i]); // group_id
+            putStr(o, ""); // group_state
+            putStr(o, ""); // protocol_type
+            putStr(o, ""); // protocol_data
+            putI32(o, 0); // members
+            if (ver >= 3)
+                putI32(o, int.min); // authorized_operations (denied/not requested)
+            continue;
+        }
         static ByteBuffer req, rep; // TLS: consumed synchronously per hop
         req.clear();
         req.appendByte(cast(char) KGOP_DESCRIBE);
@@ -4660,6 +4717,15 @@ private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 /// DescribeAcls (v0-v1): filter the store, grouped by resource.
 private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
+    // The ACL store dump (principals/hosts) requires cluster DESCRIBE.
+    if (!authorize(tKafkaCtx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
+    {
+        putI32(o, 0); // throttle_time_ms
+        putI16(o, E_CLUSTER_AUTH_FAILED); // error_code
+        putI16(o, -1); // error_message = null
+        putI32(o, 0); // zero resources
+        return;
+    }
     auto f = aclReadWire(r, ver, true);
     static ByteBuffer rb;
     KAclBinding[128] all;
