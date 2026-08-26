@@ -2801,6 +2801,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 c.chans.remove(chan);
                 return true;
             }
+            {
+                import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                if (aclUserCount() > 1) // per-op ACL on the exchange
+                {
+                    auto au = cast(const(AclUser)*) c.aclAuth;
+                    if (au !is null && !aclCanAccessKey(au, ex, false, true))
+                    {
+                        channelClose(o, chan, 403, "ACCESS_REFUSED - access to exchange refused", 40, 20);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                }
+            }
             if ((dbits & 1) && exchangeHasLiveBindings(cast(string) ex))
             {
                 // if-unused: an exchange with live bindings is "in use" — the
@@ -3125,6 +3139,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (exclusiveDenied(c, chan, o, q, 50, 20))
                     return true;
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    if (q.length && aclUserCount() > 1) // per-op ACL on the queue
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, false, true))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - access to queue refused", 50, 20);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 // headers exchange: a present x-match must be one of the four
                 // valid strings — anything else is a bind-time 406 (RabbitMQ)
                 try
@@ -3167,6 +3195,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (exclusiveDenied(c, chan, o, q, 50, 50))
                     return true; // another connection's exclusive queue: 405
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    if (q.length && aclUserCount() > 1) // per-op ACL on the queue
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, false, true))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - access to queue refused", 50, 50);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 ctlBroadcast(4, ex, q, rk); // op 4: drop the matching binding
                 try
                     autoDeleteExchangeSweep([cast(string) ex.idup]);
@@ -3183,6 +3225,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 cast(void) r.u8(); // no-wait
                 if (exclusiveDenied(c, chan, o, q, 50, 30))
                     return true; // another connection's exclusive queue: 405
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    if (q.length && aclUserCount() > 1) // per-op ACL on the queue
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, false, true))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - access to queue refused", 50, 30);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 static ByteBuffer pk; // TLS
                 queueKey(q, pk);
                 // stack-copy the key across gAmqpLen's yield (same hazard as
@@ -3206,6 +3262,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable qdel = r.u8(); // if-unused(1)/if-empty(2)/no-wait(4)
                 if (exclusiveDenied(c, chan, o, q, 50, 40))
                     return true;
+                {
+                    import dreads.acl : aclUserCount, aclCanAccessKey, AclUser;
+
+                    if (q.length && aclUserCount() > 1) // per-op ACL on the queue
+                    {
+                        auto au = cast(const(AclUser)*) c.aclAuth;
+                        if (au !is null && !aclCanAccessKey(au, q, false, true))
+                        {
+                            channelClose(o, chan, 403, "ACCESS_REFUSED - access to queue refused", 50, 40);
+                            c.chans.remove(chan);
+                            return true;
+                        }
+                    }
+                }
                 static ByteBuffer dk; // TLS
                 queueKey(q, dk);
                 // stack-copy: gAmqpLen's cross-shard hop YIELDS, and a
@@ -4362,6 +4432,11 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     // --- CC/BCC sender-selected routing: extra routing keys from the "CC"/
     // "BCC" header string-arrays; BCC is stripped from the delivered props.
     const(ubyte)[] effProps = ch.pub.props.data;
+    // per-call (NOT TLS): sp/drp hold the BCC-stripped / reply-to-rewritten
+    // property block that `effProps` slices. buildRecord reads effProps AFTER the
+    // direct-reply sendTo() yield below, so a TLS static here would be clobbered
+    // by a concurrent same-shard publish — another client's props spliced in.
+    ByteBuffer sp, drp;
     const(char)[][32] ccKeys;
     size_t nCc = 0;
     {
@@ -4418,8 +4493,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                 // STACK buffer (not TLS): consumed by buildRecord below, but a
                 // clean lifetime regardless of later yields.
                 immutable off = cast(size_t)(h0.ptr - effProps.ptr);
-                static ByteBuffer sp; // TLS: consumed by buildRecord before any yield
-                sp.clear();
+                sp.clear(); // hoisted per-call buffer (declared at function scope)
                 sp.append(cast(const(char)[]) effProps[0 .. off - 4]);
                 immutable lenAt = sp.length;
                 putU32(sp, 0);
@@ -4483,7 +4557,8 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         }
         char[160] drtok = void;
         immutable drtl = drToken(drtok, c.connId, chan, drGen);
-        static ByteBuffer drp; // TLS: consumed by buildRecord before any yield
+        // drp: hoisted per-call buffer (declared at function scope) — effProps is
+        // read after the reply sendTo() yield, so it must not be a TLS static.
         replaceReplyTo(drp, effProps, drtok[0 .. drtl]);
         effProps = cast(const(ubyte)[]) drp.data;
     }

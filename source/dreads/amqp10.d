@@ -75,6 +75,8 @@ struct A10Dec
     const(ubyte)[] p;
     size_t i;
     bool ok = true;
+    int depth; // recursion guard for nested described types (stack-overflow DoS)
+    enum int MAX_DEPTH = 32;
 
     private ubyte u8() @nogc nothrow
     {
@@ -118,6 +120,11 @@ struct A10Dec
     A10Val readValue() @nogc nothrow
     {
         A10Val v;
+        if (depth >= MAX_DEPTH) // bound nested described-type recursion
+        {
+            ok = false;
+            return v;
+        }
         immutable c = u8();
         if (!ok)
             return v;
@@ -125,7 +132,9 @@ struct A10Dec
         {
         case 0x00: // described: descriptor value, then the value itself
             {
+                depth++;
                 auto d = readValue();
+                depth--;
                 v.kind = A10Val.Kind.described;
                 v.u = d.kind == A10Val.Kind.u64 ? d.u : ulong.max;
                 return v;
@@ -343,6 +352,16 @@ package void a10PatchU32(ref ByteBuffer o, size_t at, uint v) @nogc nothrow @tru
         d[at + 2] = cast(ubyte)(v >> 8);
         d[at + 3] = cast(ubyte)(v & 0xFF);
     }
+}
+
+// snprintf returns the would-be length (can exceed the buffer); clamp it to a
+// valid slice length so `buf[0 .. a10ClampN(ret, buf.length)]` never reads OOB.
+private size_t a10ClampN(int n, size_t bufLen) @safe @nogc nothrow
+{
+    if (n <= 0)
+        return 0;
+    immutable un = cast(size_t) n;
+    return un >= bufLen ? (bufLen ? bufLen - 1 : 0) : un;
 }
 
 package void a10Null(ref ByteBuffer o) @nogc nothrow
@@ -1638,7 +1657,15 @@ private void a10HandleTransfer(A10Conn c, ushort fchan, ref A10Dec fields,
     // decode sections -> 0-9-1 props + body
     int transferRouted = plk.isMgmt ? 1 : 0; // mgmt "routes" by definition
     if (plk.isMgmt)
-        a10HandleMgmt(c, fchan, msg);
+    {
+        // copy the body out of a10ReadFrame's shared TLS `buf`: a10HandleMgmt
+        // reads corrRaw/bodyMapBytes (slices of msg) AFTER hops (a10DeclareQueue
+        // /... -> amqpDataExec park); a sibling connection's a10ReadFrame would
+        // refill `buf` during the park -> cross-connection disclosure.
+        ByteBuffer mgmtCopy;
+        mgmtCopy.append(msg);
+        a10HandleMgmt(c, fchan, cast(const(ubyte)[]) mgmtCopy.data);
+    }
     else
     {
         if (plk.v2Queue)
@@ -2803,7 +2830,7 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                                 "invalid argument '%.*s' for queue",
                                 cast(int) badArg.length, badArg.ptr);
                         a10MgmtRespond(c, fchan, "409", corrRaw, 2, null,
-                                bb2[0 .. bn2]);
+                                bb2[0 .. a10ClampN(bn2, bb2.length)]);
                         return;
                     }
                 }
@@ -2900,7 +2927,8 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
 
                 immutable en2 = snprintf(eb2.ptr, eb2.length,
                         "no queue '%.*s' in vhost '/'", cast(int) qn.length, qn.ptr);
-                a10MgmtRespond(c, fchan, "404", corrRaw, 2, null, eb2[0 .. en2]);
+                a10MgmtRespond(c, fchan, "404", corrRaw, 2, null,
+                        eb2[0 .. a10ClampN(en2, eb2.length)]);
                 return;
             }
             immutable n3 = a10QueueLen(qn);
@@ -2937,7 +2965,7 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                 immutable en = snprintf(eb.ptr, eb.length,
                         "no queue '%.*s' in vhost '/'", cast(int) qn.length, qn.ptr);
                 a10MgmtRespond(c, fchan, "404", corrRaw, 2, null,
-                        eb[0 .. en]);
+                        eb[0 .. a10ClampN(en, eb.length)]);
                 return;
             }
             bodyOut.clear();
@@ -3095,7 +3123,7 @@ private void a10HandleMgmt(A10Conn c, ushort fchan, scope const(ubyte)[] msg) no
                             dstIsX ? "dste".ptr : "dstq".ptr,
                             cast(int) dst.length, dst.ptr,
                             cast(int) key.length, key.ptr);
-                    a10Str(bodyOut, loc[0 .. lnn]);
+                    a10Str(bodyOut, loc[0 .. a10ClampN(lnn, loc.length)]);
                 }
                 a10PatchU32(bodyOut, mszAt, cast(uint)(bodyOut.length - mcntAt));
                 a10PatchU32(bodyOut, mcntAt, 6);

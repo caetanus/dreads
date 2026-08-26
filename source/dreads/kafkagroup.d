@@ -509,6 +509,13 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                     wI16(o, KG_INCONSISTENT_PROTOCOL);
                     return;
                 }
+                // closeBarrier can drop members / reset to Empty; never emit for a
+                // member it removed (mirrors KGOP_JOIN_POLL; guards emitJoinOk).
+                if (g.state == ST_EMPTY || (useMid in g.members) is null)
+                {
+                    wI16(o, KG_UNKNOWN_MEMBER);
+                    return;
+                }
                 emitJoinOk(g, useMid, o);
                 return;
             }
@@ -810,15 +817,36 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
             KgTxn* t = tp !is null ? *tp : null;
             if (t is null)
             {
-                import core.atomic : atomicOp;
-
                 if (tTxns.length >= KG_MAX_GROUPS)
                 {
                     wI16(o, 50); // INVALID_TRANSACTION_TIMEOUT: coordinator at capacity
                     return;
                 }
                 t = new KgTxn;
-                t.pid = atomicOp!"+="(gKgPidCtr, 1);
+                // Mint the producer-id from a CSPRNG: a sequential/guessable pid
+                // lets an attacker who knows the transactional.id forge TXN_ADD
+                // (which only checks pid+epoch). pid is opaque to clients and only
+                // compared within one transactional.id, so collisions are benign.
+                long rp;
+                {
+                    import dreads.tls : tlsRandBytes;
+
+                    ubyte[8] pr = void;
+                    if (tlsRandBytes(pr[]))
+                    {
+                        rp = 0;
+                        foreach (bb; pr)
+                            rp = (rp << 8) | bb;
+                        rp &= long.max; // keep it non-negative
+                    }
+                    else
+                    {
+                        import core.atomic : atomicOp;
+
+                        rp = atomicOp!"+="(gKgPidCtr, 1); // fallback: sequential
+                    }
+                }
+                t.pid = rp;
                 t.epoch = -1;
                 tTxns[groupName.idup] = t;
             }
@@ -873,8 +901,8 @@ public void kgroupApply(scope const(ubyte)[] req, ref ByteBuffer o) nothrow @tru
                     break;
                 if (topic.length > 249)
                     continue; // Kafka topic max is 249; refuse to truncate+collide
-                if (part < 0)
-                    continue; // partitions are non-negative; drop mangled entry
+                if (part < 0 || part > 1_000_000)
+                    continue; // partitions are non-negative and sanely bounded; drop
                 char[300] tb = void;
                 size_t tl = topic.length;
                 tb[0 .. tl] = topic[0 .. tl];

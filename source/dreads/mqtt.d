@@ -1007,7 +1007,12 @@ private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @tru
                 // an ONLINE v5 session (an offline/parked one has no live socket).
                 if (victim.connected && victim.protoVer == 5 && !victim.offline)
                 {
-                    static ByteBuffer db; // TLS: consumed synchronously by sendTo
+                    // PER-CALL (NOT static): sendTo's raw-TCP path hands db.data
+                    // straight to tcp.write, which yields on backpressure while
+                    // referencing it. A TLS static shared across connections' takeover
+                    // would be db.clear()'d + refilled by a sibling during that park
+                    // -> the victim gets another client's disconnect bytes.
+                    ByteBuffer db;
                     db.clear();
                     mqttServerDisconnect(db, 0x8E); // Session taken over
                     sendTo(victim, db.data);
@@ -2488,7 +2493,13 @@ public void serveMqttClient(TCPConnection tcp, bool tls = false, bool ws = false
         // wss), do the RFC 6455 handshake, then run the normal MQTT loop with a
         // WS codec framing every read/write. The response is routed over the
         // same transport (raw, or TLS-encrypted).
-        static ByteBuffer reqbuf, respbuf;
+        // PER-CONNECTION (NOT static): the read loop below yields for up to 30s
+        // (waitForData/read/legPump) before the headers are complete, and the 101
+        // response write yields on backpressure. A TLS static shared across
+        // connections' handshakes would be reqbuf.clear()'d + refilled by a sibling
+        // during those parks -> A's Sec-WebSocket-Accept computed over B's headers,
+        // and B's pipelined CONNECT bytes fed into A's wsCodec (identity injection).
+        ByteBuffer reqbuf, respbuf;
         reqbuf.clear();
         bool gotHeaders = false;
         foreach (_; 0 .. 64) // bounded: handshake completes in a few round-trips

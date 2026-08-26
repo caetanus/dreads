@@ -4274,28 +4274,63 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
                 }
                 else
                 {
-                    immutable drop = want - base;
-                    if (drop > 0 && gKafkaExec !is null)
+                    if (want > base && gKafkaExec !is null)
                     {
-                        static ByteBuffer rb;
-                        char[24] b1 = void;
-                        immutable n1 = snprintf(b1.ptr, b1.length, "%lld", drop);
-                        const(char)[][4] a = ["ltrim", key,
-                            cast(const(char)[]) b1[0 .. n1], "-1"];
-                        gKafkaExec(a[], rb);
-                        // persist the new base + invalidate every shard's cache
-                        static ByteBuffer bkb, rb2;
+                        // LTRIM(drop N) + SET(base) are two separate ops, NOT
+                        // atomic: a concurrent DeleteRecords with a stale base
+                        // could over-trim and move the base BACKWARDS. Re-read
+                        // the base at the owner right before mutating and (a)
+                        // trim only the delta from the CURRENT base and (b)
+                        // reject a backwards move (log start offsets are
+                        // monotone). This is the backwards-move guard — it does
+                        // not fully close the GET..SET window (a true fix needs
+                        // an owner-side CAS/atomic op), but eliminates the
+                        // stale-read corruption and any base regression outside
+                        // that narrow window.
+                        static ByteBuffer bkb, rbg, rb, rb2;
                         baseKey(topic, part, bkb);
                         char[10 + KAFKA_MAX_TOPIC + 16] bst = void;
                         immutable bl = bkb.length <= bst.length ? bkb.length : bst.length;
                         bst[0 .. bl] = cast(const(char)[]) bkb.data[0 .. bl];
-                        char[24] b2 = void;
-                        immutable n2 = snprintf(b2.ptr, b2.length, "%lld", want);
-                        const(char)[][3] a2 = ["set",
-                            cast(const(char)[]) bst[0 .. bl],
-                            cast(const(char)[]) b2[0 .. n2]];
-                        gKafkaExec(a2[], rb2);
-                        atomicOp!"+="(gKafkaTruncEpoch, 1);
+                        auto bkey = cast(const(char)[]) bst[0 .. bl];
+                        const(char)[][2] ag = ["get", bkey];
+                        gKafkaExec(ag[], rbg);
+                        long curBase = 0;
+                        {
+                            auto d = rbg.data;
+                            if (d.length >= 4 && d[0] == '$' && d[1] != '-')
+                            {
+                                size_t i2 = 1;
+                                long blen = 0;
+                                while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9')
+                                    blen = blen * 10 + (d[i2++] - '0');
+                                i2 += 2;
+                                long got = 0;
+                                while (i2 < d.length && d[i2] >= '0' && d[i2] <= '9'
+                                        && got < blen)
+                                {
+                                    curBase = curBase * 10 + (d[i2++] - '0');
+                                    got++;
+                                }
+                            }
+                        }
+                        // reject the backwards move: only trim when `want`
+                        // strictly advances the CURRENT persisted base.
+                        if (want > curBase)
+                        {
+                            immutable drop = want - curBase;
+                            char[24] b1 = void;
+                            immutable n1 = snprintf(b1.ptr, b1.length, "%lld", drop);
+                            const(char)[][4] a = ["ltrim", key,
+                                cast(const(char)[]) b1[0 .. n1], "-1"];
+                            gKafkaExec(a[], rb);
+                            char[24] b2 = void;
+                            immutable n2 = snprintf(b2.ptr, b2.length, "%lld", want);
+                            const(char)[][3] a2 = ["set", bkey,
+                                cast(const(char)[]) b2[0 .. n2]];
+                            gKafkaExec(a2[], rb2);
+                            atomicOp!"+="(gKafkaTruncEpoch, 1);
+                        }
                     }
                     low = want;
                 }
@@ -5334,15 +5369,23 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         else
             r.ok = true;
     }
+    // Per-topic DESCRIBE authorization for EXPLICIT requests (rawn>=0). The
+    // all-topics enumeration (rawn<0, the bootstrap/discovery path) is left
+    // ungated so that flow is never broken. No-op when gKafkaAclActive==0.
+    bool[512] tauth = true;
+    immutable perTopicAuthz = rawn >= 0;
+    if (perTopicAuthz)
+        foreach (k; 0 .. nt)
+            tauth[k] = authorize(tKafkaCtx, KRES_TOPIC, topics[k], KOP_DESCRIBE);
     // The explicit-topic Metadata request is Kafka's auto-create moment:
     // register each VALID requested topic so the all-topics form lists it —
-    // but ONLY when BOTH the broker mode and the request allow it. Registry
-    // mode (DREADS_KAFKA_AUTOCREATE=false) must keep a merely-queried topic
-    // MISSING (golib Inspector).
+    // but ONLY when BOTH the broker mode and the request allow it (and the
+    // principal is authorized). Registry mode (DREADS_KAFKA_AUTOCREATE=false)
+    // must keep a merely-queried topic MISSING (golib Inspector).
     // Safe to yield here — only fiber-local state (o) is staged.
     if (gKafkaAutoCreate && tMetaAllowAuto)
-        foreach (t; topics[0 .. nt])
-            if (validTopic(t))
+        foreach (k, t; topics[0 .. nt])
+            if (tauth[k] && validTopic(t))
                 registerTopic(t);
 
     putI32(o, 0); // throttle_time_ms
@@ -5357,8 +5400,19 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     putI32(o, 0); // controller_id
     // topics
     putCArrLen(o, cast(int) nt);
-    foreach (t; topics[0 .. nt])
+    foreach (k, t; topics[0 .. nt])
     {
+        if (!tauth[k])
+        {
+            // unauthorized explicit topic: per-topic error 29 (no partitions).
+            putI16(o, E_TOPIC_AUTH_FAILED);
+            putCStr(o, t);
+            o.appendByte(0); // is_internal
+            putCArrLen(o, 0); // no partitions
+            putI32(o, wantTopicAuthz ? 0 : int.min); // authorized_operations
+            putTaggedFields(o);
+            continue;
+        }
         if (!validTopic(t))
         {
             // requested-but-illegal name: report it WITH error 17 — filtering
@@ -5472,6 +5526,19 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
     putI32(o, cast(int) nt);
     foreach (t; topics[0 .. nt])
     {
+        // Per-topic DESCRIBE authorization: Kafka surfaces topic authz as a
+        // per-topic error INSIDE the array (never a blanket denial). Classic
+        // Metadata answers only explicitly-named topics, so an unauthorized
+        // name is reported with error 29. No-op when gKafkaAclActive==0.
+        if (!authorize(tKafkaCtx, KRES_TOPIC, t, KOP_DESCRIBE))
+        {
+            putI16(o, E_TOPIC_AUTH_FAILED); // 29
+            putStr(o, t);
+            if (ver >= 1)
+                o.appendByte(0); // is_internal
+            putI32(o, 0); // no partitions
+            continue;
+        }
         immutable reg = registeredTopicPartitions(t); // -1 if not created
         int np;
         short terr = E_NONE;

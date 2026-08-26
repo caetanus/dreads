@@ -26,6 +26,19 @@ private enum string DL_PREFIX = "sqs.dl."; // delayed messages: id -> visibleAt+
 private enum long DEDUP_WINDOW_MS = 5 * 60 * 1000; // AWS FIFO 5-minute dedup window
 private enum string GRP_PREFIX = "sqs.grp."; // FIFO locked message-groups (set)
 private enum char SEP = '\x1f'; // record field separator (never in JSON body text? escaped)
+private enum size_t SQS_MAX_BODY = 262144; // AWS SQS max message body (256 KiB)
+
+// An op may set a specific error (code/type/message) before returning false via
+// a per-call `ref SqsErr` (NOT a shared TLS var — an op parks internally, so a
+// TLS holder would be contaminated by a sibling fiber); otherwise onConn emits
+// the default NonExistentQueue 400.
+private struct SqsErr
+{
+    int code;
+    const(char)[] type;
+    const(char)[] msg;
+    bool set;
+}
 
 public void startSqs() nothrow
 {
@@ -103,10 +116,16 @@ private void onConn(TCPConnection conn) @trusted nothrow
         auto action = dot < tgt.length ? tgt[dot + 1 .. $] : tgt;
 
         ByteBuffer out_;
-        immutable ok = dispatch(action, reqBody, out_);
+        SqsErr err;
+        immutable ok = dispatch(action, reqBody, out_, err);
         if (!ok)
-            writeErr(conn, 400, "AWS.SimpleQueueService.NonExistentQueue",
-                "The specified queue does not exist.");
+        {
+            if (err.set)
+                writeErr(conn, err.code, err.type, err.msg);
+            else
+                writeErr(conn, 400, "AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.");
+        }
         else
             writeJson(conn, cast(const(char)[]) out_.data);
         conn.close();
@@ -116,7 +135,8 @@ private void onConn(TCPConnection conn) @trusted nothrow
     }
 }
 
-private bool dispatch(scope const(char)[] action, scope const(char)[] b, ref ByteBuffer o) @trusted
+private bool dispatch(scope const(char)[] action, scope const(char)[] b, ref ByteBuffer o,
+        ref SqsErr err) @trusted
 {
     if (action == "CreateQueue")
         return opCreateQueue(b, o);
@@ -134,7 +154,7 @@ private bool dispatch(scope const(char)[] action, scope const(char)[] b, ref Byt
         return true;
     }
     if (action == "SendMessage")
-        return opSendMessage(b, o);
+        return opSendMessage(b, o, err);
     if (action == "SendMessageBatch")
         return opSendMessageBatch(b, o);
     if (action == "ReceiveMessage")
@@ -257,11 +277,20 @@ private bool opGetQueueAttributes(scope const(char)[] b, ref ByteBuffer o) @trus
     return true;
 }
 
-private bool opSendMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
+private bool opSendMessage(scope const(char)[] b, ref ByteBuffer o, ref SqsErr err) @trusted
 {
     auto name = queueFromUrl(jsonStrRaw(b, "QueueUrl"));
     if (name.length == 0 || !queueExists(name))
         return false;
+    // Reject oversize bodies rather than silently truncating (wrong MD5): the
+    // jsonStr decode buffer is 256 KiB, and the raw (still-escaped) length is an
+    // upper bound on the decoded size.
+    if (jsonStrRaw(b, "MessageBody").length > SQS_MAX_BODY)
+    {
+        err = SqsErr(400, "InvalidMessageContents",
+            "The message body exceeds the maximum allowed size (256 KiB).", true);
+        return false;
+    }
     auto group = jsonStrRaw(b, "MessageGroupId");
     auto dedup = jsonStrRaw(b, "MessageDeduplicationId");
     // copy out of jsonStr's shared TLS ub: dedupSeen()/sendOne() park under
@@ -363,10 +392,23 @@ private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @truste
         return false;
     o.append(`{"Successful":[`);
     bool first = true;
+    ByteBuffer failed; // per-call: oversize entries reported in the Failed array
+    bool firstF = true;
     // Entries: [{"Id":"..","MessageBody":".."}, ...]
     jsonEachEntry(b, "Entries", (scope const(char)[] entry) {
         auto id = jsonStrRaw(entry, "Id");
         auto egroup = jsonStrRaw(entry, "MessageGroupId");
+        // reject oversize bodies (would truncate -> wrong MD5): report Failed
+        if (jsonStrRaw(entry, "MessageBody").length > SQS_MAX_BODY)
+        {
+            if (!firstF)
+                failed.append(",");
+            firstF = false;
+            failed.append(`{"Id":"`);
+            appendJsonStr(failed, id);
+            failed.append(`","SenderFault":true,"Code":"InvalidMessageContents","Message":"The message body exceeds the maximum allowed size (256 KiB)."}`);
+            return;
+        }
         // copy out of jsonStr's shared TLS ub before sendOne() may park
         ByteBuffer ebodyBuf;
         ebodyBuf.append(jsonStr(entry, "MessageBody"));
@@ -388,7 +430,9 @@ private bool opSendMessageBatch(scope const(char)[] b, ref ByteBuffer o) @truste
         o.append(md5[]);
         o.append(`"}`);
     });
-    o.append(`],"Failed":[]}`);
+    o.append(`],"Failed":[`);
+    o.append(cast(const(char)[]) failed.data);
+    o.append(`]}`);
     return true;
 }
 
@@ -410,7 +454,11 @@ private bool opReceiveMessage(scope const(char)[] b, ref ByteBuffer o) @trusted
     if (visTimeout > 43200)
         visTimeout = 43200; // AWS max (12h); also prevents *1000 long overflow
 
-    static ByteBuffer rb, qkey, ifkey, val, grpkey;
+    static ByteBuffer rb, val;
+    // per-call (NOT static): these are re-read to build exec args across many
+    // hops/parks; a sibling opReceiveMessage would clobber a shared TLS static
+    // during a park -> operations against the wrong queue.
+    ByteBuffer qkey, ifkey, grpkey;
     qkey.clear();
     qkey.append(Q_PREFIX);
     qkey.append(name);
