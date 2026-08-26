@@ -141,6 +141,26 @@ The architectural exceptions — the things that will *stay* different:
 Everything else — commands, replies, error strings, encodings, RESP3 framing —
 is a convergence target, and the live Valkey blackbox suite is the yardstick.
 
+## Protocol faces
+
+RESP is one face. The same process, threads, and share-nothing fabric serve
+**four more messaging protocols natively** — no bridge, no sidecar. The structural
+trick is always the same: a queue or partition **is** a keyspace list, so it is
+durable via the AOF and inspectable through the core, and the cross-shard hop that
+routes RESP routes these too. Each face has its own guide, including an explicit
+*"where it differs"* section (divergent-by-design vs. not-done-yet):
+
+| Face | Wire | Guide |
+|---|---|---|
+| **AMQP 0-9-1** | RabbitMQ classic | [AMQP.md](AMQP.md) |
+| **AMQP 1.0** | OASIS/ISO standard | [AMQP10.md](AMQP10.md) |
+| **MQTT** | 3.1.1 + 5.0 (TCP/TLS/WS) | [MQTT.md](MQTT.md) |
+| **Kafka** | Apache Kafka protocol | [KAFKA.md](KAFKA.md) |
+| **Amazon SQS** | AWS SQS JSON (boto3) | [SQS.md](SQS.md) |
+
+Each is off by default; a single `--amqp-port` / `--mqtt-port` / `--kafka-port` /
+`--sqs-port` lights it up on its own listener.
+
 ## Origin
 
 dreads started as an experiment with a single question: **would D's fibers give
