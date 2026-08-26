@@ -528,4 +528,16 @@ vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
 
 ## License
 
-MIT © Marcelo Aires Caetano
+[Business Source License 1.1](LICENSE) © Marcelo Aires Caetano.
+
+- **Additional Use Grant** — production use is allowed, *except* offering dreads
+  to third parties on a hosted or embedded basis as a competitive offering (a
+  paid product or service that significantly overlaps with the capabilities of
+  the paid version). A product that is not a competitive offering when it first
+  ships does not become one later just because dreads releases a new version.
+- **Change Date** — 2030-08-22. On that date each version converts to its
+  **Change License: Apache License, Version 2.0**.
+
+The full parameters and the exact terms are in [LICENSE](LICENSE); this summary
+is for orientation only. Third-party components are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
