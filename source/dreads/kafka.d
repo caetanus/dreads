@@ -6270,13 +6270,14 @@ private void handleFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
                     }
                 }
             }
-            // patch records size
-            auto d3 = cast(ubyte[]) o.data;
-            immutable rsz = o.length - recAt - 4;
-            d3[recAt] = cast(ubyte)(rsz >> 24);
-            d3[recAt + 1] = cast(ubyte)(rsz >> 16);
-            d3[recAt + 2] = cast(ubyte)(rsz >> 8);
-            d3[recAt + 3] = cast(ubyte)(rsz & 0xFF);
+            // patch records size — bounds-checked via patchI32. If the reserving
+            // putI32(o,0) above no-oped under OOM (tByteBufferOom: appendByte
+            // drops when len==cap and realloc fails), o.length stays at recAt and
+            // a RAW write to [recAt..recAt+4] would be a 4-byte OOB write past the
+            // allocation (heap corruption). patchI32 skips when recAt+4>o.length,
+            // matching the guarded epilogue size backpatch. The value underflows
+            // to a bogus size in that case but is never written (write skipped).
+            patchI32(o, recAt, cast(int)(o.length - recAt - 4));
             emittedParts++;
         }
         patchI32(o, partsCountOff, emittedParts); // count == entries actually emitted

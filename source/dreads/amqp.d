@@ -3436,6 +3436,13 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 }
                 if (getHit)
                 {
+                    // Copy the record out of the shared TLS `pay` BEFORE the
+                    // gAmqpLen hop below parks: during that park a sibling
+                    // basic.get on this thread refills `pay`, and we then
+                    // idup/slice/emit it — cross-client disclosure + a wrong
+                    // unacked record. recCopy is per-call (stack).
+                    ByteBuffer recCopy;
+                    recCopy.append(cast(const(char)[]) pay.data);
                     immutable remaining = gAmqpLen !is null ? gAmqpLen(getKey) : 0;
                     immutable gtag = c.nextTag++;
                     try
@@ -3450,17 +3457,17 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     if (!getNoAck)
                         try
                         {
-                            c.unacked[gtag] = Unacked(q.idup, pay.data.idup, chan, 0, true);
-                            c.unackedBytes += pay.data.length;
+                            c.unacked[gtag] = Unacked(q.idup, recCopy.data.idup, chan, 0, true);
+                            c.unackedBytes += recCopy.data.length;
                             // NOT counted in the channel's consumer window:
                             // qos is a consumer contract (fromGet above).
                         }
                         catch (Exception)
                         {
                         }
-                    immutable redlv = recordRedelivered(pay.data);
-                    auto grk = recordRoutingKey(pay.data);
-                    auto gex = recordExchange(pay.data);
+                    immutable redlv = recordRedelivered(recCopy.data);
+                    auto grk = recordRoutingKey(recCopy.data);
+                    auto gex = recordExchange(recCopy.data);
                     method(o, chan, 60, 71, (ref ByteBuffer b) @nogc nothrow {
                         putU64(b, gtag);
                         b.appendByte(redlv ? 1 : 0); // redelivered
@@ -3468,7 +3475,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         putShortStr(b, grk); // original routing key
                         putU32(b, cast(uint)(remaining < 0 ? 0 : remaining));
                     });
-                    emitContent(o, chan, pay.data, c.frameMax);
+                    emitContent(o, chan, recCopy.data, c.frameMax);
                 }
                 else
                     method(o, chan, 60, 72, (ref ByteBuffer b) @nogc nothrow {

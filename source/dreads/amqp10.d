@@ -4036,6 +4036,11 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                         continue;
                     }
                 }
+                // capture link identity BEFORE the fetch park: a concurrent
+                // detach/attach during a10Pop/a10PeekAt can free/move the A10Link
+                // that pl5 aliases (ps5.links is A10Link-by-value).
+                immutable bool linkStream = pl5.stream;
+                auto linkRkey = pl5.rkey;
                 long streamOffThis = -1;
                 pay.clear();
                 bool got;
@@ -4113,6 +4118,30 @@ private void a10StartDelivery(A10Conn c, ushort fchan, uint handle) nothrow
                 }
                 else
                     got = a10Pop(pl5.rkey, pay);
+                // Re-validate link+session after the fetch park: a DETACH/END the
+                // serve loop processed during the hop removes/rehashes ps5.links
+                // (freeing/moving the A10Link pl5 aliases) and already requeued
+                // this link's unsettled set. Using the stale pl5 would
+                // use-after-free, mutate the wrong link and transfer on a detached
+                // handle; and a just-popped message would be stranded in unsettled
+                // AFTER that requeue -> permanent loss. Refresh, or requeue+stop.
+                {
+                    auto ps5r = ch5 in cc.sessions;
+                    auto pl5r = ps5r !is null ? h5 in ps5r.links : null;
+                    if (cc.closing || pl5r is null || pl5r.detached
+                            || pl5r.rkey != linkRkey)
+                    {
+                        if (got && !linkStream)
+                        {
+                            import dreads.amqp : a10Requeue;
+
+                            a10Requeue(linkRkey, cast(const(ubyte)[]) pay.data);
+                        }
+                        return;
+                    }
+                    ps5 = ps5r;
+                    pl5 = pl5r;
+                }
                 if (!got)
                 {
                     if (pl5.drain)
