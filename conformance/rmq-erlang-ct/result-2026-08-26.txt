@@ -1,0 +1,10 @@
+# RabbitMQ amqp_client system_SUITE (network group) vs dreads — run 2026-08-26
+#
+# dreads:  c4c34cf  (after the round-1..6 hardening commits)
+# runner:  docker erlang:26, rebar3 ct --suite test/dreads_system_SUITE
+# setup:   ACL seeded before the run (default/guest/test_user_no_perms), per conformance/README.md
+#
+# RESULT: All 344 tests passed.
+#
+%%% dreads_system_SUITE: ........................................................................................................................................................................................................................................................................................................................................................
+All 344 tests passed.

@@ -1,0 +1,36 @@
+===> Verifying dependencies...
+===> Fetching meck v1.2.0
+===> Fetching amqp_client v3.12.14
+===> Fetching credentials_obfuscation v3.4.0
+===> Fetching rabbit_common v3.12.14
+===> Fetching recon v2.5.3
+===> Fetching thoas v1.0.0
+===> Analyzing applications...
+===> Compiling credentials_obfuscation
+===> Compiling recon
+     \x{250C}\x{2500} _build/default/lib/recon/src/recon_alloc.erl:
+     \x{2502}
+ 702 \x{2502}  usage(0.0,0.0) -> 1.00;
+     \x{2502}        \x{2570}\x{2500}\x{2500} Warning: matching on the float 0.0 will no longer also match -0.0 in OTP 27. If you specifically intend to match 0.0 alone, write +0.0 instead.
+
+     \x{250C}\x{2500} _build/default/lib/recon/src/recon_alloc.erl:
+     \x{2502}
+ 702 \x{2502}  usage(0.0,0.0) -> 1.00;
+     \x{2502}            \x{2570}\x{2500}\x{2500} Warning: matching on the float 0.0 will no longer also match -0.0 in OTP 27. If you specifically intend to match 0.0 alone, write +0.0 instead.
+
+
+===> Compiling meck
+===> Compiling thoas
+===> Compiling rabbit_common
+===> Compiling amqp_client
+===> Analyzing applications...
+===> Compiling extra_test
+    \x{250C}\x{2500} _build/test/extras/test/dreads_system_SUITE.erl:
+    \x{2502}
+ 17 \x{2502}  -compile(export_all).
+    \x{2502}   \x{2570}\x{2500}\x{2500} Warning: export_all flag enabled - all functions will be exported
+
+
+===> Running Common Test suites...
+%%% dreads_system_SUITE: ........................................................................................................................................................................................................................................................................................................................................................
+All 344 tests passed.
