@@ -402,6 +402,15 @@ private struct Rd
                 return 0;
             }
             immutable b = p[i++];
+            // 5th byte (shift==28) carries only the top 4 bits of a 32-bit
+            // value. Anything above 0x0F would shift PAST the uint width and
+            // silently WRAP to zero (e.g. 0x10<<28 == 0), turning a malformed
+            // varint into an apparently valid length/count. REJECT, never clamp.
+            if (shift == 28 && (b & 0x7F) > 0x0F)
+            {
+                ok = false; // overflows 32 bits: malformed
+                return 0;
+            }
             v |= (cast(uint)(b & 0x7F)) << shift;
             if ((b & 0x80) == 0)
                 return v;
@@ -5736,7 +5745,7 @@ private void pidUpdate(scope const(char)[] topic, int part, long pid, short epoc
 private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    tKafkaDecompUsed = 0; // reset the per-request decompression budget
+    size_t decompUsed = 0; // handler-local per-request decompression budget (was a shared TLS counter)
     if (ver >= 3)
         cast(void) r.str(); // transactional_id (nullable) — ignored (no txn support)
     immutable acks = r.i16();
@@ -5856,7 +5865,7 @@ private bool handleProduce(ref Rd r, short ver, ref ByteBuffer o) nothrow @trust
                         putInternalRec(blobArena, ts, k, kn, v, vn, hdr);
                     offs[nrec * 2 + 1] = blobArena.length - offs[nrec * 2];
                     nrec++;
-                });
+                }, decompUsed);
                 if (dn < 0 || decErr)
                 {
                     err = E_CORRUPT;
@@ -6471,6 +6480,15 @@ private ulong getUVarint(scope const(ubyte)[] p, ref size_t i, ref bool ok) @nog
             return 0;
         }
         immutable ubyte b = p[i++];
+        // 10th byte (shift==63) carries only the single top bit of a 64-bit
+        // value. Anything above 0x01 shifts PAST the ulong width and silently
+        // wraps/truncates, turning a malformed RecordBatch varint into an
+        // apparently valid length/delta. REJECT, never clamp.
+        if (shift == 63 && (b & 0x7F) > 0x01)
+        {
+            ok = false; // overflows 64 bits: malformed
+            return 0;
+        }
         result |= cast(ulong)(b & 0x7F) << shift;
         if ((b & 0x80) == 0)
             return result;
@@ -6955,22 +6973,26 @@ private bool zstdInto(scope const(ubyte)[] src, ref ByteBuffer dst, size_t capMa
     return true;
 }
 
-/// Request-level ceiling on TOTAL decompressed bytes, reset per Produce request
-/// (tKafkaDecompUsed). The per-partition KAFKA_DECOMP_MAX bounds ONE batch, but a
+/// Request-level ceiling on TOTAL decompressed bytes, tracked per Produce request
+/// by handleProduce's local `decompUsed`. The per-partition KAFKA_DECOMP_MAX bounds ONE batch, but a
 /// request enumerating many partitions each carrying a ~1000:1 frame could
 /// otherwise amplify a 64 MB request into tens of GB of decompress+store work.
+// The running total is a HANDLER-LOCAL counter threaded down from handleProduce,
+// NOT a TLS global: a Produce request parks in gKafkaExec between partitions, and
+// a shared global would be reset/incremented by a sibling Produce fiber during
+// that park — so this request would either bypass the budget or reject wrongly.
 private enum size_t KAFKA_DECOMP_REQ_MAX = 512 << 20;
-private size_t tKafkaDecompUsed; // TLS, reset at the top of handleProduce
 
 /// Decompress a v2 batch's compressed records region (codec = attrs & 0x07)
 /// into `dst`. 1=gzip, 2=snappy, 3=lz4, 4=zstd — all Kafka codecs supported;
 /// undefined 5/6/7 reject. Bounded by both the per-batch cap and the running
 /// per-request budget.
-private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst) nothrow @trusted
+private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBuffer dst,
+        ref size_t decompUsed) nothrow @trusted
 {
-    if (tKafkaDecompUsed >= KAFKA_DECOMP_REQ_MAX)
+    if (decompUsed >= KAFKA_DECOMP_REQ_MAX)
         return false; // request-level decompression budget exhausted
-    immutable size_t remain = KAFKA_DECOMP_REQ_MAX - tKafkaDecompUsed;
+    immutable size_t remain = KAFKA_DECOMP_REQ_MAX - decompUsed;
     immutable size_t cap = remain < KAFKA_DECOMP_MAX ? remain : KAFKA_DECOMP_MAX;
     bool ok;
     switch (codec)
@@ -6991,7 +7013,7 @@ private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBu
         return false; // codecs 5/6/7 are undefined in Kafka
     }
     if (ok)
-        tKafkaDecompUsed += dst.length;
+        decompUsed += dst.length;
     return ok;
 }
 
@@ -7001,7 +7023,7 @@ private bool decompressRecords(ubyte codec, scope const(ubyte)[] src, ref ByteBu
 /// record count, or -1 on any malformation / unsupported-codec / bomb.
 private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
         scope const(ubyte)[] key, bool keyNull, scope const(ubyte)[] val, bool valNull,
-        scope const(ubyte)[] hdrSection) nothrow rec) nothrow
+        scope const(ubyte)[] hdrSection) nothrow rec, ref size_t decompUsed) nothrow
 {
     if (b.length < 61)
         return -1; // fixed v2 batch header is 61 bytes
@@ -7035,7 +7057,7 @@ private int decodeV2Batch(scope const(ubyte)[] b, scope void delegate(long ts,
     static ByteBuffer plain; // TLS: decompressed records (codec != 0)
     if (codec != 0)
     {
-        if (!decompressRecords(codec, b[h.i .. $], plain))
+        if (!decompressRecords(codec, b[h.i .. $], plain, decompUsed))
             return -1; // unsupported codec / malformed / decompression bomb
         rp = cast(const(ubyte)[]) plain.data;
         i = 0;
@@ -7435,12 +7457,13 @@ unittest // v2 batch codec round-trip: internal blobs -> encode -> decode -> bac
     // decode and rebuild internal blobs; must equal the originals
     ByteBuffer[3] out_;
     size_t seen = 0;
+    size_t decompUsed = 0;
     immutable n = decodeV2Batch(cast(const(ubyte)[]) batch.data, (long ts, scope const(ubyte)[] key,
             bool keyNull, scope const(ubyte)[] val, bool valNull, scope const(ubyte)[] hdr) nothrow{
         if (seen < 3)
             putInternalRec(out_[seen], ts, key, keyNull, val, valNull, hdr);
         seen++;
-    });
+    }, decompUsed);
     assert(n == 3 && seen == 3);
     assert(out_[0].data == r0.data);
     assert(out_[1].data == r1.data);
@@ -7450,5 +7473,5 @@ unittest // v2 batch codec round-trip: internal blobs -> encode -> decode -> bac
     auto bad = cast(ubyte[]) batch.data.dup;
     bad[17] ^= 0xFF; // flip a byte inside the crc field region
     assert(decodeV2Batch(cast(const(ubyte)[]) bad, (long, scope const(ubyte)[], bool,
-            scope const(ubyte)[], bool, scope const(ubyte)[]) nothrow{}) == -1);
+            scope const(ubyte)[], bool, scope const(ubyte)[]) nothrow{}, decompUsed) == -1);
 }

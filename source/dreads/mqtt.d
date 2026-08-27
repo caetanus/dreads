@@ -993,7 +993,11 @@ public void mqttExpireRetained() @trusted nothrow
 /// Close a local session a NEWER CONNECT (gen) superseded. Same-thread, so the
 /// map access is unlocked. Setting closed + waking the socket makes the victim's
 /// serve fiber observe the close on its next read and run its normal teardown.
-private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @trusted
+/// `fromDrain` = we are running on the SHARD DRAIN fiber (mqttTakeover), where
+/// parking is forbidden: the drain must keep draining gInbound or every lane
+/// fills and all cross-shard producers spin forever.
+private void takeoverLocal(scope const(char)[] clientId, ulong gen,
+        bool fromDrain = false) nothrow @trusted
 {
     try
     {
@@ -1007,15 +1011,41 @@ private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @tru
                 // an ONLINE v5 session (an offline/parked one has no live socket).
                 if (victim.connected && victim.protoVer == 5 && !victim.offline)
                 {
-                    // PER-CALL (NOT static): sendTo's raw-TCP path hands db.data
-                    // straight to tcp.write, which yields on backpressure while
-                    // referencing it. A TLS static shared across connections' takeover
-                    // would be db.clear()'d + refilled by a sibling during that park
-                    // -> the victim gets another client's disconnect bytes.
-                    ByteBuffer db;
-                    db.clear();
-                    mqttServerDisconnect(db, 0x8E); // Session taken over
-                    sendTo(victim, db.data);
+                    // This courtesy DISCONNECT is BEST-EFFORT and must never park the
+                    // SHARD DRAIN fiber: sendTo takes victim.wlock, and the victim's
+                    // writer holds that lock across a stalled tcp.write (slow/zero-
+                    // window reader). Parking the drain there stops this shard
+                    // draining gInbound entirely -> every lane fills and every
+                    // shardEnqueue producer spins in its yield-retry forever, hanging
+                    // all cross-shard traffic for this shard's keys (remote DoS from
+                    // one slow reader + one cross-shard CONNECT for the same id).
+                    // From the drain we therefore send ONLY when the lock is free; a
+                    // held lock means the write is already stalled, so the DISCONNECT
+                    // could not reach the peer before the tcp.close() below anyway.
+                    // The takeover itself (close + wake) proceeds either way, and the
+                    // serve-fiber path (fromDrain=false) keeps the blocking send.
+                    bool maySend = true;
+                    if (fromDrain)
+                    {
+                        maySend = victim.wlock.tryLock();
+                        if (maySend)
+                            victim.wlock.unlock(); // sendTo re-locks below; there is NO
+                        // yield between this unlock and that lock, so under cooperative
+                        // scheduling no other fiber can take it in between (and
+                        // TaskMutex is non-recursive, so we must not hold it here)
+                    }
+                    if (maySend)
+                    {
+                        // PER-CALL (NOT static): sendTo's raw-TCP path hands db.data
+                        // straight to tcp.write, which yields on backpressure while
+                        // referencing it. A TLS static shared across connections'
+                        // takeover would be db.clear()'d + refilled by a sibling
+                        // during that park -> the victim gets another client's bytes.
+                        ByteBuffer db;
+                        db.clear();
+                        mqttServerDisconnect(db, 0x8E); // Session taken over
+                        sendTo(victim, db.data);
+                    }
                 }
                 victim.closed = true;
                 try
@@ -1037,9 +1067,10 @@ private void takeoverLocal(scope const(char)[] clientId, ulong gen) nothrow @tru
 }
 
 /// A CONNECT on another shard took over `clientId` (drain's mqttConnect fan-in).
+/// Runs ON THE DRAIN FIBER -> fromDrain=true: never park on a victim's write lock.
 public void mqttTakeover(scope const(char)[] clientId, ulong gen) nothrow @trusted
 {
-    takeoverLocal(clientId, gen);
+    takeoverLocal(clientId, gen, true);
 }
 
 /// Deliver `topic`/`payload` to THIS thread's matching subscribers, and update

@@ -161,7 +161,12 @@ public struct Config
 public __gshared Config gConfig;
 
 /// "100mb"-style sizes. Returns false on garbage.
-public bool parseMemory(string s, out ulong bytes) nothrow
+/// `bytes` is `ref`, not `out`: an `out` parameter is zeroed on entry, so a
+/// rejected value used to wipe the field it was parsing into — the operator
+/// sees "ignoring invalid option" (app.d) while proto-max-bulk-len or
+/// client-query-buffer-limit silently becomes 0 instead of keeping its default.
+/// On failure the caller's value is left exactly as it was.
+public bool parseMemory(string s, ref ulong bytes) nothrow
 {
     import std.conv : to;
 
@@ -192,7 +197,16 @@ public bool parseMemory(string s, out ulong bytes) nothrow
     else if (mult == 1 && s.length > 1 && (s[$ - 1] == 'g' || s[$ - 1] == 'G'))
         suffix(1, 1_000_000_000);
     try
-        bytes = num.to!ulong * mult;
+    {
+        immutable n = num.to!ulong;
+        // `n * mult` wraps silently: "18014398509481984kb" would land as 0 while
+        // the directive reports success, so maxmemory / proto-max-bulk-len /
+        // client-query-buffer-limit would quietly take a value nobody asked for.
+        // Refuse the value instead of storing the wrapped one.
+        if (mult > 1 && n > ulong.max / mult)
+            return false;
+        bytes = n * mult;
+    }
     catch (Exception)
         return false;
     return true;
@@ -248,6 +262,40 @@ unittest
     assert(envToDirective("DREADSX") is null);
 }
 
+unittest
+{
+    // Every skin DB must fit the per-shard keyspace array (NUM_DBS == 20).
+    // sqs-db once accepted anything below 256, and the value is fed straight to
+    // myKeyspace(db) -> gShardKs[tShard*NUM_DBS + db]: an out-of-bounds index on
+    // every SQS operation.
+    Config c;
+    assert(applyDirective("sqs-db", "19", c) && c.sqsDb == 19); // the default
+    assert(!applyDirective("sqs-db", "20", c));
+    assert(!applyDirective("sqs-db", "100", c));
+    assert(!applyDirective("sqs-db", "255", c));
+    assert(c.sqsDb == 19); // a rejected value must not have been stored
+    foreach (d; ["amqp-db", "mqtt-db", "kafka-db"])
+        assert(!applyDirective(d, "20", c));
+
+    // Directive names are matched case-insensitively (the switch lowercases),
+    // so the per-name assignment must compare the lowercased name too —
+    // "AMQP-DB" used to fall through and configure kafkaDb instead.
+    Config u;
+    immutable kafkaBefore = u.kafkaDb;
+    assert(applyDirective("AMQP-DB", "5", u));
+    assert(u.amqpDb == 5, "uppercase amqp-db must set amqpDb");
+    assert(u.kafkaDb == kafkaBefore, "uppercase amqp-db must not touch kafkaDb");
+    assert(applyDirective("Mqtt-Db", "6", u) && u.mqttDb == 6);
+
+    // A suffixed size must not wrap: `n * mult` silently overflowed, so a huge
+    // value landed as something small (often 0) while the directive said "ok".
+    Config m;
+    assert(applyDirective("maxmemory", "256mb", m) && m.maxmemory == 256UL * 1024 * 1024);
+    assert(!applyDirective("maxmemory", "18014398509481984kb", m)); // would wrap to 0
+    assert(!applyDirective("maxmemory", "18446744073709551615gb", m));
+    assert(m.maxmemory == 256UL * 1024 * 1024); // rejected values are not stored
+}
+
 /// Applies one directive; false = unknown or invalid value.
 public bool applyDirective(string name, string value, ref Config cfg) nothrow
 {
@@ -293,9 +341,12 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             immutable n = value.to!uint;
             if (n > 18) // must fit the per-shard keyspace array (NUM_DBS)
                 return false;
-            if (name == "amqp-db")
+            // compare the LOWERCASED name: the switch above matched on `lname`,
+            // so `--AMQP-DB=5` reaches here with name=="AMQP-DB" and would fall
+            // through to the else, silently configuring kafkaDb instead.
+            if (lname == "amqp-db")
                 cfg.amqpDb = n;
-            else if (name == "mqtt-db")
+            else if (lname == "mqtt-db")
                 cfg.mqttDb = n;
             else
                 cfg.kafkaDb = n;
@@ -377,7 +428,12 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
         try
         {
             immutable n = value.to!uint;
-            if (n >= 256)
+            // must fit the per-shard keyspace array (NUM_DBS == 20), exactly
+            // like amqp-db/mqtt-db/kafka-db above. The old `>= 256` bound let
+            // 20..255 through, and gSqsExec feeds the value straight to
+            // myKeyspace(db) -> gShardKs[tShard*NUM_DBS + db] — an index past
+            // the array on every SQS op. 19 stays legal: it is the default.
+            if (n > 19)
                 return false;
             cfg.sqsDb = n;
         }
