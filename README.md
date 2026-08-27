@@ -7,7 +7,7 @@
 <p align="center"><b>A fast, reliable, in-memory data store — written in D.</b></p>
 
 <p align="center">
-  <a href="https://github.com/caetanus/dreads/actions/workflows/ci.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI — 548 tests + native Valkey parity sweep"></a>
+  <a href="https://github.com/caetanus/dreads/actions/workflows/ci.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI — 596 tests + native Valkey parity sweep"></a>
   <a href="https://github.com/caetanus/dreads/actions/workflows/windows.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/windows.yml/badge.svg?branch=master" alt="Windows build (static x64)"></a>
   <a href="https://github.com/caetanus/dreads/actions/workflows/macos.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/macos.yml/badge.svg?branch=master" alt="macOS build (arm64)"></a>
   <a href="https://github.com/caetanus/dreads/actions/workflows/docker.yml"><img src="https://github.com/caetanus/dreads/actions/workflows/docker.yml/badge.svg" alt="docker publish"></a>
@@ -160,6 +160,38 @@ routes RESP routes these too. Each face has its own guide, including an explicit
 
 Each is off by default; a single `--amqp-port` / `--mqtt-port` / `--kafka-port` /
 `--sqs-port` lights it up on its own listener.
+
+### Verified against the incumbents' own test suites
+
+"Compatible" is what every broker claims. These are the **upstream projects' own
+suites** — the tests RabbitMQ, Eclipse and Confluent wrote for their own
+software — run unmodified against dreads. Laundering is limited to the
+broker-management plumbing (node boot, `rabbitmqctl`, CT certs), justified
+in-file; results and runner logs are versioned under **[conformance/](conformance/)**.
+
+| Suite | Whose | Result |
+|---|---|---|
+| `amqp_client system_SUITE` (network group) | RabbitMQ server, Erlang | **344 / 344 pass** · re-run 2026-08-26 |
+| `FunctionalTestSuite` | rabbitmq-java-client | **325 pass, 0 fail** (5 errors are `rabbitmqctl`-driven, 7 skip) |
+| `blocking_adapter_test` | pika (reference AMQP client) | **82 / 82** |
+| Paho v5 / v3.1.1 | Eclipse (reference MQTT client) | **27 / 27** and **10 / 10** |
+| librdkafka suite | Confluent (reference Kafka client) | **150 / 166** · re-run 2026-08-26 |
+| AMQP 1.0 interop matrix + rhea/java | mixed | **6 / 6**, AmqpTest 52/54 |
+
+**The Kafka 16, stated plainly:** six are artifacts of the harness, not dreads —
+five need Kafka's Java CLI (`test_kafka_topics`/`test_kafka_cmd`) which the runner
+box lacks, and one sets `security.protocol=ssl` against a client built
+`--disable-ssl`. The rest are real and cluster in **one place: Admin API response
+encoding** (`CreateTopics` parses as NULL, `CreateAcls` v1 fails to parse) — none
+of them on the produce/consume data path. That re-run also carries **zero
+regressions** against `baseline-2026-08-24` (38 tests improved, none broke), which
+is what a re-run is for.
+
+Two suites are dreads' own rather than upstream: `test/conformance/sqs_conformance.py`
+(19 checks, boto3-free) and the golib-derived Kafka invariants (14). And
+`test/run-conformance.sh` boots **one** dreads with every skin bound and runs the
+whole battery against it — the five faces are verified to coexist, not just to
+work one at a time.
 
 ## Origin
 
@@ -485,6 +517,20 @@ Valkey server with the upstream **blackbox** suite (`blackbox/sweep.sh`); every
 suite failure fixed gets its own internal unit test, and the by-design skips are
 catalogued in `blackbox/valkey-sync.skip`.
 
+For the messaging faces there is a second battery:
+
+```sh
+test/run-conformance.sh          # build + unit + every skin suite
+test/run-conformance.sh --quick  # skip build and unit, suites only
+```
+
+It boots **one** dreads with RESP, AMQP, MQTT, Kafka and SQS all bound, then runs
+each skin's suite against that single broker — so coexistence is proven, not
+assumed. A suite whose Python client isn't installed is skipped, not failed, so
+it degrades cleanly on a bare box. The heavyweight upstream suites (RabbitMQ's
+Erlang and Java suites, librdkafka) are driven separately from
+[conformance/](conformance/), which also holds their dated results and logs.
+
 ## Architecture
 
 ```
@@ -517,9 +563,17 @@ vendor/emplace/ non-GC containers + RAII smart pointers (submodule)
 
 ## Roadmap
 
-- **Sharding** — slot ranges (CRC16/16384) each owned by a Raft group: the
-  single-machine shared-nothing thread-per-shard model, and where the
-  `CLUSTER`/`MOVED`/`ASK` surface lands.
+Sharding landed — `--shards N` is thread-per-core share-nothing today, with
+Redis Cluster slot semantics (hashtags, `CROSSSLOT`, same-slot transactions) on
+one process, and Raft per shard. What is still open:
+
+- **Kafka Admin API response encoding** — `CreateTopics` returns a result
+  librdkafka parses as NULL and `CreateAcls` v1 fails to parse, the residual
+  cluster in that suite (see `conformance/kafka-librdkafka/result-2026-08-26.txt`).
+  Nothing on the produce/consume path.
+- **Automated crash-consistency** — `kill -9` at each apply/log/fsync/ack point,
+  asserting no acknowledged write is ever lost. Verified by hand today; it needs
+  to be continuous, and it is the weakest link in the durability story.
 - **Closing the blackbox tail** — error-stats telemetry (`INFO Errorstats`/
   `Commandstats`), the remaining ACL niceties (subcommand-arg validation,
   `ACL CAT <category>` command listing, subscriber-kill on channel revoke), and
