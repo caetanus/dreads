@@ -185,6 +185,23 @@ of the consumer fiber's exits must give back — the exact defect class that los
 give-back path is not even exercised by the regression test that covers the
 first batch. Not a trade worth making for an effect smaller than the noise.
 
+## The ceiling is not measurable on this box
+
+The obvious way to price the structural fix is to emulate perfect locality: run
+N separate dreads processes, one shard and one core each, each owning its own
+queues, and see whether N of them deliver N times one. That experiment cannot be
+run here. RabbitMQ PerfTest — a JVM client — tops out around 900k msg/s on this
+machine (the highest figure observed across the whole campaign is 924k, from a
+SINGLE shard with 32 consumers). Four locality-perfect brokers would have to be
+driven past 3M msg/s to show 4x, so the client would cap the result long before
+the broker did, and any number it produced would be the client's.
+
+Pricing the fix needs a C-level AMQP load generator, the way redis-benchmark is
+for RESP. None is installed here (no rabbitmq-c tools), and paho's Python client
+is two orders of magnitude too slow (measured 14.8k msg/s). Until one exists,
+the size of the prize is unmeasured — the CAUSE above is proven, its price is
+not.
+
 ## What would actually work
 
 Remove the handoff instead of paying for it: run the delivery loop on the thread
