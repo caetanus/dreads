@@ -83,3 +83,73 @@ At s2 with 16 consumers the same build only reaches 2.16-2.30 µs/msg — the
 remaining cost there is the cross-shard hop, not the unacked store. The
 per-message `pay.data.idup` (a GC allocation that copies the payload) also
 survives this change and is the next candidate.
+
+---
+
+# Why Amdahl does not work for AMQP (measured 2026-09-01)
+
+Amdahl's law describes a ceiling: speedup flattens, it never descends. AMQP
+consume DESCENDS with shard count, which is the USL crosstalk term, not Amdahl.
+Here is what that term actually is, measured rather than modelled.
+
+## The measurements
+
+Drain of 800k messages, 16 queues/consumers, server pinned to cores 0-7.
+
+| shards | rate | CPU | busiest thread | vol. ctx switches | per msg |
+|---|---:|---:|---:|---:|---:|
+| s1 | 692k | 1.11 s | 0.50 core | 611 | 0.001 |
+| s2 | 688k | 1.78 s | 0.45 core | 9 747 | 0.012 |
+| s4 | 668k | 2.67 s | 0.42 core | 78 831 | **0.099** |
+
+With 32 consumers the throughput curve is unambiguous: **853k (s1) -> 617k (s2)
+-> 560k (s4)**. Adding shards makes it slower.
+
+## What it is not
+
+- **Not CPU saturation.** No shard thread exceeds 0.50 of a core at ANY shard
+  count. The consume path is latency-bound, not compute-bound — more threads
+  cannot buy throughput from a system that is not using the threads it has.
+- **Not the idle spin.** That was real and large (7.96 cores at s8 with zero
+  messages) and is fixed in 331a673, but the retrograde curve survives it: with
+  the spin compiled out entirely, s4 still costs 2.86 s against s1's 0.98 s.
+- **Not per-message broadcast.** With ONE queue and ONE consumer at s4, only two
+  threads burn anything (4.08 s + 0.12 s) and the total matches s1 (4.20 vs
+  4.03 s). Nothing fans out to every shard.
+- **Not hop round-trip latency that batching could amortise.** Raising the
+  consumer batch from 64 to 256 made every configuration slightly WORSE
+  (s1 1.52 -> 1.65, s4 4.28 -> 4.91 us/msg).
+- **Not the client.** A single shard reaches 924k msg/s with 32 consumers, well
+  past the ~780k that earlier runs mistook for a ceiling.
+
+## What it is
+
+**Adding a shard does not split the work; it converts an in-process call into a
+cross-thread park/wake pair.** At s4 the broker performs 129x more voluntary
+context switches per message than at s1, and `perf` puts the extra time exactly
+there: the kernel's share of samples goes from 11.8% to 38.5% while total
+samples rise 3.5x — about 11x more kernel time. At ~15 us per switch, 0.099
+switches/msg is ~1.5 us, and the measured excess is 1.95 us/msg (2.67 s vs
+1.11 s over 800k). The overhead accounts for essentially all of it.
+
+The consumer fiber runs on the CONNECTION's thread; the queue's owner is chosen
+by key hash. They coincide with probability 1/N, so the fraction of deliveries
+paying a cross-thread handoff is (N-1)/N — it GROWS with N. That is why the
+curve descends instead of flattening.
+
+Spin and park are two halves of one bill: the drain spin budget hides the
+handoff by burning a core, parking pays for it in syscalls. Neither removes it.
+
+## What is still unexplained
+
+The arithmetic does not close. 78 831 switches over 12 500 bursts is 6.3 per
+burst — 8.4 per REMOTE burst — where one pop round-trip should cost one. Other
+hop sites in the consume path are unaccounted for. Finding them needs a hop
+counter, not another curve; building the fix (pipelining the pop hop the way
+gAmqpPushStage already pipelines publishes) on the present model would be
+building on a model that does not add up.
+
+The structural answer, if locality is confirmed as the cause, is to remove the
+handoff rather than pay for it: run the delivery loop on the thread that owns
+the queue, or place the queue on the consumer's shard. The second changes shard
+placement and must not be done without asking.
