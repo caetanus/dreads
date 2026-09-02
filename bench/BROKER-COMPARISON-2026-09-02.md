@@ -163,3 +163,32 @@ that cannot show the presence or the absence of a broker-side gain. Shrinking
 both servers to four cores, so the load generator has room, is what made the
 27% visible. Same error as the PerfTest episode earlier in this campaign:
 concluding from a saturated client.
+
+### The hop actually disappears
+
+Counting cross-shard keyspace executions over a 1M-record produce run,
+--shards 4, bucketed by key prefix for the WHOLE run (an earlier count sampled
+only the first 40 and drew the wrong conclusion from startup traffic):
+
+| | remote total | partition logs | topic config | other |
+|---|---:|---:|---:|---:|
+| routing off | 8 061 | 3 478 | 4 580 | 3 |
+| routing on | 3 296 | **0** | 3 295 | 1 |
+| routing on + tcfg cache | **6** | 0 | 3 | 3 |
+
+With routing on the partition log NEVER crosses a shard — the client's routing is
+exact. Everything left was `kafka.tcfg.<topic>`, a process-global key that hashes
+to one shard, read by the compaction gate on every Produce request; caching it
+per shard takes the total from 3 296 to 6.
+
+| | records/sec, 4 cores each |
+|---|---:|
+| dreads s4, routing off | 3 231 031 |
+| dreads s4, routing on | 4 089 190 |
+| **dreads s4, routing + cache** | **4 255 082** |
+| Apache Kafka 3.7 | 2 726 648 |
+
+1.56x Apache Kafka at the same core budget under the same client. Shard scaling
+with both changes: s1 2.93M, s2 4.08M (1.39x), s4 4.15M (1.41x) — the curve now
+saturates at two shards rather than at one, and what caps it next is no longer
+cross-shard traffic.

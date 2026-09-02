@@ -4516,8 +4516,58 @@ private bool topicCfgGet(scope const(char)[] topic, scope const(char)[] name,
     return true;
 }
 
+/// Per-shard cache of the compaction gate.
+///
+/// `kafka.tcfg.<topic>` is a process-global key: it hashes to ONE shard, so
+/// every other shard reaches across for it. Once partition routing landed that
+/// became the ONLY thing still crossing shards — measured over a 1M-record
+/// produce run at --shards 4, routing on: 3295 of 3296 remote keyspace
+/// executions were this HGET, against ZERO for the partition logs.
+///
+/// Cached per shard with a short TTL rather than a broadcast invalidation.
+/// cleanup.policy changes through an admin call, and a bounded second of
+/// staleness on other shards is worth taking a cross-shard hop off every
+/// Produce request. (The topic registry next door already caches per shard with
+/// no expiry at all; this is the more conservative version of the same trick.)
+private enum long KAFKA_TCFG_CACHE_MS = 1000;
+private enum size_t KAFKA_TCFG_CACHE_MAX = 4096; // bound the per-shard table
+private struct CompactEntry
+{
+    bool compacted;
+    long atMs;
+}
+
+private CompactEntry[string] tCompactCache; // TLS: one per shard thread
+
 /// Does cleanup.policy contain "compact"? (comma-separated list semantics)
 private bool topicCompacted(scope const(char)[] topic) nothrow @trusted
+{
+    immutable now = kMonoMs();
+    try
+    {
+        if (auto e = topic in tCompactCache)
+        {
+            if (now - e.atMs < KAFKA_TCFG_CACHE_MS)
+                return e.compacted;
+        }
+    }
+    catch (Exception)
+    {
+    }
+    immutable r = topicCompactedUncached(topic);
+    try
+    {
+        if (tCompactCache.length >= KAFKA_TCFG_CACHE_MAX)
+            tCompactCache.clear(); // pathological topic churn: start over
+        tCompactCache[topic.idup] = CompactEntry(r, now);
+    }
+    catch (Exception)
+    {
+    }
+    return r;
+}
+
+private bool topicCompactedUncached(scope const(char)[] topic) nothrow @trusted
 {
     static ByteBuffer vb;
     if (!topicCfgGet(topic, "cleanup.policy", vb))
