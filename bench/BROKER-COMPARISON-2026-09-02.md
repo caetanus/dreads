@@ -59,26 +59,57 @@ paho probe at s1 and s2 receives 200/200 on all 8 topics — so this is a
 throughput pathology in the cross-shard fan-out, not lost messages. Unexplained;
 the largest open perf item in the tree.
 
-## Kafka — bench/kafkaload, 4 topics, produce acks=1
+## Kafka — measured with KAFKA'S OWN producer
 
-| | produce msg/s |
-|---:|---:|
-| **dreads s1** | **4 033 964** |
-| dreads s2 | 2 673 941 |
-| dreads s4 | 3 109 904 |
-| dreads s8 | 2 417 916 |
-| Apache Kafka 3.7 (KRaft) | 494 586 |
+Kafka is designed around a SMART CLIENT: the producer accumulates records
+asynchronously and ships large batches (batch.size/linger.ms), and the broker is
+built to expect that. A hand-rolled producer measures the tool, not the broker.
+bench/kafkaload sends 32 records per Produce request; the Java producer with
+stock settings batches roughly 1000 records of this size. Benchmarking Kafka
+with ours understated it by about the batching ratio.
 
-dreads s1 is 8.2x Apache Kafka. Shard scaling is flat-to-negative here too.
+kafka-producer-perf-test.sh (the reference client), 5M records of 16 bytes,
+acks=1, one producer:
+
+| | records/sec |
+|---|---:|
+| dreads s1 | 2 292 526 |
+| dreads s2 | 2 248 201 |
+| dreads s4 | 2 352 941 |
+| dreads s8 | 2 275 831 |
+| Apache Kafka 3.7 (KRaft) | 2 134 016 |
+
+Both land in the same band, and dreads is flat across shard counts — the
+signature of a client ceiling. Three concurrent producers confirm it:
+
+| | records/sec, 3 producers |
+|---|---:|
+| dreads s4 | 3 647 741 |
+| Apache Kafka 3.7 | 3 536 544 |
+
+**A 3% difference. Kafka and dreads are a tie on produce**, and the measurement
+is still client-bound for both. The earlier "8.2x Apache Kafka" in this file was
+an artifact of the naive producer and is retracted.
+
+For the record, the same suspicion was checked against RabbitMQ, and there it
+does NOT hold: RabbitMQ driven by its own PerfTest reaches 128 842 msg/s (8
+queues, 20s, mixed) — LOWER than the 263 189 it reached with bench/amqpload. Our
+client did not handicap it.
 
 ## Reading these honestly
 
-- **One shard is the best configuration for AMQP acks, MQTT and Kafka.** Only
-  RESP and AMQP delivery-only scale up with shards. That is a real limitation,
-  not a footnote.
+- **One shard is the best configuration for AMQP acks and MQTT.** Only RESP and
+  AMQP delivery-only scale up with shards; Kafka produce is flat because the
+  client saturates first. That is a real limitation, not a footnote.
+- **Use the vendor's own client where the protocol has one.** Kafka's throughput
+  lives in client-side batching, and measuring it with a hand-rolled producer
+  produced an 8x claim that a fair test turned into a 3% tie. AMQP and MQTT have
+  no equivalent client-side accumulation, and the RabbitMQ cross-check above
+  confirms our client did not disadvantage it — but the question has to be asked
+  per protocol, not assumed.
 - Competitors run their own default tuning apart from valkey's io-threads. A
   tuned RabbitMQ or Kafka would do better than shown; these are stock images.
-- Kafka's 494k is a single broker with acks=1 and no replication — its usual
+- Kafka here is a single broker with acks=1 and no replication — its usual
   deployment shape is different, and its durability guarantees are not dreads'.
 - The RESP s8 figure is at the client's ceiling and should be read as a lower
   bound.
