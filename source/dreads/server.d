@@ -2642,6 +2642,24 @@ private void shardDrainLoop() nothrow
     // published, and producers skip the wake entirely. The budget bounds the
     // idle burn on a dedicated pinned core; an idle server still sleeps.
     enum DRAIN_SPIN_BUDGET = 4096;
+    // Spin ONLY while the shard is earning the core it burns.
+    //
+    // A fixed budget assumes "idle means no traffic at all", which is false for
+    // the skins: an AMQP consumer polls its queue every 1ms, and when the queue
+    // lives on another shard each poll is a hop. Sixteen idle consumers make a
+    // lane ready every ~60us, so the budget never ran out, the thread never
+    // parked, and every shard thread past the first burned a FULL CORE
+    // delivering nothing — measured 7.96 cores at --shards 8 with 16 consumers
+    // and ZERO messages.
+    //
+    // The useful signal is not how soon the next message arrives but how much
+    // work the last pass actually found: spinning to save a park/wake pair is
+    // worth it when a pass drains a batch, and never worth it when it drains
+    // one hop every few hundred microseconds. (Timing how long we spun instead
+    // flaps — the budget then hunts the point where spin time equals the
+    // arrival gap, and burns a core at the top of every cycle.)
+    enum DRAIN_SPIN_MIN_BATCH = 8;
+    size_t lastDrained = DRAIN_SPIN_MIN_BATCH; // start hot; the first pass decides
     while (true)
     {
         try
@@ -2650,14 +2668,15 @@ private void shardDrainLoop() nothrow
                 import dreads.shard : gInbound;
 
                 auto inb = gInbound.length > tShard ? gInbound[tShard] : null;
+                immutable budget = lastDrained >= DRAIN_SPIN_MIN_BATCH ? DRAIN_SPIN_BUDGET : 0;
                 int spins = 0;
-                while (inb !is null && !inb.anyReady() && spins++ < DRAIN_SPIN_BUDGET)
+                while (inb !is null && !inb.anyReady() && spins++ < budget)
                     yield();
             }
             shardWaitInbound(); // park on the per-shard event ONLY when all lanes idle
             refreshWall(); // one clock read per drain pass (owner dispatches hopped cmds)
             replyTouch = 0; // requester shards we owe a batch + single wake this pass
-            cast(void) shardDrainOnce!handle();
+            lastDrained = shardDrainOnce!handle();
             {
                 // MQTT fan-in deliveries accumulated this pass flush here
                 import dreads.mqtt : mqttFlushDirty;

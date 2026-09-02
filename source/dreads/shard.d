@@ -401,10 +401,13 @@ public void shardPush(uint dst, scope const(ubyte)[] payload, void* tag, ulong m
 /// `fn(payload, tag, meta, kind)` with a slice pointing straight into the ring (valid
 /// until `fn` returns), then pop it. No intermediate buffer — the owner parses/dispatches
 /// the command, or copies the reply into the requester's pending, directly from the ring.
-/// Returns true if at least one message was processed. SPSC: only this thread pops.
-public bool shardDrainOnce(alias fn)() nothrow
+/// Returns the NUMBER of messages processed (0 = none), so a caller can tell a
+/// real batch from a trickle — the drain loop spends its spin budget on that.
+/// Non-zero is still just "something happened", so `while (shardDrainOnce!f())`
+/// keeps reading the way it always did. SPSC: only this thread pops.
+public size_t shardDrainOnce(alias fn)() nothrow
 {
-    bool any = false;
+    size_t n = 0;
     foreach (ref lane; gInbound[tShard].lanes)
     {
         const(ubyte)[] p;
@@ -413,12 +416,12 @@ public bool shardDrainOnce(alias fn)() nothrow
         uint kind;
         while (lane.front(p, tag, meta, kind))
         {
-            any = true;
+            n++;
             fn(p, tag, meta, kind); // p is a live slice into the slot; valid until pop
             lane.pop();
         }
     }
-    return any;
+    return n;
 }
 
 /// Consumer side: block until at least one inbound lane has data (delegates to the
