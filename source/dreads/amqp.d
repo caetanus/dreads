@@ -1925,6 +1925,308 @@ private struct Unacked
     // settles must credit the right consumer's counter.
 }
 
+/// Max slots the dense unacked window will span before falling back to the
+/// hash spill. Sized so the fast path covers every sane prefetch window
+/// (65536 outstanding deliveries) while bounding the per-connection cost of a
+/// client that acks a high tag and sits on a low one forever.
+private enum size_t UNACKED_WINDOW_MAX = 1 << 16;
+
+/// Unacked store: a DENSE SLIDING WINDOW keyed by delivery tag, with an AA
+/// spill for the pathological case.
+///
+/// Delivery tags are `c.nextTag++` — strictly sequential per connection — and
+/// settles arrive in roughly the order they were issued, so the live set is
+/// almost always a compact run. Holding that run in a hash map made the ack
+/// path a pointer chase: profiling the consume drain (s2, 16 queues) put 18.8%
+/// of all cycles in the AA (`_aaGetX` 7.9%, `settleTagUnknown` 7.0% — a single
+/// lookup, i.e. cache misses — plus resize/hash/mix) and fed the 16.4% the GC
+/// spent scanning its buckets. A ring indexed by (tag - base) turns both the
+/// insert and the settle into contiguous array access.
+///
+/// The interface mirrors the built-in AA it replaced (`in`, `[]=`, `remove`,
+/// `length`, `clear`, `foreach`) so the ~17 call sites are untouched. The one
+/// visible difference is ITERATION ORDER: ascending by tag instead of hash
+/// order. Every foreach site collects tags and then sorts them explicitly
+/// (requeue needs highest-first, dead-letter lowest-first), so ordering is not
+/// load-bearing — but do not add a site that relies on it.
+private struct UnackedMap
+{
+    private Unacked[] buf; // ring, length is a power of two (0 = unallocated)
+    private bool[] live;
+    private ulong base_; // tag held at window offset 0
+    private size_t head; // ring index of window offset 0
+    private size_t span; // window width; slots [head, head+span) may be live
+    private size_t n; // live entries inside the window
+    private Unacked[ulong] spill; // tags too far past base_ to fit the window
+
+    private size_t idx(ulong tag) const @nogc nothrow @safe
+    {
+        return (head + cast(size_t)(tag - base_)) & (buf.length - 1);
+    }
+
+    private bool inWindow(ulong tag) const @nogc nothrow @safe
+    {
+        return span != 0 && tag >= base_ && tag - base_ < span;
+    }
+
+    /// Grow to hold `need` slots, re-laying the window at offset 0.
+    private void grow(size_t need) nothrow @trusted
+    {
+        size_t cap = buf.length ? buf.length : 64;
+        while (cap < need)
+            cap <<= 1;
+        auto nb = new Unacked[cap];
+        auto nl = new bool[cap];
+        foreach (i; 0 .. span)
+        {
+            immutable src = (head + i) & (buf.length - 1);
+            if (live[src])
+            {
+                nb[i] = buf[src];
+                nl[i] = true;
+            }
+        }
+        buf = nb;
+        live = nl;
+        head = 0;
+    }
+
+    /// Drop dead slots off the front so `base_` tracks the lowest live tag.
+    private void advance() nothrow @trusted
+    {
+        while (span != 0 && !live[head])
+        {
+            head = (head + 1) & (buf.length - 1);
+            base_++;
+            span--;
+        }
+        if (span == 0)
+        {
+            head = 0;
+            // window is empty: adopt the spill's lowest tag as the new base so
+            // a client that stranded one low tag still gets the fast path back.
+            if (spill.length)
+                try
+                {
+                    ulong lo = ulong.max;
+                    foreach (t, ref _u; spill)
+                        if (t < lo)
+                            lo = t;
+                    base_ = lo;
+                    ulong[] moved;
+                    foreach (t, ref u; spill)
+                        if (t - lo < UNACKED_WINDOW_MAX)
+                            moved ~= t;
+                    foreach (t; moved)
+                    {
+                        auto u = spill[t];
+                        spill.remove(t);
+                        opIndexAssign(u, t);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+        }
+    }
+
+    void opIndexAssign(Unacked v, ulong tag) nothrow @trusted
+    {
+        if (span == 0)
+        {
+            if (buf.length == 0)
+                grow(64);
+            base_ = tag;
+            head = 0;
+            span = 1;
+            live[0] = true;
+            buf[0] = v;
+            n++;
+            return;
+        }
+        if (tag < base_ || tag - base_ >= UNACKED_WINDOW_MAX)
+        {
+            try
+                spill[tag] = v;
+            catch (Exception)
+            {
+            }
+            return;
+        }
+        immutable need = cast(size_t)(tag - base_) + 1;
+        if (need > buf.length)
+            grow(need);
+        if (need > span)
+            span = need;
+        immutable i = idx(tag);
+        if (!live[i])
+            n++;
+        live[i] = true;
+        buf[i] = v;
+    }
+
+    inout(Unacked)* opBinaryRight(string op : "in")(ulong tag) inout @nogc nothrow @trusted
+    {
+        if (inWindow(tag))
+        {
+            immutable i = idx(tag);
+            return live[i] ? &buf[i] : null;
+        }
+        if (spill.length)
+            return tag in spill;
+        return null;
+    }
+
+    bool remove(ulong tag) nothrow @trusted
+    {
+        if (inWindow(tag))
+        {
+            immutable i = idx(tag);
+            if (!live[i])
+                return false;
+            live[i] = false;
+            buf[i] = Unacked.init; // drop the payload reference for the GC
+            n--;
+            advance();
+            return true;
+        }
+        if (spill.length)
+            try
+                return spill.remove(tag);
+            catch (Exception)
+            {
+            }
+        return false;
+    }
+
+    size_t length() const @nogc nothrow @safe
+    {
+        return n + spill.length;
+    }
+
+    void clear() nothrow @trusted
+    {
+        buf = null;
+        live = null;
+        base_ = 0;
+        head = 0;
+        span = 0;
+        n = 0;
+        try
+            spill.clear();
+        catch (Exception)
+        {
+        }
+    }
+
+    /// Ascending by tag over the window, then the spill. The delegate is typed
+    /// `nothrow` because every call site sits inside a nothrow frame handler;
+    /// a template opApply cannot be used here (foreach cannot infer the loop
+    /// variable types from one).
+    int opApply(scope int delegate(ulong, ref Unacked) nothrow dg) nothrow @trusted
+    {
+        foreach (i; 0 .. span)
+        {
+            immutable j = (head + i) & (buf.length - 1);
+            if (!live[j])
+                continue;
+            if (auto r = dg(base_ + i, buf[j]))
+                return r;
+        }
+        if (spill.length)
+            try
+            {
+                foreach (t, ref u; spill)
+                    if (auto r = dg(t, u))
+                        return r;
+            }
+            catch (Exception)
+            {
+            }
+        return 0;
+    }
+}
+
+unittest // UnackedMap: AA-compatible surface over the dense sliding window
+{
+    static Unacked mk(ushort ch, string ct = "")
+    {
+        return Unacked("q", cast(const(ubyte)[]) "body", ch, 0, false, ct);
+    }
+
+    UnackedMap m;
+    assert(m.length == 0);
+    assert((1UL in m) is null);
+    assert(m.remove(1) == false); // removing from an empty map is not a crash
+
+    // insert / lookup / length
+    foreach (t; 1 .. 6)
+        m[t] = mk(cast(ushort)(t * 10));
+    assert(m.length == 5);
+    assert((3UL in m) !is null && (3UL in m).chan == 30);
+    assert((6UL in m) is null);
+
+    // OUT-OF-ORDER settle: freeing a middle tag must not slide the base, and
+    // must not disturb its neighbours (the bug a ring gets wrong).
+    assert(m.remove(3));
+    assert((3UL in m) is null);
+    assert((2UL in m) !is null && (4UL in m) !is null);
+    assert(m.length == 4);
+    assert(m.remove(3) == false); // double settle
+
+    // freeing the FRONT slides the base past every dead slot at once
+    assert(m.remove(1));
+    assert(m.remove(2));
+    assert(m.base_ == 4 && m.length == 2); // 3 was already dead: skipped too
+
+    // ascending iteration, and every live tag yielded exactly once
+    ulong[] seen;
+    foreach (t, ref u; m)
+        seen ~= t;
+    assert(seen == [4UL, 5UL]);
+
+    // growth past the initial capacity, with the window still correct
+    UnackedMap g;
+    foreach (t; 1 .. 500)
+        g[t] = mk(cast(ushort)(t % 60000));
+    assert(g.length == 499);
+    assert((499UL in g) !is null && (499UL in g).chan == cast(ushort)(499 % 60000));
+    foreach (t; 1 .. 500)
+        assert(g.remove(t));
+    assert(g.length == 0);
+    assert((250UL in g) is null);
+
+    // SPILL: a tag too far past the base for the window falls back to the AA
+    // and stays fully visible through the same interface.
+    UnackedMap sp;
+    sp[1] = mk(1);
+    immutable far = 1UL + UNACKED_WINDOW_MAX + 7;
+    sp[far] = mk(2);
+    assert(sp.length == 2);
+    assert((far in sp) !is null && (far in sp).chan == 2);
+    ulong[] both;
+    foreach (t, ref u; sp)
+        both ~= t;
+    assert(both.length == 2 && both[0] == 1 && both[1] == far);
+    // draining the window re-bases onto the spill so the fast path comes back
+    assert(sp.remove(1));
+    assert(sp.length == 1);
+    assert((far in sp) !is null);
+    assert(sp.base_ == far); // migrated out of the spill, back into the window
+    assert(sp.remove(far));
+    assert(sp.length == 0);
+
+    // clear drops everything, window and spill alike
+    UnackedMap c;
+    c[1] = mk(1);
+    c[1UL + UNACKED_WINDOW_MAX + 1] = mk(2);
+    c.clear();
+    assert(c.length == 0);
+    assert((1UL in c) is null);
+    c[9] = mk(3); // usable again after clear
+    assert(c.length == 1 && (9UL in c) !is null);
+}
+
 private final class AmqpConn
 {
     TlsLeg* tlsLeg; // null = plaintext
@@ -1943,7 +2245,7 @@ private final class AmqpConn
     ubyte loginUserLen;
     long connectedMs; // wall time at connect (registry age)
     bool[string] cancelledTags; // basic.cancel'ed consumer tags
-    Unacked[ulong] unacked; // delivery-tag -> record (no_ack=false consumers)
+    UnackedMap unacked; // delivery-tag -> record (no_ack=false consumers)
     size_t unackedBytes; // running sum of unacked blob bytes (byte-cap the window)
     size_t pendingBytes; // running sum of in-progress publish body bytes across channels (DoS cap)
     ulong nextTag = 1;
@@ -3761,11 +4063,11 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         foreach (t, ref u; c.unacked)
                             if ((tag == 0 || t <= tag) && u.chan == chan)
                                 all ~= t; // tag 0 + multiple = ALL outstanding
-                        // preserve delivery order on redelivery: tags are
-                        // monotonic (delivery order), but the AA yields them in
-                        // hash order. requeue pushes to the FRONT, so settle
-                        // highest-tag-first (lowest ends up frontmost = FIFO);
-                        // dead-letter RPUSHes the DLX tail, so settle lowest-first.
+                        // preserve delivery order on redelivery: requeue pushes
+                        // to the FRONT, so settle highest-tag-first (lowest ends
+                        // up frontmost = FIFO); dead-letter RPUSHes the DLX tail,
+                        // so settle lowest-first. Sort explicitly rather than
+                        // leaning on the store's iteration order.
                         import std.algorithm.sorting : sort;
 
                         if (requeue)
