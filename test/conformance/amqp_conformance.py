@@ -198,6 +198,50 @@ last = k2.basic_get("amqpc.ovfdh", auto_ack=True)[2]
 check("drop-head keeps the TAIL", last == b"d6", "first-out=%s" % last)
 c2.close()
 
+# --- [X-DELIVERY-LIMIT] a poison message stops being requeued ---------------
+# Without a limit a consumer that keeps nacking spins the same record forever.
+# LavinMQ enforces this; measured there, a limit of 2 yields 3 deliveries and
+# then the message is dead-lettered.
+print("\n[X-DELIVERY-LIMIT]")
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+for q in ("amqpc.dlsrc", "amqpc.dldead"):
+    try: k2.queue_delete(queue=q)
+    except Exception:
+        c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.queue_declare(queue="amqpc.dldead", durable=True)
+k2.queue_declare(queue="amqpc.dlsrc", durable=True,
+                 arguments={"x-delivery-limit": 2, "x-dead-letter-exchange": "",
+                            "x-dead-letter-routing-key": "amqpc.dldead"})
+k2.basic_publish("", "amqpc.dlsrc", b"poison")
+n = 0
+for _ in range(10):
+    m, _p, _b = k2.basic_get("amqpc.dlsrc", auto_ack=False)
+    if m is None:
+        break
+    n += 1
+    k2.basic_nack(m.delivery_tag, requeue=True)
+left = k2.queue_declare(queue="amqpc.dlsrc", durable=True, passive=True).method.message_count
+dead = k2.queue_declare(queue="amqpc.dldead", durable=True, passive=True).method.message_count
+check("x-delivery-limit bounds redelivery", n <= 4, "deliveries=%d (limit 2)" % n)
+check("the message leaves the source queue", left == 0, "left=%d" % left)
+check("and is dead-lettered, not dropped", dead == 1, "dead=%d" % dead)
+
+# a queue WITHOUT the limit still requeues without bound
+try: k2.queue_delete(queue="amqpc.dlnone")
+except Exception:
+    c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.queue_declare(queue="amqpc.dlnone", durable=True)
+k2.basic_publish("", "amqpc.dlnone", b"forever")
+n2 = 0
+for _ in range(6):
+    m, _p, _b = k2.basic_get("amqpc.dlnone", auto_ack=False)
+    if m is None:
+        break
+    n2 += 1
+    k2.basic_nack(m.delivery_tag, requeue=True)
+check("no limit still requeues unbounded", n2 == 6, "deliveries=%d" % n2)
+c2.close()
+
 conn.close()
 print("\n" + "=" * 60)
 print("AMQP 0-9-1 conformance: %d passed, %d failed" % (passed, failed))

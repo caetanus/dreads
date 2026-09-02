@@ -321,6 +321,11 @@ private struct QueueMeta
     /// queue then refuses the message instead of evicting its head, and a
     /// publisher in confirm mode gets basic.nack rather than basic.ack.
     ubyte overflow;
+    /// x-delivery-limit ENCODED +1 (0 = unset, N+1 = limit N). A message that
+    /// has been delivered and requeued N times is dead-lettered instead of
+    /// requeued again — the poison-message brake LavinMQ has and this broker
+    /// did not, which without it loops such a message forever.
+    long delLimit;
 }
 
 /// x-expires lease deadlines (nowMs-based), shard-local. Stamped by the op-3
@@ -710,8 +715,12 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             ubyte ovfw = 0;
             if (tb.length >= 26)
                 ovfw = tb[25]; // absent on a shorter (older) encode: drop-head
+            long dlw = 0;
+            if (tb.length >= 34)
+                foreach (k; 26 .. 34)
+                    dlw = (dlw << 8) | tb[k];
             QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0,
-                    expw, (fl & 8) != 0, ovfw);
+                    expw, (fl & 8) != 0, ovfw, dlw);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (!(fl & 1))
@@ -730,6 +739,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     qm.maxLen = ex0.maxLen;
                 if (ovfw == 0)
                     qm.overflow = ex0.overflow; // merge, like every other arg
+                if (dlw == 0)
+                    qm.delLimit = ex0.delLimit;
                 if (!(fl & 8))
                 {
                     qm.expMs = ex0.expMs;
@@ -3515,10 +3526,20 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
-                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0
-                            || ovfEnc != 0)
+                    long dlV;
+                    immutable dlPresent = tableIntKind(argsTbl, "x-delivery-limit", dlV) > 0;
+                    if (dlPresent && dlV < 0)
                     {
-                        ubyte[26] tb = void;
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - invalid arg 'x-delivery-limit'", 50, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                    immutable dlEnc = dlPresent ? dlV + 1 : 0;
+                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0
+                            || ovfEnc != 0 || dlEnc > 0)
+                    {
+                        ubyte[34] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
@@ -3531,6 +3552,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         foreach (k; 0 .. 8)
                             tb[17 + k] = cast(ubyte)((ek > 0 ? expV : 0) >> ((7 - k) * 8));
                         tb[25] = ovfEnc; // appended: older peers stop at 25 and default to drop-head
+                        foreach (k; 0 .. 8)
+                            tb[26 + k] = cast(ubyte)(dlEnc >> ((7 - k) * 8));
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -4557,7 +4580,7 @@ private void commitTx(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuffer o)
         // uncommitted message isn't in the queue yet (transactionalPublishWithGet
         // pins this). Re-stamp publishMs (record bytes 4..12, after the magic).
         auto stamped = cast(ubyte[]) tp.record.dup;
-        if (stamped.length >= 12 && stamped[0] == 0x04)
+        if (stamped.length >= 12 && (stamped[0] == 0x04 || stamped[0] == 0x05))
         {
             immutable nowc = cast(ulong) nowMs();
             foreach (k; 0 .. 8)
@@ -4691,9 +4714,17 @@ private void buildRecord(ref ByteBuffer o, long publishMs, int deaths,
     // with the redelivered flag in bit 7), then the ORIGINAL exchange (u16 len)
     // ahead of the routing key. basic.deliver/basic.get-ok must carry the real
     // exchange the message was published to (recordExchange reads it back).
-    o.append("\x04AMQ");
+    // v5 record: v4 plus a DELIVERY COUNT byte at 13 (everything after it shifts
+    // by one). x-delivery-limit needs to know how many times a message has been
+    // delivered and requeued, and there was nowhere to keep it: the deaths byte
+    // is x-death hop count in bits 0..6 with the redelivered FLAG in bit 7, and
+    // a flag cannot answer "how many". Readers for v1..v4 stay, so existing
+    // records and AOF replay are unaffected; only an OLDER build reading a
+    // record written by this one would not see the new field.
+    o.append("\x05AMQ");
     putU64(o, cast(ulong) publishMs); // wall-clock ms at publish (0 = unknown)
     o.appendByte(cast(char)(deaths > 255 ? 255 : (deaths < 0 ? 0 : deaths))); // x-death hop count
+    o.appendByte(0); // delivery count: a fresh publish has never been delivered
     immutable el = exchange.length > 0xFFFF ? 0xFFFF : exchange.length;
     o.appendByte(cast(char)(el >> 8));
     o.appendByte(cast(char)(el & 0xFF));
@@ -4711,6 +4742,35 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
         out int deaths, out const(char)[] rkey, out const(ubyte)[] props,
         out const(ubyte)[] body_) @nogc nothrow
 {
+    if (blob.length >= 18 && blob[0] == 0x05 && blob[1] == 'A' && blob[2] == 'M'
+            && blob[3] == 'Q')
+    {
+        long pm = 0;
+        foreach (k; 0 .. 8)
+            pm = (pm << 8) | blob[4 + k];
+        publishMs = pm;
+        deaths = blob[12] & 0x7F; // bit 7 is the redelivered flag, not a death
+        // blob[13] is the delivery count (recordDeliveryCount), then v4's layout
+        immutable el = (cast(size_t) blob[14] << 8) | blob[15];
+        immutable ro = 16 + el; // routing-key length offset
+        if (ro + 2 <= blob.length)
+        {
+            immutable rl = (cast(size_t) blob[ro] << 8) | blob[ro + 1];
+            immutable po = ro + 2 + rl;
+            if (po + 4 <= blob.length)
+            {
+                rkey = cast(const(char)[]) blob[ro + 2 .. po];
+                immutable pl = (cast(size_t) blob[po] << 24) | (cast(size_t) blob[po + 1] << 16)
+                    | (cast(size_t) blob[po + 2] << 8) | blob[po + 3];
+                if (po + 4 + pl <= blob.length)
+                {
+                    props = blob[po + 4 .. po + 4 + pl];
+                    body_ = blob[po + 4 + pl .. $];
+                    return;
+                }
+            }
+        }
+    }
     if (blob.length >= 17 && blob[0] == 0x04 && blob[1] == 'A' && blob[2] == 'M'
             && blob[3] == 'Q')
     {
@@ -4803,8 +4863,17 @@ package void splitRecord(scope const(ubyte)[] blob, out long publishMs,
 /// both read false, matching RabbitMQ (dead-letter starts a fresh delivery).
 package bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
 {
-    return blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04) && blob[1] == 'A'
-        && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
+    return blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04 || blob[0] == 0x05)
+        && blob[1] == 'A' && blob[2] == 'M' && blob[3] == 'Q' && (blob[12] & 0x80) != 0;
+}
+
+/// How many times this message has been delivered and put back (v5 records
+/// only; anything older has no counter and reads 0, so a queue that gains an
+/// x-delivery-limit never retro-kills messages published before it).
+package uint recordDeliveryCount(scope const(ubyte)[] blob) @nogc nothrow
+{
+    return blob.length >= 18 && blob[0] == 0x05 && blob[1] == 'A' && blob[2] == 'M'
+        && blob[3] == 'Q' ? blob[13] : 0;
 }
 
 /// The ORIGINAL exchange a message was published to ([basic.deliver]/
@@ -4813,6 +4882,13 @@ package bool recordRedelivered(scope const(ubyte)[] blob) @nogc nothrow
 /// correct value for a default-exchange publish.
 private const(char)[] recordExchange(return scope const(ubyte)[] blob) @nogc nothrow
 {
+    if (blob.length >= 18 && blob[0] == 0x05 && blob[1] == 'A' && blob[2] == 'M'
+            && blob[3] == 'Q')
+    {
+        immutable el = (cast(size_t) blob[14] << 8) | blob[15];
+        if (16 + el <= blob.length)
+            return cast(const(char)[]) blob[16 .. 16 + el];
+    }
     if (blob.length >= 17 && blob[0] == 0x04 && blob[1] == 'A' && blob[2] == 'M'
             && blob[3] == 'Q')
     {
@@ -4843,11 +4919,15 @@ private void markRedelivered(ref ByteBuffer dst, scope const(ubyte)[] blob) @nog
 {
     dst.clear();
     dst.append(cast(const(char)[]) blob);
-    if (blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04) && blob[1] == 'A'
-            && blob[2] == 'M' && blob[3] == 'Q')
+    if (blob.length >= 15 && (blob[0] == 0x03 || blob[0] == 0x04 || blob[0] == 0x05)
+            && blob[1] == 'A' && blob[2] == 'M' && blob[3] == 'Q')
     {
         auto d = cast(ubyte[]) dst.data;
         d[12] |= 0x80;
+        // v5 also COUNTS the redelivery, saturating: x-delivery-limit needs the
+        // number, and a wrap would hand a poison message a fresh budget.
+        if (blob[0] == 0x05 && dst.length >= 18 && d[13] < 255)
+            d[13]++;
     }
 }
 
@@ -5559,6 +5639,15 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
     {
         if (!queueExists(u.queue))
             return; // the queue died: its messages die with it (no ghost list)
+        // x-delivery-limit: a message that has already been handed out this many
+        // times is not put back again — it is dead-lettered, so a consumer that
+        // keeps nacking cannot spin the same record forever.
+        immutable dlim = queueDeliveryLimit(u.queue);
+        if (dlim >= 0 && recordDeliveryCount(u.blob) >= dlim)
+        {
+            deadLetter(u.queue, u.blob, "delivery_limit");
+            return;
+        }
         queueKey(u.queue, kb4);
         // mark the requeued copy redelivered so the next delivery sets the flag
         // (both TLS buffers are consumed by gAmqpPushFront before its yield)
@@ -5572,6 +5661,19 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
         return;
     }
     deadLetter(u.queue, u.blob, "rejected");
+}
+
+/// The queue's x-delivery-limit, or -1 when unset. A record whose delivery
+/// count has REACHED it is dead-lettered instead of requeued.
+private long queueDeliveryLimit(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto m = cast(string) q in gQueueMeta)
+            return m.delLimit > 0 ? m.delLimit - 1 : -1;
+    catch (Exception)
+    {
+    }
+    return -1;
 }
 
 /// The queue's x-message-ttl in ms (-1 = none; 0 = expire immediately).
