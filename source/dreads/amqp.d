@@ -1318,13 +1318,29 @@ private void routeTo(scope const(char)[] ex, scope const(char)[] rkey,
 private enum ubyte FRAME_METHOD = 1, FRAME_HEADER = 2, FRAME_BODY = 3,
         FRAME_HEARTBEAT = 8, FRAME_END = 0xCE;
 
+// Frame writers reserve ONCE and store, instead of appendByte per byte. Every
+// appendByte is its own reserve + capacity check, so a u32 cost four of each and
+// a u64 eight; profiling the settle path put 23% of all cycles in this handful
+// of functions. freeSpace/grow is the buffer's own API for exactly this, and it
+// keeps the OOM contract: freeSpace returns short, and the writer drops the
+// bytes rather than overrunning the block.
 private void frameStart(ref ByteBuffer o, ubyte type, ushort chan, out size_t sizeAt) @nogc nothrow
 {
-    o.appendByte(cast(char) type);
-    o.appendByte(cast(char)(chan >> 8));
-    o.appendByte(cast(char)(chan & 0xFF));
-    sizeAt = o.length;
-    o.append("\0\0\0\0"); // patched by frameFinish
+    auto d = o.freeSpace(7);
+    if (d.length < 7)
+    {
+        sizeAt = o.length;
+        return; // OOM: the buffer flags it and every writer below no-ops
+    }
+    d[0] = type;
+    d[1] = cast(ubyte)(chan >> 8);
+    d[2] = cast(ubyte)(chan & 0xFF);
+    d[3] = 0;
+    d[4] = 0;
+    d[5] = 0;
+    d[6] = 0; // size placeholder, patched by frameFinish
+    o.grow(7);
+    sizeAt = o.length - 4;
 }
 
 private void frameFinish(ref ByteBuffer o, size_t sizeAt) @nogc nothrow @trusted
@@ -1340,22 +1356,34 @@ private void frameFinish(ref ByteBuffer o, size_t sizeAt) @nogc nothrow @trusted
 
 private void putU16(ref ByteBuffer o, ushort v) @nogc nothrow
 {
-    o.appendByte(cast(char)(v >> 8));
-    o.appendByte(cast(char)(v & 0xFF));
+    auto d = o.freeSpace(2);
+    if (d.length < 2)
+        return;
+    d[0] = cast(ubyte)(v >> 8);
+    d[1] = cast(ubyte)(v & 0xFF);
+    o.grow(2);
 }
 
 private void putU32(ref ByteBuffer o, uint v) @nogc nothrow
 {
-    o.appendByte(cast(char)(v >> 24));
-    o.appendByte(cast(char)(v >> 16));
-    o.appendByte(cast(char)(v >> 8));
-    o.appendByte(cast(char)(v & 0xFF));
+    auto d = o.freeSpace(4);
+    if (d.length < 4)
+        return;
+    d[0] = cast(ubyte)(v >> 24);
+    d[1] = cast(ubyte)(v >> 16);
+    d[2] = cast(ubyte)(v >> 8);
+    d[3] = cast(ubyte)(v & 0xFF);
+    o.grow(4);
 }
 
 private void putU64(ref ByteBuffer o, ulong v) @nogc nothrow
 {
-    putU32(o, cast(uint)(v >> 32));
-    putU32(o, cast(uint) v);
+    auto d = o.freeSpace(8);
+    if (d.length < 8)
+        return;
+    foreach (i; 0 .. 8)
+        d[i] = cast(ubyte)(v >> (56 - 8 * i));
+    o.grow(8);
 }
 
 private void putShortStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
@@ -1364,8 +1392,12 @@ private void putShortStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
     // would truncate the length byte while the full bytes still follow, desyncing
     // a spec-strict consumer's frame stream. Emit at most 255 with a matching len.
     immutable n = s.length > 255 ? 255 : s.length;
-    o.appendByte(cast(char) n);
-    o.append(s[0 .. n]);
+    auto d = o.freeSpace(n + 1);
+    if (d.length < n + 1)
+        return;
+    d[0] = cast(ubyte) n;
+    d[1 .. n + 1] = cast(const(ubyte)[]) s[0 .. n];
+    o.grow(n + 1);
 }
 
 private void putLongStr(ref ByteBuffer o, scope const(char)[] s) @nogc nothrow
