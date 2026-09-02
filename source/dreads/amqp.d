@@ -6998,7 +6998,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     // window: count only THIS consumer's unacked deliveries
                     perConsumer = wch !is null && wch.prefetch && !wch.prefetchGlobal;
                     if (perConsumer)
-                        chanN = (tt in cc.consumerUnacked) ? cc.consumerUnacked[tt] : 0u;
+                    {
+                        // one hash, not two: `in` already hands back the slot
+                        auto pcn = tt in cc.consumerUnacked;
+                        chanN = pcn ? *pcn : 0u;
+                    }
                     // a GLOBAL window gates no-ack consumers too: their
                     // deliveries don't ADD to the window, but they must wait
                     // while it is full (noAckObeysLimit pins this)
@@ -7178,8 +7182,16 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                             // fresh lookup (the pop yielded; AA may have moved)
                             if (auto uch = chn in cc.chans)
                                 uch.unackedN++;
-                            cc.consumerUnacked[tt] = ((tt in cc.consumerUnacked)
-                                    ? cc.consumerUnacked[tt] : 0u) + 1;
+                            // This ran THREE string hashes per delivered message
+                            // (in, index, index-assign) on a key the fiber
+                            // already holds. Profiling the settle path put ~9%
+                            // of all cycles in string hashing and AA lookup;
+                            // bumping through the slot `in` returns makes it one
+                            // hash, and none at all once the consumer is known.
+                            if (auto pcu = tt in cc.consumerUnacked)
+                                ++*pcu;
+                            else
+                                cc.consumerUnacked[tt] = 1;
                             chanN++; // keep the burst-local window in step
                         }
                         catch (Exception)
