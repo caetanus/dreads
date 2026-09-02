@@ -138,7 +138,7 @@ int main(string[] args)
 {
     if (args.length < 6)
     {
-        printf("usage: amqpload pub|sub host port queue n [payloadLen] [window]\n");
+        printf("usage: amqpload pub|sub|suback host port queue n [payloadLen] [window]\n");
         return 2;
     }
     auto mode = args[1];
@@ -229,17 +229,25 @@ int main(string[] args)
         printf("amqp pub confirmed: %lld msgs in %lld ms = %lld msg/s\n", acked, ms,
                 ms ? acked * 1000 / ms : 0);
     }
-    else // sub: basic.consume no_ack=true, count deliver METHOD frames
+    else // sub / suback: count deliver METHOD frames
     {
+        // `suback` consumes with no-ack=FALSE and sends one basic.ack per
+        // delivery, so the unacked window and the settle path are exercised —
+        // the shape PerfTest drives. `sub` (no-ack=true) measures delivery
+        // alone. Keep both: a scaling claim made with one does not carry to the
+        // other, and conflating them is how a broker gets credited with
+        // throughput on a path it never ran.
+        immutable doAck = mode == "suback";
         ubyte[] a;
         putU16(a, 0);
         putShort(a, queue);
         putShort(a, "lt");
-        a ~= 2; // no-ack
+        a ~= doAck ? 0 : 2; // bit 1 = no-ack
         putU32(a, 0);
         gs.send(methodFrame(1, 60, 20, a));
         awaitMethod(60, 21);
         long seen = 0;
+        ubyte[] ackBuf;
         bool started = false;
         StopWatch sw;
         while (seen < n)
@@ -264,9 +272,37 @@ int main(string[] args)
                     immutable c2 = (rbuf[pos + 7] << 8) | rbuf[pos + 8];
                     immutable m2 = (rbuf[pos + 9] << 8) | rbuf[pos + 10];
                     if (c2 == 60 && m2 == 60)
+                    {
                         seen++;
+                        if (doAck)
+                        {
+                            // basic.deliver args: consumer-tag shortstr, then
+                            // the u64 delivery-tag we have to settle.
+                            size_t ap = pos + 11;
+                            if (ap < rlen)
+                            {
+                                ap += 1 + rbuf[ap]; // skip consumer-tag
+                                if (ap + 8 <= pos + 7 + fsize)
+                                {
+                                    ulong tag = 0;
+                                    foreach (k; 0 .. 8)
+                                        tag = (tag << 8) | rbuf[ap + k];
+                                    ubyte[] ak;
+                                    putU64(ak, tag);
+                                    ak ~= 0; // multiple = 0: settle one by one
+                                    ackBuf ~= methodFrame(1, 60, 80, ak);
+                                }
+                            }
+                        }
+                    }
                 }
                 pos += 7 + fsize + 1;
+            }
+            if (ackBuf.length)
+            {
+                gs.send(ackBuf); // one write per read: TCP coalesces the batch
+                ackBuf.length = 0;
+                ackBuf.assumeSafeAppend();
             }
             if (pos > 0)
             {
@@ -276,7 +312,8 @@ int main(string[] args)
             }
         }
         auto ms = sw.peek.total!"msecs";
-        printf("amqp sub delivered: %lld msgs in %lld ms = %lld msg/s\n", seen, ms,
+        printf("amqp %s delivered: %lld msgs in %lld ms = %lld msg/s\n",
+                doAck ? "suback".ptr : "sub".ptr, seen, ms,
                 ms ? seen * 1000 / ms : 0);
     }
     return 0;

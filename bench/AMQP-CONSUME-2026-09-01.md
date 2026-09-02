@@ -22,7 +22,8 @@ That is an Amdahl curve — rising, then flattening — not a retrograde one. It
 implies a serial fraction around 28%. A single shard saturates its one thread at
 4.74M msg/s (0.97 cores, 0.5% run-to-run spread), and eight shards reach 13.8M.
 The earlier conclusion, "--shards 1 is the fastest configuration for a
-consume-heavy AMQP workload", is WRONG and is retracted.
+consume-heavy AMQP workload", is WRONG and is retracted — but see the ack-path
+section below before reading this table as the whole story.
 
 ## What the old numbers actually measured
 
@@ -34,12 +35,31 @@ counting is correct, 5.1 switches per hop is correct — but it describes the co
 of *coordinating a trickle*, not how the broker scales under load. The
 retrograde throughput curve was the client saturating, and nothing else.
 
-Caveat, stated because it matters: `amqpload sub` consumes with `no_ack=true`,
-so it exercises delivery WITHOUT the ack and unacked-window path that PerfTest's
-manual-ack drain exercises. The two are not the same workload. What is
-established is that delivery scales positively with shards; whether the
-manual-ack path does too is not yet measured, and needs an acking mode in
-amqpload.
+## Delivery scales; the ack path does not (measured 2026-09-02)
+
+The caveat above — that `amqpload sub` uses `no_ack=true` and so skips the ack
+and unacked-window path entirely — turned out to carry the whole disagreement.
+`amqpload suback` was added (basic.consume with no-ack=FALSE, one basic.ack per
+delivery, the shape PerfTest drives). Median of three, 8 queues:
+
+| shards | delivery only | with manual ack | ack us/msg |
+|---|---:|---:|---:|
+| s1 | 4.65M | 2.34M | 0.42 |
+| s2 | 5.62M | 2.61M | 0.50 |
+| s4 | 8.20M | **3.74M** | 0.64 |
+| s8 | 8.39M | 2.41M | **1.53** |
+
+Delivery scales ~1.8x. Manual-ack consume scales to 1.6x at four shards and then
+REGRESSES at eight, while its per-message cost rises 3.6x. So both earlier
+positions were partly wrong: the retrograde curve was not purely a client
+artifact (the ack path really does turn over), and the flat-throughput reading
+was not the broker's ceiling either (PerfTest capped at ~0.9M, below even the ack
+path's 2.34M at one shard).
+
+The operative conclusion: **AMQP consume scales to about four shards. Past that
+the ack path costs more than the extra shard returns.** A single connection with
+per-message acks tops out near 890k msg/s against one shard — 5.5x below the
+same broker's 4.88M delivery-only rate, which is what the settle path costs.
 
 ## The spin gate, re-judged under real load
 
