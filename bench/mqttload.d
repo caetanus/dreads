@@ -73,7 +73,31 @@ TcpSocket dial(string host, ushort port)
     vh ~= 2; // clean session
     vh ~= 0;
     vh ~= 30; // keepalive
-    putStr(vh, "mqttload");
+    // UNIQUE per process. A fixed client id made every connection take over the
+    // previous one (MQTT session takeover), so with N publishers and N
+    // subscribers only the last connection survived and subscribers received
+    // nothing — the tool could not measure the multi-connection load it exists
+    // to generate.
+    {
+        import core.sys.posix.unistd : getpid;
+
+        char[32] cid = void;
+        size_t cl = 0;
+        foreach (ch; "mqttload-")
+            cid[cl++] = ch;
+        uint v = cast(uint) getpid();
+        char[10] tmp = void;
+        size_t t = 0;
+        do
+        {
+            tmp[t++] = cast(char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (v > 0);
+        while (t > 0)
+            cid[cl++] = tmp[--t];
+        putStr(vh, cast(string) cid[0 .. cl].idup);
+    }
     encodeVarint(c, cast(uint) vh.length);
     c ~= vh;
     s.send(c);
