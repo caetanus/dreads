@@ -140,16 +140,55 @@ curve descends instead of flattening.
 Spin and park are two halves of one bill: the drain spin budget hides the
 handoff by burning a core, parking pays for it in syscalls. Neither removes it.
 
-## What is still unexplained
+## The arithmetic, closed with a hop counter
 
-The arithmetic does not close. 78 831 switches over 12 500 bursts is 6.3 per
-burst — 8.4 per REMOTE burst — where one pop round-trip should cost one. Other
-hop sites in the consume path are unaccounted for. Finding them needs a hop
-counter, not another curve; building the fix (pipelining the pop hop the way
-gAmqpPushStage already pipelines publishes) on the present model would be
-building on a model that does not add up.
+A first pass at this could not make the numbers add up: 78 831 switches over an
+assumed 12 500 bursts is 6.3 per burst, where one pop round-trip should cost
+one. The assumption was wrong, not the model. Counting AMQP keyspace ops
+directly (local vs hopped, bucketed by command) gives, for one 800k drain at
+--shards 4:
 
-The structural answer, if locality is confirmed as the cause, is to remove the
-handoff rather than pay for it: run the delivery loop on the thread that owns
-the queue, or place the queue on the consumer's shard. The second changes shard
-placement and must not be done without asking.
+    lpop  local=3 273  remote=13 606      (80.6% remote)
+    llen  local=6      remote=26
+
+16 879 pops for 800k messages is 47 messages per pop — the 64-deep batch with
+partial fills — and **69 677 context switches over 13 606 remote hops is 5.1 per
+hop**. There are no hidden hop sites. One round trip costs ~5 switches: the
+asking fiber parks, the owner's drain loop wakes and re-parks, the asker's drain
+loop wakes and re-parks. 13 606 x 5.1 = 69 400 against 69 677 measured.
+
+## Spin and park are one bill, paid two ways
+
+| --shards 4 | rate | CPU | ctx switches/msg |
+|---|---:|---:|---:|
+| fixed spin 4096 | 659k | 4.05 s | 0.001 |
+| batch-gated spin (shipped) | 723k | 2.59 s | 0.090 |
+| *s1 for reference* | *755k* | *1.00 s* | *0.001* |
+
+Spinning removes the switches completely — 0.001/msg, the same as a single
+shard — and costs more CPU than the switches did. Sweeping the ceiling
+(0/32/128/512/4096 with the gate) lands everything between 2.7 and 3.1 s: there
+is no tuning that gets both. Neither policy comes near s1's 1.00 s, because both
+are ways of PAYING for the handoff rather than removing it.
+
+## A fix that was tried and rejected
+
+Pipelining the pop — fire the next batch's hop before delivering the current
+one, the way gAmqpPushStage already pipelines publishes — was implemented and
+measured. Median of three, --shards 4: 644k -> 677k msg/s with 16 consumers,
+542k -> 568k with 32. About 5%, which is INSIDE this harness's +/-10% run-to-run
+spread: three samples cannot demonstrate it works.
+
+It was reverted. The cost was a second batch held off the queue that every one
+of the consumer fiber's exits must give back — the exact defect class that lost
+63 messages earlier the same day — and the tight-qos guard means the new
+give-back path is not even exercised by the regression test that covers the
+first batch. Not a trade worth making for an effect smaller than the noise.
+
+## What would actually work
+
+Remove the handoff instead of paying for it: run the delivery loop on the thread
+that OWNS the queue, or place the queue on the consumer's shard. The second
+changes shard placement and must not be done without asking. Until one of those
+happens, AMQP consume does not scale with shards, and --shards 1 is the fastest
+configuration for a consume-heavy AMQP workload.
