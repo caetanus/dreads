@@ -2017,6 +2017,9 @@ private struct Unacked
     bool fromGet; // basic.get delivery: OUTSIDE the consumer qos window
     // (RabbitMQ: qos governs consumers only), so its settle must not
     // decrement the channel's consumer-window counter.
+    CuCell* cu; // delivering consumer's unacked counter (null for basic.get):
+    // released by the UnackedMap when this record leaves it, so no settle path
+    // has to remember to.
     string ctag; // delivering consumer's tag ("" for basic.get): qos with
     // global=false is a PER-CONSUMER window (the 0-9-1 java default), so
     // settles must credit the right consumer's counter.
@@ -2046,6 +2049,58 @@ private enum size_t UNACKED_WINDOW_MAX = 1 << 16;
 /// order. Every foreach site collects tags and then sorts them explicitly
 /// (requeue needs highest-first, dead-letter lowest-first), so ordering is not
 /// load-bearing — but do not add a site that relies on it.
+/// Per-consumer unacked counter, held by POINTER instead of looked up by tag.
+///
+/// The count was a `uint[string]` keyed by the consumer tag, hashed once on
+/// every delivery and once on every settle — 6.2% of cycles on the settle path
+/// (hash mix, _d_aaInH, bytesHash) for a value both sides can simply hold.
+///
+/// A dense index would be wrong here: a consumer can be CANCELLED while its
+/// deliveries are still unacked, so an index could be recycled under records
+/// that still point at it. The cell instead frees itself when both halves are
+/// done — the consumer has exited AND its last delivery has settled — so no
+/// owner has to outlive the other. Everything below runs on the connection's
+/// own thread (the consumer fiber delivers, the read fiber settles), so plain
+/// increments are correct; no atomics.
+private struct CuCell
+{
+    uint count;
+    bool gone; // the consumer fiber has exited
+}
+
+private CuCell* cuNew() @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : calloc;
+
+    return cast(CuCell*) calloc(1, CuCell.sizeof);
+}
+
+/// One settle: drop the count, and reap the cell if the consumer already left.
+private void cuRelease(CuCell* cu) @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : free;
+
+    if (cu is null)
+        return;
+    if (cu.count > 0)
+        cu.count--;
+    if (cu.count == 0 && cu.gone)
+        free(cu);
+}
+
+/// The consumer fiber is leaving: reap now if nothing is still outstanding,
+/// otherwise let the last settle do it.
+private void cuGone(CuCell* cu) @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : free;
+
+    if (cu is null)
+        return;
+    cu.gone = true;
+    if (cu.count == 0)
+        free(cu);
+}
+
 /// Copy a delivery's record into memory the UnackedMap OWNS. Deliberately not
 /// the GC: this is one allocation per delivered message, it holds no pointers,
 /// and profiling the settle path put ~4.7% of cycles in GC mark and GCBits
@@ -2072,6 +2127,9 @@ private void freeBlob(ref Unacked u) @nogc nothrow @trusted
     if (u.blob.ptr !is null)
         free(cast(void*) u.blob.ptr);
     u.blob = null;
+    // the record's other owned resource: its consumer's window credit
+    cuRelease(u.cu);
+    u.cu = null;
 }
 
 private struct UnackedMap
@@ -2297,7 +2355,7 @@ unittest // UnackedMap: AA-compatible surface over the dense sliding window
     // static storage would abort.
     static Unacked mk(ushort ch, string ct = "")
     {
-        return Unacked("q", dupBlob(cast(const(ubyte)[]) "body"), ch, 0, false, ct);
+        return Unacked("q", dupBlob(cast(const(ubyte)[]) "body"), ch, 0, false, null, ct);
     }
 
     UnackedMap m;
@@ -2406,7 +2464,6 @@ private final class AmqpConn
     // ("Unsolicited delivery" kills the java client). Gen-keyed so a reopened
     // channel's fresh consumers don't block the OLD close.
     uint[ulong] chanConsumers;
-    uint[string] consumerUnacked; // live unacked per consumer tag (qos global=false)
     ulong flushSeq; // bumps after each serve-loop reply flush: a consumer's
     // FIRST delivery must wait for the flush carrying its consume-ok (a long
     // pipelined batch outlives the old fixed 1ms park -> "Unsolicited delivery")
@@ -5352,8 +5409,7 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
     // requeue loop above must not skip the free.
     try
     {
-        c.unacked.clear();
-        c.consumerUnacked.clear();
+        c.unacked.clear(); // releases every record's blob AND its window credit
         c.unackedBytes = 0;
     }
     catch (Exception)
@@ -5391,23 +5447,6 @@ private void chanUnackedDec(AmqpConn c, ushort chan) nothrow @trusted
             ch.unackedN--;
 }
 
-private void consumerUnackedDec(AmqpConn c, scope const(char)[] ctag) nothrow @trusted
-{
-    if (ctag.length == 0)
-        return;
-    try
-        if (auto p = (cast(string) ctag) in c.consumerUnacked)
-        {
-            if (*p > 1)
-                --*p;
-            else
-                c.consumerUnacked.remove(cast(string) ctag);
-        }
-    catch (Exception)
-    {
-    }
-}
-
 private void dropUnacked(AmqpConn c, ulong tag, Unacked* pu = null) nothrow @trusted
 {
     try
@@ -5418,7 +5457,6 @@ private void dropUnacked(AmqpConn c, ulong tag, Unacked* pu = null) nothrow @tru
             if (!p.fromGet)
             {
                 chanUnackedDec(c, p.chan);
-                consumerUnackedDec(c, p.ctag);
             }
             c.unacked.remove(tag);
         }
@@ -5445,7 +5483,6 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             if (!u.fromGet)
             {
                 chanUnackedDec(c, u.chan);
-                consumerUnackedDec(c, u.ctag);
             }
             // The map OWNS u.blob and frees it on remove, but everything below
             // (markRedelivered, deadLetter) still needs the record — and it
@@ -6983,8 +7020,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
     }
     try
         cast(void) runTask((AmqpConn cc, ushort chn, string qq, string tt, bool na, uint mg, int myPrio) nothrow {
+            auto cu = cuNew(); // this consumer's unacked counter, by pointer
             scope (exit)
             {
+                // hand the cell over: it is reaped here if nothing is still
+                // outstanding, otherwise by whichever settle finishes last.
+                cuGone(cu);
                 atomicOp!"-="(gAmqpConsumers, 1);
                 if (cc.consumerCount > 0)
                     cc.consumerCount--;
@@ -7103,11 +7144,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     // window: count only THIS consumer's unacked deliveries
                     perConsumer = wch !is null && wch.prefetch && !wch.prefetchGlobal;
                     if (perConsumer)
-                    {
-                        // one hash, not two: `in` already hands back the slot
-                        auto pcn = tt in cc.consumerUnacked;
-                        chanN = pcn ? *pcn : 0u;
-                    }
+                        chanN = cu !is null ? cu.count : 0u; // no lookup at all
                     // a GLOBAL window gates no-ack consumers too: their
                     // deliveries don't ADD to the window, but they must wait
                     // while it is full (noAckObeysLimit pins this)
@@ -7282,21 +7319,13 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (!na)
                         try
                         {
-                            cc.unacked[tg] = Unacked(qq, dupBlob(pay.data), chn, 0, false, tt);
+                            cc.unacked[tg] = Unacked(qq, dupBlob(pay.data), chn, 0, false, cu, tt);
                             cc.unackedBytes += pay.data.length;
                             // fresh lookup (the pop yielded; AA may have moved)
                             if (auto uch = chn in cc.chans)
                                 uch.unackedN++;
-                            // This ran THREE string hashes per delivered message
-                            // (in, index, index-assign) on a key the fiber
-                            // already holds. Profiling the settle path put ~9%
-                            // of all cycles in string hashing and AA lookup;
-                            // bumping through the slot `in` returns makes it one
-                            // hash, and none at all once the consumer is known.
-                            if (auto pcu = tt in cc.consumerUnacked)
-                                ++*pcu;
-                            else
-                                cc.consumerUnacked[tt] = 1;
+                            if (cu !is null)
+                                cu.count++; // the record released it on settle
                             chanN++; // keep the burst-local window in step
                         }
                         catch (Exception)
