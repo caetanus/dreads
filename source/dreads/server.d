@@ -3207,7 +3207,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpPushFront, gAmqpPop, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpPushFront, gAmqpPop, gAmqpPopN, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -3222,6 +3222,41 @@ private void amqpInstallHooks() nothrow
         static ByteBuffer rbf; // TLS
         const(char)[][3] a = ["lpush", key, payload]; // requeue goes to the FRONT
         amqpDataExec(a[], rbf);
+    };
+    // BATCHED pop — one exec (one cross-shard hop) for up to `count` messages.
+    // The reply is copied into the CALLER's buffer: the consumer holds it across
+    // yields, so it must not stay in a shared TLS static.
+    gAmqpPopN = (scope const(char)[] key, uint count, ref ByteBuffer outRaw) nothrow {
+        static ByteBuffer rbN; // TLS: consumed into outRaw before any yield
+        char[12] cb = void;
+        size_t cl = 0;
+        {
+            uint v = count == 0 ? 1 : count;
+            char[12] tmp = void;
+            size_t t = 0;
+            while (v > 0) { tmp[t++] = cast(char)('0' + (v % 10)); v /= 10; }
+            while (t > 0) cb[cl++] = tmp[--t];
+        }
+        const(char)[][3] a = ["lpop", key, cast(const(char)[]) cb[0 .. cl]];
+        amqpDataExec(a[], rbN);
+        outRaw.clear();
+        auto d = rbN.data;
+        // `*N\r\n...` = N elements; `*-1` / `$-1` / anything else = empty
+        if (d.length < 4 || d[0] != '*' || d[1] == '-')
+            return 0;
+        size_t i = 1;
+        int n = 0;
+        while (i < d.length && d[i] != '\r')
+        {
+            if (d[i] < '0' || d[i] > '9')
+                return 0;
+            n = n * 10 + (d[i] - '0');
+            i++;
+        }
+        if (n <= 0)
+            return 0;
+        outRaw.append(d[i + 2 .. $]); // the element stream, header stripped
+        return n;
     };
     gAmqpPop = (scope const(char)[] key, ref ByteBuffer outPayload) nothrow {
         static ByteBuffer rb2; // TLS

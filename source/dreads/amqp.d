@@ -49,6 +49,16 @@ public __gshared void delegate(scope const(char)[] key, scope const(char)[] payl
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushStage;
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushFront;
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
+/// BATCHED pop: takes up to `count` messages in ONE core exec (`LPOP key n`).
+/// The consumer burst used to call gAmqpPop per message — each of those is a
+/// full cross-shard round-trip when the queue is owned elsewhere, so a 64-deep
+/// burst cost 64 hops. That per-message round-trip is the USL crosstalk term
+/// that made s4 SLOWER than s1 (retrograde scaling). One hop per burst instead.
+/// Fills `outRaw` with the raw RESP multi-bulk reply, which the CALLER owns —
+/// it must survive the yields inside the burst (deadLetter hops), so it cannot
+/// be a shared TLS buffer. Returns the element count (0 = queue empty).
+public __gshared int delegate(scope const(char)[] key, uint count,
+        ref ByteBuffer outRaw) nothrow gAmqpPopN;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
 public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
 /// Non-destructive head read (LINDEX key 0) for the active-TTL reaper; false =
@@ -185,6 +195,10 @@ enum size_t AMQP_MAX_CHANNELS = 2047;   // matches the advertised channel-max
 /// single max body (AMQP_MAX_BODY=128MB) with headroom while bounding the flood.
 enum size_t AMQP_MAX_PENDING_BYTES = 256UL << 20;
 enum size_t AMQP_MAX_CONSUMERS = 4096;
+/// Bytes of stacked deliveries that force a socket write while the queue is
+/// still hot. The consumer otherwise flushes only when the queue runs dry, so
+/// this is a memory bound on a deep backlog, not a batch size.
+enum size_t AMQP_CONSUMER_FLUSH_BYTES = 256 * 1024;
 /// A dead-letter is dropped once it has been dead-lettered this many times
 /// (the x-death hop count) — bounds an A->X->A dead-letter cycle.
 // Backstop only: PURE-automatic dead-letter loops (TTL->DLX->...->same queue,
@@ -6530,6 +6544,15 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             kb.append(qq);
             ByteBuffer pay;
             ByteBuffer ob;
+            // BATCH prefetch: one `LPOP key 64` per burst instead of 64 pops.
+            // Each gAmqpPop is a cross-shard round-trip when the queue lives on
+            // another shard, so the old burst paid 64 hops — the crosstalk that
+            // inverted the scaling curve. FIBER-LOCAL (not TLS): the burst
+            // yields inside (deadLetter), and a shared static would be
+            // clobbered by a sibling consumer mid-drain.
+            ByteBuffer batch;
+            size_t batchPos = 0;
+            int batchLeft = 0;
             // runTask runs this fiber SYNCHRONOUSLY up to its first yield — a
             // same-shard pop + sendTo here would put the first delivery on the
             // wire BEFORE the consume-ok still staged in the handler's reply
@@ -6651,9 +6674,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                         return;
                     continue;
                 }
-                // BURST drain: up to 64 messages per socket write — a delivery
-                // per write capped the consumer at ~137k msg/s (measured)
-                ob.clear();
+                // BURST drain. `ob` is NOT cleared per burst any more: we keep
+                // stacking frames across consecutive non-empty bursts and only
+                // hit the socket when the queue runs dry (or the buffer hits the
+                // cap). That is LavinMQ's shape — it flushes right before it
+                // blocks, never per batch — and it turns a deep backlog into a
+                // few large writes instead of one write per 64 messages.
                 int burst = 0;
                 while (burst < 64)
                 {
@@ -6661,8 +6687,56 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                             || cc.unackedBytes >= AMQP_MAX_UNACKED_BYTES))
                         break; // window filled mid-burst (count OR bytes)
                     pay.clear();
-                    if (!(gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay)))
-                        break;
+                    // refill from ONE hop when the local batch runs dry
+                    if (batchLeft == 0)
+                    {
+                        batchPos = 0;
+                        if (gAmqpPopN !is null)
+                            batchLeft = gAmqpPopN(kb.data.asChars, 64, batch);
+                        else if (gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay))
+                        {
+                            batchLeft = -1; // legacy single-pop already in `pay`
+                        }
+                        if (batchLeft == 0)
+                            break; // queue empty
+                    }
+                    if (batchLeft > 0)
+                    {
+                        // next `$len\r\n<payload>\r\n` element of the batch
+                        auto bd = batch.data;
+                        if (batchPos + 2 > bd.length || bd[batchPos] != '$')
+                        {
+                            batchLeft = 0;
+                            break;
+                        }
+                        size_t bi = batchPos + 1;
+                        bool neg = bi < bd.length && bd[bi] == '-';
+                        size_t blen = 0;
+                        if (neg)
+                            bi++;
+                        while (bi < bd.length && bd[bi] != '\r')
+                        {
+                            blen = blen * 10 + (bd[bi] - '0');
+                            bi++;
+                        }
+                        bi += 2; // skip \r\n
+                        if (neg)
+                        {
+                            batchPos = bi;
+                            batchLeft--;
+                            continue; // nil element: skip, don't deliver
+                        }
+                        if (bi + blen > bd.length)
+                        {
+                            batchLeft = 0;
+                            break;
+                        }
+                        pay.append(bd[bi .. bi + blen]);
+                        batchPos = bi + blen + 2; // payload + \r\n
+                        batchLeft--;
+                    }
+                    else
+                        batchLeft = 0; // legacy path: `pay` already filled
                     // x-message-ttl: an expired head is dead-lettered (or
                     // dropped), never delivered. Count it toward the burst so a
                     // backlog of expired heads can't drain unboundedly in one
@@ -6740,6 +6814,14 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 }
                 if (burst == 0)
                 {
+                    // queue is dry: THIS is the moment to hit the socket, then
+                    // idle. Everything stacked since the last flush goes out in
+                    // one write.
+                    if (ob.length)
+                    {
+                        sendTo(cc, ob.data);
+                        ob.clear();
+                    }
                     try
                         sleep(1.msecs);
                     catch (Exception)
@@ -6761,7 +6843,15 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 catch (Exception)
                 {
                 }
-                sendTo(cc, ob.data);
+                // Still messages flowing: keep stacking. Flush only to bound
+                // the buffer (and so a very deep backlog still streams out
+                // instead of ballooning in RAM). Yield on BYTES delivered, not
+                // per burst, so the loop stays tight while the queue is hot.
+                if (ob.length >= AMQP_CONSUMER_FLUSH_BYTES)
+                {
+                    sendTo(cc, ob.data);
+                    ob.clear();
+                }
             }
         }, c, chan, qs, ts, noAck, myGen, prio);
     catch (Exception)
