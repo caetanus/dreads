@@ -302,6 +302,30 @@ time.sleep(0.3)
 pk = k2.queue_purge("amqpc.prio4")
 left = k2.queue_declare(queue="amqpc.prio4", durable=True, passive=True).method.message_count
 check("purge empties every level", left == 0, "left=%d" % left)
+
+# x-max-length bounds the QUEUE, not each level: the first cut of priority
+# support counted only level 0, so a bound of 2 let six messages through.
+_fresh("amqpc.prio5", {"x-max-priority": 10, "x-max-length": 2})
+for i in range(6):
+    k2.basic_publish("", "amqpc.prio5", b"m%d" % i,
+                     properties=pika.BasicProperties(priority=7))
+time.sleep(0.5)
+d5 = k2.queue_declare(queue="amqpc.prio5", durable=True, passive=True).method.message_count
+check("x-max-length bounds the whole priority queue", d5 == 2, "depth=%d of bound 2" % d5)
+
+# and overflow must cost the LEAST important messages
+_fresh("amqpc.prio6", {"x-max-priority": 10, "x-max-length": 2})
+for pr, body in [(0, b"low1"), (0, b"low2"), (9, b"high")]:
+    k2.basic_publish("", "amqpc.prio6", body, properties=pika.BasicProperties(priority=pr))
+time.sleep(0.5)
+kept = []
+while True:
+    m, _p, b = k2.basic_get("amqpc.prio6", auto_ack=True)
+    if m is None:
+        break
+    kept.append(b.decode())
+check("overflow drops the lowest priority first", kept == ["high", "low2"],
+      "kept=%s" % kept)
 c2.close()
 
 conn.close()
