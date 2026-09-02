@@ -2291,13 +2291,11 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto group = r.str();
-    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
-    {
-        if (ver >= 3)
-            putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero topics = well-formed GROUP authorization denial
-        return;
-    }
+    // OffsetCommit has NO top-level error field: the error is per-partition, so
+    // a denial must answer every requested partition (an empty topics array
+    // would read as a SUCCESSFUL commit of nothing). Reuse the fence-error path,
+    // which already stamps a group-level error onto every partition entry.
+    immutable denied = !authorize(ctx, KRES_GROUP, group, KOP_READ);
     int genId = -1;
     const(char)[] cMember = null;
     if (ver >= 1)
@@ -2312,8 +2310,8 @@ private void handleOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     // Generation fencing (real consumer groups): ONLY when the commit names a
     // generation (>= 0). Simple/assign() consumers commit with generation -1
     // and keep the historic unfenced path untouched.
-    short fenceErr = E_NONE;
-    if (ver >= 1 && genId >= 0 && r.ok && group.length)
+    short fenceErr = denied ? E_GROUP_AUTH_FAILED : E_NONE;
+    if (!denied && ver >= 1 && genId >= 0 && r.ok && group.length)
     {
         static ByteBuffer fq, fr; // TLS: consumed synchronously per hop
         fq.clear();
@@ -2486,12 +2484,9 @@ private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) not
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto tid = r.str();
-    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero topics = well-formed authorization denial
-        return;
-    }
+    // No top-level error field: the error is per-partition, so a denial must
+    // answer every requested partition (an empty array would read as success).
+    immutable denied = !authorize(ctx, KRES_TXNID, tid, KOP_WRITE);
     immutable pid = r.i64();
     immutable epoch = r.i16();
     immutable ntopics = safeCount(r.i32());
@@ -2544,8 +2539,9 @@ private void handleAddPartitionsToTxn(ref Rd r, short ver, ref ByteBuffer o) not
             nt++;
     }
     patchI32(req, nOff, nAll);
-    short err = E_NONE;
-    if (tid.length && kgOp(tid, cast(const(ubyte)[]) req.data, rep))
+    // 53 = TRANSACTIONAL_ID_AUTHORIZATION_FAILED, stamped on every partition
+    short err = denied ? cast(short) 53 : E_NONE;
+    if (!denied && tid.length && kgOp(tid, cast(const(ubyte)[]) req.data, rep))
     {
         Rd rr = Rd(cast(const(ubyte)[]) rep.data);
         err = rr.i16();
@@ -2787,13 +2783,10 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     auto tid = r.cstr(); // transactional_id
-    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putCArrLen(o, 0); // zero topics (compact) = well-formed authz denial
-        putTaggedFields(o);
-        return;
-    }
+    // No top-level error field: the error is per-partition, so a denial must
+    // answer every requested partition (an empty array would read as success).
+    immutable denied = !authorize(ctx, KRES_TXNID, tid, KOP_WRITE);
+    immutable short pErr = denied ? cast(short) 53 : E_NONE; // TXN_ID_AUTH_FAILED
     auto group = r.cstr();
     immutable pid = r.i64();
     immutable epoch = r.i16();
@@ -2839,7 +2832,7 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
             cast(void) r.i32(); // committed_leader_epoch (v2+)
             auto meta = r.cstr(); // metadata (nullable compact)
             r.skipTaggedFields(); // partition tagged fields
-            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+            if (!denied && r.ok && validTopic(topic) && part >= 0 && off >= 0)
             {
                 putStr(req, topic);
                 putI32(req, part);
@@ -2850,7 +2843,7 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
                 nAll++;
             }
             putI32(o, part);
-            putI16(o, E_NONE); // error_code
+            putI16(o, pErr); // error_code (53 when denied)
             putTaggedFields(o); // partition tagged fields
             ep++;
         }
@@ -2862,7 +2855,7 @@ private void handleTxnOffsetCommitFlex(ref Rd r, short ver, ref ByteBuffer o) no
     patchCArrLen(o, tOff, et);
     putTaggedFields(o); // response tagged fields
     patchI32(req, nOff2, nAll);
-    if (tid !is null && tid.length && nAll > 0)
+    if (!denied && tid !is null && tid.length && nAll > 0)
         cast(void) kgOp(tid, cast(const(ubyte)[]) req.data, rep);
 }
 
@@ -2875,12 +2868,10 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
         return;
     }
     auto tid = r.str(); // transactional_id
-    if (!authorize(ctx, KRES_TXNID, tid, KOP_WRITE))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero topics = well-formed authorization denial
-        return;
-    }
+    // No top-level error field: the error is per-partition, so a denial must
+    // answer every requested partition (an empty array would read as success).
+    immutable denied = !authorize(ctx, KRES_TXNID, tid, KOP_WRITE);
+    immutable short pErr = denied ? cast(short) 53 : E_NONE; // TXN_ID_AUTH_FAILED
     auto group = r.str();
     immutable pid = r.i64();
     immutable epoch = r.i16();
@@ -2923,7 +2914,7 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
             if (ver >= 2)
                 cast(void) r.i32(); // committed_leader_epoch (v2+)
             auto meta = r.str(); // metadata (nullable)
-            if (r.ok && validTopic(topic) && part >= 0 && off >= 0)
+            if (!denied && r.ok && validTopic(topic) && part >= 0 && off >= 0)
             {
                 putStr(req, topic);
                 putI32(req, part);
@@ -2934,14 +2925,14 @@ private void handleTxnOffsetCommit(ref Rd r, short ver, ref ByteBuffer o) nothro
                 nAll++;
             }
             putI32(o, part);
-            putI16(o, E_NONE); // error_code
+            putI16(o, pErr); // error_code (53 when denied)
             ep++;
         }
         patchI32(o, pOff, ep);
     }
     patchI32(o, tOff, et);
     patchI32(req, nOff2, nAll);
-    if (tid !is null && tid.length && nAll > 0)
+    if (!denied && tid !is null && tid.length && nAll > 0)
         cast(void) kgOp(tid, cast(const(ubyte)[]) req.data, rep);
 }
 
@@ -3234,22 +3225,20 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
         return;
     }
     auto group = r.str();
-    if (!authorize(ctx, KRES_GROUP, group, KOP_READ))
-    {
-        if (ver >= 3)
-            putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero topics
-        if (ver >= 2)
-            putI16(o, E_GROUP_AUTH_FAILED); // top-level error_code
-        return;
-    }
+    // v2+ carries a top-level error_code, but v0/v1 do NOT — there a denial has
+    // to be stamped on every requested partition, else the client reads an empty
+    // (successful) answer. Parse as usual and stamp instead of short-circuiting.
+    immutable denied = !authorize(ctx, KRES_GROUP, group, KOP_READ);
     immutable rawN = r.i32();
     immutable respStart = o.length;
     if (ver >= 3)
         putI32(o, 0); // throttle_time_ms
     if (rawN < 0)
     {
-        emitAllGroupOffsets(group, ver, o); // null topics = fetch all
+        if (denied)
+            putI32(o, 0); // deny the all-offsets enumeration (v2+ error below)
+        else
+            emitAllGroupOffsets(group, ver, o); // null topics = fetch all
     }
     else
     {
@@ -3275,7 +3264,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
                 if (!r.ok || o.length - respStart > KAFKA_MAX_RESP)
                     break;
                 immutable part = r.i32();
-                immutable off = (r.ok && validTopic(topic) && part >= 0)
+                immutable off = (!denied && r.ok && validTopic(topic) && part >= 0)
                     ? fetchGroupOffset(group, topic, part) : -1;
                 putI32(o, part);
                 putI64(o, off); // committed_offset (-1 = none)
@@ -3289,7 +3278,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
                     putStr(o, cast(const(char)[]) mb.data);
                 else
                     putI16(o, -1); // metadata = null
-                putI16(o, E_NONE); // error_code
+                putI16(o, denied ? E_GROUP_AUTH_FAILED : E_NONE); // error_code
                 emittedParts++;
             }
             patchI32(o, partsOff, emittedParts);
@@ -3297,7 +3286,7 @@ private void handleOffsetFetch(ref Rd r, short ver, ref ByteBuffer o) nothrow @t
         patchI32(o, topicsCountOff, emittedTopics);
     }
     if (ver >= 2)
-        putI16(o, E_NONE); // top-level error_code
+        putI16(o, denied ? E_GROUP_AUTH_FAILED : E_NONE); // top-level error_code
 }
 
 /// Heartbeat (v0-v4): real coordinator — validates member + generation,
@@ -3719,12 +3708,8 @@ private void handleLeaveGroup(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero results = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested resource (one result per resource).
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DESCRIBE);
     immutable nres = safeCount(r.i32());
     // STACK-local: the existence probe below hops cross-shard and yields; a
     // TLS static would be clobbered by another connection during the park.
@@ -3758,24 +3743,25 @@ private void handleDescribeConfigs(ref Rd r, short ver, ref ByteBuffer o) nothro
     {
         // describing a topic nobody created answers 3 with no entries (0081);
         // GROUP configs (wire type 32) answer INVALID_REQUEST in this dialect
-        immutable missing = rtype[i] == 2
+        immutable missing = !denied && rtype[i] == 2
             && (!validTopic(rname[i]) || registeredTopicPartitions(rname[i]) < 0);
         immutable isGroup = rtype[i] == 32 || rtype[i] == 3;
-        putI16(o, isGroup ? cast(short) 42
-                : (missing ? E_UNKNOWN_TOPIC : E_NONE)); // error_code
+        putI16(o, denied ? E_CLUSTER_AUTH_FAILED
+                : (isGroup ? cast(short) 42
+                    : (missing ? E_UNKNOWN_TOPIC : E_NONE))); // error_code
         putI16(o, -1); // error_message = null
         o.appendByte(cast(char) rtype[i]); // resource_type
         putStr(o, rname[i]); // resource_name
         // resource_type 2 == TOPIC: emit the fixed defaults an inspector needs
         // (a stateless broker has no per-topic overrides); others: empty.
-        if (rtype[i] == 2 && !missing)
+        if (!denied && rtype[i] == 2 && !missing)
         {
             putI32(o, cast(int) KAFKA_TOPIC_CONFIGS.length);
             foreach (cfg; KAFKA_TOPIC_CONFIGS)
                 putConfigEntry(o, ver, cfg[0], cfg[1]);
         }
         else
-            putI32(o, 0);
+            putI32(o, 0); // denied/missing/non-topic: no config entries
     }
 }
 
@@ -4041,13 +4027,11 @@ private enum short E_INVALID_CONFIG = 40;
 private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_CREATE))
-    {
-        if (ver >= 2)
-            putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero topics = well-formed authorization denial
-        return;
-    }
+    // A denial must NOT short-circuit: CreateTopics carries ONE RESULT PER
+    // REQUESTED TOPIC, so an empty array leaves the client with no topics array
+    // at all (librdkafka: "CreateTopics_result_topics returned NULL"). Parse as
+    // usual and answer every requested topic with the auth error instead.
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_CREATE);
     immutable ntopics = safeCount(r.i32());
     // STACK-local (not TLS static): registerTopic below hops cross-shard and
     // yields; a shared static would be clobbered by another connection's
@@ -4104,7 +4088,8 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         if (nt < names.length && r.ok)
         {
             names[nt] = name;
-            errs[nt] = validTopic(name) ? terr : E_INVALID_TOPIC;
+            errs[nt] = denied ? E_CLUSTER_AUTH_FAILED
+                : (validTopic(name) ? terr : E_INVALID_TOPIC);
             immutable c = effNp > 0 ? effNp : cast(int) KAFKA_PARTITIONS;
             nparts[nt] = c > KAFKA_MAX_PARTITIONS ? KAFKA_MAX_PARTITIONS : c; // cap
             cfgFrom[nt] = cfrom;
@@ -4114,7 +4099,7 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     }
     cast(void) r.i32(); // timeout_ms
     immutable validateOnly = ver >= 1 && r.ok && r.i8() != 0;
-    if (!validateOnly)
+    if (!validateOnly && !denied) // denied: answer the errors, create nothing
         foreach (i; 0 .. nt)
             if (errs[i] == E_NONE)
             {
@@ -4149,12 +4134,8 @@ private void handleCreateTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero resources = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested resource (one result per resource).
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS);
     immutable nres = safeCount(r.i32());
     byte[16] rtypes;
     const(char)[][16] rnames;
@@ -4205,6 +4186,11 @@ private void handleAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     immutable validateOnly = r.ok && r.i8() != 0;
     foreach (i; 0 .. nr)
     {
+        if (denied)
+        {
+            rerrs[i] = E_CLUSTER_AUTH_FAILED; // answer the error, alter nothing
+            continue;
+        }
         if (rerrs[i] != E_NONE || rtypes[i] != 2)
             continue;
         // altering a non-existent topic: pre-2.7 brokers answer
@@ -4254,12 +4240,8 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
     import core.atomic : atomicOp;
     import core.stdc.stdio : snprintf;
 
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
-    {
-        putI32(o, 0); // throttle_time_ms (v0+)
-        putI32(o, 0); // zero topics = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested partition (one result per partition).
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE);
     immutable ntopics = safeCount(r.i32());
     putI32(o, 0); // throttle_time_ms (v0+)
     immutable tOff = o.length;
@@ -4288,7 +4270,9 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
                 break;
             long low = -1;
             short err = E_NONE;
-            if (!validTopic(topic) || part < 0)
+            if (denied)
+                err = E_CLUSTER_AUTH_FAILED; // answer the error, delete nothing
+            else if (!validTopic(topic) || part < 0)
                 err = E_UNKNOWN_TOPIC;
             else
             {
@@ -4386,12 +4370,8 @@ private void handleDeleteRecords(ref Rd r, short ver, ref ByteBuffer o) nothrow 
 private void handleCreatePartitions(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
-    {
-        putI32(o, 0); // throttle_time_ms (v0+)
-        putI32(o, 0); // zero results = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested topic (one result per topic is required).
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER);
     immutable ntopics = safeCount(r.i32());
     const(char)[][64] names;
     int[64] counts;
@@ -4424,6 +4404,11 @@ private void handleCreatePartitions(ref Rd r, short ver, ref ByteBuffer o) nothr
     immutable validateOnly = r.ok && r.i8() != 0;
     foreach (i; 0 .. nt)
     {
+        if (denied)
+        {
+            errs[i] = E_CLUSTER_AUTH_FAILED; // answer the error, alter nothing
+            continue;
+        }
         immutable cur = registeredTopicPartitions(names[i]);
         if (!validTopic(names[i]) || cur < 0)
             errs[i] = E_UNKNOWN_TOPIC;
@@ -4824,12 +4809,11 @@ private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
     // ACL administration requires cluster ALTER (super-users pass); otherwise an
     // anonymous client could self-grant a wildcard binding (AOF-persisted).
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero results = well-formed authorization denial
-        return;
-    }
+    // A denial must NOT short-circuit the response: CreateAcls carries ONE
+    // RESULT PER REQUESTED BINDING, so an empty array is an unparseable frame
+    // (librdkafka: "parse failure for CreateAcls v1 at 8/8"). Parse the request
+    // as usual and answer every binding with the auth error instead.
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER);
     immutable n = safeCount(r.i32());
     KAclBinding[64] bs;
     short[64] errs;
@@ -4841,16 +4825,17 @@ private void handleCreateAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
         auto b = aclReadWire(r, ver, false);
         if (nb < bs.length && r.ok)
         {
-            errs[nb] = (b.pattern == 3 || b.pattern == 4) ? E_NONE
-                : cast(short) 44; // INVALID_REQUEST-ish for filter patterns
+            errs[nb] = denied ? E_CLUSTER_AUTH_FAILED
+                : ((b.pattern == 3 || b.pattern == 4) ? E_NONE
+                    : cast(short) 44); // INVALID_REQUEST-ish for filter patterns
             bs[nb] = b;
             nb++;
         }
     }
     foreach (i; 0 .. nb)
     {
-        if (errs[i] != E_NONE || gKafkaExec is null)
-            continue;
+        if (denied || errs[i] != E_NONE || gKafkaExec is null)
+            continue; // denied: answer the error, store nothing
         static ByteBuffer fb, rb;
         aclField(bs[i], fb);
         const(char)[][4] a = ["hset", KAFKA_ACL_KEY,
@@ -4934,13 +4919,10 @@ private void handleDescribeAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @
 private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    // ACL administration requires cluster ALTER (super-users pass).
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero filter_results = well-formed authorization denial
-        return;
-    }
+    // ACL administration requires cluster ALTER (super-users pass). Denial
+    // answers EVERY requested filter (one filter_result per filter) with the
+    // auth error and zero matches — an empty array would be unparseable.
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER);
     immutable nf = safeCount(r.i32());
     KAclBinding[16] filters;
     size_t nfl;
@@ -4956,6 +4938,13 @@ private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
     putI32(o, cast(int) nfl); // filter_results
     foreach (fi; 0 .. nfl)
     {
+        if (denied)
+        {
+            putI16(o, E_CLUSTER_AUTH_FAILED); // filter error_code
+            putI16(o, -1); // error_message
+            putI32(o, 0); // zero matching_acls (nothing deleted)
+            continue;
+        }
         static ByteBuffer rb;
         KAclBinding[128] all;
         const(char)[][128] fields;
@@ -5015,12 +5004,8 @@ private void handleDeleteAcls(ref Rd r, short ver, ref ByteBuffer o) nothrow @tr
 private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS))
-    {
-        putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero responses = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested resource (one response per resource).
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_ALTER_CONFIGS);
     immutable nres = safeCount(r.i32());
     // response staged AFTER the full parse (writes hop cross-shard mid-parse
     // is fine — slices point into the stable request buffer)
@@ -5071,6 +5056,11 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
     immutable validateOnly = r.ok && r.i8() != 0;
     foreach (i; 0 .. nr)
     {
+        if (denied)
+        {
+            rerrs[i] = E_CLUSTER_AUTH_FAILED; // answer the error, alter nothing
+            continue;
+        }
         if (rerrs[i] != E_NONE)
             continue;
         if (rtypes[i] == 32 || rtypes[i] == 3)
@@ -5079,7 +5069,7 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
                 && (!validTopic(rnames[i]) || registeredTopicPartitions(rnames[i]) < 0))
             rerrs[i] = -1; // unknown topic: UNKNOWN_SERVER_ERROR pre-2.7
     }
-    if (!validateOnly && gKafkaExec !is null)
+    if (!validateOnly && !denied && gKafkaExec !is null)
         foreach (i; 0 .. nops)
         {
             auto op = ops[i];
@@ -5184,13 +5174,9 @@ private void handleIncrementalAlterConfigs(ref Rd r, short ver, ref ByteBuffer o
 private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @trusted
 {
     auto ctx = tKafkaCtx; // stack-capture: authz principal, immune to sibling clobber across hops
-    if (!authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE))
-    {
-        if (ver >= 1)
-            putI32(o, 0); // throttle_time_ms
-        putI32(o, 0); // zero results = well-formed authorization denial
-        return;
-    }
+    // Denial answers EVERY requested topic (one result per topic is required);
+    // an empty array would leave the client with no results to read.
+    immutable denied = !authorize(ctx, KRES_CLUSTER, "kafka-cluster", KOP_DELETE);
     immutable ntopics = safeCount(r.i32());
     const(char)[][64] names;
     size_t nt;
@@ -5206,6 +5192,11 @@ private void handleDeleteTopics(ref Rd r, short ver, ref ByteBuffer o) nothrow @
     short[64] derrs = E_NONE;
     foreach (i; 0 .. nt)
     {
+        if (denied)
+        {
+            derrs[i] = E_CLUSTER_AUTH_FAILED; // answer the error, delete nothing
+            continue;
+        }
         if (gKafkaExec is null || !validTopic(names[i]))
         {
             derrs[i] = E_UNKNOWN_TOPIC;
