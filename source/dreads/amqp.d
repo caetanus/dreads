@@ -285,20 +285,17 @@ private void queueKeyPrio(scope const(char)[] q, uint lvl, ref ByteBuffer o) @no
     queueKey(q, o);
     if (lvl == 0)
         return;
+    // FIXED THREE DIGITS. x-max-priority goes to 255, so ".p1" and ".p10" would
+    // order lexicographically as p1 < p10 < p2 — wrong for anything that scans
+    // or lists these keys (a KEYS sweep, the dashboard, a human reading a dump).
+    // Zero-padding makes lexicographic order match numeric order across the
+    // whole legal range, and keeps every level key the same width.
     o.append(".p");
-    char[4] nb = void;
-    size_t n = 0;
-    uint v = lvl;
-    char[4] tmp = void;
-    size_t t = 0;
-    while (v > 0)
-    {
-        tmp[t++] = cast(char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (t > 0)
-        nb[n++] = tmp[--t];
-    o.append(nb[0 .. n]);
+    char[3] nb = void;
+    nb[0] = cast(char)('0' + (lvl / 100) % 10);
+    nb[1] = cast(char)('0' + (lvl / 10) % 10);
+    nb[2] = cast(char)('0' + lvl % 10);
+    o.append(nb[]);
 }
 
 /// Build the key of the HIGHEST non-empty priority level of `q` into `o`, and
