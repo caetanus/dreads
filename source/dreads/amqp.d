@@ -2014,6 +2014,34 @@ private enum size_t UNACKED_WINDOW_MAX = 1 << 16;
 /// order. Every foreach site collects tags and then sorts them explicitly
 /// (requeue needs highest-first, dead-letter lowest-first), so ordering is not
 /// load-bearing — but do not add a site that relies on it.
+/// Copy a delivery's record into memory the UnackedMap OWNS. Deliberately not
+/// the GC: this is one allocation per delivered message, it holds no pointers,
+/// and profiling the settle path put ~4.7% of cycles in GC mark and GCBits
+/// scanning exactly these blobs. Every free is inside UnackedMap, so no caller
+/// has to remember one.
+private const(ubyte)[] dupBlob(scope const(ubyte)[] src) @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : malloc;
+    import core.stdc.string : memcpy;
+
+    if (src.length == 0)
+        return null;
+    auto p = cast(ubyte*) malloc(src.length);
+    if (p is null)
+        return null; // caller degrades: an unacked with no body still settles
+    memcpy(p, src.ptr, src.length);
+    return cast(const(ubyte)[]) p[0 .. src.length];
+}
+
+private void freeBlob(ref Unacked u) @nogc nothrow @trusted
+{
+    import core.stdc.stdlib : free;
+
+    if (u.blob.ptr !is null)
+        free(cast(void*) u.blob.ptr);
+    u.blob = null;
+}
+
 private struct UnackedMap
 {
     private Unacked[] buf; // ring, length is a power of two (0 = unallocated)
@@ -2126,6 +2154,8 @@ private struct UnackedMap
         immutable i = idx(tag);
         if (!live[i])
             n++;
+        else
+            freeBlob(buf[i]); // reused slot: its record goes with it
         live[i] = true;
         buf[i] = v;
     }
@@ -2150,14 +2180,19 @@ private struct UnackedMap
             if (!live[i])
                 return false;
             live[i] = false;
-            buf[i] = Unacked.init; // drop the payload reference for the GC
+            freeBlob(buf[i]); // this map owns the record's memory
+            buf[i] = Unacked.init;
             n--;
             advance();
             return true;
         }
         if (spill.length)
             try
+            {
+                if (auto sp = tag in spill)
+                    freeBlob(*sp);
                 return spill.remove(tag);
+            }
             catch (Exception)
             {
             }
@@ -2171,6 +2206,18 @@ private struct UnackedMap
 
     void clear() nothrow @trusted
     {
+        foreach (i; 0 .. span)
+        {
+            immutable j = (head + i) & (buf.length - 1);
+            if (live[j])
+                freeBlob(buf[j]);
+        }
+        try
+            foreach (t, ref u; spill)
+                freeBlob(u);
+        catch (Exception)
+        {
+        }
         buf = null;
         live = null;
         base_ = 0;
@@ -2214,9 +2261,11 @@ private struct UnackedMap
 
 unittest // UnackedMap: AA-compatible surface over the dense sliding window
 {
+    // dupBlob, not a literal: the map FREES what it is given, and handing it
+    // static storage would abort.
     static Unacked mk(ushort ch, string ct = "")
     {
-        return Unacked("q", cast(const(ubyte)[]) "body", ch, 0, false, ct);
+        return Unacked("q", dupBlob(cast(const(ubyte)[]) "body"), ch, 0, false, ct);
     }
 
     UnackedMap m;
@@ -3838,7 +3887,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     if (!getNoAck)
                         try
                         {
-                            c.unacked[gtag] = Unacked(q.idup, recCopy.data.idup, chan, 0, true);
+                            c.unacked[gtag] = Unacked(q.idup, dupBlob(recCopy.data), chan, 0, true);
                             c.unackedBytes += recCopy.data.length;
                             // NOT counted in the channel's consumer window:
                             // qos is a consumer contract (fromGet above).
@@ -5263,6 +5312,14 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
                     gAmqpPushFront(kb6.data.asChars, rq6.data.asChars);
                 enforceMaxLen(u.queue); // x-max-length holds across requeues
             }
+    }
+    catch (Exception)
+    {
+    }
+    // OUTSIDE the try: the map owns every record's memory, so a throw in the
+    // requeue loop above must not skip the free.
+    try
+    {
         c.unacked.clear();
         c.consumerUnacked.clear();
         c.unackedBytes = 0;
@@ -5343,6 +5400,7 @@ private void dropUnacked(AmqpConn c, ulong tag, Unacked* pu = null) nothrow @tru
 private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @trusted
 {
     Unacked u;
+    ByteBuffer keep; // stack-local: outlives the map entry, not shared across yields
     bool found = false;
     try
     {
@@ -5357,6 +5415,13 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
                 chanUnackedDec(c, u.chan);
                 consumerUnackedDec(c, u.ctag);
             }
+            // The map OWNS u.blob and frees it on remove, but everything below
+            // (markRedelivered, deadLetter) still needs the record — and it
+            // cannot run before the remove, because both yield and a sibling
+            // ack of this same tag during that yield would settle it twice.
+            // So take a copy, then remove.
+            keep.append(u.blob);
+            u.blob = keep.data;
             c.unacked.remove(tag);
         }
     }
@@ -7185,7 +7250,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (!na)
                         try
                         {
-                            cc.unacked[tg] = Unacked(qq, pay.data.idup, chn, 0, false, tt);
+                            cc.unacked[tg] = Unacked(qq, dupBlob(pay.data), chn, 0, false, tt);
                             cc.unackedBytes += pay.data.length;
                             // fresh lookup (the pop yielded; AA may have moved)
                             if (auto uch = chn in cc.chans)
