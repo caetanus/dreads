@@ -1,3 +1,73 @@
+# CORRECTION (2026-09-02): AMQP consume DOES scale with shards
+
+Everything below this section about retrograde scaling was measured through
+RabbitMQ PerfTest, and **PerfTest was the bottleneck, not the broker.** The repo
+already ships a native load generator, `bench/amqpload.d` — the redis-benchmark
+of the AMQP skin — and it was not used. It should have been.
+
+    single subscriber, one shard:   amqpload 4.88M msg/s     PerfTest ~0.9M
+
+Re-measured with the native client (8-32 queues, one subscriber each, 16-byte
+messages, consume-only drain of a pre-filled backlog, server pinned to cores
+0-7, clients to 8-15+24-31):
+
+| shards | rate | speedup | cores |
+|---|---:|---:|---:|
+| s1 | 4.77M | 1.00 | 0.98 |
+| s2 | 6.80M | 1.43 | 1.71 |
+| s4 | 8.9-12.9M | 1.9-2.7 | 2.5-3.3 |
+| s8 | **13.8M** | **2.91** | 4.4 |
+
+That is an Amdahl curve — rising, then flattening — not a retrograde one. It
+implies a serial fraction around 28%. A single shard saturates its one thread at
+4.74M msg/s (0.97 cores, 0.5% run-to-run spread), and eight shards reach 13.8M.
+The earlier conclusion, "--shards 1 is the fastest configuration for a
+consume-heavy AMQP workload", is WRONG and is retracted.
+
+## What the old numbers actually measured
+
+PerfTest capped near 900k msg/s, about 20% of what one shard can deliver. Every
+figure in the sections below was taken with the broker mostly idle, being
+trickled by a slow client. In that regime the analysis is still literally true —
+more shards do mean more threads waking for a trickle, the context-switch
+counting is correct, 5.1 switches per hop is correct — but it describes the cost
+of *coordinating a trickle*, not how the broker scales under load. The
+retrograde throughput curve was the client saturating, and nothing else.
+
+Caveat, stated because it matters: `amqpload sub` consumes with `no_ack=true`,
+so it exercises delivery WITHOUT the ack and unacked-window path that PerfTest's
+manual-ack drain exercises. The two are not the same workload. What is
+established is that delivery scales positively with shards; whether the
+manual-ack path does too is not yet measured, and needs an acking mode in
+amqpload.
+
+## The spin gate, re-judged under real load
+
+`331a673` gates the drain spin on how much the previous pass drained. It was
+tuned in the trickle regime. Re-measured with the native client at 16 queues:
+
+| --shards | full spin (4096) | gated (shipped) |
+|---|---:|---:|
+| 4 | 11.63M / 2.05 s | 10.32M / 1.83 s |
+| 8 | 13.73M / 2.92 s | 12.40M / 2.32 s |
+
+The gate costs ~10% of throughput under load and saves the idle burn (7.96 cores
+at s8 with zero messages, which is real and independent of client speed). Both
+alternatives tried — hysteresis on the batch signal, and gating on delivered
+RATE instead — were measured and neither beat the shipped gate in both regimes,
+so neither was kept. Making the policy a config directive, so an operator with
+dedicated cores can choose the full spin, is the open item.
+
+## Method note for whoever reads this next
+
+Use `bench/amqpload.d`, built with `ldc2 -O2 -release`. PerfTest is fine for
+CONFORMANCE and for ack-path behaviour; it cannot measure this broker's
+throughput. Before reporting any ceiling as the broker's, check `cpu/wall` from
+`/proc/<pid>/stat`: under ~1.0 core per shard thread the broker is not the
+limit.
+
+---
+
 # AMQP consume: 2.8x less CPU per message (2026-09-01, 3950X)
 
 Replacing the unacked hash map with a dense sliding window keyed by delivery tag
