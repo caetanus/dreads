@@ -316,6 +316,11 @@ private struct QueueMeta
     bool ttlSet; // x-message-ttl arg present (0 is a VALID immediate-expiry TTL)
     long expMs; // x-expires: the queue's unused-lease in ms (meaningful when expSet)
     bool expSet;
+    /// x-overflow: 0 = drop-head (the AMQP default and what this broker always
+    /// did), 1 = reject-publish. RabbitMQ 4 and LavinMQ both enforce it; a full
+    /// queue then refuses the message instead of evicting its head, and a
+    /// publisher in confirm mode gets basic.nack rather than basic.ack.
+    ubyte overflow;
 }
 
 /// x-expires lease deadlines (nowMs-based), shard-local. Stamped by the op-3
@@ -702,8 +707,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     expw = (expw << 8) | tb[k];
             // merge, don't clobber: a redeclare that sets only ttl must not
             // erase a previously-configured DLX (and vice-versa)
+            ubyte ovfw = 0;
+            if (tb.length >= 26)
+                ovfw = tb[25]; // absent on a shorter (older) encode: drop-head
             QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0,
-                    expw, (fl & 8) != 0);
+                    expw, (fl & 8) != 0, ovfw);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (!(fl & 1))
@@ -720,6 +728,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                 }
                 if (mxl == 0)
                     qm.maxLen = ex0.maxLen;
+                if (ovfw == 0)
+                    qm.overflow = ex0.overflow; // merge, like every other arg
                 if (!(fl & 8))
                 {
                     qm.expMs = ex0.expMs;
@@ -958,6 +968,7 @@ private char[256] tPubMemoQBuf = void;
 private size_t tPubMemoQLen;
 private bool tPubMemoExists;
 private long tPubMemoMaxLen; // gQueueMeta.maxLen (bound+1 encoding; 0 = unset)
+private ubyte tPubMemoOverflow; // gQueueMeta.overflow, memoised with maxLen
 private ulong tPubMemoEpoch = ulong.max;
 
 /// True iff `q` names a queue that is currently declared (op 8, not yet op 9)
@@ -3480,13 +3491,34 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     immutable ttl = tk > 0 ? ttlV : 0;
                     long mxl2;
                     immutable mlPresent = tableIntKind(argsTbl, "x-max-length", mxl2) > 0;
+                    // x-overflow: "drop-head" (default) or "reject-publish".
+                    // reject-publish-dlx is NOT claimed — silently treating it
+                    // as plain reject would drop messages a client expects to
+                    // find in its dead-letter queue.
+                    ubyte ovfEnc = 0;
+                    {
+                        auto ovs = tableGetStr(argsTbl, "x-overflow");
+                        if (ovs !is null)
+                        {
+                            if (ovs == "reject-publish")
+                                ovfEnc = 1;
+                            else if (ovs != "drop-head")
+                            {
+                                channelClose(o, chan, 406,
+                                        "PRECONDITION_FAILED - invalid arg 'x-overflow'", 50, 10);
+                                c.chans.remove(chan);
+                                return true;
+                            }
+                        }
+                    }
                     // ENCODED as value+1 on the wire and in the meta: maxlen 0
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
-                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0)
+                    if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0
+                            || ovfEnc != 0)
                     {
-                        ubyte[25] tb = void;
+                        ubyte[26] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
@@ -3498,6 +3530,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                                 | (ek > 0 ? 8 : 0));
                         foreach (k; 0 .. 8)
                             tb[17 + k] = cast(ubyte)((ek > 0 ? expV : 0) >> ((7 - k) * 8));
+                        tb[25] = ovfEnc; // appended: older peers stop at 25 and default to drop-head
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -5180,6 +5213,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     uint[64] seenOff = void;
     uint[64] seenLen = void;
     size_t ns = 0;
+    bool pubRejected = false; // x-overflow reject-publish refused a target queue
     scope void delegate(scope const(char)[]) nothrow pushSink = (scope const(char)[] q) nothrow {
         foreach (di; 0 .. ns)
             if (seenArena[seenOff[di] .. seenOff[di] + seenLen[di]] == q)
@@ -5199,6 +5233,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         // publishes to the same queue skips the AA probes entirely.
         bool exists;
         long mlP1;
+        ubyte ovf;
         {
             import core.atomic : MemoryOrder, atomicLoad;
 
@@ -5208,15 +5243,20 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             {
                 exists = tPubMemoExists;
                 mlP1 = tPubMemoMaxLen;
+                ovf = tPubMemoOverflow;
             }
             else
             {
                 exists = queueExists(q);
                 mlP1 = 0;
+                ovf = 0;
                 if (exists)
                     try
                         if (auto m = cast(string) q in gQueueMeta) // reinterpret: read-only AA probe, no alloc
+                        {
                             mlP1 = m.maxLen;
+                            ovf = m.overflow;
+                        }
                     catch (Exception)
                     {
                     }
@@ -5226,6 +5266,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                     tPubMemoQLen = q.length;
                     tPubMemoExists = exists;
                     tPubMemoMaxLen = mlP1;
+                    tPubMemoOverflow = ovf;
                     tPubMemoEpoch = ep;
                 }
             }
@@ -5234,6 +5275,18 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             return;
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
+        // x-overflow: reject-publish. The default (drop-head) evicts the queue's
+        // HEAD after the push; reject-publish refuses the message instead, and a
+        // publisher in confirm mode is nacked rather than acked. The length probe
+        // costs a keyspace read, so it runs ONLY for a queue configured this way.
+        if (ovf == 1 && mlP1 > 0 && gAmqpLen !is null)
+        {
+            if (gAmqpLen(kb3.data.asChars) >= mlP1 - 1)
+            {
+                pubRejected = true;
+                return; // not enqueued: routed stays 0 for this queue
+            }
+        }
         // FIRE the RPUSH: a local key applies inline, a remote one is enqueued into
         // the owner's ring and forgotten (the ring guarantees delivery — see
         // gAmqpPushStage). The confirm ships at the batch flush, already promised.
@@ -5302,11 +5355,13 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
     if (ch.confirmMode)
     {
         // RabbitMQ confirms a returned mandatory message too: the return is the
-        // routing signal, the ack is the broker-took-responsibility signal
+        // routing signal, the ack is the broker-took-responsibility signal.
+        // x-overflow reject-publish is the one case where the broker refuses
+        // responsibility, and that is a basic.nack, not a basic.ack.
         immutable tag = ch.confirmSeq++;
-        method(o, chan, 60, 80, (ref ByteBuffer b) @nogc nothrow {
+        method(o, chan, 60, pubRejected ? 120 : 80, (ref ByteBuffer b) @nogc nothrow {
             putU64(b, tag);
-            b.appendByte(0); // multiple=false
+            b.appendByte(0); // multiple=false (nack's requeue bit is unused here)
         });
     }
 }

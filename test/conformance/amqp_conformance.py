@@ -153,6 +153,51 @@ check("cancelling mid-batch loses no message",
 check("the returned batch tail keeps queue order",
       seen == sorted(seen), "first=%s" % seen[:4])
 
+# --- [X-OVERFLOW] a full queue can refuse instead of dropping its head -------
+# RabbitMQ 4 and LavinMQ both enforce x-overflow; the AMQP default (drop-head)
+# silently evicts, which is the wrong answer for a client that would rather be
+# told. reject-publish refuses the message AND nacks a confirming publisher.
+print("\n[X-OVERFLOW]")
+qn = "amqpc.ovf"
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+try: k2.queue_delete(queue=qn)
+except Exception: c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.queue_declare(queue=qn, durable=True,
+                 arguments={"x-max-length": 2, "x-overflow": "reject-publish"})
+k2.confirm_delivery()
+nacked = False
+try:
+    for i in range(8):
+        k2.basic_publish("", qn, b"o%d" % i)
+except Exception:
+    nacked = True
+check("x-overflow reject-publish nacks past the bound", nacked)
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+d = k2.queue_declare(queue=qn, durable=True, passive=True).method.message_count
+check("reject-publish keeps the HEAD, not the tail", d <= 2, "depth=%d (bound 2)" % d)
+first = k2.basic_get(qn, auto_ack=True)[2]
+check("the retained head is the FIRST message", first == b"o0", "first=%s" % first)
+c2.close()
+
+# drop-head (the default) still evicts rather than refusing
+qn = "amqpc.ovfdh"
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+try: k2.queue_delete(queue=qn)
+except Exception: c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.queue_declare(queue=qn, durable=True, arguments={"x-max-length": 2})
+k2.confirm_delivery()
+dropped_ok = True
+try:
+    for i in range(8):
+        k2.basic_publish("", qn, b"d%d" % i)
+except Exception:
+    dropped_ok = False
+check("default overflow still drop-head (accepts, evicts)", dropped_ok)
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+last = k2.basic_get("amqpc.ovfdh", auto_ack=True)[2]
+check("drop-head keeps the TAIL", last == b"d6", "first-out=%s" % last)
+c2.close()
+
 conn.close()
 print("\n" + "=" * 60)
 print("AMQP 0-9-1 conformance: %d passed, %d failed" % (passed, failed))
