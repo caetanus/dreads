@@ -326,6 +326,22 @@ while True:
     kept.append(b.decode())
 check("overflow drops the lowest priority first", kept == ["high", "low2"],
       "kept=%s" % kept)
+
+# a queue whose NAME looks like another queue's level key must stay its own
+# queue. Nothing rejects a dot in a queue name, so a printable separator made
+# "foo.p001" and level 1 of "foo" the same keyspace list.
+_fresh("amqpc.col", {"x-max-priority": 5})
+_fresh("amqpc.col.p001")
+k2.basic_publish("", "amqpc.col", b"level1", properties=pika.BasicProperties(priority=1))
+k2.basic_publish("", "amqpc.col.p001", b"other")
+time.sleep(0.5)
+da = k2.queue_declare(queue="amqpc.col", durable=True, passive=True).method.message_count
+db = k2.queue_declare(queue="amqpc.col.p001", durable=True, passive=True).method.message_count
+ba = k2.basic_get("amqpc.col", auto_ack=True)[2]
+bb = k2.basic_get("amqpc.col.p001", auto_ack=True)[2]
+check("a queue named like a level key is a separate queue",
+      da == 1 and db == 1 and ba == b"level1" and bb == b"other",
+      "depths=%d/%d bodies=%s/%s" % (da, db, ba, bb))
 c2.close()
 
 conn.close()

@@ -285,12 +285,18 @@ private void queueKeyPrio(scope const(char)[] q, uint lvl, ref ByteBuffer o) @no
     queueKey(q, o);
     if (lvl == 0)
         return;
-    // FIXED THREE DIGITS. x-max-priority goes to 255, so ".p1" and ".p10" would
-    // order lexicographically as p1 < p10 < p2 — wrong for anything that scans
-    // or lists these keys (a KEYS sweep, the dashboard, a human reading a dump).
-    // Zero-padding makes lexicographic order match numeric order across the
-    // whole legal range, and keeps every level key the same width.
-    o.append(".p");
+    // SEPARATOR IS \x1f, not '.'. A printable separator is ambiguous: nothing
+    // rejects a dot in a queue name, so a queue literally called "foo.p001"
+    // would produce the same key as level 1 of queue "foo" and the two would
+    // share a list. \x1f (unit separator) is what this codebase already uses to
+    // join fields that must not run together — see the Kafka ACL binding key.
+    //
+    // FIXED THREE DIGITS. x-max-priority is legal to 255, so an unpadded suffix
+    // orders lexicographically as 1 < 10 < 2 — wrong for anything that globs or
+    // lists these keys. Padding makes lexicographic order match numeric order
+    // across the whole range and keeps every level key the same width, so
+    // `amq.q.<name>\x1f???` matches exactly the levels of that queue.
+    o.appendByte('\x1f');
     char[3] nb = void;
     nb[0] = cast(char)('0' + (lvl / 100) % 10);
     nb[1] = cast(char)('0' + (lvl / 10) % 10);
