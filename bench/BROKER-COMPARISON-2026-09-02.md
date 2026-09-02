@@ -114,27 +114,52 @@ client did not handicap it.
 - The RESP s8 figure is at the client's ceiling and should be read as a lower
   bound.
 
-## Kafka partition routing (kafka-shard-ports), measured 2026-09-02
+## Kafka partition routing (kafka-shard-ports) — the fair comparison
 
-`kafka-shard-ports yes` advertises one broker per shard and names each
-partition's owning shard as its leader, so a partition-aware client routes
-around the cross-shard hop. Counting cross-shard keyspace executions directly
-(--shards 4, 1M records via kafka-producer-perf-test):
+The Kafka table above is UNFAIR TO DREADS and is superseded here. It gave Apache
+Kafka a routing client and all of its internal parallelism while measuring dreads
+at one shard (one core) and at four shards WITHOUT partition routing, where every
+partition a shard does not own costs a cross-shard hop. Neither is dreads doing
+the thing the Kafka protocol was designed for.
 
-| | local | remote | remote share |
-|---|---:|---:|---:|
-| routing off | 978 | 6 925 | 87.6% |
-| routing on | 5 358 | 3 345 | 38.4% |
+Re-measured with an EQUAL CORE BUDGET and a load generator that is not the
+ceiling: both servers pinned to physical cores 0-3, six kafka-producer-perf-test
+producers on 4-15 + 20-31 (three times the server's budget, and avoiding the
+servers' own SMT siblings), 1.5M x 16-byte records each, acks=1.
 
-It works: remote executions more than halve and the partition log accesses go
-local. What still crosses is METADATA, not data — sampling the remaining remote
-keys gives 37x `kafka.tcfg.<topic>`, 2x `kafka.topics`, 1x `kafka.acls`, all
-process-global keys that hash to one shard. The AMQP skin solved this class with
-a thread-local, broadcast-replicated control plane; Kafka's config/registry reads
-have no equivalent yet.
+| | records/sec (3 runs) | median |
+|---|---|---:|
+| dreads s4, routing OFF | 3 332 908 / 3 231 031 / 3 142 617 | 3 231 031 |
+| **dreads s4, routing ON** | 4 089 190 / 4 120 030 / 3 993 021 | **4 089 190** |
+| Apache Kafka 3.7 (KRaft) | 2 585 997 / 2 687 868 / 2 496 995 | 2 585 997 |
 
-Throughput does NOT move, because both sides are client-bound here (six JVM
-producers cap near 3.8M; Apache Kafka tops out at 3.54M with three). A saturated
-load generator cannot show the presence or the absence of a broker-side gain —
-which is why the hop counter, read from our own process, is the measurement that
-settles it.
+**Routing is worth +27%**, and with it dreads is **1.58x Apache Kafka** at the
+same core budget under the same smart client. No run of any group overlaps
+another.
+
+And it makes Kafka produce SCALE with shards for the first time (4 cores,
+routing on):
+
+| shards | records/sec | speedup |
+|---|---:|---:|
+| s1 | 2 924 247 | 1.00 |
+| s2 | 3 592 647 | 1.23 |
+| s4 | 4 086 940 | 1.40 |
+
+Sublinear — 35% efficiency at four shards, not the linear the design aims for —
+but monotonic and positive, against the FLAT curve that preceded it (s1 3.15M,
+s4 3.03M, s8 3.25M). The likely remaining brake is the metadata that still
+crosses shards: `kafka.tcfg.<topic>`, `kafka.topics` and `kafka.acls` are
+process-global keys that hash to one shard, so every other shard reaches across
+for them. The AMQP skin solved that class with a thread-local,
+broadcast-replicated control plane; Kafka has no equivalent yet.
+
+### What was wrong before, and why
+
+An earlier note in this file said the feature "did not materialise". That was
+measured with six JVM producers against a server on EIGHT cores, where the
+client saturates near 3.8M and Apache Kafka itself tops out at 3.54M — a test
+that cannot show the presence or the absence of a broker-side gain. Shrinking
+both servers to four cores, so the load generator has room, is what made the
+27% visible. Same error as the PerfTest episode earlier in this campaign:
+concluding from a saturated client.
