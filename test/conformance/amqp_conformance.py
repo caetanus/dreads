@@ -91,6 +91,68 @@ while ch.basic_get("amqpc.mix", auto_ack=True)[0] is not None:
     cnt += 1
 check("interleaved declare+publish batch intact", cnt == 1000, "cnt=%d" % cnt)
 
+# --- [QOS DELIVERY] a consumer that sets basic.qos still gets its messages ---
+# Regression: batching the consumer pop made the burst break on a full prefetch
+# window with burst > 0, which skipped the queue-dry flush. Staged deliveries sat
+# in the write buffer until it reached its byte cap -- which it never did,
+# because the window only reopens when the client acks what is still buffered.
+# Every consumer that set basic.qos received NOTHING. PerfTest leaves prefetch
+# unlimited, so no existing suite covered it.
+print("\n[QOS DELIVERY]")
+for pf in (1, 5, 50):
+    qn = "amqpc.qos%d" % pf
+    c2 = pika.BlockingConnection(params); k2 = c2.channel()
+    k2.queue_delete(queue=qn); k2.queue_declare(queue=qn, durable=True)
+    for i in range(120):
+        k2.basic_publish("", qn, b"q%03d" % i)
+    c2.close()
+    c2 = pika.BlockingConnection(params); k2 = c2.channel()
+    k2.basic_qos(prefetch_count=pf)
+    got = 0
+    for m, _p, _b in k2.consume(qn, inactivity_timeout=4):
+        if m is None:
+            break
+        k2.basic_ack(m.delivery_tag); got += 1
+        if got >= 120:
+            break
+    k2.cancel(); c2.close()
+    check("basic.qos prefetch=%d delivers (no buffered-delivery stall)" % pf,
+          got == 120, "received=%d/120" % got)
+
+# --- [BATCH TAIL] a consumer that stops mid-batch keeps nothing --------------
+# The consumer prefetches a batch off the list, so between the pop and the
+# delivery its fiber is the only holder. Cancelling with a tight window leaves
+# the rest of that batch held by nobody once the fiber ends: off the queue,
+# never delivered, never requeued.
+print("\n[BATCH TAIL]")
+qn = "amqpc.batchtail"
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.queue_delete(queue=qn); k2.queue_declare(queue=qn, durable=True)
+for i in range(200):
+    k2.basic_publish("", qn, b"b%03d" % i)
+c2.close()
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+k2.basic_qos(prefetch_count=1)
+took = 0
+for m, _p, _b in k2.consume(qn, inactivity_timeout=4):
+    if m is None:
+        break
+    k2.basic_ack(m.delivery_tag); took += 1
+    break
+k2.cancel(); c2.close()
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+seen = []
+while True:
+    m, _p, b = k2.basic_get(qn, auto_ack=True)
+    if m is None:
+        break
+    seen.append(b.decode())
+c2.close()
+check("cancelling mid-batch loses no message",
+      len(seen) == 200 - took, "left=%d expected=%d" % (len(seen), 200 - took))
+check("the returned batch tail keeps queue order",
+      seen == sorted(seen), "first=%s" % seen[:4])
+
 conn.close()
 print("\n" + "=" * 60)
 print("AMQP 0-9-1 conformance: %d passed, %d failed" % (passed, failed))

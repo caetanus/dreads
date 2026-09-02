@@ -48,6 +48,66 @@ public __gshared void delegate(scope const(char)[] key, scope const(char)[] payl
 /// one cross-thread wake, forward only, no return trip.
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushStage;
 public __gshared void delegate(scope const(char)[] key, scope const(char)[] payload) nothrow gAmqpPushFront;
+
+/// Return the UNDELIVERED tail of a prefetched batch to the head of its queue.
+///
+/// `gAmqpPopN` takes records OFF the list, so between the pop and the delivery
+/// the consumer fiber is the only holder. Every way that fiber can end —
+/// basic.cancel, channel close, channel reopened under a new generation, the
+/// queue being deleted, the connection closing — must put the tail back or those
+/// records are gone: off the queue, never delivered, never requeued. (The
+/// single-pop burst this replaced held at most one record, and pushed it back.)
+///
+/// Not marked redelivered: these were never put on the wire.
+private void returnBatchRemainder(scope const(char)[] key, ref ByteBuffer batch,
+        ref size_t batchPos, ref int batchLeft) nothrow @trusted
+{
+    if (batchLeft <= 0)
+    {
+        batchLeft = 0;
+        return;
+    }
+    immutable(ubyte)[][] rest;
+    auto bd = batch.data;
+    size_t p = batchPos;
+    while (batchLeft > 0)
+    {
+        batchLeft--;
+        if (p + 2 > bd.length || bd[p] != '$')
+            break;
+        size_t i = p + 1;
+        immutable neg = i < bd.length && bd[i] == '-';
+        size_t blen = 0;
+        if (neg)
+            i++;
+        while (i < bd.length && bd[i] != '\r')
+        {
+            blen = blen * 10 + (bd[i] - '0');
+            i++;
+        }
+        i += 2; // \r\n
+        if (neg)
+        {
+            p = i; // nil element: nothing to give back
+            continue;
+        }
+        if (i + blen > bd.length)
+            break;
+        try
+            rest ~= bd[i .. i + blen].idup; // copy: the pushes below yield
+        catch (Exception)
+            break;
+        p = i + blen + 2;
+    }
+    batchLeft = 0;
+    batchPos = 0;
+    if (gAmqpPushFront is null)
+        return;
+    // REVERSE: each push lands at the head, so pushing last-first restores the
+    // original order at the front of the queue.
+    foreach_reverse (rec; rest)
+        gAmqpPushFront(key, cast(const(char)[]) rec);
+}
 public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayload) nothrow gAmqpPop;
 /// BATCHED pop: takes up to `count` messages in ONE core exec (`LPOP key n`).
 /// The consumer burst used to call gAmqpPop per message — each of those is a
@@ -6855,6 +6915,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             ByteBuffer batch;
             size_t batchPos = 0;
             int batchLeft = 0;
+            // The fiber has five exits (cancel, channel closed, channel
+            // reopened, queue deleted, conn closing) plus the loop falling
+            // through; none of them can be allowed to drop a prefetched tail.
+            scope (exit)
+                returnBatchRemainder(kb.data.asChars, batch, batchPos, batchLeft);
             // runTask runs this fiber SYNCHRONOUSLY up to its first yield — a
             // same-shard pop + sendTo here would put the first delivery on the
             // wire BEFORE the consume-ok still staged in the handler's reply
@@ -6960,6 +7025,17 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 }
                 if (windowFull)
                 {
+                    // FLUSH BEFORE PARKING. The burst breaks on a full window
+                    // with burst > 0, so the queue-dry flush below is skipped
+                    // and `ob` would sit here until it reached the byte cap --
+                    // which it never does, because the window only reopens when
+                    // the client acks what is still in `ob`. That deadlocks
+                    // every consumer that sets basic.qos.
+                    if (ob.length)
+                    {
+                        sendTo(cc, ob.data);
+                        ob.clear();
+                    }
                     try
                         sleep(1.msecs);
                     catch (Exception)
@@ -6970,6 +7046,11 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                 // queue, lower ones idle (RabbitMQ dispatch preference)
                 if (myPrio < qPrioMax(qq))
                 {
+                    if (ob.length) // same rule: never park holding deliveries
+                    {
+                        sendTo(cc, ob.data);
+                        ob.clear();
+                    }
                     try
                         sleep(1.msecs);
                     catch (Exception)
@@ -7075,6 +7156,9 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     }
                     if (gone)
                     {
+                        // tail first, then THIS record on top of it: pushes go
+                        // to the head, so the last push ends up frontmost.
+                        returnBatchRemainder(kb.data.asChars, batch, batchPos, batchLeft);
                         if (gAmqpPushFront !is null)
                             gAmqpPushFront(kb.data.asChars, pay.data.asChars);
                         break;
