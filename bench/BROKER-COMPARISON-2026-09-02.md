@@ -113,3 +113,28 @@ client did not handicap it.
   deployment shape is different, and its durability guarantees are not dreads'.
 - The RESP s8 figure is at the client's ceiling and should be read as a lower
   bound.
+
+## Kafka partition routing (kafka-shard-ports), measured 2026-09-02
+
+`kafka-shard-ports yes` advertises one broker per shard and names each
+partition's owning shard as its leader, so a partition-aware client routes
+around the cross-shard hop. Counting cross-shard keyspace executions directly
+(--shards 4, 1M records via kafka-producer-perf-test):
+
+| | local | remote | remote share |
+|---|---:|---:|---:|
+| routing off | 978 | 6 925 | 87.6% |
+| routing on | 5 358 | 3 345 | 38.4% |
+
+It works: remote executions more than halve and the partition log accesses go
+local. What still crosses is METADATA, not data — sampling the remaining remote
+keys gives 37x `kafka.tcfg.<topic>`, 2x `kafka.topics`, 1x `kafka.acls`, all
+process-global keys that hash to one shard. The AMQP skin solved this class with
+a thread-local, broadcast-replicated control plane; Kafka's config/registry reads
+have no equivalent yet.
+
+Throughput does NOT move, because both sides are client-bound here (six JVM
+producers cap near 3.8M; Apache Kafka tops out at 3.54M with three). A saturated
+load generator cannot show the presence or the absence of a broker-side gain —
+which is why the hop counter, read from our own process, is the measurement that
+settles it.
