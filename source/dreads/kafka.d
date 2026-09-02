@@ -1232,6 +1232,51 @@ public shared ulong gKafkaProduced; // records stored via Produce (dashboard)
 public shared ulong gKafkaFetched;  // records served via Fetch (dashboard)
 public __gshared const(char)[] gKafkaHost = "127.0.0.1";
 public __gshared ushort gKafkaPort = 9092;
+/// Advertise one broker per shard (node_id = shard, port = base + shard) and
+/// name each partition's OWNING shard as its leader.
+///
+/// A Kafka client is partition-aware by design: it reads Metadata, learns which
+/// broker leads each partition, and sends that partition's data straight there.
+/// Advertising a single broker throws that away — every client lands on an
+/// arbitrary shard (SO_REUSEPORT round-robin, which is the right answer for a
+/// client that cannot route) and the broker then pays a cross-shard hop for
+/// every partition it does not own. Measured: Kafka produce is FLAT across
+/// shard counts (s1 3.15M, s4 3.03M, s8 3.25M records/sec with three
+/// producers), because extra shards only add hops.
+///
+/// With this on, the routing happens where Kafka intended it — in the client —
+/// and a shard only ever touches its own partitions.
+///
+/// PORTS: the configured kafka-port stays the shared bootstrap listener (every
+/// shard accepts on it via SO_REUSEPORT, which is the right behaviour for a
+/// client that cannot route). Shard i ALSO gets a dedicated kafka-port + 1 + i,
+/// and that is what Metadata advertises for node i. Using base + i instead
+/// would put node 0 back on the shared port, where a third of the traffic would
+/// land on the wrong thread and hop anyway.
+public __gshared bool gKafkaShardPorts = false;
+
+/// The shard that owns a partition's log: the slot owner of its list key, which
+/// is what the produce/fetch path would otherwise hop to.
+private uint kafkaPartOwner(scope const(char)[] topic, int part) nothrow @trusted
+{
+    import dreads.shard : shardOfSlot, sharded;
+    import dreads.slots : keyToSlot;
+
+    if (!sharded())
+        return 0;
+    // consumed immediately, no yield between build and use
+    static ByteBuffer ownK;
+    partKey(topic, part, ownK);
+    return shardOfSlot(keyToSlot(cast(const(char)[]) ownK.data));
+}
+
+/// Number of brokers to advertise: one per shard when the client can route.
+private uint kafkaBrokerCount() @nogc nothrow @trusted
+{
+    import dreads.shard : gShardCount;
+
+    return gKafkaShardPorts && gShardCount > 1 ? gShardCount : 1;
+}
 public __gshared ushort gKafkaTlsPort = 0; // the TLS listener (advertised to TLS conns)
 
 // Which port THIS connection should see in Metadata/FindCoordinator broker
@@ -5424,13 +5469,20 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
                 registerTopic(t);
 
     putI32(o, 0); // throttle_time_ms
-    // brokers: just us
-    putCArrLen(o, 1);
-    putI32(o, 0); // node_id
-    putCStr(o, gKafkaHost);
-    putI32(o, advPort);
-    putCStrNull(o, null, true); // rack: null
-    putTaggedFields(o); // broker tagged fields
+    // brokers: one per shard when the client routes, else just us
+    immutable nbrk = kafkaBrokerCount();
+    putCArrLen(o, cast(int) nbrk);
+    foreach (b; 0 .. nbrk)
+    {
+        putI32(o, cast(int) b); // node_id == shard id
+        putCStr(o, gKafkaHost);
+        // Single-broker topology keeps the BASE port: the dedicated ports only
+        // exist when shard-ports is on, and advertising one that was never
+        // bound leaves the client retrying a dead node forever.
+        putI32(o, nbrk > 1 ? advPort + 1 + cast(int) b : advPort);
+        putCStrNull(o, null, true); // rack: null
+        putTaggedFields(o); // broker tagged fields
+    }
     putCStrNull(o, "dreads-cluster", false); // cluster_id (0063/0121 read it)
     putI32(o, 0); // controller_id
     // topics
@@ -5469,14 +5521,18 @@ private void handleMetadataFlex(ref Rd r, short ver, ref ByteBuffer o) nothrow @
         putCArrLen(o, np);
         foreach (int p2; 0 .. np)
         {
+            // The partition's leader is the shard that OWNS its log, so a
+            // routing client sends it straight there and no hop is needed.
+            // replica/isr name the same node: there is one copy of a partition.
+            immutable lead = nbrk > 1 ? cast(int) kafkaPartOwner(t, p2) : 0;
             putI16(o, E_NONE);
             putI32(o, p2); // partition_index
-            putI32(o, 0); // leader_id
+            putI32(o, lead); // leader_id
             putI32(o, 0); // leader_epoch (v7+)
             putCArrLen(o, 1); // replica_nodes
-            putI32(o, 0);
+            putI32(o, lead);
             putCArrLen(o, 1); // isr_nodes
-            putI32(o, 0);
+            putI32(o, lead);
             putCArrLen(o, 0); // offline_replicas (v5+): none
             putTaggedFields(o); // partition tagged fields
         }
@@ -5545,13 +5601,17 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
             r.ok = true; // tolerate a truncated tail
     }
 
-    // brokers: just us
-    putI32(o, 1);
-    putI32(o, 0); // node_id 0
-    putStr(o, gKafkaHost);
-    putI32(o, advPort);
-    if (ver >= 1)
-        putI16(o, -1); // rack: null
+    // brokers: one per shard when the client routes, else just us
+    immutable nbrk = kafkaBrokerCount();
+    putI32(o, cast(int) nbrk);
+    foreach (b; 0 .. nbrk)
+    {
+        putI32(o, cast(int) b); // node_id == shard id
+        putStr(o, gKafkaHost);
+        putI32(o, nbrk > 1 ? advPort + 1 + cast(int) b : advPort); // base when unsharded
+        if (ver >= 1)
+            putI16(o, -1); // rack: null
+    }
     if (ver >= 2)
     {
         // cluster_id (nullable string): a real id — clusterid tests read it
@@ -5603,13 +5663,14 @@ private void handleMetadata(ref Rd r, short ver, ref ByteBuffer o) nothrow
         putI32(o, np);
         foreach (int p2; 0 .. np)
         {
+            immutable lead = nbrk > 1 ? cast(int) kafkaPartOwner(t, p2) : 0;
             putI16(o, E_NONE);
             putI32(o, p2);
-            putI32(o, 0); // leader: us
+            putI32(o, lead); // leader: the shard that owns this partition's log
             putI32(o, 1); // replicas
-            putI32(o, 0);
+            putI32(o, lead);
             putI32(o, 1); // isr
-            putI32(o, 0);
+            putI32(o, lead);
         }
     }
 }

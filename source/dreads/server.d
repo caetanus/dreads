@@ -748,6 +748,24 @@ public int runServer(ushort port, const(char)[] aofPath = null, const(char)[] lo
                 serveKafkaClient(conn, true);
             }, listenOpts);
         printf("dreads Kafka skin on port %u\n", cast(uint) gConfig.kafkaPort);
+        {
+            // Shard 0's DEDICATED port. The base port above stays shared across
+            // all shards (SO_REUSEPORT) for bootstrap and for clients that
+            // cannot route; this one is what Metadata advertises as node 0, so
+            // a partition-aware client reaches this thread directly.
+            import dreads.kafka : gKafkaShardPorts;
+            import dreads.shard : gShardCount;
+
+            gKafkaShardPorts = gConfig.kafkaShardPorts;
+            if (gKafkaShardPorts && gShardCount > 1)
+            {
+                immutable ushort p0 = cast(ushort)(gConfig.kafkaPort + 1);
+                cast(void) listenTCP(p0, delegate(TCPConnection conn) @trusted nothrow {
+                    serveKafkaClient(conn);
+                }, TCPListenOptions.reuseAddress);
+                printf("dreads Kafka shard 0 on port %u\n", cast(uint) p0);
+            }
+        }
     }
     // sharded: main thread becomes shard 0 (this listener is its router); spawn the
     // other N-1 shard threads, each its own SO_REUSEPORT listener + drain. No-op when
@@ -5126,6 +5144,17 @@ private void shardThreadEntry(uint sid, ushort port) nothrow
                 cast(void) listenTCP(gConfig.kafkaTlsPort, delegate(TCPConnection conn) @trusted nothrow {
                     serveKafkaClient(conn, true);
                 }, sopts);
+            // THIS shard's dedicated port, advertised as node `sid`. The shared
+            // base port above still round-robins for clients that cannot route;
+            // a partition-aware client comes straight here for the partitions
+            // this shard owns, and never makes us hop.
+            if (gConfig.kafkaShardPorts)
+            {
+                immutable ushort ps = cast(ushort)(gConfig.kafkaPort + 1 + sid);
+                cast(void) listenTCP(ps, delegate(TCPConnection conn) @trusted nothrow {
+                    serveKafkaClient(conn);
+                }, TCPListenOptions.reuseAddress);
+            }
         }
         catch (Exception)
         {

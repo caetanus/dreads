@@ -43,6 +43,15 @@ public struct Config
     ushort mqttTlsPort = 0;
     ushort amqpTlsPort = 0;
     ushort kafkaTlsPort = 0;
+    /// Advertise ONE KAFKA BROKER PER SHARD instead of one for the whole
+    /// process. Shard i additionally listens on kafka-port + i, Metadata lists
+    /// N brokers, and each partition names the shard that OWNS its log as its
+    /// leader. A partition-aware client (the Java producer, librdkafka) then
+    /// sends every partition straight to the thread that owns it and the
+    /// cross-shard hop disappears — which is the whole reason Kafka clients
+    /// route: the broker is not supposed to hide its topology.
+    /// Off by default: it changes the topology existing clients see.
+    bool kafkaShardPorts = false;
     bool kafkaRequireSasl = false; // every data/admin API needs SASL first
     string kafkaSuperUsers; // "User:admin,User:kafka" — bypass ACL enforcement
     // scripts as durable state: SCRIPT LOAD/FLUSH enter the AOF (or the raft
@@ -332,6 +341,24 @@ public bool applyDirective(string name, string value, ref Config cfg) nothrow
             cfg.mqttPort = value.to!ushort;
         catch (Exception)
             return false;
+        return true;
+    case "kafka-shard-ports":
+        {
+            // ASCII fold in place: std.uni.toLower is not nothrow and this
+            // function is.
+            char[8] lv = void;
+            if (value.length == 0 || value.length > lv.length)
+                return false;
+            foreach (i, ch; value)
+                lv[i] = (ch >= 'A' && ch <= 'Z') ? cast(char)(ch + 32) : ch;
+            const(char)[] v = lv[0 .. value.length];
+            if (v == "yes" || v == "true" || v == "1" || v == "on")
+                cfg.kafkaShardPorts = true;
+            else if (v == "no" || v == "false" || v == "0" || v == "off")
+                cfg.kafkaShardPorts = false;
+            else
+                return false;
+        }
         return true;
     case "amqp-db":
     case "mqtt-db":
