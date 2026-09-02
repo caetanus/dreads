@@ -1891,7 +1891,12 @@ private struct TxSettle
 /// an outstanding unacked entry of THIS channel that the open tx hasn't
 /// already settled; the multiple form (tag = upper bound, 0 = all) is only
 /// checked for "was this tag ever issued" (tags are conn-monotonic).
-private bool settleTagUnknown(AmqpConn c, ushort chan, ulong tag, bool multiple) nothrow @trusted
+/// `pu`, when given, is the slot the caller has ALREADY looked up for this tag:
+/// the single-settle path would otherwise hash/index `unacked` here and again in
+/// dropUnacked, two touches of the same entry per ack. Ignored for a multiple
+/// settle, which does not resolve one tag.
+private bool settleTagUnknown(AmqpConn c, ushort chan, ulong tag, bool multiple,
+        Unacked* pu = null) nothrow @trusted
 {
     try
     {
@@ -1905,7 +1910,7 @@ private bool settleTagUnknown(AmqpConn c, ushort chan, ulong tag, bool multiple)
                 return tag > mch.lastTag;
             return tag >= c.nextTag;
         }
-        auto u = tag in c.unacked;
+        auto u = pu !is null ? pu : (tag in c.unacked);
         if (u is null || u.chan != chan)
             return true;
         if (auto tch = chan in c.chans)
@@ -4016,7 +4021,10 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
             {
                 immutable tag = r.u64();
                 immutable multiple = r.ok && r.i < p.length ? (p[r.i] & 1) != 0 : false;
-                if (settleTagUnknown(c, chan, tag, multiple))
+                // ONE lookup for the whole settle: the check and the drop both
+                // take the slot instead of finding it again.
+                auto ackSlot = multiple ? null : (tag in c.unacked);
+                if (settleTagUnknown(c, chan, tag, multiple, ackSlot))
                 {
                     channelClose(o, chan, 406,
                             "PRECONDITION_FAILED - unknown delivery tag", 60, 80);
@@ -4056,7 +4064,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                             dropUnacked(c, t);
                     }
                     else
-                        dropUnacked(c, tag);
+                        dropUnacked(c, tag, ackSlot);
                 }
                 catch (Exception)
                 {
@@ -5311,10 +5319,10 @@ private void consumerUnackedDec(AmqpConn c, scope const(char)[] ctag) nothrow @t
     }
 }
 
-private void dropUnacked(AmqpConn c, ulong tag) nothrow @trusted
+private void dropUnacked(AmqpConn c, ulong tag, Unacked* pu = null) nothrow @trusted
 {
     try
-        if (auto p = tag in c.unacked)
+        if (auto p = pu !is null ? pu : (tag in c.unacked))
         {
             immutable n = p.blob.length;
             c.unackedBytes = c.unackedBytes >= n ? c.unackedBytes - n : 0;
