@@ -277,6 +277,156 @@ public void queueKey(scope const(char)[] q, ref ByteBuffer o) @nogc nothrow
     o.append(q);
 }
 
+/// The backing list for one priority LEVEL of a queue. Level 0 IS the queue's
+/// own key, so a queue without x-max-priority is byte-identical to what it was
+/// and no other call site has to know about levels.
+private void queueKeyPrio(scope const(char)[] q, uint lvl, ref ByteBuffer o) @nogc nothrow
+{
+    queueKey(q, o);
+    if (lvl == 0)
+        return;
+    o.append(".p");
+    char[4] nb = void;
+    size_t n = 0;
+    uint v = lvl;
+    char[4] tmp = void;
+    size_t t = 0;
+    while (v > 0)
+    {
+        tmp[t++] = cast(char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (t > 0)
+        nb[n++] = tmp[--t];
+    o.append(nb[0 .. n]);
+}
+
+/// Build the key of the HIGHEST non-empty priority level of `q` into `o`, and
+/// return that level. Falls back to level 0 (the queue's own key) when every
+/// level is empty, so a caller can always just read from what it gets back.
+/// Costs one LLEN per level above 0 that is empty; a plain FIFO queue (mp == 0)
+/// pays nothing and takes the same path it always did.
+private uint queueKeyRead(scope const(char)[] q, ref ByteBuffer o) nothrow @trusted
+{
+    immutable mp = queueMaxPrio(q);
+    if (mp == 0 || gAmqpLen is null)
+    {
+        queueKey(q, o);
+        return 0;
+    }
+    for (uint lvl = mp; lvl > 0; lvl--)
+    {
+        queueKeyPrio(q, lvl, o);
+        if (gAmqpLen(o.data.asChars) > 0)
+            return lvl;
+    }
+    queueKey(q, o);
+    return 0;
+}
+
+/// Total depth across every priority level (the number a client must see).
+private long queueDepth(scope const(char)[] q) nothrow @trusted
+{
+    if (gAmqpLen is null)
+        return 0;
+    static ByteBuffer kdq; // TLS: consumed immediately, no yield
+    immutable mp = queueMaxPrio(q);
+    long tot = 0;
+    foreach (lvl; 0 .. mp + 1)
+    {
+        queueKeyPrio(q, lvl, kdq);
+        immutable n = gAmqpLen(kdq.data.asChars);
+        if (n > 0)
+            tot += n;
+    }
+    return tot;
+}
+
+/// Apply `fn` to every backing list of `q` (just its own key when it is a plain
+/// FIFO queue). Used by purge and delete: a priority queue that dropped only
+/// level 0 would leak every higher-priority message it still held.
+private void queueEachLevel(scope const(char)[] q,
+        scope void delegate(scope const(char)[] key) nothrow fn) nothrow @trusted
+{
+    static ByteBuffer kel; // TLS
+    immutable mp = queueMaxPrio(q);
+    foreach (lvl; 0 .. mp + 1)
+    {
+        queueKeyPrio(q, lvl, kel);
+        fn(kel.data.asChars);
+    }
+}
+
+/// Which level of `q` a stored record belongs to (0 for a plain FIFO queue).
+private uint recordPrio(scope const(char)[] q, scope const(ubyte)[] blob) nothrow @trusted
+{
+    immutable mp = queueMaxPrio(q);
+    if (mp == 0)
+        return 0;
+    long pm;
+    int dth;
+    const(char)[] rk;
+    const(ubyte)[] pr, bd;
+    splitRecord(blob, pm, dth, rk, pr, bd);
+    return propsPriority(pr, mp);
+}
+
+/// x-max-priority for a queue, 0 when it is a plain FIFO queue.
+private uint queueMaxPrio(scope const(char)[] q) nothrow @trusted
+{
+    try
+        if (auto m = cast(string) q in gQueueMeta)
+            return m.maxPrio;
+    catch (Exception)
+    {
+    }
+    return 0;
+}
+
+/// The `priority` basic property, clamped to the queue's ceiling. Walks the
+/// properties that precede it in flags order, like propsExpiration does:
+/// content-type, content-encoding, headers (field table), delivery-mode.
+package uint propsPriority(scope const(ubyte)[] props, uint cap) @nogc nothrow
+{
+    if (props.length < 2)
+        return 0;
+    immutable flags = (cast(ushort) props[0] << 8) | props[1];
+    size_t i = 2;
+    static bool skipShort(scope const(ubyte)[] p, ref size_t j) @nogc nothrow
+    {
+        if (j + 1 > p.length)
+            return false;
+        immutable n = p[j];
+        j += 1 + n;
+        return j <= p.length;
+    }
+
+    if (flags & 0x8000) // content-type
+        if (!skipShort(props, i))
+            return 0;
+    if (flags & 0x4000) // content-encoding
+        if (!skipShort(props, i))
+            return 0;
+    if (flags & 0x2000) // headers: long field table
+    {
+        if (i + 4 > props.length)
+            return 0;
+        immutable tl = (cast(size_t) props[i] << 24) | (cast(size_t) props[i + 1] << 16)
+            | (cast(size_t) props[i + 2] << 8) | props[i + 3];
+        i += 4 + tl;
+        if (i > props.length)
+            return 0;
+    }
+    if (flags & 0x1000) // delivery-mode: octet
+        i += 1;
+    if (!(flags & 0x0800)) // no priority property
+        return 0;
+    if (i + 1 > props.length)
+        return 0;
+    immutable pr = props[i];
+    return pr > cap ? cap : pr;
+}
+
 // ---------------------------------------------------------------------------
 // Control plane: exchanges + bindings (THREAD-LOCAL, broadcast-replicated).
 
@@ -326,6 +476,11 @@ private struct QueueMeta
     /// requeued again — the poison-message brake LavinMQ has and this broker
     /// did not, which without it loops such a message forever.
     long delLimit;
+    /// x-max-priority: 0 = a plain FIFO queue (and every key stays exactly where
+    /// it was); N > 0 = a priority queue backed by N+1 lists, level 0 at the
+    /// queue's own key and levels 1..N at `<key>.p<level>`. That is how RabbitMQ
+    /// implements them too, and it keeps non-priority queues untouched.
+    ubyte maxPrio;
 }
 
 /// x-expires lease deadlines (nowMs-based), shard-local. Stamped by the op-3
@@ -719,8 +874,11 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             if (tb.length >= 34)
                 foreach (k; 26 .. 34)
                     dlw = (dlw << 8) | tb[k];
+            ubyte mpw = 0;
+            if (tb.length >= 35)
+                mpw = tb[34];
             QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0,
-                    expw, (fl & 8) != 0, ovfw, dlw);
+                    expw, (fl & 8) != 0, ovfw, dlw, mpw);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (!(fl & 1))
@@ -741,6 +899,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     qm.overflow = ex0.overflow; // merge, like every other arg
                 if (dlw == 0)
                     qm.delLimit = ex0.delLimit;
+                if (mpw == 0)
+                    qm.maxPrio = ex0.maxPrio;
                 if (!(fl & 8))
                 {
                     qm.expMs = ex0.expMs;
@@ -3526,6 +3686,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
+                    long mpV;
+                    immutable mpPresent = tableIntKind(argsTbl, "x-max-priority", mpV) > 0;
+                    if (mpPresent && (mpV < 0 || mpV > 255))
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - invalid arg 'x-max-priority'", 50, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                    immutable mpEnc = mpPresent ? cast(ubyte) mpV : 0;
                     long dlV;
                     immutable dlPresent = tableIntKind(argsTbl, "x-delivery-limit", dlV) > 0;
                     if (dlPresent && dlV < 0)
@@ -3537,9 +3707,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     }
                     immutable dlEnc = dlPresent ? dlV + 1 : 0;
                     if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0
-                            || ovfEnc != 0 || dlEnc > 0)
+                            || ovfEnc != 0 || dlEnc > 0 || mpEnc != 0)
                     {
-                        ubyte[34] tb = void;
+                        ubyte[35] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
@@ -3554,6 +3724,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         tb[25] = ovfEnc; // appended: older peers stop at 25 and default to drop-head
                         foreach (k; 0 .. 8)
                             tb[26 + k] = cast(ubyte)(dlEnc >> ((7 - k) * 8));
+                        tb[34] = mpEnc;
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -3656,9 +3827,7 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 catch (Exception)
                 {
                 }
-                static ByteBuffer kb; // TLS
-                queueKey(qq, kb);
-                immutable cnt = gAmqpLen !is null ? gAmqpLen(kb.data.asChars) : 0;
+                immutable cnt = queueDepth(qq); // sums every priority level
                 immutable ccnt = (cast(string) qq in gQueueConsumers)
                     ? gQueueConsumers[cast(string) qq] : 0u;
                 if (!(qflags & 16)) // nowait: no declare-ok
@@ -3822,9 +3991,15 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 immutable pklen = pk.length <= purgeKeyStore.length ? pk.length : purgeKeyStore.length;
                 purgeKeyStore[0 .. pklen] = cast(const(char)[]) pk.data[0 .. pklen];
                 auto purgeKey = cast(const(char)[]) purgeKeyStore[0 .. pklen];
-                immutable n = gAmqpLen !is null ? gAmqpLen(purgeKey) : 0;
+                immutable n = queueDepth(q); // every priority level
                 if (gAmqpDelKey !is null)
+                {
                     gAmqpDelKey(purgeKey); // DEL empties the list; queue-meta kept
+                    if (queueMaxPrio(q) > 0)
+                        queueEachLevel(q, (scope const(char)[] key) nothrow {
+                            gAmqpDelKey(key); // ... and the upper levels with it
+                        });
+                }
                 method(o, chan, 50, 31, (ref ByteBuffer b) @nogc nothrow {
                     putU32(b, cast(uint)(n < 0 ? 0 : n)); // purged message_count
                 });
@@ -3976,7 +4151,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                 {
                 }
                 static ByteBuffer kb2; // TLS
-                queueKey(q, kb2);
+                // x-max-priority: read the highest non-empty level (level 0 IS
+                // the queue's key, so a plain FIFO queue is unaffected)
+                cast(void) queueKeyRead(q, kb2);
                 // stack-copy the key: the expired-head drain below calls
                 // deadLetter, whose cross-shard DLX push YIELDS, and a
                 // concurrent fiber's queueKey would clobber the TLS `kb2` used
@@ -5355,6 +5532,21 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             return;
         static ByteBuffer kb3; // TLS
         queueKey(q, kb3);
+        // x-max-priority: the message lands in the list for ITS priority level.
+        // Level 0 is the queue's own key, so a plain FIFO queue never takes this
+        // branch and its key is unchanged.
+        {
+            immutable mp = queueMaxPrio(q);
+            if (mp > 0)
+            {
+                long pmP;
+                int dthP;
+                const(char)[] rkP;
+                const(ubyte)[] prP, bdP;
+                splitRecord(cast(const(ubyte)[]) payload, pmP, dthP, rkP, prP, bdP);
+                queueKeyPrio(q, propsPriority(prP, mp), kb3);
+            }
+        }
         // x-overflow: reject-publish. The default (drop-head) evicts the queue's
         // HEAD after the push; reject-publish refuses the message instead, and a
         // publisher in confirm mode is nacked rather than acked. The length probe
@@ -5529,7 +5721,7 @@ private void requeueAllUnacked(AmqpConn c) nothrow @trusted
                 if (!queueExists(u.queue))
                     continue; // dead queue: no ghost list on teardown either
                 static ByteBuffer kb6; // TLS
-                queueKey(u.queue, kb6);
+                queueKeyPrio(u.queue, recordPrio(u.queue, u.blob), kb6);
                 static ByteBuffer rq6; // TLS: redelivered-marked copy
                 markRedelivered(rq6, u.blob);
                 if (gAmqpPushFront !is null)
@@ -5648,7 +5840,7 @@ private void settleNegative(AmqpConn c, ulong tag, bool requeue) nothrow @truste
             deadLetter(u.queue, u.blob, "delivery_limit");
             return;
         }
-        queueKey(u.queue, kb4);
+        queueKeyPrio(u.queue, recordPrio(u.queue, u.blob), kb4);
         // mark the requeued copy redelivered so the next delivery sets the flag
         // (both TLS buffers are consumed by gAmqpPushFront before its yield)
         static ByteBuffer rq4; // TLS
@@ -6424,7 +6616,7 @@ private void deadLetter(scope const(char)[] queue, scope const(ubyte)[] blob,
     auto blobc = dlrec.data.asChars;
     routeTo(meta.dlx, rk, propsHeaders(paug.data), (scope const(char)[] q) nothrow {
         static ByteBuffer kb5; // TLS
-        queueKey(q, kb5);
+        queueKeyPrio(q, recordPrio(q, cast(const(ubyte)[]) blobc), kb5);
         if (gAmqpPush !is null)
             gAmqpPush(kb5.data.asChars, blobc);
     });
@@ -6494,7 +6686,7 @@ package int a10Publish(scope const(char)[] exchange, scope const(char)[] rkey,
         if (!queueExists(q))
             return;
         static ByteBuffer kb10; // TLS
-        queueKey(q, kb10);
+        queueKeyPrio(q, recordPrio(q, cast(const(ubyte)[]) payload), kb10);
         if (gAmqpPush !is null)
             gAmqpPush(kb10.data.asChars, payload);
         routed++;
@@ -6516,9 +6708,7 @@ package long a10QueueLen(scope const(char)[] q) nothrow @trusted
 {
     if (gAmqpLen is null)
         return 0;
-    static ByteBuffer kbl; // TLS
-    queueKey(q, kbl);
-    immutable n = gAmqpLen(kbl.data.asChars);
+    immutable n = queueDepth(q); // sums every priority level
     return n < 0 ? 0 : n;
 }
 
@@ -6589,10 +6779,10 @@ package void a10DeleteQueue(scope const(char)[] q) nothrow @trusted
     {
         auto adSeeds = bindingSourcesTo(q, false);
         ctlBroadcast(9, q, "", "");
-        static ByteBuffer kdd; // TLS
-        queueKey(q, kdd);
         if (gAmqpDelKey !is null)
-            gAmqpDelKey(kdd.data.asChars);
+            queueEachLevel(q, (scope const(char)[] key) nothrow {
+                gAmqpDelKey(key); // every priority level, not just level 0
+            });
         autoDeleteExchangeSweep(adSeeds);
     }
     catch (Exception)
@@ -6602,10 +6792,10 @@ package void a10DeleteQueue(scope const(char)[] q) nothrow @trusted
 
 package void a10PurgeQueue(scope const(char)[] q) nothrow @trusted
 {
-    static ByteBuffer kpp; // TLS
-    queueKey(q, kpp);
     if (gAmqpDelKey !is null)
-        gAmqpDelKey(kpp.data.asChars);
+        queueEachLevel(q, (scope const(char)[] key) nothrow {
+            gAmqpDelKey(key); // every priority level
+        });
 }
 
 /// Snapshot the stored queue meta for 1.0 redeclare-equivalence (409).
@@ -6854,7 +7044,7 @@ package bool a10Pop(scope const(char)[] q, ref ByteBuffer outPayload) nothrow @t
     if (gAmqpPop is null)
         return false;
     static ByteBuffer kbp; // TLS
-    queueKey(q, kbp);
+    cast(void) queueKeyRead(q, kbp); // highest non-empty priority level
     char[8 + 256 + 4] ks = void;
     immutable kl = kbp.length <= ks.length ? kbp.length : ks.length;
     ks[0 .. kl] = cast(const(char)[]) kbp.data[0 .. kl];
@@ -6885,7 +7075,7 @@ package void a10Requeue(scope const(char)[] q, scope const(ubyte)[] blob) nothro
     if (!queueExists(q))
         return;
     static ByteBuffer kbr; // TLS
-    queueKey(q, kbr);
+    queueKeyPrio(q, recordPrio(q, blob), kbr); // back to its OWN level
     static ByteBuffer rqr; // TLS
     markRedelivered(rqr, blob);
     if (gAmqpPushFront !is null)
@@ -6963,7 +7153,7 @@ package void a10RequeueAnn(scope const(char)[] q, scope const(ubyte)[] blob,
         return;
     }
     static ByteBuffer kra; // TLS
-    queueKey(q, kra);
+    queueKeyPrio(q, recordPrio(q, cast(const(ubyte)[]) nrec.data), kra);
     static ByteBuffer rqa; // TLS
     markRedelivered(rqa, cast(const(ubyte)[]) nrec.data);
     if (gAmqpPushFront !is null)
@@ -7028,7 +7218,7 @@ public void amqpTtlSweep() nothrow @trusted
             // DLX push), and the TLS `kb` would be clobbered by a concurrent
             // fiber's queueKey during that park -> the next peek/pop would hit a
             // DIFFERENT queue. The stack copy survives the yield.
-            queueKey(q, kb);
+            cast(void) queueKeyRead(q, kb); // highest non-empty priority level
             char[8 + 256 + 4] keyStore = void; // "amq.q." + queue name
             immutable klen = kb.length <= keyStore.length ? kb.length : keyStore.length;
             keyStore[0 .. klen] = cast(const(char)[]) kb.data[0 .. klen];
@@ -7207,6 +7397,7 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
             ByteBuffer kb;
             kb.append("amq.q.");
             kb.append(qq);
+            immutable cMaxPrio = queueMaxPrio(qq); // 0 = plain FIFO, unchanged path
             ByteBuffer pay;
             ByteBuffer ob;
             // BATCH prefetch: one `LPOP key 64` per burst instead of 64 pops.
@@ -7377,6 +7568,12 @@ private void startConsumer(AmqpConn c, ushort chan, scope const(char)[] q,
                     if (batchLeft == 0)
                     {
                         batchPos = 0;
+                        // x-max-priority: serve the highest non-empty level.
+                        // Re-picked per refill, not once per fiber: a level that
+                        // was empty when this consumer started may be the one to
+                        // drain now.
+                        if (cMaxPrio > 0)
+                            cast(void) queueKeyRead(qq, kb);
                         if (gAmqpPopN !is null)
                             batchLeft = gAmqpPopN(kb.data.asChars, 64, batch);
                         else if (gAmqpPop !is null && gAmqpPop(kb.data.asChars, pay))

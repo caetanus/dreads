@@ -5,7 +5,7 @@
 #
 #   amqp_conformance.py <amqp_port>   e.g. ... 5672
 #   (start dreads first: ./bin/dreads --port 7300 --amqp-port 5672 --shards 4)
-import sys, pika
+import sys, time, pika
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5672
 passed = 0
@@ -240,6 +240,68 @@ for _ in range(6):
     n2 += 1
     k2.basic_nack(m.delivery_tag, requeue=True)
 check("no limit still requeues unbounded", n2 == 6, "deliveries=%d" % n2)
+c2.close()
+
+# --- [X-MAX-PRIORITY] higher priority is served first ------------------------
+# Backed by one list per level (level 0 is the queue's own key, so a plain FIFO
+# queue is byte-identical to what it was). Every read, requeue, purge, delete
+# and depth has to span the levels or a priority queue silently loses messages.
+print("\n[X-MAX-PRIORITY]")
+c2 = pika.BlockingConnection(params); k2 = c2.channel()
+def _fresh(q, args=None):
+    global c2, k2
+    try: k2.queue_delete(queue=q)
+    except Exception:
+        c2 = pika.BlockingConnection(params); k2 = c2.channel()
+    k2.queue_declare(queue=q, durable=True, arguments=args or {})
+PRIOS = [(1, b"p1"), (5, b"p5"), (0, b"p0"), (3, b"p3"), (5, b"p5b")]
+_fresh("amqpc.prio", {"x-max-priority": 5})
+for pr, body in PRIOS:
+    k2.basic_publish("", "amqpc.prio", body, properties=pika.BasicProperties(priority=pr))
+time.sleep(0.4)
+d = k2.queue_declare(queue="amqpc.prio", durable=True, passive=True).method.message_count
+check("depth counts every priority level", d == 5, "depth=%d of 5" % d)
+got = []
+while True:
+    m, _p, b = k2.basic_get("amqpc.prio", auto_ack=True)
+    if m is None:
+        break
+    got.append(b.decode())
+check("basic.get serves highest priority first", got == ["p5", "p5b", "p3", "p1", "p0"],
+      "order=%s" % got)
+
+_fresh("amqpc.prio2", {"x-max-priority": 5})
+for pr, body in PRIOS:
+    k2.basic_publish("", "amqpc.prio2", body, properties=pika.BasicProperties(priority=pr))
+time.sleep(0.4)
+seen = []
+for m, _p, b in k2.consume("amqpc.prio2", inactivity_timeout=4):
+    if m is None:
+        break
+    seen.append(b.decode()); k2.basic_ack(m.delivery_tag)
+    if len(seen) >= 5:
+        break
+k2.cancel()
+check("a consumer serves highest priority first", seen == ["p5", "p5b", "p3", "p1", "p0"],
+      "order=%s" % seen)
+
+_fresh("amqpc.prio3", {"x-max-priority": 5})
+k2.basic_publish("", "amqpc.prio3", b"hi", properties=pika.BasicProperties(priority=4))
+k2.basic_publish("", "amqpc.prio3", b"lo", properties=pika.BasicProperties(priority=0))
+time.sleep(0.3)
+m, _p, b = k2.basic_get("amqpc.prio3", auto_ack=False)
+k2.basic_nack(m.delivery_tag, requeue=True); time.sleep(0.3)
+m2, _p2, b2 = k2.basic_get("amqpc.prio3", auto_ack=True)
+check("requeue puts a message back at ITS level", b == b"hi" and b2 == b"hi",
+      "first=%s after-requeue=%s" % (b, b2))
+
+_fresh("amqpc.prio4", {"x-max-priority": 5})
+for pr, body in PRIOS:
+    k2.basic_publish("", "amqpc.prio4", body, properties=pika.BasicProperties(priority=pr))
+time.sleep(0.3)
+pk = k2.queue_purge("amqpc.prio4")
+left = k2.queue_declare(queue="amqpc.prio4", durable=True, passive=True).method.message_count
+check("purge empties every level", left == 0, "left=%d" % left)
 c2.close()
 
 conn.close()
