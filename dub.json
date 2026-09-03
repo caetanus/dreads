@@ -179,11 +179,21 @@
 	"libs-posix": [
 		"sodium",
 		"z",
-		"stdc++"
+		"stdc++",
+		"ssl",
+		"crypto"
 	],
 	"libs-windows": [
 		"libsodium",
-		"advapi32"
+		"libssl",
+		"libcrypto",
+		"snappy",
+		"zstd",
+		"advapi32",
+		"ws2_32",
+		"crypt32",
+		"user32",
+		"gdi32"
 	],
 	"libs-linux": [
 		"jemalloc"
@@ -192,9 +202,5 @@
 	"name": "dreads",
 	"targetPath": "bin",
 	"targetType": "executable",
-	"lflags-linux": [],
-	"libs": [
-		"ssl",
-		"crypto"
-	]
+	"lflags-linux": []
 }

@@ -31,12 +31,14 @@ Consequences on Windows:
 ## Build
 
 ```powershell
-# needs LDC, MSVC (cl/lib), and libsodium (static). See .github/workflows/windows.yml
+# needs LDC, MSVC (cl/lib), and static libsodium + openssl + snappy + zstd
+# (vcpkg x64-windows-static). See .github/workflows/windows.yml
 dub build --compiler=ldc2
 ```
 
-The build is fully static: `-mscrtlib=libcmt` (static CRT), static libsodium
-(vcpkg `x64-windows-static`), and the vendored Lua + lz4 compiled `/MT`.
+The build is fully static: `-mscrtlib=libcmt` (static CRT), static libsodium,
+OpenSSL (TLS), snappy + zstd (Kafka decompression) from vcpkg `x64-windows-static`,
+and the vendored Lua + lz4 compiled `/MT`.
 
 ## Run
 

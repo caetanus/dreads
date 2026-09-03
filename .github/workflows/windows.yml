@@ -1,7 +1,7 @@
 name: windows
 
 # Windows build CI: a fully static (libcmt) x64 dreads.exe — posix syscall shims,
-# vibe-core, static libsodium (vcpkg) + vendored lua/lz4 (/MT). Publishes the exe
+# vibe-core, static libsodium/openssl/snappy/zstd (vcpkg) + vendored lua/lz4 (/MT). Publishes the exe
 # as a versioned artifact. Runs on master + PRs (badge on the README).
 on:
   push:
@@ -30,14 +30,26 @@ jobs:
       # cl/lib for the vendored lua+lz4 PowerShell builds (preBuildCommands-windows).
       - uses: ilammy/msvc-dev-cmd@v1
 
-      # Static libsodium.lib for the link (jemalloc is libs-linux, skipped here).
+      # Static libs for the link (jemalloc is libs-linux, skipped here):
+      # libsodium (acl/auth), openssl (tls.d: libssl+libcrypto), snappy + zstd
+      # (kafka.d record-batch decompression; posix builds them from vendor/).
       # x64-windows-static builds with the static CRT (/MT), matching dreads'
       # -mscrtlib=libcmt and the /MT lua+lz4 objects → a fully static .exe. Put its
-      # lib dir on LIB so link.exe finds libsodium.lib (msvc-dev-cmd set LIB first).
-      - name: Install libsodium (vcpkg, static)
+      # lib dir on LIB so link.exe finds them (msvc-dev-cmd set LIB first).
+      # The vcpkg tree is cached — openssl alone is several minutes from source.
+      - name: Cache vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed # = $VCPKG_INSTALLATION_ROOT on windows-latest (runner env is not in the env context)
+          key: vcpkg-x64-windows-static-libsodium-openssl-snappy-zstd-v1
+
+      - name: Install libsodium + openssl + snappy + zstd (vcpkg, static)
         shell: pwsh
         run: |
-          vcpkg install libsodium:x64-windows-static
+          if ('${{ steps.vcpkg-cache.outputs.cache-hit }}' -ne 'true') {
+            vcpkg install libsodium:x64-windows-static openssl:x64-windows-static snappy:x64-windows-static zstd:x64-windows-static
+          }
           $lib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib"
           "LIB=$lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
 
