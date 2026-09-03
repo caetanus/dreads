@@ -30,6 +30,15 @@ public struct DList
         return seg.length;
     }
 
+    /// Live bytes held by this list: payload plus the per-entry length fields.
+    /// O(1) — the segment tracks it because the quicklist caps a node by it —
+    /// which is what makes a byte-bounded queue affordable at all (summing the
+    /// elements would be O(n) on every publish).
+    @property ulong usedBytes() const @nogc nothrow
+    {
+        return seg.usedBytes;
+    }
+
     @property ulong enqueued() const @nogc nothrow
     {
         return enq_;

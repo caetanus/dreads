@@ -339,6 +339,26 @@ da = k2.queue_declare(queue="amqpc.col", durable=True, passive=True).method.mess
 db = k2.queue_declare(queue="amqpc.col.p001", durable=True, passive=True).method.message_count
 ba = k2.basic_get("amqpc.col", auto_ack=True)[2]
 bb = k2.basic_get("amqpc.col.p001", auto_ack=True)[2]
+# --- [X-MAX-LENGTH-BYTES] bound the queue by SIZE, not just by count ---------
+# RabbitMQ 4 and LavinMQ both enforce it. A count-only bound cannot express it:
+# one 10 MB message and one 10-byte message cost the same against x-max-length.
+print("\n[X-MAX-LENGTH-BYTES]")
+_fresh("amqpc.mlb", {"x-max-length-bytes": 1000})
+for i in range(50):
+    k2.basic_publish("", "amqpc.mlb", b"x" * 100)   # 5000 bytes offered
+time.sleep(0.6)
+mbDepth = k2.queue_declare(queue="amqpc.mlb", durable=True, passive=True).method.message_count
+check("x-max-length-bytes evicts to fit the byte bound", 0 < mbDepth <= 12,
+      "depth=%d (1000B / 100B ~ 10; LavinMQ keeps 7)" % mbDepth)
+
+# no byte bound = no byte eviction
+_fresh("amqpc.mlb2")
+for i in range(50):
+    k2.basic_publish("", "amqpc.mlb2", b"x" * 100)
+time.sleep(0.6)
+mbDepth2 = k2.queue_declare(queue="amqpc.mlb2", durable=True, passive=True).method.message_count
+check("without the arg nothing is evicted", mbDepth2 == 50, "depth=%d of 50" % mbDepth2)
+
 check("a queue named like a level key is a separate queue",
       da == 1 and db == 1 and ba == b"level1" and bb == b"other",
       "depths=%d/%d bodies=%s/%s" % (da, db, ba, bb))

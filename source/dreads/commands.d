@@ -1239,6 +1239,25 @@ public bool dispatch(const ref RVal cmd, ref Keyspace ks, ref ByteBuffer o, ref 
                 repInt(o, obj is null ? 0 : cast(long) obj.list.length);
             break;
         }
+    case cmdIx!"qbytes":
+        {
+            // dreads-native: a list's live byte size, O(1) (the packed segment
+            // tracks it). LLEN answers "how many"; a byte-bounded queue needs
+            // "how big", and summing the elements would be O(n) per publish.
+            // Separate from qstats so the dashboard's reply shape is untouched.
+            if (args.length != 1)
+            {
+                arityErr(o, "qbytes");
+                break;
+            }
+            bool wrong;
+            auto obj = ks.lookupTyped(args[0].str, ObjType.list, wrong);
+            if (wrong)
+                repWrongType(o);
+            else
+                repInt(o, obj is null ? 0 : cast(long) obj.list.usedBytes);
+            break;
+        }
     case cmdIx!"qstats":
         {
             // dreads-native: per-queue counters for a list — total items ever

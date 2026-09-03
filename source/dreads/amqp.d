@@ -120,6 +120,9 @@ public __gshared bool delegate(scope const(char)[] key, ref ByteBuffer outPayloa
 public __gshared int delegate(scope const(char)[] key, uint count,
         ref ByteBuffer outRaw) nothrow gAmqpPopN;
 public __gshared long delegate(scope const(char)[] key) nothrow gAmqpLen;
+/// Live bytes of a queue's backing list (the `qbytes` command), O(1) on the
+/// owner. x-max-length-bytes needs "how big", and LLEN only answers "how many".
+public __gshared long delegate(scope const(char)[] key) nothrow gAmqpBytes;
 public __gshared void delegate(scope const(char)[] key) nothrow gAmqpDelKey;
 /// Non-destructive head read (LINDEX key 0) for the active-TTL reaper; false =
 /// empty queue. Installed by server.d.
@@ -425,6 +428,26 @@ private long queueDepth(scope const(char)[] q) nothrow @trusted
     return tot;
 }
 
+/// Total live bytes across every priority level.
+private long queueBytes(scope const(char)[] q) nothrow @trusted
+{
+    if (gAmqpBytes is null)
+        return 0;
+    static ByteBuffer kbq; // TLS: consumed immediately, no yield
+    immutable mp = queueMaxPrio(q);
+    long tot = 0;
+    foreach (lvl; 0 .. mp + 1)
+    {
+        if (lvl > 0 && !prioBitGet(q, lvl))
+            continue;
+        queueKeyPrio(q, lvl, kbq);
+        immutable n = gAmqpBytes(kbq.data.asChars);
+        if (n > 0)
+            tot += n;
+    }
+    return tot;
+}
+
 /// Apply `fn` to every backing list of `q` (just its own key when it is a plain
 /// FIFO queue). Used by purge and delete: a priority queue that dropped only
 /// level 0 would leak every higher-priority message it still held.
@@ -566,6 +589,11 @@ private struct QueueMeta
     /// queue's own key and levels 1..N at `<key>.p<level>`. That is how RabbitMQ
     /// implements them too, and it keeps non-priority queues untouched.
     ubyte maxPrio;
+    /// x-max-length-bytes ENCODED +1 (0 = unset). Bounds the queue by the SIZE
+    /// of what it holds, which RabbitMQ 4 and LavinMQ both enforce and a
+    /// count-only bound cannot: one 10 MB message and one 10-byte message cost
+    /// the same against x-max-length.
+    long maxBytes;
 }
 
 /// x-expires lease deadlines (nowMs-based), shard-local. Stamped by the op-3
@@ -962,8 +990,12 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
             ubyte mpw = 0;
             if (tb.length >= 35)
                 mpw = tb[34];
+            long mbw = 0;
+            if (tb.length >= 43)
+                foreach (k; 35 .. 43)
+                    mbw = (mbw << 8) | tb[k];
             QueueMeta qm = QueueMeta(a, b, ttl, mxl, (fl & 1) != 0, (fl & 4) != 0,
-                    expw, (fl & 8) != 0, ovfw, dlw, mpw);
+                    expw, (fl & 8) != 0, ovfw, dlw, mpw, mbw);
             if (auto ex0 = (cast(string) ex) in gQueueMeta)
             {
                 if (!(fl & 1))
@@ -986,6 +1018,8 @@ public void amqpApplyCtl(scope const(ubyte)[] p) nothrow @trusted
                     qm.delLimit = ex0.delLimit;
                 if (mpw == 0)
                     qm.maxPrio = ex0.maxPrio;
+                if (mbw == 0)
+                    qm.maxBytes = ex0.maxBytes;
                 if (!(fl & 8))
                 {
                     qm.expMs = ex0.expMs;
@@ -1234,6 +1268,7 @@ private size_t tPubMemoQLen;
 private bool tPubMemoExists;
 private long tPubMemoMaxLen; // gQueueMeta.maxLen (bound+1 encoding; 0 = unset)
 private ubyte tPubMemoOverflow; // gQueueMeta.overflow, memoised with maxLen
+private long tPubMemoMaxBytes; // gQueueMeta.maxBytes (bound+1; 0 = unset)
 private ulong tPubMemoEpoch = ulong.max;
 
 /// True iff `q` names a queue that is currently declared (op 8, not yet op 9)
@@ -3780,6 +3815,16 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     // is a VALID bound (the queue holds nothing) and must be
                     // distinguishable from unset.
                     immutable mlEnc = mlPresent ? mxl2 + 1 : 0;
+                    long mbV;
+                    immutable mbPresent = tableIntKind(argsTbl, "x-max-length-bytes", mbV) > 0;
+                    if (mbPresent && mbV < 0)
+                    {
+                        channelClose(o, chan, 406,
+                                "PRECONDITION_FAILED - invalid arg 'x-max-length-bytes'", 50, 10);
+                        c.chans.remove(chan);
+                        return true;
+                    }
+                    immutable mbEnc = mbPresent ? mbV + 1 : 0;
                     long mpV;
                     immutable mpPresent = tableIntKind(argsTbl, "x-max-priority", mpV) > 0;
                     if (mpPresent && (mpV < 0 || mpV > 255))
@@ -3801,9 +3846,9 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                     }
                     immutable dlEnc = dlPresent ? dlV + 1 : 0;
                     if (dlx !is null || dlrk !is null || tk > 0 || mlEnc > 0 || ek > 0
-                            || ovfEnc != 0 || dlEnc > 0 || mpEnc != 0)
+                            || ovfEnc != 0 || dlEnc > 0 || mpEnc != 0 || mbEnc > 0)
                     {
-                        ubyte[35] tb = void;
+                        ubyte[43] tb = void;
                         foreach (k; 0 .. 8)
                             tb[k] = cast(ubyte)(ttl >> ((7 - k) * 8));
                         foreach (k; 0 .. 8)
@@ -3819,6 +3864,8 @@ private bool handleFrame(AmqpConn c, ubyte ftype, ushort chan,
                         foreach (k; 0 .. 8)
                             tb[26 + k] = cast(ubyte)(dlEnc >> ((7 - k) * 8));
                         tb[34] = mpEnc;
+                        foreach (k; 0 .. 8)
+                            tb[35 + k] = cast(ubyte)(mbEnc >> ((7 - k) * 8));
                         ctlBroadcast(3, qq, dlx is null ? "" : dlx,
                                 dlrk is null ? "" : dlrk, tb[]);
                     }
@@ -5246,16 +5293,20 @@ private void requeueAndDropChannel(AmqpConn c, ushort chan) nothrow @trusted
 /// and the pops can hop cross-shard and YIELD (the delKeyStore hazard).
 private void enforceMaxLen(scope const(char)[] q) nothrow @trusted
 {
-    long ml = 0;
+    long ml = 0, mb = 0;
     try
         if (auto m = cast(string) q in gQueueMeta) // reinterpret: read-only probe
+        {
             ml = m.maxLen;
+            mb = m.maxBytes;
+        }
     catch (Exception)
     {
     }
-    if (ml <= 0 || gAmqpLen is null || gAmqpPop is null)
+    if ((ml <= 0 && mb <= 0) || gAmqpLen is null || gAmqpPop is null)
         return;
     ml -= 1; // decode: stored as bound+1 so a 0 bound stays distinct from unset
+    mb -= 1; // same encoding; < 0 now means "unset"
     static ByteBuffer mkq; // consumed into the stack copy before any yield
     queueKey(q, mkq);
     char[8 + 256 + 4] ks = void;
@@ -5268,9 +5319,13 @@ private void enforceMaxLen(scope const(char)[] q) nothrow @trusted
     {
         // x-max-length bounds the QUEUE, not one level of it: count across the
         // levels and evict from the LOWEST non-empty one.
-        immutable n = mp == 0 ? gAmqpLen(key) : queueDepth(q);
-        if (n <= ml)
-            break; // ml may be 0: a zero bound evicts everything
+        // x-max-length and x-max-length-bytes are BOTH bounds: whichever is
+        // exceeded evicts, exactly like RabbitMQ.
+        immutable overCount = ml >= 0
+            && (mp == 0 ? gAmqpLen(key) : queueDepth(q)) > ml;
+        immutable overBytes = mb >= 0 && queueBytes(q) > mb;
+        if (!overCount && !overBytes)
+            break; // a zero bound evicts everything, hence > and not >=
         ByteBuffer pay; // local: the pop yields
         if (mp == 0)
         {
@@ -5601,6 +5656,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         // publishes to the same queue skips the AA probes entirely.
         bool exists;
         long mlP1;
+        long mbP1;
         ubyte ovf;
         {
             import core.atomic : MemoryOrder, atomicLoad;
@@ -5611,18 +5667,21 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
             {
                 exists = tPubMemoExists;
                 mlP1 = tPubMemoMaxLen;
+                mbP1 = tPubMemoMaxBytes;
                 ovf = tPubMemoOverflow;
             }
             else
             {
                 exists = queueExists(q);
                 mlP1 = 0;
+                mbP1 = 0;
                 ovf = 0;
                 if (exists)
                     try
                         if (auto m = cast(string) q in gQueueMeta) // reinterpret: read-only AA probe, no alloc
                         {
                             mlP1 = m.maxLen;
+                            mbP1 = m.maxBytes;
                             ovf = m.overflow;
                         }
                     catch (Exception)
@@ -5634,6 +5693,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
                     tPubMemoQLen = q.length;
                     tPubMemoExists = exists;
                     tPubMemoMaxLen = mlP1;
+                    tPubMemoMaxBytes = mbP1;
                     tPubMemoOverflow = ovf;
                     tPubMemoEpoch = ep;
                 }
@@ -5664,6 +5724,12 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         // HEAD after the push; reject-publish refuses the message instead, and a
         // publisher in confirm mode is nacked rather than acked. The length probe
         // costs a keyspace read, so it runs ONLY for a queue configured this way.
+        if (ovf == 1 && mbP1 > 0 && gAmqpBytes !is null
+                && queueBytes(q) >= mbP1 - 1)
+        {
+            pubRejected = true;
+            return; // over the BYTE bound and configured to refuse
+        }
         if (ovf == 1 && mlP1 > 0 && gAmqpLen !is null)
         {
             // the bound is the QUEUE's: on a priority queue the level key alone
@@ -5684,7 +5750,7 @@ private void finishPublish(AmqpConn c, ushort chan, ref Channel ch, ref ByteBuff
         else if (gAmqpPush !is null)
             gAmqpPush(kb3.data.asChars, payload);
         routed++;
-        if (mlP1 > 0)
+        if (mlP1 > 0 || mbP1 > 0) // either bound is reason to enforce
             enforceMaxLen(q);
     };
     if (!drDirect)

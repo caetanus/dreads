@@ -3244,7 +3244,7 @@ private Keyspace* myKeyspace2(uint db) nothrow @trusted
 
 private void amqpInstallHooks() nothrow
 {
-    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpPushFront, gAmqpPop, gAmqpPopN, gAmqpLen, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
+    import dreads.amqp : gAmqpPush, gAmqpPushStage, gAmqpPushFront, gAmqpPop, gAmqpPopN, gAmqpLen, gAmqpBytes, gAmqpDelKey, gAmqpAofFlush, gAmqpPeekHead, gAmqpPeekAt, gAmqpOwns, gAmqpCtlFanout;
 
     gAmqpPush = (scope const(char)[] key, scope const(char)[] payload) nothrow {
         static ByteBuffer rb; // TLS
@@ -3315,6 +3315,22 @@ private void amqpInstallHooks() nothrow
             return false;
         outPayload.append(d[i .. i + n]);
         return true;
+    };
+    gAmqpBytes = (scope const(char)[] key) nothrow {
+        static ByteBuffer rbB; // TLS
+        const(char)[][2] a = ["qbytes", key];
+        amqpDataExec(a[], rbB);
+        auto d = rbB.data;
+        if (d.length < 2 || d[0] != ':')
+            return 0L;
+        long v = 0;
+        size_t i = 1;
+        while (i < d.length && d[i] >= '0' && d[i] <= '9')
+        {
+            v = v * 10 + (d[i] - '0');
+            i++;
+        }
+        return v;
     };
     gAmqpLen = (scope const(char)[] key) nothrow {
         static ByteBuffer rb3; // TLS

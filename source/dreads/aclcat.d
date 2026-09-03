@@ -309,6 +309,7 @@ immutable CmdCats[] gCmdCats = [
     {"zunion", AclCat.read | AclCat.slow | AclCat.sortedset},
     {"zunionstore", AclCat.slow | AclCat.sortedset | AclCat.write},
     {"qstats", AclCat.fast | AclCat.server}, // dreads-internal (appended: indices above must not move)
+    {"qbytes", AclCat.fast | AclCat.server}, // dreads-internal (appended)
 
 ];
 
