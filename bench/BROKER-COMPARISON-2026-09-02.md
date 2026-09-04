@@ -67,11 +67,22 @@ accumulation to lose.
 | dreads s8 | 135 849 |
 | mosquitto 2 | 118 038 |
 
-dreads at one shard is **~31x mosquitto**. Past one shard the fan-out collapses
-by an order of magnitude, and it reproduces. Delivery stays CORRECT there — a
-paho probe at s1 and s2 receives 200/200 on all 8 topics — so this is a
-throughput pathology in the cross-shard fan-out, not lost messages. It is the
-largest open performance item in the tree.
+dreads at one shard is **~31x mosquitto**, and one shard is stable: repeated
+runs give 2.2-3.7M with every subscriber served.
+
+**Past one shard the numbers above are not a throughput curve — they are an
+erratic delivery defect, and calling them a "collapse" understated it.**
+Re-measured 2026-09-03 with the native client: two back-to-back runs of the SAME
+binary at `--shards 2` gave 769 453 msg/s with 4 of 4 subscribers reporting, then
+2 171 msg/s with 1 of 4 — the other three never received enough to finish a 5 s
+window while their topics were being published to. That is why every earlier
+MQTT figure here scattered between 174k and 5.3M: they were sampling a
+non-deterministic failure, not a slow path.
+
+Light load does not show it (a paho probe gets 200/200 on 8 topics at s1 and s2).
+Tracked as D-MQTT-02 in SECURITY-AUDIT.md; it needs the cross-shard fan-out
+instrumented before any fix, and the multi-shard rows above should not be read as
+performance numbers.
 
 ## Kafka — kafka-producer-perf-test.sh (the reference client), equal core budget
 
