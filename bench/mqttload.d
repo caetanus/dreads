@@ -19,6 +19,7 @@ module mqttload;
 import core.stdc.stdio : printf;
 import std.socket : TcpSocket, InternetAddress, SocketOptionLevel, SocketOption;
 import std.datetime.stopwatch : StopWatch, AutoStart;
+import core.time : dur, msecs;
 import std.conv : to;
 
 __gshared ubyte[1 << 20] rbuf;
@@ -213,13 +214,82 @@ int main(string[] args)
         size_t rlen = 0;
         bool started = false;
         immutable long durMs = args.length > 6 ? args[6].to!long : 0;
+        // Grace: how long to keep waiting when NOTHING has arrived yet. Without
+        // it a starved subscriber blocks in receive() forever and prints
+        // nothing at all -- which reads downstream as "the broker delivered
+        // nothing" when it may equally be "this process was never scheduled".
+        // A run that reports 0 is data; a run that hangs is not.
+        immutable long graceMs = args.length > 7 ? args[7].to!long : 10_000;
+        // The duration check used to sit before a BLOCKING receive, so it only
+        // ran when a delivery arrived -- the one case where it did not matter.
+        s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(100));
         StopWatch sw;
-        while (seen < n)
+        auto swWall = StopWatch(AutoStart.yes);
+        auto swIdle = StopWatch(AutoStart.yes);
+        bool closed = false;
+        // READY on stdout AFTER the SUBACK: a harness can then hold the
+        // publishers until every subscriber is actually registered, instead of
+        // racing them and blaming the broker for the ones that arrived late.
+        {
+            bool suback = false;
+            while (!suback && swWall.peek.total!"msecs" < graceMs)
+            {
+                auto r0 = s.receive(rbuf[rlen .. $]);
+                if (r0 == 0)
+                {
+                    closed = true;
+                    break;
+                }
+                if (r0 < 0)
+                    continue; // recv timeout
+                rlen += r0;
+                size_t p0 = 0;
+                while (p0 < rlen)
+                {
+                    size_t hp0 = p0 + 1;
+                    uint rem0;
+                    if (!decodeVarint(rbuf[0 .. rlen], hp0, rem0) || hp0 + rem0 > rlen)
+                        break;
+                    if ((rbuf[p0] >> 4) == 9)
+                        suback = true;
+                    p0 = hp0 + rem0;
+                }
+                if (p0 > 0)
+                {
+                    foreach (i; 0 .. rlen - p0)
+                        rbuf[i] = rbuf[p0 + i];
+                    rlen -= p0;
+                }
+            }
+            printf("READY\n");
+            import core.stdc.stdio : fflush, stdout;
+
+            fflush(stdout);
+            swWall = StopWatch(AutoStart.yes);
+        }
+        while (seen < n && !closed)
         {
             if (durMs > 0 && started && sw.peek.total!"msecs" >= durMs)
                 break;
+            // starved: give up on the GRACE clock, and still report
+            if (!started && swWall.peek.total!"msecs" >= graceMs)
+                break;
+            // count-to-N mode: stop when the stream has been QUIET for graceMs
+            // rather than when a wall window expires. A fixed window makes a
+            // subscriber leave while its publisher is still running, and the
+            // messages that follow then legitimately match no subscriber --
+            // which is indistinguishable downstream from the broker losing
+            // them. Draining to quiet removes that confound.
+            if (durMs == 0 && started && swIdle.peek.total!"msecs" >= graceMs)
+                break;
             auto r = s.receive(rbuf[rlen .. $]);
-            assert(r > 0, "broker closed");
+            if (r == 0)
+            {
+                closed = true;
+                break;
+            }
+            if (r < 0)
+                continue; // recv timeout -- re-check the deadlines above
             rlen += r;
             size_t pos = 0;
             while (pos < rlen)
@@ -239,6 +309,7 @@ int main(string[] args)
                         sw = StopWatch(AutoStart.yes);
                         started = true;
                     }
+                    swIdle.reset();
                     seen++;
                 }
                 pos = hp + rem;

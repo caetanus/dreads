@@ -68,21 +68,22 @@ accumulation to lose.
 | mosquitto 2 | 118 038 |
 
 dreads at one shard is **~31x mosquitto**, and one shard is stable: repeated
-runs give 2.2-3.7M with every subscriber served.
+runs deliver 100% to every subscriber.
 
-**Past one shard the numbers above are not a throughput curve — they are an
-erratic delivery defect, and calling them a "collapse" understated it.**
-Re-measured 2026-09-03 with the native client: two back-to-back runs of the SAME
-binary at `--shards 2` gave 769 453 msg/s with 4 of 4 subscribers reporting, then
-2 171 msg/s with 1 of 4 — the other three never received enough to finish a 5 s
-window while their topics were being published to. That is why every earlier
-MQTT figure here scattered between 174k and 5.3M: they were sampling a
-non-deterministic failure, not a slow path.
+**The multi-shard MQTT rows above are not a throughput curve and must not be
+read as one.** Re-measured 2026-09-03 with a corrected client: at `--shards 4`,
+four publisher/subscriber pairs on their own topics, every publisher gets PUBACK
+for all 2 000 000 QoS-1 publishes, three subscribers receive 2 000 000 and the
+fourth receives **0**. `--shards 8` does not finish. `--shards 1` and
+`--shards 2` deliver 100% in every controlled run — an earlier note here blamed
+`shards >= 2`, which the clean measurements refute.
 
-Light load does not show it (a paho probe gets 200/200 on 8 topics at s1 and s2).
-Tracked as D-MQTT-02 in SECURITY-AUDIT.md; it needs the cross-shard fan-out
-instrumented before any fix, and the multi-shard rows above should not be read as
-performance numbers.
+The scatter in the older MQTT figures (174k to 5.3M) was two harness defects,
+now fixed in `bench/mqttload.d`, plus this defect: a starved subscriber used to
+hang and vanish from the results instead of reporting a zero. Tracked as
+D-MQTT-02 in SECURITY-AUDIT.md, together with the one alternative explanation
+(the skin's deliberate QoS-0 drop at a full outbox) that has NOT yet been
+eliminated.
 
 ## Kafka — kafka-producer-perf-test.sh (the reference client), equal core budget
 
